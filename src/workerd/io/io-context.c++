@@ -17,6 +17,12 @@
 #include <workerd/util/uncaught-exception-source.h>
 #include <workerd/util/use-perfetto-categories.h>
 
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <workerd/experimental/guest-kernel/gk.h>
+
+#include <cstdlib>
+#endif
+
 #include <kj/debug.h>
 
 #include <atomic>
@@ -1422,6 +1428,77 @@ void IoContext::runInContextScope(Worker::LockType lockType,
   });
 }
 
+namespace {
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+// Experimental guest-kernel isolation (see experimental/guest-kernel/gk.h): when
+// WORKERD_EXPERIMENTAL_GUEST_KERNEL is set, each JS turn runs inside the KVM guest via
+// gk_run_here(). The guest boundary is not a C++ call frame, so an exception thrown inside the
+// turn cannot unwind across it; the trampoline catches everything in the guest and the host
+// side re-throws it, so callers observe the same exceptions as without the guest.
+
+bool isGuestKernelEnabled() {
+  static const bool enabled = getenv("WORKERD_EXPERIMENTAL_GUEST_KERNEL") != nullptr;
+  return enabled;
+}
+
+// Depth of guest-kernel turns on this thread. A turn can re-enter runImpl (for example, a
+// destructor run during JS may enter another IoContext's scope); such nested turns already
+// execute in the guest and must not call gk_run_here() again from inside it.
+thread_local uint guestTurnDepth = 0;
+
+template <typename Func>
+struct GuestTurn {
+  Func& body;
+  kj::Maybe<kj::Exception> exception;
+  bool jsExceptionThrown = false;
+
+  static long trampoline(void* ptr) {
+    auto& turn = *reinterpret_cast<GuestTurn*>(ptr);
+    try {
+      turn.body();
+    } catch (const jsg::JsExceptionThrown&) {
+      // The pending exception stays on the isolate; only the C++ signal must be re-raised.
+      turn.jsExceptionThrown = true;
+    } catch (...) {
+      turn.exception = kj::getCaughtExceptionAsKj();
+    }
+    return 0;
+  }
+};
+#endif
+
+// Run one JS turn, inside the guest kernel when it is enabled and directly otherwise.
+template <typename Func>
+void runJsTurn(Func&& body) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (isGuestKernelEnabled() && guestTurnDepth == 0) {
+    ++guestTurnDepth;
+    KJ_DEFER(--guestTurnDepth);
+
+    GuestTurn<Func> turn{body};
+    long result = gk_run_here(&GuestTurn<Func>::trampoline, &turn);
+    if (result != 0) {
+      // The guest was abandoned mid-turn (its frames, locks and RAII state are gone), so there
+      // is no consistent state to unwind through.
+      KJ_LOG(FATAL, "guest-kernel: JS turn did not complete", result, gk_fault_addr());
+      abort();
+    }
+
+    if (turn.jsExceptionThrown) {
+      throw jsg::JsExceptionThrown();
+    }
+    KJ_IF_SOME(e, turn.exception) {
+      kj::throwFatalException(kj::mv(e));
+    }
+    return;
+  }
+#endif
+  body();
+}
+
+}  // namespace
+
 void IoContext::runImpl(Runnable& runnable,
     Worker::LockType lockType,
     kj::Maybe<InputGate::Lock> inputLock,
@@ -1432,7 +1509,9 @@ void IoContext::runImpl(Runnable& runnable,
 
   getIoChannelFactory().getTimer().syncTime();
 
-  runInContextScope(lockType, kj::mv(inputLock), [&](Worker::Lock& workerLock) {
+  // One JS turn: the runnable plus the microtask / message-loop draining that must follow it,
+  // all under the isolate lock and inside the context scope.
+  auto turn = [&](Worker::Lock& workerLock) {
     kj::Own<void> event;
     if (!exceptional) {
       workerLock.requireNoPermanentException();
@@ -1579,7 +1658,10 @@ void IoContext::runImpl(Runnable& runnable,
         }
       }
     }
-  });
+  };
+
+  runInContextScope(lockType, kj::mv(inputLock),
+      [&](Worker::Lock& workerLock) { runJsTurn([&]() { turn(workerLock); }); });
 }
 
 static constexpr auto kAsyncIoErrorMessage =
