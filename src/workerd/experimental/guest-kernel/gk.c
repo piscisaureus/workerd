@@ -233,23 +233,27 @@ static void unmap4k_root(uint64_t *root, uint64_t va) {
 //
 // Memory is backed one aligned GK_BACK_WIN window at a time (region_ensure
 // rounds outward to the window), rather than one memslot per exact host mapping.
-// This matters for correctness, not just speed: creating tight, exact-bounds
-// memslots and extending them page by page as brk/mmap grow a live mapping under
-// the running guest corrupts the memory being grown (glibc's heap, in practice).
-// An aligned window absorbs a mapping's growth without touching the memslot that
-// already backs it, and because everything is identity-mapped an oversized
-// window that spills into an unmapped hole is harmless -- the guest never has a
-// PTE there, so KVM never faults it in. Protection is not cached on the region;
-// the PTE carries the live host protection, re-read on every fault.
+// This is a cost choice, not a correctness one. Exact per-page memslots are
+// safe (given the malloc-free fault path -- see demand_map's signal-safety
+// note), but each KVM_SET_USER_MEMORY_REGION costs on the order of 20us, and a
+// V8-sized heap backed by 4K slots would blow past KVM's ~32764-memslot limit.
+// A window amortizes both: one create backs 2MB, and a mapping's later growth
+// usually lands in a window that already exists. Because everything is
+// identity-mapped, an oversized window that spills into an unmapped hole is
+// harmless -- the guest never has a PTE there, so KVM never faults it in.
+// Protection is not cached on the region; the PTE carries the live host
+// protection, re-read on every fault.
 //
-// Memslots are created once and never deleted: an identity memslot validly backs
+// Memslots are created once and never deleted. An identity memslot validly backs
 // its window whether or not the host currently has memory there, so mprotect and
-// munmap only need to drop the guest PTEs (see forward_syscall), not the memslot.
+// munmap only need to drop the guest PTEs (see forward_syscall), not the memslot
+// -- and a delete is not free: KVM invalidates every nested-page-table root when
+// a memslot is removed, whereas adding an abutting memslot zaps nothing.
 //
 // TODO: 2MB windows over-back sparsely committed reservations. A production MMU
 // could track exact VMAs (cf. FreeBSD's vm_map RB tree, sys/vm, 2-clause BSD)
-// once the exact-bounds growth path above is made safe, and issue cross-vCPU TLB
-// shootdowns.
+// and issue cross-vCPU TLB shootdowns. Exact bounds are already safe, so this is
+// a density/cost improvement, not a correctness fix.
 #define GK_BACK_WIN (2UL << 20)   // memslot backing granularity (2MB, aligned)
 typedef struct gk_region {
   uintptr_t start, end;   // [start, end), GK_BACK_WIN-aligned
@@ -258,9 +262,23 @@ typedef struct gk_region {
   struct gk_region *l, *r;
 } gk_region;
 static gk_region *g_regions;      // treap root
-// Region nodes come from a static pool: region_add runs on the fault path, and
-// the faulting guest thread may be inside malloc holding its arena lock, so the
-// host side of that same thread must never call malloc there.
+// Region nodes come from a static pool because the fault path must not allocate.
+// The host side of a guest fault runs on the SAME host thread whose guest half
+// took the fault, and that thread may be in the middle of glibc malloc -- in
+// fact the store that faults is often sysmalloc writing the freshly-grown heap
+// top chunk's size field, so at that instant the arena's top chunk has size 0
+// and its invariants are momentarily broken. If the fault handler then allocates
+// it re-enters that same arena: single-threaded, glibc skips the arena lock and
+// the nested malloc corrupts the arena (aborting later inside sysmalloc, at
+// malloc.c's top-chunk assertion); multi-threaded, it deadlocks on the arena
+// lock the guest half holds. So the fault path -- and the host side of any
+// syscall malloc itself forwards, e.g. the brk/mmap sysmalloc issues -- must be
+// async-signal-safe with respect to the guest thread: no malloc/free, no
+// allocating stdio, no lock the guest may hold. That is why host_region reads
+// /proc/self/maps with raw open/read rather than fopen, and region nodes come
+// from this pool rather than calloc. (This corruption was once attributed to
+// KVM's on-demand memslot creation; the memslot ioctl is not involved -- an
+// added, abutting memslot invalidates nothing. See the backing-window note.)
 #define GK_MAX_REGIONS 65536
 static gk_region g_region_pool[GK_MAX_REGIONS];
 static int g_region_n;
@@ -565,6 +583,38 @@ static int mmu_map_range(uintptr_t s, uintptr_t e, int perms) {
     if (map4k_root(g_pml4, v, (uint64_t)perms, pkey_lookup(v)) < 0) return -1;
   return 0;
 }
+
+// Allocation guard for the fault path (off by default). The fault handler must
+// not call malloc (see the region-pool note): the faulting guest thread may be
+// mid-malloc with its arena in a transient state. Building with
+// -DGK_GUARD_HANDLER_ALLOC and -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc
+// makes any allocation between GK_HANDLER_ENTER/LEAVE abort loudly rather than
+// silently corrupt glibc's arena, so a future stray malloc/fopen on this path is
+// caught deterministically at any backing granularity. Shipping builds compile
+// the macros to nothing and never wrap malloc.
+#ifdef GK_GUARD_HANDLER_ALLOC
+static __thread int g_in_handler;
+#define GK_HANDLER_ENTER() (g_in_handler = 1)
+#define GK_HANDLER_LEAVE() (g_in_handler = 0)
+extern void *__real_malloc(size_t);
+extern void *__real_calloc(size_t, size_t);
+extern void *__real_realloc(void *, size_t);
+static void gk_guard_alloc(const char *w) {
+  if (!g_in_handler) return;
+  const char a[] = "[gk] FATAL: ";
+  const char b[] = "() on the fault-handler path (must be malloc-free)\n";
+  write(2, a, sizeof a - 1);
+  write(2, w, strlen(w));
+  write(2, b, sizeof b - 1);
+  abort();
+}
+void *__wrap_malloc(size_t n) { gk_guard_alloc("malloc"); return __real_malloc(n); }
+void *__wrap_calloc(size_t n, size_t s) { gk_guard_alloc("calloc"); return __real_calloc(n, s); }
+void *__wrap_realloc(void *p, size_t n) { gk_guard_alloc("realloc"); return __real_realloc(p, n); }
+#else
+#define GK_HANDLER_ENTER() ((void)0)
+#define GK_HANDLER_LEAVE() ((void)0)
+#endif
 
 // Handle a guest page fault: if the faulting page is host-accessible, back it
 // with a memslot and PTE so the guest can retry. Caller must not hold g_lock.
@@ -1126,8 +1176,9 @@ static long forward_syscall(struct kvm_regs *r) {
   // in between. The memslot backing is left in place: guest-physical equals
   // host-virtual, so a memslot validly covers its range whether or not the host
   // currently has memory there, and if the range is later remapped at the same
-  // address the same memslot backs it. Deleting and recreating memslots here
-  // instead corrupts memory the guest is actively using.
+  // address the same memslot backs it. Deleting the memslot here would be
+  // correct but wasteful -- KVM invalidates every nested-page-table root on a
+  // memslot removal, so we never delete to reflect a protection or unmap change.
   //
   // Other vCPUs' TLBs are not shot down: a stale entry there carries the old
   // protection or key until it is evicted or faults (a page fault invalidates
@@ -1388,7 +1439,10 @@ static long run_vcpu(void) {
             g_fault_addr = cr2;
             return GK_EFAULT;
           }
-          if (demand_map((uintptr_t)cr2) < 0) {
+          GK_HANDLER_ENTER();
+          int dm = demand_map((uintptr_t)cr2);
+          GK_HANDLER_LEAVE();
+          if (dm < 0) {
             if (g_dbg) {
               struct kvm_regs rr;
               ioctl(tls.fd, KVM_GET_REGS, &rr);

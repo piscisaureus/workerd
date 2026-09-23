@@ -146,17 +146,15 @@ decides the overall cost.
   existing mappings are, because the subtrees are shared.
 - **The MMU backs whole 2 MiB windows, not exact VMAs.** It reparses
   `/proc/self/maps` per fault, flushes the whole TLB on each `mprotect`/`munmap`,
-  and only the faulting thread's TLB (no cross-vCPU shootdown). Backing is done
-  in aligned 2 MiB windows rather than exact mapping bounds as a workaround for a
-  hazard that is not yet root-caused: creating tight, exact-bounds memslots and
-  extending them page by page as `brk`/`mmap` grow a live mapping under the
-  running guest deterministically corrupts the memory being grown (glibc's heap,
-  in practice), even though the final backing is consistent. Backing a whole
-  window on first touch makes on-demand memslot creation rare rather than proving
-  it safe; the likely culprit is KVM's handling of an incremental memslot update
-  next to memory the guest is using. A production MMU should track exact VMAs
-  (see the FreeBSD `sys/vm` note in `gk.c`) once that hazard is understood, and
-  follow `mmap`/`mprotect`/`munmap` with per-range shootdowns.
+  and only the faulting thread's TLB (no cross-vCPU shootdown). Backing in aligned
+  2 MiB windows rather than exact mapping bounds is a **cost** choice, not a
+  correctness one: exact per-page memslots are safe, but each memslot create
+  costs ~20 us and a V8-sized heap of 4 KiB slots would exceed KVM's ~32764-slot
+  limit. (The heap corruption once blamed on on-demand memslot creation was
+  actually fault-path re-entrancy into glibc `malloc` — the memslot ioctl is not
+  involved; see the signal-safety note in `gk.c`.) A production MMU could track
+  exact VMAs (see the FreeBSD `sys/vm` note in `gk.c`) for density and add
+  per-range cross-vCPU shootdowns; both are refinements, not correctness fixes.
 - **Not integrated with the workerd build.** Integrating with V8's cage would
   require the V8 sandbox to be enabled in the build first.
 
