@@ -2172,6 +2172,21 @@ typedef struct { gk_thread *t; long (*fn)(void *); void *arg; int user; } gk_her
 // frame; a store above it is a wall violation and ends the turn with
 // GK_EFAULT.
 //
+// The wall is read-only, not no-read: the host frames stay readable, so a
+// ring-3 escape can still read the return addresses there (an ASLR infoleak,
+// though no longer a write/control primitive). Making them unreadable too
+// (mapping the window supervisor) would fault the conservative GC scan, which
+// walks the whole thread stack, unless that scan were first bounded to the
+// guest's entry frame. V8 has the hook for that -- a per-turn
+// v8::StackStartMarker (jsg.h, guarded by V8_HAS_STACK_START_MARKER) that sets
+// the isolate's stack-scan start -- but it depends on an internal Cloudflare
+// V8 patch that is not in the OSS tree. The low-level setter it needs
+// (base::Stack::SetStackStart) does exist here, so the patch itself is small;
+// the real work is confirming nothing else (V8's main-heap scan, the unwinder,
+// stack-trace capture, the profiler, glibc) reads above the bound during a
+// live turn. We could upgrade to a no-read wall once that patch is available;
+// until then the wall stays read-only.
+//
 // The window is per vCPU: it walls the turn's own writes. Another thread's
 // vCPU maps the same shared base subtree with its own (empty) window, so its
 // writes to this thread's frames are not walled; that is the cross-thread
