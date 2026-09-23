@@ -1,11 +1,14 @@
 // Tests for the gk library.
+#define _GNU_SOURCE
 #include "gk.h"
 
 #include <stdint.h>
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <pthread.h>
 
@@ -189,6 +192,76 @@ static int deny_write(long nr, long a1, long a2, long a3, long a4, long a5, long
   return nr != 1;  // 0 = deny
 }
 
+// ---- memory protection keys -------------------------------------------------
+// The guest's pkeys must be enforced by the guest CPU: a page assigned a key
+// with pkey_mprotect is only accessible as the calling thread's PKRU allows,
+// and the PKRU is the guest's own (wrpkru in the guest, via glibc's pkey_set).
+// Each step is a separate gk_run because a denied access ends the run with
+// GK_EFAULT; the vCPU (and its PKRU) persists across the runs of one thread.
+struct pk { int key; volatile unsigned char *page; unsigned child_pkru; };
+
+static unsigned read_pkru(void) {
+  unsigned v;
+  __asm__ __volatile__("rdpkru" : "=a"(v) : "c"(0) : "edx");
+  return v;
+}
+
+// Allocate a key whose initial rights disable writes, map a page, write it
+// while it still has the default key, then assign the new key. Returns the
+// key's rights as the guest sees them: pkey_alloc's initial rights must have
+// reached this thread's guest PKRU, as they reach the calling thread natively.
+static long pk_setup(void *arg) {
+  struct pk *p = arg;
+  p->key = pkey_alloc(0, PKEY_DISABLE_WRITE);
+  if (p->key <= 0) return -1;
+  p->page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p->page == MAP_FAILED) return -2;
+  p->page[0] = 0x5a;
+  if (pkey_mprotect((void *)p->page, 4096, PROT_READ | PROT_WRITE, p->key) != 0) return -3;
+  return pkey_get(p->key);
+}
+static long pk_read(void *arg) { return ((struct pk *)arg)->page[0]; }
+static long pk_write(void *arg) { ((struct pk *)arg)->page[0] = 0x77; return 0; }
+static long pk_disable_access_read(void *arg) {
+  struct pk *p = arg;
+  pkey_set(p->key, PKEY_DISABLE_ACCESS);
+  return p->page[0];
+}
+static long pk_enable_write_read(void *arg) {
+  struct pk *p = arg;
+  pkey_set(p->key, 0);
+  p->page[0] = 0x77;
+  return p->page[0];
+}
+// A thread created in the guest inherits its creator's PKRU.
+static void *pk_child(void *arg) {
+  ((struct pk *)arg)->child_pkru = read_pkru();
+  return NULL;
+}
+static long pk_inherit(void *arg) {
+  struct pk *p = arg;
+  pkey_set(p->key, PKEY_DISABLE_WRITE);
+  pthread_t t;
+  if (pthread_create(&t, NULL, pk_child, p) != 0) return -1;
+  pthread_join(t, NULL);
+  return (p->child_pkru >> (2 * p->key)) & 3;
+}
+// Unallocated keys are rejected as the kernel rejects them; the freed key's
+// page, reassigned the default key, is plainly accessible again.
+static long pk_teardown(void *arg) {
+  struct pk *p = arg;
+  int bad = 15;
+  while (bad > 0 && bad == p->key) bad--;
+  if (pkey_mprotect((void *)p->page, 4096, PROT_READ | PROT_WRITE, bad) == 0 || errno != EINVAL)
+    return -1;
+  if (pkey_mprotect((void *)p->page, 4096, PROT_READ | PROT_WRITE, 0) != 0) return -2;
+  if (pkey_free(p->key) != 0) return -3;
+  pkey_set(p->key, PKEY_DISABLE_ACCESS);  // the page no longer has this key
+  long v = p->page[0];
+  munmap((void *)p->page, 4096);
+  return v;
+}
+
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (gk_init() != 0) {
@@ -309,7 +382,28 @@ int main(void) {
          "churned, vCPUs -> %d [%s]\n", ch.iters * ch.per_iter, before, after_guest,
          after_host, ok8 ? "OK" : "FAIL");
 
-  int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8;
+  // Memory protection keys, enforced by the guest CPU against the guest PKRU.
+  struct pk pk = {0};
+  long pk_rights = gk_run(pk_setup, &pk);          // WD from pkey_alloc
+  long pk_r1 = gk_run(pk_read, &pk);               // readable under WD
+  long pk_w1 = gk_run(pk_write, &pk);              // write denied under WD
+  unsigned long pk_wfault = gk_fault_addr();
+  long pk_r2 = gk_run(pk_disable_access_read, &pk);  // read denied under AD
+  unsigned long pk_rfault = gk_fault_addr();
+  long pk_r3 = gk_run(pk_enable_write_read, &pk);  // all allowed again
+  long pk_inh = gk_run(pk_inherit, &pk);           // child sees WD
+  long pk_end = gk_run(pk_teardown, &pk);
+  int ok9 = pk_rights == PKEY_DISABLE_WRITE && pk_r1 == 0x5a &&
+            pk_w1 == GK_EFAULT && pk_wfault == (uintptr_t)pk.page &&
+            pk_r2 == GK_EFAULT && pk_rfault == (uintptr_t)pk.page &&
+            pk_r3 == 0x77 && pk_inh == PKEY_DISABLE_WRITE && pk_end == 0x77;
+  printf("protection keys: key %d rights after alloc=%ld, read=%#lx, write->%s, "
+         "read with access disabled->%s, re-enabled rw=%#lx, child inherits=%ld, "
+         "teardown=%#lx [%s]\n", pk.key, pk_rights, pk_r1,
+         pk_w1 == GK_EFAULT ? "FAULT" : "allowed", pk_r2 == GK_EFAULT ? "FAULT" : "allowed",
+         pk_r3, pk_inh, pk_end, ok9 ? "OK" : "FAIL");
+
+  int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

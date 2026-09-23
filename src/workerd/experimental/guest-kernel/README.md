@@ -76,10 +76,23 @@ hardware:
   aligned 2 MiB window at a time; memslots are created once and never deleted.
   Faults into another arena's region are refused, preserving isolation.
 - **W^X.** Pages are mapped with their host protection: executable pages are not
-  writable and writable pages are not executable (NX is enabled in the guest).
+  writable and writable pages are not executable (NX is enabled in the guest,
+  and `CR0.WP` is set so the ring-0 guest cannot write a read-only page either).
   `mprotect` and `munmap` are reflected by dropping the affected guest PTEs and
-  flushing the TLB, so the next access re-maps with the new protection. This is
-  what lets code that flips pages between writable and executable work.
+  flushing the TLB (a guest `CR3` reload, since re-setting identical control
+  registers through KVM does not flush), so the next access re-maps with the new
+  protection. This is what lets code that flips pages between writable and
+  executable work.
+- **Protection keys (PKU).** V8's sandbox assigns protection keys with
+  `pkey_mprotect` and flips its PKRU to write its code and pointer tables only in
+  controlled windows. gk virtualizes this rather than stripping it: each range's
+  key is tracked, reflected into the guest PTEs (bits 62:59), and the guest's own
+  `wrpkru` sets its per-vCPU PKRU, so the guest CPU enforces the key exactly as it
+  would natively and a violation arrives as a `#PF` with the PK bit. The host VMA
+  is left keyless (the `pkey_mprotect` reaches the host as a plain `mprotect`) so
+  KVM's page backing never pkey-faults. A single switch (`GK_VIRTUALIZE_PKEYS`)
+  turns the whole scheme off, since gk already isolates by page-table root and
+  does not depend on the keys for security.
 
 Enabling SSE and AVX in the guest (`CR4.OSFXSR`, `OSXSAVE`, and `XCR0`) is
 required before compiled code and glibc, which use those instructions, will
@@ -157,14 +170,11 @@ What it took, beyond the MMU:
   stack, so without this it reports a false stack overflow.
 
 The JIT works too, with V8's default configuration (no special flags): a
-JIT-optimized hot loop runs to the correct result across repeated runs. Two
-things make this work. First, W^X plus mprotect reflection handles code pages
-that flip between writable and executable. Second, gk strips `pkey_mprotect` to a
-plain `mprotect`: V8's sandbox protects its code and code-pointer tables with a
-protection key and flips its own PKRU to write them, but KVM backs the guest's
-write using the host thread's PKRU, not the guest's, so it would fault. gk does
-not need V8's host-side keys because it isolates via page tables and arenas, so
-dropping the key is safe here and lets KVM back the writes.
+JIT-optimized hot loop runs to the correct result across repeated runs. W^X plus
+mprotect reflection handles the code pages that flip between writable and
+executable, and the protection keys V8's sandbox uses on its code and pointer
+tables are virtualized into the guest (see the PKU point above), so the isolate
+runs with the sandbox enabled and its keys honored, not stripped.
 
 V8 also runs **multi-threaded** now, with its default platform: the background
 GC/compiler worker threads V8 spawns are intercepted at `clone`/`clone3` and

@@ -6,6 +6,11 @@
     .type gk_syscall_tramp, @function
 gk_syscall_tramp:
     outb %al, $0x11
+// The instruction after the hypercall. The host resumes the guest here when it
+// ran a stub (below) in the middle of a syscall exit (see run_stub in gk.c), as
+// KVM only completes the pending outb, i.e. skips it, when RIP is unchanged.
+    .globl gk_syscall_tramp_resume
+gk_syscall_tramp_resume:
     jmpq *%rcx
 
     .globl gk_exit_tramp
@@ -41,6 +46,36 @@ gk_exc_pf:
     outb %al, $0xFC    /* demand-page CR2: host maps it and resumes us */
     addq $8, %rsp      /* discard the #PF error code the CPU pushed */
     iretq              /* retry the faulting instruction */
+
+// PKRU accessor the host runs on a vCPU between guest instructions: computes
+// pkru = (pkru & %esi) | %edi, writes it back, and reports the new value in
+// %eax on port 0xFB. The guest PKRU is only reachable through the guest's own
+// rdpkru/wrpkru, so the host reads and updates it by running this stub with
+// the vCPU's registers saved around it (see guest_pkru_update). Touches no
+// memory, so it can run with any rsp.
+    .globl gk_pkru_stub
+    .type gk_pkru_stub, @function
+gk_pkru_stub:
+    xorl %ecx, %ecx
+    rdpkru
+    andl %esi, %eax
+    orl %edi, %eax
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    wrpkru
+    outb %al, $0xFB
+    hlt
+
+// TLB flush the host runs on a vCPU between guest instructions: reloading CR3
+// drops the vCPU's (non-global) TLB entries, which no host-side ioctl does
+// while the guest's control registers stay the same. Reports on port 0xFA.
+    .globl gk_flush_stub
+    .type gk_flush_stub, @function
+gk_flush_stub:
+    movq %cr3, %rax
+    movq %rax, %cr3
+    outb %al, $0xFA
+    hlt
 
 // Host-side helpers for guest thread creation. These run on the host, never in
 // the guest.

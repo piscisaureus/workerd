@@ -21,7 +21,11 @@
 #define PTE_W (1UL << 1)
 #define PTE_U (1UL << 2)
 #define PTE_NX (1UL << 63)
+#define PTE_PKEY_SHIFT 59        // bits 62:59 hold the page's protection key
+#define PTE_PKEY_MASK (0xfUL << PTE_PKEY_SHIFT)
+#define PF_ERR_PK (1UL << 5)     // #PF error code: protection-key violation
 #define CR0_PE (1UL << 0)
+#define CR0_WP (1UL << 16)
 #define CR0_PG (1UL << 31)
 #define CR4_PAE (1UL << 5)
 #define CR4_OSFXSR (1UL << 9)
@@ -44,6 +48,8 @@
 #define PORT_FAULT 0xFE
 #define PORT_UDRIP 0xFD
 #define PORT_DEMAND 0xFC
+#define PORT_PKRU 0xFB
+#define PORT_FLUSH 0xFA
 
 // ---- global platform state (set once by gk_init) ---------------------------
 static int g_kvm = -1, g_vmfd = -1;
@@ -107,6 +113,7 @@ typedef struct {
   uint64_t loaded_cr3;
   uint64_t last_fault;
   int fault_repeat;
+  int pkru_ready;          // guest PKRU has been given its initial value
   uint64_t *active_pml4;   // root this thread runs under
   gk_arena *active_arena;
   // Set for a thread the guest created via clone (see clone_thread): it runs
@@ -128,9 +135,12 @@ struct gk_arena {
 
 // Trampolines and exception handlers (gk_asm.S), in this binary's mapped text.
 extern void gk_syscall_tramp(void);
+extern void gk_syscall_tramp_resume(void);
 extern void gk_exit_tramp(void);
 extern void gk_exc_de(void), gk_exc_ud(void), gk_exc_df(void), gk_exc_gp(void),
     gk_exc_pf(void);
+extern void gk_pkru_stub(void);
+extern void gk_flush_stub(void);
 // Host-side helpers for guest thread creation (gk_asm.S); never run in the guest.
 extern long gk_host_clone_raw(long nr, long a1, long a2, long a3, long a4,
                               long a5);
@@ -172,7 +182,11 @@ static uint64_t *next_table(uint64_t *tbl, int idx) {
 }
 
 // Four-level map of one page; guest-virtual == guest-physical == host-virtual.
-static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags) {
+// `pkey` (0..15) is the page's protection key, placed in PTE bits 62:59; the
+// guest CPU checks it against the guest PKRU on every data access (with
+// CR4.PKE and CR0.WP set, see vcpu_init), which is what makes the guest's own
+// protection keys real. Key 0 is the default, unrestricted key.
+static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
   uint64_t *pdpt = next_table(root, (va >> 39) & 0x1ff);
   if (!pdpt) return -1;
   uint64_t *pd = next_table(pdpt, (va >> 30) & 0x1ff);
@@ -185,6 +199,7 @@ static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags) {
   uint64_t pte = (va & ~0xfffULL) | PTE_P | PTE_U;
   if (flags & 2) pte |= PTE_W;
   if (!(flags & 4)) pte |= PTE_NX;
+  pte |= ((uint64_t)pkey << PTE_PKEY_SHIFT) & PTE_PKEY_MASK;
   pt[(va >> 12) & 0x1ff] = pte;
   return 0;
 }
@@ -345,6 +360,120 @@ static int region_ensure(uintptr_t s, uintptr_t e) {
   return 0;
 }
 
+// ---- protection keys ---------------------------------------------------------
+// The guest's memory protection keys are virtualized, not emulated: the guest
+// runs with CR4.PKE, so its rdpkru/wrpkru operate on the vCPU's own PKRU (KVM
+// saves and restores it around every exit), and every guest PTE carries the
+// key its page was assigned with pkey_mprotect (map4k_root). The guest CPU then
+// enforces the key on every data access exactly as it would natively, and a
+// violation arrives as a #PF with the PK error bit (see run_vcpu).
+//
+// The host side is deliberately kept out of it. A pkey_mprotect is issued on
+// the host as a plain mprotect, so no host VMA ever carries a key and KVM's
+// page backing (get_user_pages, which checks the host thread's PKRU against the
+// host VMA's key) can never pkey-fault whatever the guest has put in its PKRU.
+// Only the guest enforces; the host's PKRU is irrelevant to correctness (see
+// host_pkru_allow_all).
+//
+// The key of each range is tracked here, in a sorted array of disjoint
+// [start, end) ranges holding a nonzero key (key 0, the default, is implicit).
+// Linux semantics are followed: pkey_mprotect with an explicit key sets it, a
+// plain mprotect (or pkey -1) keeps the range's key, munmap and mmap drop it
+// (a fresh mapping has key 0), and pkey_free leaves it in the PTEs. Lookups
+// run on the fault path (demand_map), so the table is static and the lookup a
+// binary search: no allocation there. Guarded by g_lock.
+// Master switch for protection-key virtualization. gk isolates isolates by
+// page-table root, so V8's host-side keys are not needed for security in this
+// model; set this to 0 and the guest PTEs carry no key, so nothing is enforced
+// and the keys become no-ops -- turning the whole scheme off in one line while
+// leaving the rest (W^X, CR0.WP, the real TLB flush) intact.
+#ifndef GK_VIRTUALIZE_PKEYS
+#define GK_VIRTUALIZE_PKEYS 1
+#endif
+
+#define GK_MAX_PKEY_RANGES 4096
+typedef struct { uintptr_t start, end; int pkey; } gk_pkey_range;
+static gk_pkey_range g_pkeys[GK_MAX_PKEY_RANGES];
+static int g_pkey_n;
+// Keys the guest holds from pkey_alloc, as a bitmask; key 0 is always held.
+// pkey_mprotect validates against this the way the kernel would (EINVAL).
+static unsigned g_pkeys_held = 1;
+
+// The key of the page holding `addr`, or 0. Caller holds g_lock.
+static int pkey_lookup(uintptr_t addr) {
+  if (!GK_VIRTUALIZE_PKEYS) return 0;  // keys not reflected into PTEs -> no-ops
+  int lo = 0, hi = g_pkey_n;
+  while (lo < hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (addr < g_pkeys[mid].start) hi = mid;
+    else if (addr >= g_pkeys[mid].end) lo = mid + 1;
+    else return g_pkeys[mid].pkey;
+  }
+  return 0;
+}
+
+// Index of the first range whose end is beyond `addr`. Caller holds g_lock.
+static int pkey_lower_bound(uintptr_t addr) {
+  int lo = 0, hi = g_pkey_n;
+  while (lo < hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (g_pkeys[mid].end <= addr) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+// Set the key of [s, e) (page-aligned) to `pkey`, replacing whatever keys the
+// range held. Existing ranges overlapping [s, e) are trimmed, split or removed;
+// a nonzero key is then inserted and merged with equal-key neighbors. Fails
+// only when the table is full (pkey_room() guarantees it is not); the table is
+// then left unchanged. Caller holds g_lock.
+static int pkey_room(void) { return g_pkey_n + 2 <= GK_MAX_PKEY_RANGES; }
+static int pkey_set_range(uintptr_t s, uintptr_t e, int pkey) {
+  if (!pkey_room()) return -1;
+  int i = pkey_lower_bound(s);
+  while (i < g_pkey_n && g_pkeys[i].start < e) {
+    gk_pkey_range *r = &g_pkeys[i];
+    if (r->start < s && r->end > e) {  // [s, e) is strictly inside r: split it
+      memmove(&g_pkeys[i + 2], &g_pkeys[i + 1], (size_t)(g_pkey_n - i - 1) * sizeof *r);
+      g_pkey_n++;
+      g_pkeys[i + 1] = (gk_pkey_range){e, r->end, r->pkey};
+      r->end = s;
+      i++;
+      break;
+    } else if (r->start < s) {  // r sticks out to the left: keep that part
+      r->end = s;
+      i++;
+    } else if (r->end > e) {  // r sticks out to the right: keep that part
+      r->start = e;
+      break;
+    } else {  // r lies within [s, e): drop it
+      memmove(r, r + 1, (size_t)(g_pkey_n - i - 1) * sizeof *r);
+      g_pkey_n--;
+    }
+  }
+  if (pkey == 0) return 0;
+  // Now every range before index i ends at or before s, and every range from i
+  // on starts at or after e. Insert [s, e), absorbing adjacent equal keys.
+  if (i > 0 && g_pkeys[i - 1].end == s && g_pkeys[i - 1].pkey == pkey) {
+    g_pkeys[i - 1].end = e;
+    if (i < g_pkey_n && g_pkeys[i].start == e && g_pkeys[i].pkey == pkey) {
+      g_pkeys[i - 1].end = g_pkeys[i].end;
+      memmove(&g_pkeys[i], &g_pkeys[i + 1], (size_t)(g_pkey_n - i - 1) * sizeof g_pkeys[0]);
+      g_pkey_n--;
+    }
+    return 0;
+  }
+  if (i < g_pkey_n && g_pkeys[i].start == e && g_pkeys[i].pkey == pkey) {
+    g_pkeys[i].start = s;
+    return 0;
+  }
+  memmove(&g_pkeys[i + 1], &g_pkeys[i], (size_t)(g_pkey_n - i) * sizeof g_pkeys[0]);
+  g_pkeys[i] = (gk_pkey_range){s, e, pkey};
+  g_pkey_n++;
+  return 0;
+}
+
 // Parse one /proc/self/maps line ("start-end perms ...") into its bounds and
 // protection bits (bit0=r, bit1=w, bit2=x). Returns 0 if the line is malformed.
 static int parse_maps_line(const char *l, const char *end, uintptr_t *s,
@@ -425,7 +554,7 @@ static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms)
 static int mmu_map_range(uintptr_t s, uintptr_t e, int perms) {
   if (region_ensure(s, e) < 0) return -1;
   for (uintptr_t v = s & ~0xfffUL; v < e; v += 0x1000)
-    if (map4k_root(g_pml4, v, (uint64_t)perms) < 0) return -1;
+    if (map4k_root(g_pml4, v, (uint64_t)perms, pkey_lookup(v)) < 0) return -1;
   return 0;
 }
 
@@ -454,9 +583,13 @@ static int demand_map(uintptr_t addr) {
     pthread_mutex_unlock(&g_lock);
     return -1;
   }
-  int r = map4k_root(g_pml4, page, (uint64_t)perms);  // honor R/W/X for W^X
+  int pkey = pkey_lookup(page);
+  int r = map4k_root(g_pml4, page, (uint64_t)perms, pkey);  // honor R/W/X for W^X
   if (r >= 0) g_demand_ok++;
   pthread_mutex_unlock(&g_lock);
+  if (g_dbg && pkey != 0)
+    fprintf(stderr, "[gk] vcpu %d demand-map %#lx perms=%d pkey=%d (PTE bits 62:59)\n",
+            tls.id, (unsigned long)page, perms, pkey);
   return r;
 }
 
@@ -567,7 +700,11 @@ static int vcpu_init(int with_stack) {
   ioctl(fd, KVM_GET_SREGS, &s);
   s.cr3 = (uint64_t)(uintptr_t)g_pml4;
   s.cr4 = CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_OSXSAVE | CR4_PKE;
-  s.cr0 = CR0_PE | CR0_PG;
+  // The guest runs in ring 0, where the CPU ignores a PTE's write-protect bit
+  // and a protection key's write-disable bit unless CR0.WP is set. It is, so
+  // read-only pages and write-disabled keys hold for the guest as they would
+  // for a user-mode process.
+  s.cr0 = CR0_PE | CR0_WP | CR0_PG;
   s.efer = EFER_LME | EFER_LMA | EFER_SCE | EFER_NXE;
   struct kvm_segment cs = {.base = 0, .limit = 0xffffffff, .selector = 0x08,
                            .type = 11, .present = 1, .s = 1, .l = 1, .g = 1};
@@ -636,6 +773,7 @@ ready:
   tls.loaded_cr3 = (uint64_t)(uintptr_t)g_pml4;
   tls.last_fault = 0;
   tls.fault_repeat = 0;
+  tls.pkru_ready = 0;  // a fresh or reused vCPU gets its PKRU at first entry
   if (!tls.active_pml4) tls.active_pml4 = g_pml4;
   tls.inited = 1;
   // A gk_run thread gives its vCPU back when it ends (see vcpu_key_dtor).
@@ -654,7 +792,7 @@ static int map_handler_text(void) {
   uintptr_t hs[] = {
       (uintptr_t)&gk_exc_de, (uintptr_t)&gk_exc_ud, (uintptr_t)&gk_exc_df,
       (uintptr_t)&gk_exc_gp, (uintptr_t)&gk_exc_pf, (uintptr_t)&gk_syscall_tramp,
-      (uintptr_t)&gk_exit_tramp};
+      (uintptr_t)&gk_exit_tramp, (uintptr_t)&gk_pkru_stub, (uintptr_t)&gk_flush_stub};
   uintptr_t lo = hs[0], hi = hs[0];
   for (size_t i = 1; i < sizeof hs / sizeof hs[0]; i++) {
     if (hs[i] < lo) lo = hs[i];
@@ -719,13 +857,46 @@ unsigned long gk_fault_addr(void) { return g_fault_addr; }
 void gk_set_syscall_filter(gk_syscall_filter f) { g_filter = f; }
 
 #define GK_EPERM 1
+#define GK_ENOMEM 12
 #define GK_EINVAL 22
 
-// Reload CR3 on this vCPU, flushing its non-global TLB entries.
-static void flush_tlb(void) {
-  struct kvm_sregs s;
-  ioctl(tls.fd, KVM_GET_SREGS, &s);
-  ioctl(tls.fd, KVM_SET_SREGS, &s);
+// Run one of the gk_asm.S stubs on this vCPU until it reports on `port`.
+// Clobbers the vCPU's general registers: the caller reprograms them afterwards
+// (gk_run and child_entry set the entry registers; a syscall exit sets the
+// snapshot back and, because KVM only completes the pending outb when RIP is
+// unchanged, points RIP at gk_syscall_tramp_resume). Sregs are untouched.
+static int run_stub(void (*stub)(void), uint64_t rdi, uint64_t rsi, uint16_t port,
+                    const char *what) {
+  struct kvm_regs regs = {0};
+  regs.rip = (uintptr_t)stub;
+  regs.rdi = rdi;
+  regs.rsi = rsi;
+  regs.rflags = 0x2;
+  ioctl(tls.fd, KVM_SET_REGS, &regs);
+  for (;;) {
+    if (ioctl(tls.fd, KVM_RUN, 0) < 0) {
+      if (errno == EINTR) continue;
+      if (g_dbg) fprintf(stderr, "[gk] vcpu %d: %s stub KVM_RUN: %s\n", tls.id, what, strerror(errno));
+      return -1;
+    }
+    if (tls.run->exit_reason == KVM_EXIT_IO && tls.run->io.direction == KVM_EXIT_IO_OUT &&
+        tls.run->io.port == port)
+      return 0;
+    if (g_dbg)
+      fprintf(stderr, "[gk] vcpu %d: %s stub: unexpected exit reason=%u\n", tls.id, what,
+              tls.run->exit_reason);
+    return -1;
+  }
+}
+
+// Flush this vCPU's TLB from a syscall exit, whose register snapshot is `r`:
+// the guest reloads its CR3 (gk_flush_stub) and resumes after the hypercall.
+// No ioctl does this from the host: KVM flushes the guest TLB only when
+// KVM_SET_SREGS changes a control register, and re-setting the same values is
+// a no-op.
+static void flush_tlb(struct kvm_regs *r) {
+  if (run_stub(gk_flush_stub, 0, 0, PORT_FLUSH, "flush") == 0)
+    r->rip = (uintptr_t)&gk_syscall_tramp_resume;
 }
 
 // ---- guest thread creation -------------------------------------------------
@@ -759,11 +930,14 @@ typedef struct {
   void *host_stack;
   size_t host_stack_size;
   int parent_id;
+  uint32_t pkru;          // the parent's guest PKRU, inherited like a real clone
 } gk_child;
 
 static long run_vcpu(void);
 static int sync_cr3(void);
 static void host_pkru_allow_all(void);
+static uint32_t host_pkru(void);
+static int guest_pkru_update(uint32_t keep, uint32_t set, uint32_t *out);
 
 static long child_entry(void *arg) {
   gk_child c = *(gk_child *)arg;
@@ -795,11 +969,14 @@ static long child_entry(void *arg) {
   }
   if (sync_cr3() < 0) host_syscall(SYS_exit_group, 70, 0, 0, 0, 0, 0);
   host_pkru_allow_all();
+  // A clone's child starts with its parent's PKRU.
+  if (guest_pkru_update(0, c.pkru, NULL) < 0) host_syscall(SYS_exit_group, 70, 0, 0, 0, 0, 0);
+  tls.pkru_ready = 1;
   ioctl(tls.fd, KVM_SET_REGS, &c.regs);
   if (g_dbg)
-    fprintf(stderr, "[gk] vcpu %d: guest thread tid %ld (from vcpu %d) rip=%#llx rsp=%#llx\n",
+    fprintf(stderr, "[gk] vcpu %d: guest thread tid %ld (from vcpu %d) rip=%#llx rsp=%#llx pkru=%#x\n",
             tls.id, host_syscall(SYS_gettid, 0, 0, 0, 0, 0, 0), c.parent_id,
-            (unsigned long long)c.regs.rip, (unsigned long long)c.regs.rsp);
+            (unsigned long long)c.regs.rip, (unsigned long long)c.regs.rsp, c.pkru);
   long r = run_vcpu();
   // A guest thread only leaves through exit/exit_group, handled in
   // forward_syscall; reaching here means it faulted or the VM shut down.
@@ -828,6 +1005,11 @@ static long clone_thread(struct kvm_regs *r, long nr) {
   }
   if (child_sp == 0) return -GK_EINVAL;
 
+  // The child inherits the parent's PKRU, read from the parent vCPU now.
+  uint32_t pkru = 0;
+  if (guest_pkru_update(~0u, 0, &pkru) < 0) return -GK_EINVAL;
+  r->rip = (uintptr_t)&gk_syscall_tramp_resume;  // the stub consumed the outb
+
   void *hs = mmap(NULL, GK_HOST_STACK, PROT_READ | PROT_WRITE,
                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
   if (hs == MAP_FAILED) return -errno;
@@ -842,6 +1024,7 @@ static long clone_thread(struct kvm_regs *r, long nr) {
   c->host_stack = hs;
   c->host_stack_size = GK_HOST_STACK;
   c->parent_id = tls.id;
+  c->pkru = pkru;
   // gk_host_clone_raw's child pops [arg, fn] off its initial stack.
   uint64_t top = (uint64_t)(uintptr_t)hs + GK_HOST_STACK - 16;
   ((uint64_t *)(uintptr_t)top)[0] = (uint64_t)(uintptr_t)c;
@@ -897,9 +1080,13 @@ static long forward_syscall(struct kvm_regs *r) {
     vcpu_park();
     gk_host_unmapself_exit(tls.host_stack, tls.host_stack_size, a1);
   }
-  // Isolates are separated by page-table roots, not host protection keys, so
-  // reduce pkey_mprotect to a plain mprotect: the guest PTEs carry the R/W/X
-  // perms and no host-side pkey needs to be assigned.
+  // Protection keys (see the protection-keys section above). pkey_mprotect
+  // records the key for the range and goes to the host as a plain mprotect,
+  // so the key lives only in the guest PTEs; the PTE clearing below then makes
+  // the range re-fault and pick the key up. pkey_alloc and pkey_free are
+  // forwarded so the host hands out the key numbers, and the calling vCPU's
+  // PKRU gets the new key's initial access rights, as the kernel would give the
+  // calling thread.
   //
   // Protection/mapping changes are reflected by clearing the guest PTEs for the
   // affected range so the next access re-faults and demand-maps with the new
@@ -912,47 +1099,107 @@ static long forward_syscall(struct kvm_regs *r) {
   // address the same memslot backs it. Deleting and recreating memslots here
   // instead corrupts memory the guest is actively using.
   //
-  // Other vCPUs' TLBs are not shot down: a stale entry there only carries the
-  // old protection, and a fault against it is resolved by the retry path in
-  // run_vcpu, which flushes that vCPU's TLB when a fault repeats.
+  // Other vCPUs' TLBs are not shot down: a stale entry there carries the old
+  // protection or key until it is evicted or faults (a page fault invalidates
+  // the entry, so the retry re-walks and sees the new PTE).
   long ret;
   int reflect = (nr == SYS_mprotect || nr == SYS_munmap ||
                  nr == SYS_pkey_mprotect ||
                  (nr == SYS_mmap && (a4 & MAP_FIXED))) && a2 > 0;
+  uintptr_t rs = (uintptr_t)a1 & ~0xfffUL;
+  uintptr_t re = ((uintptr_t)a1 + (uintptr_t)a2 + 0xfff) & ~0xfffUL;
   if (reflect) pthread_mutex_lock(&g_lock);
-  if (nr == SYS_pkey_mprotect)
-    ret = host_syscall(SYS_mprotect, a1, a2, a3, 0, 0, 0);
-  else
+  if (nr == SYS_pkey_mprotect) {
+    long pkey = a4;
+    if (pkey != -1 && (pkey < 0 || pkey > 15 || !(g_pkeys_held & (1u << pkey))))
+      ret = -GK_EINVAL;
+    else if (pkey != -1 && !pkey_room())
+      ret = -GK_ENOMEM;
+    else {
+      ret = host_syscall(SYS_mprotect, a1, a2, a3, 0, 0, 0);
+      if (ret == 0 && pkey != -1 && a2 > 0) pkey_set_range(rs, re, (int)pkey);  // room checked
+    }
+  } else {
     ret = host_syscall(nr, a1, a2, a3, a4, a5, a6);
+  }
   if (reflect) {
     if (nr == SYS_mmap ? ret == a1 : ret == 0) {
-      for (uintptr_t v = (uintptr_t)a1 & ~0xfffUL;
-           v < (uintptr_t)a1 + (uintptr_t)a2; v += 0x1000)
-        unmap4k_root(g_pml4, v);
+      // A new or removed mapping has no key.
+      if ((nr == SYS_munmap || nr == SYS_mmap) && pkey_set_range(rs, re, 0) < 0 && g_dbg)
+        fprintf(stderr, "[gk] pkey table full; [%#lx,%#lx) keeps a stale key\n",
+                (unsigned long)rs, (unsigned long)re);
+      for (uintptr_t v = rs; v < re; v += 0x1000) unmap4k_root(g_pml4, v);
     }
     pthread_mutex_unlock(&g_lock);
-    flush_tlb();
+    flush_tlb(r);
+  } else if (nr == SYS_mmap && a2 > 0 && (unsigned long)ret < (unsigned long)-4096) {
+    // A fresh mapping, placed by the kernel: whatever key was last recorded
+    // for those addresses belonged to a mapping that is gone.
+    pthread_mutex_lock(&g_lock);
+    if (pkey_set_range((uintptr_t)ret & ~0xfffUL,
+                       ((uintptr_t)ret + (uintptr_t)a2 + 0xfff) & ~0xfffUL, 0) < 0 && g_dbg)
+      fprintf(stderr, "[gk] pkey table full; mapping at %#lx keeps a stale key\n",
+              (unsigned long)ret);
+    pthread_mutex_unlock(&g_lock);
   }
-  if (g_dbg)
+  if (nr == SYS_pkey_alloc && ret >= 0 && ret <= 15) {
+    // The kernel gave the calling *host* thread the key's initial rights; the
+    // guest thread is this vCPU, so give them to its PKRU (2 bits per key:
+    // bit 0 = access disable, bit 1 = write disable).
+    g_pkeys_held |= 1u << ret;
+    uint32_t shift = 2u * (uint32_t)ret, pkru = 0;
+    if (guest_pkru_update(~(3u << shift), ((uint32_t)a2 & 3u) << shift, &pkru) == 0)
+      r->rip = (uintptr_t)&gk_syscall_tramp_resume;  // the stub consumed the outb
+    if (g_dbg)
+      fprintf(stderr, "[gk] vcpu %d pkey_alloc -> key %ld, rights %#lx; guest PKRU now %#x\n",
+              tls.id, ret, (unsigned long)a2, pkru);
+  }
+  if (nr == SYS_pkey_free && ret == 0 && a1 >= 1 && a1 <= 15)
+    g_pkeys_held &= ~(1u << a1);
+  if (g_dbg) {
     fprintf(stderr, "[gk] vcpu %d syscall %ld(%#lx, %#lx, %#lx, %#lx) -> %ld\n",
             tls.id, nr, (unsigned long)a1, (unsigned long)a2, (unsigned long)a3,
             (unsigned long)a4, ret);
+    if (nr == SYS_pkey_mprotect && ret == 0)
+      fprintf(stderr, "[gk] vcpu %d pkey_mprotect [%#lx,%#lx) key %ld: host mprotect only, "
+              "guest PTEs will carry key %d\n", tls.id, (unsigned long)rs, (unsigned long)re,
+              a4, a4 == -1 ? pkey_lookup(rs) : (int)a4);
+  }
   return ret;
 }
 
-// V8's sandbox write-protects its pointer tables with a memory protection key
-// and flips PKRU only around controlled writes. In the guest those WRPKRUs set
-// the guest PKRU, but KVM's host-side page backing (get_user_pages) uses the
-// host thread's PKRU, which would still deny the write and fault. Clear the host
-// PKRU so KVM can always back the guest's access.
-// TODO: to keep in-guest pkey protections meaningful, reflect the guest PTE
-// protection-key bits and guest PKRU into the host instead of disabling.
+// The host thread's PKRU is what KVM's page backing (get_user_pages) checks
+// against a host VMA's key. No host VMA carries a key (pkey_mprotect reaches
+// the host as mprotect), so the host PKRU cannot deny a backing; it is cleared
+// anyway so that also holds for memory keyed outside gk's knowledge. The
+// guest's protection is the guest PKRU, which KVM keeps separate from this.
 static void host_pkru_allow_all(void) {
   __asm__ __volatile__("xor %%ecx,%%ecx\n\t"
                        "xor %%edx,%%edx\n\t"
                        "xor %%eax,%%eax\n\t"
                        "wrpkru"
                        ::: "eax", "ecx", "edx");
+}
+
+static uint32_t host_pkru(void) {
+  uint32_t v;
+  __asm__ __volatile__("rdpkru" : "=a"(v) : "c"(0) : "edx");
+  return v;
+}
+
+// Set this vCPU's guest PKRU to (pkru & keep) | set and return the new value in
+// *out (if non-NULL), by running gk_pkru_stub on the vCPU (see run_stub for the
+// register contract). KVM's view of the guest PKRU (KVM_GET_XSAVE) is
+// unreliable when the host PKRU is zero, as it is here: the XSAVE header bit
+// that says PKRU is present is written from the host value, so the guest's
+// value can be reported as zero. Running the stub reads and writes the real
+// register.
+static int guest_pkru_update(uint32_t keep, uint32_t set, uint32_t *out) {
+  if (run_stub(gk_pkru_stub, set, keep, PORT_PKRU, "pkru") < 0) return -1;
+  struct kvm_regs regs;
+  ioctl(tls.fd, KVM_GET_REGS, &regs);
+  if (out) *out = (uint32_t)regs.rax;
+  return 0;
 }
 
 // Point this vCPU's CR3 at the thread's active root. Refreshes the active
@@ -981,7 +1228,17 @@ static int sync_cr3(void) {
 long gk_run(long (*fn)(void *), void *arg) {
   if (vcpu_init(1) < 0) return -1;
   if (sync_cr3() < 0) return -1;
+  uint32_t hp = host_pkru();
   host_pkru_allow_all();
+  if (!tls.pkru_ready) {
+    // The thread enters the guest with the PKRU the kernel gave it (the
+    // process default, or its creator's), as its guest value.
+    if (guest_pkru_update(0, hp, NULL) < 0) return -1;
+    tls.pkru_ready = 1;
+    if (g_dbg) fprintf(stderr, "[gk] vcpu %d: initial guest PKRU %#x\n", tls.id, hp);
+  }
+  tls.last_fault = 0;  // fault-repeat tracking is per guest invocation
+  tls.fault_repeat = 0;
   uint64_t sp = tls.stack_top - 8;
   *(uint64_t *)sp = (uintptr_t)&gk_exit_tramp;
 
@@ -1036,6 +1293,22 @@ static long run_vcpu(void) {
           if (repeat) {
             if (++tls.fault_repeat > 2) { g_fault_addr = cr2; return GK_EFAULT; }
           } else { tls.last_fault = cr2; tls.fault_repeat = 0; }
+          // A protection-key violation is the guest CPU enforcing the page's
+          // key against this vCPU's PKRU: a genuine fault, unless the entry
+          // this vCPU used carried the page's previous key (another vCPU
+          // changed it without a shootdown). The fault invalidated that entry,
+          // so one retry against the current PTE tells the two apart.
+          struct kvm_regs pr;
+          ioctl(tls.fd, KVM_GET_REGS, &pr);
+          uint64_t pf_err = *(uint64_t *)(uintptr_t)pr.rsp;  // top of the #PF frame
+          int pk = (pf_err & PF_ERR_PK) != 0;
+          if (pk && repeat) {
+            if (g_dbg)
+              fprintf(stderr, "[gk] vcpu %d: protection-key violation at %#llx (err=%#llx)\n",
+                      tls.id, (unsigned long long)cr2, (unsigned long long)pf_err);
+            g_fault_addr = cr2;
+            return GK_EFAULT;
+          }
           if (demand_map((uintptr_t)cr2) < 0) {
             if (g_dbg) {
               struct kvm_regs rr;
@@ -1059,10 +1332,8 @@ static long run_vcpu(void) {
             g_fault_addr = cr2;
             return GK_EFAULT;
           }
-          // A repeated fault on a page that is mapped means this vCPU's TLB
-          // holds a stale entry (another vCPU changed the PTE and only flushed
-          // its own TLB); drop it before retrying.
-          if (repeat) flush_tlb();
+          // The retry re-walks the page tables: a page fault invalidates the
+          // TLB entry it was taken through, so no explicit flush is needed.
         } else if (port == PORT_FAULT) {
           struct kvm_regs rr; struct kvm_sregs sr;
           ioctl(tls.fd, KVM_GET_REGS, &rr);
@@ -1104,7 +1375,7 @@ gk_arena *gk_arena_create(size_t size) {
   memcpy(a->pml4, g_pml4, 0x1000);  // share the base root's top-level entries
   if (region_ensure(va, va + size) < 0) { free(a); pthread_mutex_unlock(&g_lock); return NULL; }
   for (uint64_t v = va; v < va + size; v += 0x1000)
-    if (map4k_root(a->pml4, v, 1 | 2) < 0) { free(a); pthread_mutex_unlock(&g_lock); return NULL; }
+    if (map4k_root(a->pml4, v, 1 | 2, 0) < 0) { free(a); pthread_mutex_unlock(&g_lock); return NULL; }
   a->cage_entry = a->pml4[a->cage_idx];  // remember the private cage subtree
   if (g_arena_n < GK_MAX_ARENAS) {
     g_arenas[g_arena_n].base = va;

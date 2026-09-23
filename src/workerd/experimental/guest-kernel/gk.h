@@ -28,8 +28,16 @@ const char *gk_last_error(void);
 
 // Run fn(arg) inside guest ring 0 with syscalls forwarded to the host, and
 // return its return value. If the guest takes an unhandled fault (for example
-// an access to an inactive arena), gk_run stores the faulting address (see
-// gk_fault_addr) and returns GK_EFAULT.
+// an access to an inactive arena, or to a page whose memory protection key the
+// guest's PKRU denies), gk_run stores the faulting address (see gk_fault_addr)
+// and returns GK_EFAULT.
+//
+// Memory protection keys work in the guest as they do natively: pkey_alloc,
+// pkey_mprotect and pkey_free are forwarded, the assigned keys are placed in
+// the guest page tables, and the guest's own rdpkru/wrpkru (glibc's pkey_get/
+// pkey_set) act on the calling thread's vCPU PKRU, which the CPU enforces. A
+// thread enters the guest with the PKRU it has on the host; a thread created
+// inside the guest inherits its creator's.
 long gk_run(long (*fn)(void *), void *arg);
 
 #define GK_EFAULT (-1001)  // guest faulted; see gk_fault_addr()
