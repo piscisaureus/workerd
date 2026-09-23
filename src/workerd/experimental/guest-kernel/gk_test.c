@@ -114,6 +114,75 @@ static long guest_try_write(void *arg) {
   return ret;
 }
 
+// ---- guest-created threads --------------------------------------------------
+// Threads created *from inside the guest* (pthread_create -> clone3/clone) must
+// enter the guest themselves. The thread body reads CR0, which only works in
+// ring 0: on the host it would SIGSEGV, in the guest it returns CR0 with PG set.
+struct gt { int id; long n; unsigned long cr0; long sum; };
+
+static void *guest_thread_body(void *arg) {
+  struct gt *t = arg;
+  unsigned long cr0;
+  __asm__ __volatile__("mov %%cr0, %0" : "=r"(cr0));
+  t->cr0 = cr0;
+  long sum = 0;
+  for (long i = 0; i < t->n; i++) sum += (i * 3 + t->id) & 0xff;
+  t->sum = sum;
+  char *buf = malloc(64);  // libc from a guest-created thread
+  int len = snprintf(buf, 64, "guest thread %d ran in ring 0\n", t->id);
+  write(1, buf, (size_t)len);
+  free(buf);
+  return (void *)(uintptr_t)(t->id * 10);
+}
+
+// Runs in the guest: creates threads, joins them, checks their return values.
+static long spawn_in_guest(void *arg) {
+  struct gt *ts = arg;
+  enum { N = 3 };
+  pthread_t th[N];
+  for (int i = 0; i < N; i++)
+    if (pthread_create(&th[i], NULL, guest_thread_body, &ts[i]) != 0) return -1;
+  long ok = 1;
+  for (int i = 0; i < N; i++) {
+    void *rv = NULL;
+    if (pthread_join(th[i], &rv) != 0) return -2;
+    if ((long)(uintptr_t)rv != ts[i].id * 10) ok = 0;
+  }
+  return ok;
+}
+
+// Thread churn: KVM never destroys a vCPU, so gk must recycle the vCPUs of
+// ended threads or a long-lived process would exhaust KVM's vCPU limit. Runs
+// in the guest: spawns and joins a few threads per iteration, many iterations.
+struct churn { int iters; int per_iter; long bad; };
+
+static void *churn_body(void *arg) {
+  unsigned long cr0;
+  __asm__ __volatile__("mov %%cr0, %0" : "=r"(cr0));
+  return (void *)(uintptr_t)((cr0 & (1UL << 31)) ? (uintptr_t)arg : 0);
+}
+
+static long churn_in_guest(void *arg) {
+  struct churn *c = arg;
+  pthread_t th[8];
+  for (int it = 0; it < c->iters; it++) {
+    for (int i = 0; i < c->per_iter; i++)
+      if (pthread_create(&th[i], NULL, churn_body, (void *)(uintptr_t)(it * 8 + i + 1)) != 0)
+        return -1;
+    for (int i = 0; i < c->per_iter; i++) {
+      void *rv = NULL;
+      if (pthread_join(th[i], &rv) != 0) return -2;
+      if ((uintptr_t)rv != (uintptr_t)(it * 8 + i + 1)) c->bad++;
+    }
+  }
+  return 0;
+}
+
+// Host-side churn: a host thread enters the guest via gk_run and then ends.
+static void *host_churn_thread(void *arg) {
+  return (void *)(uintptr_t)gk_run(test_compute, arg);
+}
+
 // Filter: deny write (nr 1), allow everything else.
 static int deny_write(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
   (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
@@ -205,7 +274,42 @@ int main(void) {
   printf("syscall policy: denied write returned %ld (want -1/-EPERM) [%s]\n",
          denied, ok6 ? "OK" : "FAIL");
 
-  int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6;
+  // Threads created from inside the guest enter the guest as their own vCPUs.
+  struct gt ts[3];
+  for (int i = 0; i < 3; i++) { ts[i].id = i + 1; ts[i].n = 100000; ts[i].cr0 = 0; ts[i].sum = -1; }
+  long spawned = gk_run(spawn_in_guest, ts);
+  int ok7 = (spawned == 1);
+  for (int i = 0; i < 3; i++) {
+    long want7 = 0;
+    for (long j = 0; j < ts[i].n; j++) want7 += (j * 3 + ts[i].id) & 0xff;
+    if (!(ts[i].cr0 & (1UL << 31)) || ts[i].sum != want7) ok7 = 0;
+  }
+  printf("guest-created threads: 3 threads spawned in the guest ran in ring 0 "
+         "(gk_run=%ld, cr0=%#lx) [%s]\n", spawned, ts[0].cr0, ok7 ? "OK" : "FAIL");
+
+  // Thread churn must not grow the vCPU count: 200 iterations of 3 guest-
+  // spawned threads may add at most 3 vCPUs (peak concurrency), and 20
+  // sequential host threads entering via gk_run may add at most 1.
+  int before = gk_vcpu_count();
+  struct churn ch = {.iters = 200, .per_iter = 3, .bad = 0};
+  long churned = gk_run(churn_in_guest, &ch);
+  int after_guest = gk_vcpu_count();
+  int ok8_host = 1;
+  for (int i = 0; i < 20; i++) {
+    pthread_t t;
+    void *rv;
+    pthread_create(&t, NULL, host_churn_thread, (void *)1000);
+    pthread_join(t, &rv);
+    if ((long)(uintptr_t)rv != want) ok8_host = 0;
+  }
+  int after_host = gk_vcpu_count();
+  int ok8 = (churned == 0) && ch.bad == 0 && (after_guest - before) <= 3 &&
+            (after_host - after_guest) <= 1 && ok8_host;
+  printf("vCPU pooling: %d guest threads churned, vCPUs %d -> %d; 20 host threads "
+         "churned, vCPUs -> %d [%s]\n", ch.iters * ch.per_iter, before, after_guest,
+         after_host, ok8 ? "OK" : "FAIL");
+
+  int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

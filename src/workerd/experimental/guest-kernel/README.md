@@ -56,7 +56,14 @@ hardware:
 - **Threads as vCPUs.** Each host thread that enters the guest gets its own
   vCPU, stack and TLS base, sharing the VM and memory. Four threads run in the
   guest concurrently, and two threads each locked into their own arena run at
-  the same time, each isolated from the other's cage.
+  the same time, each isolated from the other's cage. Threads the guest itself
+  creates (via `clone`/`clone3` with `CLONE_VM|CLONE_THREAD`) are intercepted so
+  the new thread enters the guest as a vCPU too, and vCPUs of ended threads are
+  pooled and reused, so the vCPU count is bounded by peak concurrency, not by the
+  number of threads ever created (KVM cannot reclaim a vCPU id, so the objects
+  are recycled). Each vCPU takes exceptions on a private IST stack via a per-vCPU
+  TSS, so a fault never pushes onto the interrupted code's stack (which would
+  corrupt the x86-64 red zone that leaf functions use).
 - **Syscall policy.** A filter can bound what forwarded code may do; a denied
   syscall is not forwarded and the guest sees `-EPERM`. The test denies `write`
   and confirms the guest gets `-EPERM` while other syscalls still work.
@@ -97,11 +104,14 @@ decides the overall cost.
 
 ## Limitations (remaining work)
 
-- **No cross-vCPU TLB shootdown yet.** Adding mappings needs none (a
+- **No cross-vCPU TLB shootdown IPIs yet.** Adding mappings needs none (a
   not-present entry has nothing stale to flush), which is why dynamic `mmap`
   and per-thread stacks work across vCPUs. Removing or shrinking a mapping
-  (`munmap`, `mprotect` to less access) that another vCPU has cached would
-  need an IPI-driven flush; that is not implemented.
+  (`munmap`, `mprotect` to less access) that another vCPU has cached is handled
+  only lazily: the reflection runs under the global lock and flushes the faulting
+  vCPU's TLB when a fault repeats at the same address, rather than sending an
+  IPI-driven flush to every vCPU. So a stale entry on another vCPU can briefly
+  retain the old permission until its next repeated fault.
 - **No signal delivery** into the library's API yet; only faults are caught,
   via the in-guest IDT handlers. (Injecting a host signal as a guest interrupt
   is demonstrated separately and would be wired in here.)
@@ -155,6 +165,13 @@ protection key and flips its own PKRU to write them, but KVM backs the guest's
 write using the host thread's PKRU, not the guest's, so it would fault. gk does
 not need V8's host-side keys because it isolates via page tables and arenas, so
 dropping the key is safe here and lets KVM back the writes.
+
+V8 also runs **multi-threaded** now, with its default platform: the background
+GC/compiler worker threads V8 spawns are intercepted at `clone`/`clone3` and
+enter the guest as vCPUs, and the whole isolate lifecycle (including joining the
+workers on shutdown) runs in guest ring 0 with the correct result. The worker
+pool's threads are long-lived, and the vCPU pool bounds the vCPU count even under
+heavy thread churn.
 
 So both jitless and JIT V8 run a JavaScript program end to end inside the guest.
 A fuller solution would virtualize PKU (reflect the guest key state and the

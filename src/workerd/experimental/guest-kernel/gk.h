@@ -38,6 +38,11 @@ long gk_run(long (*fn)(void *), void *arg);
 // The guest-virtual address of the last fault reported by gk_run.
 unsigned long gk_fault_addr(void);
 
+// The number of KVM vCPUs created so far. vCPUs of ended threads are pooled
+// and reused, so this is bounded by the peak number of concurrently running
+// guest threads, not by the number of threads ever created.
+int gk_vcpu_count(void);
+
 // Per-isolate memory arena: a region with its own page-table root. While an
 // arena is active, other arenas' memory is unmapped and unaddressable. This is
 // the isolate-cage primitive; in workerd one arena would hold one isolate's V8
