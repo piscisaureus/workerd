@@ -1,0 +1,4 @@
+# The guest-kernel isolation prototype is a standalone x86-64 program built
+# with its own Makefile (see README.md), not Bazel. This otherwise-empty
+# package marks the directory as its own Bazel package so the surrounding
+# build never globs these sources into a runtime target.
