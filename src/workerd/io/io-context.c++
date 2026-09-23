@@ -1503,7 +1503,11 @@ void runJsTurn(jsg::Lock& js, Func&& body) {
     KJ_DEFER(guestTurnArena = nullptr);
 
     GuestTurn<Func> turn{body};
-    long result = gk_run_here(&GuestTurn<Func>::trampoline, &turn);
+    // Run the JS turn (V8, JIT, and the C++ runtime it calls) at guest ring 3. Combined with the
+    // per-isolate page-table arena entered at the jsg::Lock, this means arbitrary code execution in
+    // V8 cannot reload CR3, run privileged instructions, or touch gk's supervisor/refused pages: any
+    // such attempt faults and gk_run_here_user returns GK_EFAULT.
+    long result = gk_run_here_user(&GuestTurn<Func>::trampoline, &turn);
     if (result != 0) {
       // The guest was abandoned mid-turn (its frames, locks and RAII state are gone), so there
       // is no consistent state to unwind through.
