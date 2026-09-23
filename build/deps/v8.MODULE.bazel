@@ -67,6 +67,8 @@ PATCHES = [
     "0042-Add-v8_enable_sandbox-flag-to-the-Bazel-build.patch",
     "0043-Add-Isolate-GetMemoryProtectionKey.patch",
     "0044-Allow-external-code-space-with-multiple-pointer-compression-cages.patch",
+    "0045-Allow-placing-an-IsolateGroup-sandbox-in-an-embedder-reservation.patch",
+    "0046-Make-the-sandbox-size-a-build-time-flag.patch",
 ]
 
 http_archive(
