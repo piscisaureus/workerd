@@ -83,7 +83,11 @@ hardware:
   guest concurrently, and two threads each locked into their own arena run at
   the same time, each isolated from the other's cage. Threads the guest itself
   creates (via `clone`/`clone3` with `CLONE_VM|CLONE_THREAD`) are intercepted so
-  the new thread enters the guest as a vCPU too, and vCPUs of ended threads are
+  the new thread enters the guest as a vCPU too, at its creator's privilege: a
+  thread that ring-3 code spawns is launched into ring 3 by a `SYSRET` stub
+  (its syscalls forward and return by `SYSRET`, a privileged instruction or a
+  touch of gk's memory or another arena faults, and the fault ends that thread
+  alone), while a ring-0 creator's thread starts in ring 0. vCPUs of ended threads are
   pooled and reused, so the vCPU count is bounded by peak concurrency, not by the
   number of threads ever created (KVM cannot reclaim a vCPU id, so the objects
   are recycled). Each vCPU takes exceptions on a private IST stack via a per-vCPU

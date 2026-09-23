@@ -67,9 +67,14 @@ long gk_run_here(long (*fn)(void *), void *arg);
 // process survives. Legitimate syscalls are forwarded and the function returns
 // to ring 3 as usual.
 //
-// This slice runs the top-level fn at ring 3; threads a ring-3 fn creates
-// (clone) currently still enter at ring 0. Arena/CR3 switching stays host-
-// driven in ring 0 and is unchanged.
+// Threads created inside the guest run at their creator's privilege: a thread
+// a ring-3 fn creates (clone/clone3) starts at ring 3 too, and so do its own
+// children, while a thread a ring-0 fn (gk_run) creates starts at ring 0. A
+// ring-3 thread's syscalls are forwarded and faults are reported as above,
+// except that a fault has no gk_run call to return GK_EFAULT to: it ends that
+// thread alone (its vCPU is recycled and joiners are woken as for any thread
+// exit; a message goes to stderr and gk_fault_addr records the address) and
+// the process survives. Arena/CR3 switching stays host-driven in ring 0.
 long gk_run_user(long (*fn)(void *), void *arg);
 long gk_run_here_user(long (*fn)(void *), void *arg);
 

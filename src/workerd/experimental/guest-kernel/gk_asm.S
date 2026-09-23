@@ -36,6 +36,20 @@ gk_user_syscall_resume:
 gk_user_launch:
     sysretq
 
+// Drop into ring 3 to start a guest-created thread whose creator ran at ring 3
+// (see child_entry in gk.c). The host programs the vCPU with the child's start
+// registers -- its parent's at the clone syscall, with RAX = 0 and RSP = the
+// stack the clone named -- and RIP = this stub, RCX = the child's start RIP
+// (the guest's return address from the clone) and R11 = its RFLAGS, both as
+// SYSCALL saved them in the parent. SYSRETQ enters ring 3 there with a ring-3
+// CS/SS, so the child holds exactly the privilege its creator had; the kernel
+// returns a native clone's child the same way. A ring-0 creator's child starts
+// at its RIP directly and never runs this.
+    .globl gk_user_child_launch
+    .type gk_user_child_launch, @function
+gk_user_child_launch:
+    sysretq
+
 // Ring-0 guest exit: report RAX on port 0xFF and halt; the host's PORT_EXIT
 // handler returns it as gk_run's result. Ring-3 code cannot execute OUT, so the
 // ring-3 path uses gk_user_exit_tramp instead.

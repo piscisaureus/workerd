@@ -138,6 +138,7 @@ typedef struct gk_thread {
   struct {
     struct kvm_regs regs;
     uint32_t pkru;         // the parent's guest PKRU, inherited like a real clone
+    int user;              // the parent ran at ring 3, so the child starts there too
     int parent_id;
   } start;
   struct gk_thread *next_free;
@@ -300,6 +301,7 @@ extern void gk_syscall_tramp(void);
 extern void gk_syscall_tramp_resume(void);
 extern void gk_user_syscall_resume(void);
 extern void gk_user_launch(void);
+extern void gk_user_child_launch(void);
 extern void gk_exit_tramp(void);
 extern void gk_user_exit_tramp(void);
 extern void gk_exc_de(void), gk_exc_ud(void), gk_exc_df(void), gk_exc_gp(void),
@@ -1382,8 +1384,7 @@ ready:
   t->last_fault = 0;
   t->fault_repeat = 0;
   t->pkru_ready = 0;  // a fresh or reused vCPU gets its PKRU at first entry
-  t->user_mode = 0;   // ring 0 unless enter_guest is asked for ring 3; guest
-                       // threads (child_entry) run at ring 0
+  t->user_mode = 0;   // ring 0 until enter_guest or child_entry selects ring 3
   if (!t->active_pml4) t->active_pml4 = G->pml4;
   t->inited = 1;
   if (G->dbg)
@@ -1401,7 +1402,8 @@ static int map_handler_text(void) {
       (uintptr_t)&gk_exc_de, (uintptr_t)&gk_exc_ud, (uintptr_t)&gk_exc_df,
       (uintptr_t)&gk_exc_gp, (uintptr_t)&gk_exc_pf, (uintptr_t)&gk_syscall_tramp,
       (uintptr_t)&gk_exit_tramp, (uintptr_t)&gk_pkru_stub, (uintptr_t)&gk_flush_stub,
-      (uintptr_t)&gk_user_syscall_resume, (uintptr_t)&gk_user_launch};
+      (uintptr_t)&gk_user_syscall_resume, (uintptr_t)&gk_user_launch,
+      (uintptr_t)&gk_user_child_launch};
   // gk_user_exit_tramp is deliberately absent: it runs in ring 3, so it must
   // stay a user page (its own page-aligned section, demand-paged as user r-x).
   uintptr_t lo = hs[0], hi = hs[0];
@@ -1605,10 +1607,35 @@ static void host_pkru_allow_all(void);
 static uint32_t host_pkru(void);
 static int guest_pkru_update(gk_thread *t, uint32_t keep, uint32_t set, uint32_t *out);
 
+// End the guest-created thread `t` belongs to, from its host side (which runs
+// on the thread's private host stack): park its vCPU for reuse, return the
+// record to the pool, release the host stack, then exit the host thread so the
+// kernel's CLONE_CHILD_CLEARTID wakes joiners. `code` is the thread's exit
+// status.
+static void guest_thread_exit(gk_thread *t, long code) __attribute__((noreturn));
+static void guest_thread_exit(gk_thread *t, long code) {
+  void *hs = t->host_stack;
+  size_t hs_size = t->host_stack_size;
+  thread_release(t);  // t is the pool's again from here
+  pthread_mutex_lock(&G->lock);
+  prot_remove((uintptr_t)hs, (uintptr_t)hs + hs_size);
+  pthread_mutex_unlock(&G->lock);
+  gk_host_unmapself_exit(hs, hs_size, code);
+}
+
 // The child's first host-side code. `arg` is the record its parent prepared
 // (clone_thread), read off the child's refused host stack, so it cannot have
 // been tampered with; the record is checked to be one of the pool's all the
 // same, then claimed for this thread by tid.
+//
+// This is the child's ring-0 side: it claims the record, brings the vCPU up
+// under the parent's root and PKRU, and only then hands control to the child's
+// start routine. The child runs at the privilege its creator had: a ring-0
+// creator's child starts at its RIP in ring 0, a ring-3 creator's child is
+// launched through gk_user_child_launch, which SYSRETs down to that RIP in ring
+// 3. A thread spawned by untrusted code thus never gains ring 0, and from ring 3
+// its syscalls, faults and privileged instructions take the same paths as the
+// top-level ring-3 function's (see enter_guest).
 static long child_entry(void *arg) {
   uintptr_t off = (uintptr_t)arg - (uintptr_t)G->threads;
   if ((uintptr_t)arg < (uintptr_t)G->threads || off % sizeof(gk_thread) != 0 ||
@@ -1625,6 +1652,7 @@ static long child_entry(void *arg) {
     fprintf(stderr, "[gk] guest thread: %s failed\n", G->err);
     host_syscall(SYS_exit_group, 70, 0, 0, 0, 0, 0);
   }
+  t->user_mode = t->start.user;  // vcpu_init resets it; the vCPU may be a reused one
   // Eager-map the whole host mapping holding the child's stack (glibc's stack
   // block, with the thread descriptor and static TLS at its top). Exception
   // delivery pushes a frame on the current stack, so the stack must be present
@@ -1645,18 +1673,30 @@ static long child_entry(void *arg) {
   if (guest_pkru_update(t, 0, t->start.pkru, NULL) < 0)
     host_syscall(SYS_exit_group, 70, 0, 0, 0, 0, 0);
   t->pkru_ready = 1;
-  ioctl(t->fd, KVM_SET_REGS, &t->start.regs);
+  struct kvm_regs regs = t->start.regs;
+  if (t->start.user) {
+    // Enter ring 3 through the SYSRET stub. The snapshot's RCX and R11 already
+    // hold the return RIP and RFLAGS SYSCALL saved in the parent; the stub's
+    // contract wants RCX = the start RIP, which is that same return address.
+    regs.rip = (uintptr_t)&gk_user_child_launch;
+    regs.rcx = t->start.regs.rip;
+  }
+  ioctl(t->fd, KVM_SET_REGS, &regs);
   if (G->dbg)
-    fprintf(stderr, "[gk] vcpu %d: guest thread tid %ld (from vcpu %d) rip=%#llx rsp=%#llx pkru=%#x\n",
+    fprintf(stderr, "[gk] vcpu %d: guest thread tid %ld (from vcpu %d) rip=%#llx rsp=%#llx pkru=%#x ring %d\n",
             t->id, t->tid, t->start.parent_id, (unsigned long long)t->start.regs.rip,
-            (unsigned long long)t->start.regs.rsp, t->start.pkru);
+            (unsigned long long)t->start.regs.rsp, t->start.pkru, t->start.user ? 3 : 0);
   long r = run_vcpu(t);
   // A guest thread only leaves through exit/exit_group, handled in
-  // forward_syscall; reaching here means it faulted or the VM shut down.
-  fprintf(stderr, "[gk] vcpu %d: guest thread died: r=%ld fault=%#lx\n", t->id,
-          r, G->fault_addr);
-  host_syscall(SYS_exit_group, 70, 0, 0, 0, 0, 0);
-  return r;
+  // forward_syscall; reaching here means it faulted or the VM shut down. The
+  // fault ends this thread alone, as gk_run's caller sees GK_EFAULT for its own
+  // thread: the record and vCPU are recycled and the process goes on. The
+  // faulting address is left in gk_fault_addr for the host to read. Joiners
+  // are woken by the kernel as for any thread exit, but the thread's start
+  // routine never returned, so no return value reaches them.
+  fprintf(stderr, "[gk] vcpu %d: guest thread tid %ld (ring %d) died: r=%ld fault=%#lx; "
+          "thread terminated\n", t->id, t->tid, t->user_mode ? 3 : 0, r, G->fault_addr);
+  guest_thread_exit(t, 0);
 }
 
 // Parent side of an intercepted thread-creating clone/clone3. `t` is the
@@ -1713,6 +1753,7 @@ static long clone_thread(gk_thread *t, struct kvm_regs *r, long nr) {
   c->start.regs.rip = r->rcx;     // straight to the guest's return address
   c->start.parent_id = t->id;
   c->start.pkru = pkru;
+  c->start.user = t->user_mode;   // the child runs at its creator's privilege
   // The child inherits the parent's arena and counts as a user of it from now
   // (so a destroy in between cannot recycle the tables it is about to run
   // under); child_entry finds it in place.
@@ -1772,18 +1813,10 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
       return tid;
     }
   }
-  // A guest-created thread ending: park its vCPU for reuse, release its host
-  // stack, then exit the host thread so the kernel's CLONE_CHILD_CLEARTID wakes
-  // joiners.
+  // A guest-created thread ending (see guest_thread_exit).
   if (nr == SYS_exit && t->guest_thread) {
     if (G->dbg) fprintf(stderr, "[gk] vcpu %d syscall %ld (thread exit %ld)\n", t->id, nr, a1);
-    void *hs = t->host_stack;
-    size_t hs_size = t->host_stack_size;
-    thread_release(t);  // t is the pool's again from here
-    pthread_mutex_lock(&G->lock);
-    prot_remove((uintptr_t)hs, (uintptr_t)hs + hs_size);
-    pthread_mutex_unlock(&G->lock);
-    gk_host_unmapself_exit(hs, hs_size, a1);
+    guest_thread_exit(t, a1);
   }
   // Protection keys (see the protection-keys section above). pkey_mprotect
   // records the key for the range and goes to the host as a plain mprotect,

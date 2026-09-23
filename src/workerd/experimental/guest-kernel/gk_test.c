@@ -454,6 +454,104 @@ static long user_getpid(void *arg) {
   return pid;
 }
 
+// ---- guest-created threads at ring 3 ----------------------------------------
+// A thread that ring-3 code creates must run at ring 3 as well: gaining ring 0
+// through pthread_create would void the privilege split. These bodies run in
+// threads spawned by a gk_run_user function.
+struct ugt {
+  int id;
+  unsigned long cs;        // the thread's CS selector (0x2b at ring 3)
+  unsigned long child_cs;  // a grandchild's, spawned from this thread
+  long pid;                // a forwarded getpid from the thread
+  long wrote;              // the byte read back after writing u->page
+  unsigned char *page;     // a user page to write, or NULL
+  unsigned long addr;      // an address to touch (the faulting bodies)
+  volatile int before, after;  // reached the faulting instruction / got past it
+};
+
+static void *user_grandchild(void *arg) {
+  unsigned short cs;
+  __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
+  *(unsigned long *)arg = cs;
+  return NULL;
+}
+
+// The well-behaved ring-3 thread: records its CS, forwards a getpid, uses libc,
+// writes a user page, and spawns a grandchild that records its own CS.
+static void *user_thread_body(void *arg) {
+  struct ugt *u = arg;
+  unsigned short cs;
+  __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
+  u->cs = cs;
+  u->pid = user_getpid(NULL);
+  char *buf = malloc(64);
+  int len = snprintf(buf, 64, "guest thread %d ran at CPL %d\n", u->id, cs & 3);
+  write(1, buf, (size_t)len);
+  free(buf);
+  if (u->page) {
+    volatile unsigned char *p = u->page;
+    p[0] = (unsigned char)(0x50 + u->id);
+    u->wrote = p[0];
+  }
+  pthread_t gc;
+  if (pthread_create(&gc, NULL, user_grandchild, &u->child_cs) == 0) pthread_join(gc, NULL);
+  return (void *)(uintptr_t)(u->id * 10);
+}
+
+// Executes a privileged instruction (mov %cr3) after recording its address: at
+// ring 3 it #GPs, the thread ends there, and gk_fault_addr is that address.
+static void *user_thread_priv(void *arg) {
+  struct ugt *u = arg;
+  unsigned long v;
+  u->before = 1;
+  __asm__ __volatile__("leaq 1f(%%rip), %0\n\t"
+                       "movq %0, %1\n\t"
+                       "1: movq %%cr3, %0"
+                       : "=&r"(v), "=m"(u->addr));
+  u->after = 1;  // not reached at ring 3
+  return (void *)v;
+}
+
+// Writes the byte at u->addr: a user page works, gk's memory or another
+// arena's faults and ends the thread.
+static void *user_thread_touch(void *arg) {
+  struct ugt *u = arg;
+  u->before = 1;
+  volatile unsigned char *p = (void *)u->addr;
+  p[0] = 0x5a;
+  u->after = 1;
+  return NULL;
+}
+
+// Runs at ring 3: spawns three user_thread_body threads at once and joins
+// them, checking their return values.
+static long spawn_users_in_guest(void *arg) {
+  struct ugt *us = arg;
+  enum { N = 3 };
+  pthread_t th[N];
+  for (int i = 0; i < N; i++)
+    if (pthread_create(&th[i], NULL, user_thread_body, &us[i]) != 0) return -1;
+  long ok = 1;
+  for (int i = 0; i < N; i++) {
+    void *rv = NULL;
+    if (pthread_join(th[i], &rv) != 0) return -2;
+    if ((long)(uintptr_t)rv != us[i].id * 10) ok = 0;
+  }
+  return ok;
+}
+
+// Runs at ring 3: spawns one thread running `body` on `arg` and joins it. For
+// a thread that faults, the join must still return (the kernel clears its tid
+// on exit as for any thread), and the spawner and the process live on.
+struct spawn { void *(*body)(void *); void *arg; };
+static long spawn_one_in_guest(void *arg) {
+  struct spawn *s = arg;
+  pthread_t th;
+  if (pthread_create(&th, NULL, s->body, s->arg) != 0) return -1;
+  if (pthread_join(th, NULL) != 0) return -2;
+  return 1;
+}
+
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (gk_init() != 0) {
@@ -593,7 +691,7 @@ int main(void) {
     for (long j = 0; j < ts[i].n; j++) want7 += (j * 3 + ts[i].id) & 0xff;
     if (!(ts[i].cr0 & (1UL << 31)) || ts[i].sum != want7) ok7 = 0;
   }
-  printf("guest-created threads: 3 threads spawned in the guest ran in ring 0 "
+  printf("guest-created threads (ring-0 creator): 3 threads spawned in the guest ran in ring 0 "
          "(gk_run=%ld, cr0=%#lx) [%s]\n", spawned, ts[0].cr0, ok7 ? "OK" : "FAIL");
 
   // Thread churn must not grow the vCPU count: 200 iterations of 3 guest-
@@ -846,6 +944,108 @@ int main(void) {
     }
   }
 
+  // ---- guest-created threads at ring 3 --------------------------------------
+  // Threads spawned by a ring-3 context run at ring 3 themselves. Each faulting
+  // case ends only the thread that faulted: its spawner's join returns and the
+  // process survives to run the next check.
+  int ok15 = 1;
+  {
+    // 1. Three threads spawned at once from ring 3 run at CPL 3 (CS 0x2b), as
+    //    do the grandchildren they spawn; each forwards a getpid (3.) and
+    //    writes its own user page.
+    unsigned char *upages = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct ugt us[3];
+    memset(us, 0, sizeof us);
+    for (int i = 0; i < 3; i++) {
+      us[i].id = i + 1;
+      us[i].page = upages == MAP_FAILED ? NULL : upages + i * 4096;
+    }
+    long spawned_u = gk_run_user(spawn_users_in_guest, us);
+    int p1 = spawned_u == 1 && upages != MAP_FAILED, p3 = 1;
+    for (int i = 0; i < 3; i++) {
+      if (us[i].cs != 0x2b || us[i].child_cs != 0x2b) p1 = 0;
+      if (us[i].pid != (long)getpid()) p3 = 0;
+      if (us[i].wrote != 0x50 + us[i].id || upages[i * 4096] != 0x50 + us[i].id) p1 = 0;
+    }
+    printf("  1. ring-3 spawned threads: spawn -> %ld, CS %#lx/%#lx/%#lx, grandchildren CS "
+           "%#lx/%#lx/%#lx, user-page writes %#lx/%#lx/%#lx [%s]\n", spawned_u, us[0].cs,
+           us[1].cs, us[2].cs, us[0].child_cs, us[1].child_cs, us[2].child_cs, us[0].wrote,
+           us[1].wrote, us[2].wrote, p1 ? "OK" : "FAIL");
+    if (upages != MAP_FAILED) munmap(upages, 3 * 4096);
+
+    // 2. A privileged instruction in a ring-3 thread #GPs; the thread ends at
+    //    that instruction, the spawner joins it, the process survives.
+    struct ugt pv = {0};
+    struct spawn sp = {user_thread_priv, &pv};
+    long jp = gk_run_user(spawn_one_in_guest, &sp);
+    unsigned long fp = gk_fault_addr();
+    int p2 = jp == 1 && pv.before == 1 && pv.after == 0 && fp == pv.addr && pv.addr != 0;
+    printf("  2. ring-3 thread mov %%cr3 @%#lx: %s (fault %#lx), spawner joined -> %ld, "
+           "process survived [%s]\n", pv.addr,
+           pv.after ? "EXECUTED" : pv.before ? "#GP, thread ended" : "NOT REACHED", fp, jp,
+           p2 ? "OK" : "FAIL");
+
+    // 3. (checked above) a forwarded getpid returned to ring 3 with the pid.
+    printf("  3. ring-3 thread forwarded getpid: %ld/%ld/%ld, host %ld [%s]\n", us[0].pid,
+           us[1].pid, us[2].pid, (long)getpid(), p3 ? "OK" : "FAIL");
+
+    // 4. Under an arena, a ring-3 thread writes the arena's own committed page
+    //    but faults on gk's page tables and on another arena's page. The
+    //    faulted threads drop out of the arena, so it is destroyed cleanly
+    //    afterwards: its slot is released (a fresh arena lands on it again)
+    //    rather than leaked as still in use.
+    int p4 = 0;
+    gk_arena *ua = gk_arena_create(4096), *ub = gk_arena_create(4096);
+    unsigned long refuse = 0;
+    gk_debug_control_addrs(NULL, &refuse);
+    if (ua && ub && mprotect(gk_arena_base(ua), 4096, PROT_READ | PROT_WRITE) == 0 &&
+        mprotect(gk_arena_base(ub), 4096, PROT_READ | PROT_WRITE) == 0) {
+      unsigned char *abase = gk_arena_base(ua), *bbase = gk_arena_base(ub);
+      struct ugt own = {.id = 7, .page = abase};
+      struct ugt tpt = {.addr = refuse};
+      struct ugt tpeer = {.addr = (unsigned long)bbase};
+      struct spawn s_own = {user_thread_body, &own};
+      struct spawn s_pt = {user_thread_touch, &tpt};
+      struct spawn s_peer = {user_thread_touch, &tpeer};
+      gk_arena_enter(ua);
+      long j_own = gk_run_user(spawn_one_in_guest, &s_own);
+      long j_pt = gk_run_user(spawn_one_in_guest, &s_pt);
+      unsigned long f_pt = gk_fault_addr();
+      long j_peer = gk_run_user(spawn_one_in_guest, &s_peer);
+      unsigned long f_peer = gk_fault_addr();
+      gk_arena_enter(NULL);
+      int host_sees = abase[0] == 0x57 && bbase[0] != 0x5a;  // before the reservations go
+      gk_arena_destroy(ua);
+      gk_arena_destroy(ub);
+      // ua had the lowest free slot; a fresh arena lands there again only if
+      // the destroy released it, i.e. no faulted thread still counted as a user.
+      gk_arena *uc = gk_arena_create(4096);
+      int slot_reused = uc && gk_arena_base(uc) == abase;
+      gk_arena_destroy(uc);
+      p4 = j_own == 1 && own.cs == 0x2b && own.wrote == 0x57 && host_sees &&
+           j_pt == 1 && tpt.before && !tpt.after && f_pt == refuse &&
+           j_peer == 1 && tpeer.before && !tpeer.after && f_peer == (unsigned long)bbase &&
+           slot_reused;
+      printf("  4. ring-3 thread under arena: own page write -> %#lx (join %ld); gk page tables "
+             "@%#lx -> %s (fault %#lx, join %ld); other arena @%p -> %s (fault %#lx, join %ld); "
+             "arena slot %s after destroy [%s]\n", own.wrote, j_own, refuse,
+             tpt.after ? "WROTE" : "FAULT, thread ended", f_pt, j_pt, (void *)bbase,
+             tpeer.after ? "WROTE" : "FAULT, thread ended", f_peer, j_peer,
+             slot_reused ? "released" : "LEAKED", p4 ? "OK" : "FAIL");
+    } else {
+      printf("  4. ring-3 thread under arena: setup failed [FAIL]\n");
+    }
+    // The process is intact: ring 3 and a ring-0 guest thread still work.
+    long cpl_after = gk_run_user(user_cpl, NULL);
+    struct churn c1 = {.iters = 1, .per_iter = 2, .bad = 0};
+    long r0_after = gk_run(churn_in_guest, &c1);
+    ok15 = p1 && p2 && p3 && p4 && cpl_after == 3 && r0_after == 0 && c1.bad == 0;
+    printf("guest-created threads (ring-3 creator): run at ring 3, faults end the thread only; "
+           "afterwards ring 3 at CPL %ld, ring-0 threads %s [%s]\n", cpl_after,
+           r0_after == 0 && c1.bad == 0 ? "ok" : "BROKEN", ok15 ? "OK" : "FAIL");
+  }
+
   // ---- gk's control data is supervisor memory --------------------------------
   // The structures that decide which root a thread runs under (the arena
   // registry and structs, the page-table allocator, the memslot tree and its
@@ -905,7 +1105,7 @@ int main(void) {
   }
 
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
-            ok12 && ok13 && ok14;
+            ok12 && ok13 && ok14 && ok15;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }
