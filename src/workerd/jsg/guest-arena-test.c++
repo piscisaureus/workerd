@@ -39,8 +39,8 @@ constexpr size_t BUFFER_SIZE = 64 * 1024;
 constexpr unsigned char BUFFER_FILL = 0x5a;
 
 // Guest-side probe: reads the byte at `arg`, writes it back and returns it. Runs inside the
-// guest via gk_run_here(); an access to memory the active arena cannot address ends the run
-// with GK_EFAULT instead of returning.
+// guest via gk_run_here() (ring 0) or gk_run_here_user() (ring 3); an access to memory the
+// active arena cannot address ends the run with GK_EFAULT instead of returning.
 long touchByte(void* arg) {
   auto* p = reinterpret_cast<volatile unsigned char*>(arg);
   unsigned char v = *p;
@@ -357,6 +357,13 @@ KJ_TEST("each isolate's memory lives in its own guest-kernel arena") {
     KJ_EXPECT(gk_run_here(&touchByte, bufB) == GK_EFAULT);
     KJ_EXPECT(gk_fault_addr() == reinterpret_cast<uintptr_t>(bufB));
 
+    // The same from ring 3, which is where production runs JS turns (IoContext::runImpl uses
+    // gk_run_here_user): the arena wall must hold on the user-mode path too, where the page
+    // tables' user bit is checked as well as the root. A's buffer is reachable, B's faults.
+    KJ_EXPECT(gk_run_here_user(&touchByte, bufA) == BUFFER_FILL);
+    KJ_EXPECT(gk_run_here_user(&touchByte, bufB) == GK_EFAULT);
+    KJ_EXPECT(gk_fault_addr() == reinterpret_cast<uintptr_t>(bufB));
+
     JsTurn turn{lock};
     KJ_EXPECT(gk_run_here(&JsTurn::run, &turn) == 0);
     KJ_EXPECT(!turn.threw);
@@ -364,10 +371,13 @@ KJ_TEST("each isolate's memory lives in its own guest-kernel arena") {
     KJ_EXPECT(turn.result == 1024 * 7 + 10000 + 511.5, turn.result);
   });
 
-  // Mirror under B's lock.
+  // Mirror under B's lock, from ring 0 and ring 3.
   b.runInLockScope([&](ArenaIsolate::Lock& lock) {
     KJ_EXPECT(gk_run_here(&touchByte, bufB) == BUFFER_FILL);
     KJ_EXPECT(gk_run_here(&touchByte, bufA) == GK_EFAULT);
+    KJ_EXPECT(gk_fault_addr() == reinterpret_cast<uintptr_t>(bufA));
+    KJ_EXPECT(gk_run_here_user(&touchByte, bufB) == BUFFER_FILL);
+    KJ_EXPECT(gk_run_here_user(&touchByte, bufA) == GK_EFAULT);
     KJ_EXPECT(gk_fault_addr() == reinterpret_cast<uintptr_t>(bufA));
   });
 

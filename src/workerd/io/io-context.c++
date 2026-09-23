@@ -1509,7 +1509,13 @@ void runJsTurn(IoContext& context, Worker::Lock& workerLock, Func&& body) {
     // Run the JS turn (V8, JIT, and the C++ runtime it calls) at guest ring 3. Combined with the
     // per-isolate page-table arena entered at the jsg::Lock, this means arbitrary code execution in
     // V8 cannot reload CR3, run privileged instructions, or touch gk's supervisor/refused pages: any
-    // such attempt faults and gk_run_here_user returns GK_EFAULT.
+    // such attempt faults and gk_run_here_user returns GK_EFAULT. That confines it to this
+    // isolate's arena and keeps it out of gk's control state, but not out of the shared runtime
+    // memory (the C++/KJ heap, glibc, and this thread's stack, which the turn runs on and which
+    // holds the host frames below the guest boundary): those are user-mapped, so an escape to
+    // arbitrary code execution can still corrupt shared state and, through a host return address
+    // on the stack, potentially reach host execution. See gk.h; containing that is remaining
+    // work.
     long result = gk_run_here_user(&GuestTurn<Func>::trampoline, &turn);
     if (result != 0) {
       // The guest faulted (or gk otherwise could not complete the turn) and control is back here
@@ -1538,6 +1544,8 @@ void runJsTurn(IoContext& context, Worker::Lock& workerLock, Func&& body) {
       auto e = KJ_EXCEPTION(FAILED,
           "guest-kernel: JS turn faulted inside the guest; the isolate has been condemned", result,
           gk_fault_addr());
+      // Condemned while this thread still holds the isolate lock (`workerLock`), so a thread
+      // waiting for the lock finds the isolate condemned as soon as it acquires it.
       workerLock.getWorker().getIsolate().condemn(e.clone());
       context.abort(e.clone());
       kj::throwFatalException(kj::mv(e));
@@ -1565,10 +1573,12 @@ void IoContext::runImpl(Runnable& runnable,
     KJ_REQUIRE(l.isFor(KJ_ASSERT_NONNULL(actor).getInputGate()));
   }
 
-  // A condemned isolate (see Worker::Isolate::condemn()) must not even be locked, so refuse the
-  // turn before runInContextScope() enters it. This also covers exceptional turns, which only
-  // exist to report an exception to the inspector or tracer; logUncaughtExceptionAsync() skips
-  // them for a condemned isolate before getting here.
+  // A condemned isolate (see Worker::Isolate::condemn()) must not run JS again, so refuse the
+  // turn before runInContextScope() even tries to lock it. This is only a fast-fail: the isolate
+  // may still be condemned by the thread holding the lock while this one waits for it, which is
+  // caught by the authoritative check the lock itself performs once it is held. Exceptional
+  // turns, which only exist to report an exception to the inspector or tracer, are refused the
+  // same way; logUncaughtExceptionAsync() skips them for a condemned isolate before getting here.
   worker->getIsolate().requireNotCondemned();
 
   getIoChannelFactory().getTimer().syncTime();

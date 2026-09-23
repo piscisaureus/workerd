@@ -545,6 +545,11 @@ struct Worker::Impl {
   kj::Maybe<kj::Exception> permanentException;
 };
 
+// Whether Isolate::Impl::Lock may enter a condemned isolate (see Worker::Isolate::condemn()).
+// Only the teardown paths that release the isolate's resources say YES; every other lock attempt
+// on a condemned isolate fails instead.
+WD_STRONG_BOOL(EnterCondemned);
+
 // Note that Isolate mutable state is protected by locking the JsgWorkerIsolate unless otherwise
 // noted.
 struct Worker::Isolate::Impl {
@@ -571,7 +576,8 @@ struct Worker::Isolate::Impl {
   kj::HashSet<kj::String> errorOnceDescriptions;
 
   // See Worker::Isolate::condemn(). Guarded by its own mutex rather than the isolate lock because
-  // requireNotCondemned() runs before the isolate lock is taken.
+  // isCondemned() and the fast-fail requireNotCondemned() in IoContext::runImpl() run without the
+  // isolate lock.
   kj::MutexGuarded<kj::Maybe<kj::Exception>> condemnedReason;
 
   // Atomically incremented upon every successful lock. The ThreadProgressCounter in Impl::Lock
@@ -587,8 +593,10 @@ struct Worker::Isolate::Impl {
   class Lock {
 
    public:
-    explicit Lock(
-        const Worker::Isolate& isolate, Worker::LockType lockType, jsg::V8StackScope& stackScope)
+    explicit Lock(const Worker::Isolate& isolate,
+        Worker::LockType lockType,
+        jsg::V8StackScope& stackScope,
+        EnterCondemned enterCondemned = EnterCondemned::NO)
         : impl(*isolate.impl),
           metrics([&isolate, &lockType]() -> kj::Maybe<kj::Own<IsolateObserver::LockTiming>> {
             KJ_SWITCH_ONEOF(lockType.origin) {
@@ -610,6 +618,18 @@ struct Worker::Isolate::Impl {
           limitEnforcer(isolate.getLimitEnforcer()),
           loggingOptions(isolate.loggingOptions),
           lock(isolate.api->lock(stackScope)) {
+      // The isolate lock is held from here on, so this is the authoritative condemnation check
+      // (see Worker::Isolate::condemn()): every path that enters the isolate -- Worker::Lock,
+      // Worker::Isolate::runInLockScope(), the Worker and Script constructors and the inspector
+      // -- constructs this Lock, and the check can only be race-free once the lock is held. The
+      // thread that condemns the isolate does so while it still holds the lock, before it throws
+      // and releases it; a thread that was already waiting for the lock when that happened (and
+      // that may have passed the pre-lock fast-fail in IoContext::runImpl() while the isolate
+      // was still healthy) therefore sees the condemnation the moment it gets the lock, and
+      // never enters the inconsistent isolate. Throwing here destroys `lock`, which releases the
+      // isolate again, and none of the bookkeeping below has happened yet.
+      if (!enterCondemned) isolate.requireNotCondemned();
+
       WarnAboutIsolateLockScope::maybeWarn();
 
       // Increment the success count to expose forward progress to all threads.
@@ -1619,8 +1639,10 @@ Worker::Isolate::~Isolate() noexcept(false) {
   // is about to be destroyed, but we have to take the lock in order to enter the isolate.
   // It's also important that we lock one last time, in order to destroy any remaining workers in
   // worker destruction queue.
+  // Teardown enters a condemned isolate too: this is the only chance to release what it holds.
   jsg::runInV8Stack([&](jsg::V8StackScope& stackScope) {
-    Isolate::Impl::Lock recordedLock(*this, Worker::Lock::TakeSynchronously(kj::none), stackScope);
+    Isolate::Impl::Lock recordedLock(
+        *this, Worker::Lock::TakeSynchronously(kj::none), stackScope, EnterCondemned::YES);
     metrics->teardownLockAcquired();
     auto inspector = kj::mv(impl->inspector);
     auto dropTraceAsyncContextKey = kj::mv(traceAsyncContextKey);
@@ -1642,9 +1664,10 @@ Worker::Script::~Script() noexcept(false) {
   //   multiple scripts are co-located in the same isolate. As of this writing, that doesn't happen
   //   except in preview. In any case, Scripts are destroyed in the GC thread, where we don't care
   //   too much about lock latency.
+  // Teardown enters a condemned isolate too: this is the only chance to release what it holds.
   jsg::runInV8Stack([&](jsg::V8StackScope& stackScope) {
     Isolate::Impl::Lock recordedLock(
-        *isolate, Worker::Lock::TakeSynchronously(kj::none), stackScope);
+        *isolate, Worker::Lock::TakeSynchronously(kj::none), stackScope, EnterCondemned::YES);
     KJ_IF_SOME(c, impl->moduleContext) {
       recordedLock.disposeContext(kj::mv(c));
     }
@@ -2944,8 +2967,10 @@ class Worker::Isolate::InspectorChannelImpl final: public v8_inspector::V8Inspec
     // Delete session under lock.
     auto state = this->state.lockExclusive();
 
+    // Teardown enters a condemned isolate too: this is the only chance to release the session.
     jsg::runInV8Stack([&](jsg::V8StackScope& stackScope) {
-      Isolate::Impl::Lock recordedLock(*state->get()->isolate, InspectorLock(kj::none), stackScope);
+      Isolate::Impl::Lock recordedLock(
+          *state->get()->isolate, InspectorLock(kj::none), stackScope, EnterCondemned::YES);
       if (state->get()->isolate->currentInspectorSession != kj::none) {
         const_cast<Isolate&>(*state->get()->isolate).disconnectInspector();
       }

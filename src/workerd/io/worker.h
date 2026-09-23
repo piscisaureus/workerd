@@ -482,13 +482,16 @@ class Worker::Isolate: public kj::AtomicRefcounted {
   // Called after each completed request. Does not require a lock.
   void completedRequest() const;
 
-  // Marks the isolate as permanently unusable: every later attempt to run JS in it fails with
-  // `reason` (see IoContext::runImpl). Used when a JS turn was abandoned mid-execution rather than
-  // unwound: the experimental guest kernel reports a fault inside the guest by returning from the
-  // turn without the frames below the guest boundary ever running, so the isolate's V8 heap and
-  // per-thread state (handle scopes, TryCatch chain, JS entry frames) may be inconsistent and no
-  // more JS may run on it. Does not require a lock; safe to call from any thread. The first
-  // reason wins.
+  // Marks the isolate as permanently unusable: every later attempt to lock it fails with `reason`
+  // (checked under the lock in Isolate::Impl::Lock, so that a thread already waiting for the
+  // lock when the isolate is condemned fails as soon as it gets it; IoContext::runImpl() also
+  // fails fast before locking). Only the teardown paths that release the isolate's resources may
+  // still enter it. Used when a JS turn was abandoned mid-execution rather than unwound: the
+  // experimental guest kernel reports a fault inside the guest by returning from the turn without
+  // the frames below the guest boundary ever running, so the isolate's V8 heap and per-thread
+  // state (handle scopes, TryCatch chain, JS entry frames) may be inconsistent and no more JS may
+  // run on it. Does not itself require the lock, but the condemning thread must hold it (as the
+  // faulting thread does) for the under-lock check to be race-free. The first reason wins.
   //
   // TODO(guest-kernel): This only fences the isolate off; nothing evicts it. workerd keeps the
   //   condemned isolate's Worker in its service table and answers every request to it with
@@ -497,7 +500,9 @@ class Worker::Isolate: public kj::AtomicRefcounted {
   //   would mean rebuilding the WorkerService, which has no support for it today.
   void condemn(kj::Exception reason) const;
 
-  // Throws the reason passed to condemn() if the isolate has been condemned.
+  // Throws the reason passed to condemn() if the isolate has been condemned. Taking the isolate
+  // lock performs this check itself; calling it without the lock is only a fast-fail, as the
+  // isolate may be condemned by another thread between the check and the lock.
   void requireNotCondemned() const;
 
   bool isCondemned() const;
