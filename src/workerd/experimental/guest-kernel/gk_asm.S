@@ -33,13 +33,13 @@ gk_exc_df:
     hlt
     .globl gk_exc_gp
 gk_exc_gp:
-    movb $0x0D, %al
+    movq 8(%rsp), %rax   /* faulting RIP (error code at [rsp]) */
     outb %al, $0xFE
     hlt
     .globl gk_exc_pf
 gk_exc_pf:
-    movb $0x0E, %al
-    outb %al, $0xFE
-    hlt
+    outb %al, $0xFC    /* demand-page CR2: host maps it and resumes us */
+    addq $8, %rsp      /* discard the #PF error code the CPU pushed */
+    iretq              /* retry the faulting instruction */
 
     .section .note.GNU-stack,"",@progbits

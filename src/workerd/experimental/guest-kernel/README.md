@@ -60,6 +60,12 @@ hardware:
 - **Syscall policy.** A filter can bound what forwarded code may do; a denied
   syscall is not forwarded and the guest sees `-EPERM`. The test denies `write`
   and confirms the guest gets `-EPERM` while other syscalls still work.
+- **Demand-paged MMU.** The guest's memory is backed lazily. On a guest page
+  fault the in-guest `#PF` handler hypercalls; the host checks the faulting
+  address against its own address space and, if committed, backs it with a KVM
+  memslot and a PTE, then the handler `iretq`s to retry. Memslots are created
+  per aligned 32 MiB chunk, so they never overlap and every mapped page is
+  backed. Faults into another arena's region are refused, preserving isolation.
 
 Enabling SSE and AVX in the guest (`CR4.OSFXSR`, `OSXSAVE`, and `XCR0`) is
 required before compiled code and glibc, which use those instructions, will
@@ -98,5 +104,21 @@ decides the overall cost.
 - **Dynamic mappings** that land in a fresh top-level (PML4) entry after an
   arena is created are not reflected into that arena's root. Allocations near
   existing mappings are, because the subtrees are shared.
+- **The MMU is a fixed-chunk scheme.** It maps everything writable and reparses
+  `/proc/self/maps` per fault. A production MMU should track VMAs in an interval
+  tree (see the FreeBSD `sys/vm` note in `gk.c`) and create memslots that follow
+  `mmap`/`mprotect`/`munmap` exactly, honoring per-page protection and issuing
+  cross-vCPU TLB shootdowns.
 - **Not integrated with the workerd build.** Integrating with V8's cage would
   require the V8 sandbox to be enabled in the build first.
+
+## Running V8 inside gk (status)
+
+A separate spike links this library against workerd's V8 and enters an isolate
+inside the guest. With the demand-paged MMU plus `CR4.PKE` (glibc `pkey_set`
+uses `rdpkru`) and clearing the host PKRU (V8 write-protects its pointer tables
+with a protection key), V8 initializes, `v8::Isolate::New` completes, and
+hundreds of pages are demand-mapped correctly. The next barrier is a V8
+thread-local access during context/compile setup (V8 recorded stack/TLS state on
+the host thread but runs on the guest stack); resolving that is the remaining
+work before a script runs end to end. The spike is not part of this library.
