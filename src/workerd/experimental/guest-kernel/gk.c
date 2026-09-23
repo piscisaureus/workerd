@@ -177,12 +177,21 @@ struct gk_arena {
   gk_arena *next_free;        // free-list link while the struct is unused
 };
 
-// The supervisor/refuse registry (see prot_class below).
+// The supervisor/refuse registry (see prot_class below). An unregistered page
+// is user-accessible, so the registry must never be too small to hold every
+// range gk wants to protect: prot_add is fatal when it is full. The capacity
+// covers the worst case, which is 4 ranges per vCPU (kvm_run and the IST/TSS
+// region, which stay registered while the vCPU is pooled, plus a gk_run_here
+// side stack and a guest thread's host stack, which are different classes and
+// so cannot be coalesced), the fixed init ranges (control block, page-table
+// area, GDT/IDT, handler text), and headroom.
 #define GK_PROT_KEEP 0
 #define GK_PROT_SUPER 1
 #define GK_PROT_REFUSE 2
-#define GK_MAX_PROT_RANGES 8192
+#define GK_MAX_PROT_RANGES (4 * GK_MAX_VCPUS + 1024)
 typedef struct { uintptr_t start, end; int kind; } gk_prot_range;
+_Static_assert(GK_MAX_PROT_RANGES >= 2 * GK_MAX_VCPUS + 512,
+               "registry must hold every vCPU's permanent ranges with headroom");
 
 // A memslot-backed window (see the MMU layer below).
 #define GK_BACK_WIN (2UL << 20)   // memslot backing granularity (2MB, aligned)
@@ -332,6 +341,49 @@ static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
   return ret;
 }
 
+// Raw stderr output for the fault path and for fatal errors: a plain write(2),
+// no stdio, no allocation, no lock the guest thread could hold (see the
+// signal-safety note above region_add). Debug lines are composed in a
+// stack buffer (gk_dbuf) and written in one call.
+static void write_stderr(const char *s) {
+  ssize_t r = write(2, s, strlen(s));
+  (void)r;
+}
+
+// Fatal integrity failure: something the host side must be able to trust has
+// been tampered with (or gk has a bug). There is no safe way to continue.
+static void gk_fatal(const char *what) __attribute__((noreturn));
+static void gk_fatal(const char *what) {
+  write_stderr("[gk] FATAL: ");
+  write_stderr(what);
+  write_stderr("\n");
+  abort();
+}
+
+typedef struct { char b[512]; size_t n; } gk_dbuf;
+static void db_str(gk_dbuf *d, const char *s) {
+  while (*s && d->n < sizeof d->b - 1) d->b[d->n++] = *s++;
+}
+static void db_hex(gk_dbuf *d, uint64_t v) {  // 0x-prefixed, like printf's %#lx
+  char tmp[2 + 16], *p = tmp + sizeof tmp;
+  do { *--p = "0123456789abcdef"[v & 0xf]; v >>= 4; } while (v);
+  *--p = 'x'; *--p = '0';
+  while (p < tmp + sizeof tmp && d->n < sizeof d->b - 1) d->b[d->n++] = *p++;
+}
+static void db_dec(gk_dbuf *d, long v) {
+  char tmp[1 + 20], *p = tmp + sizeof tmp;
+  unsigned long u = v < 0 ? 0UL - (unsigned long)v : (unsigned long)v;
+  do { *--p = (char)('0' + u % 10); u /= 10; } while (u);
+  if (v < 0) *--p = '-';
+  while (p < tmp + sizeof tmp && d->n < sizeof d->b - 1) d->b[d->n++] = *p++;
+}
+static void db_flush(gk_dbuf *d) {
+  if (d->n < sizeof d->b) d->b[d->n++] = '\n';
+  ssize_t r = write(2, d->b, d->n);
+  (void)r;
+  d->n = 0;
+}
+
 // Page-table page allocator over a fixed arena: a bump allocator with a free
 // list in front of it, so the tables of a destroyed arena serve the next one.
 // Freed pages are linked through their first word; the page is zeroed again
@@ -426,12 +478,15 @@ static void unmap_range_all(uintptr_t s, uintptr_t e);
 // between its allocation and this call is re-faulted under its new class
 // rather than staying a user page. Caller holds G->lock (or is single-threaded
 // gk_init).
+//
+// A full registry is fatal, never a silent no-op: an unregistered range is
+// KEEP, i.e. user-accessible, so leaving a supervisor or refused range out
+// would hand ring 3 the very memory (a TSS/IST, kvm_run, a host stack) the
+// registry exists to keep from it. GK_MAX_PROT_RANGES is sized so that this
+// cannot happen below the vCPU limit.
 static void prot_add(uintptr_t s, uintptr_t e, int kind) {
-  if (G->prot_n >= GK_MAX_PROT_RANGES) {
-    if (G->dbg) fprintf(stderr, "[gk] prot registry full; [%#lx,%#lx) unregistered\n",
-                       (unsigned long)s, (unsigned long)e);
-    return;
-  }
+  if (G->prot_n >= GK_MAX_PROT_RANGES)
+    gk_fatal("supervisor/refuse registry full; cannot leave a protected range user-mapped");
   int i = 0;
   while (i < G->prot_n && G->prot[i].start < s) i++;
   memmove(&G->prot[i + 1], &G->prot[i], (size_t)(G->prot_n - i) * sizeof G->prot[0]);
@@ -674,9 +729,13 @@ static int region_add(uintptr_t s, uintptr_t e) {
                                           .memory_size = e - s,
                                           .userspace_addr = s};
   if (ioctl(G->vmfd, KVM_SET_USER_MEMORY_REGION, &r) < 0) {
-    if (G->dbg)
-      fprintf(stderr, "[gk] memslot %d [%#lx,%#lx) failed: %s\n", slot,
-              (unsigned long)s, (unsigned long)e, strerror(errno));
+    if (G->dbg) {  // fault path: raw output only (no strerror, it may allocate)
+      gk_dbuf d = {.n = 0};
+      db_str(&d, "[gk] memslot "); db_dec(&d, slot);
+      db_str(&d, " ["); db_hex(&d, s); db_str(&d, ","); db_hex(&d, e);
+      db_str(&d, ") failed: errno "); db_dec(&d, errno);
+      db_flush(&d);
+    }
     return -1;  // the node stays where it was (free list or untouched pool tail)
   }
   if (recycled) {
@@ -1033,9 +1092,13 @@ static int demand_map(gk_thread *t, uintptr_t addr) {
   // (handler text, GDT/IDT, IST/TSS) is mapped with U cleared by map4k_root.
   int cls = prot_class(page);
   if (cls == GK_PROT_REFUSE) {
-    if (G->dbg)
-      fprintf(stderr, "[gk] vcpu %d: REFUSE fault %#lx (gk control region)\n", t->id,
-              (unsigned long)page);
+    if (G->dbg) {
+      gk_dbuf d = {.n = 0};
+      db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+      db_str(&d, ": REFUSE fault "); db_hex(&d, page);
+      db_str(&d, " (gk control region)");
+      db_flush(&d);
+    }
     pthread_mutex_unlock(&G->lock);
     return -1;
   }
@@ -1076,12 +1139,16 @@ static int demand_map(gk_thread *t, uintptr_t addr) {
     }
   }
   pthread_mutex_unlock(&G->lock);
-  if (G->dbg && cls == GK_PROT_SUPER)
-    fprintf(stderr, "[gk] vcpu %d: SUPER demand-map %#lx perms=%d (U cleared)\n", t->id,
-            (unsigned long)page, perms);
-  if (G->dbg && pkey != 0)
-    fprintf(stderr, "[gk] vcpu %d demand-map %#lx perms=%d pkey=%d (PTE bits 62:59)\n",
-            t->id, (unsigned long)page, perms, pkey);
+  if (G->dbg && (cls == GK_PROT_SUPER || pkey != 0)) {
+    gk_dbuf d = {.n = 0};
+    db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+    db_str(&d, cls == GK_PROT_SUPER ? ": SUPER demand-map " : ": demand-map ");
+    db_hex(&d, page);
+    db_str(&d, " perms="); db_dec(&d, perms);
+    if (cls == GK_PROT_SUPER) db_str(&d, " (U cleared)");
+    if (pkey != 0) { db_str(&d, " pkey="); db_dec(&d, pkey); db_str(&d, " (PTE bits 62:59)"); }
+    db_flush(&d);
+  }
   return r;
 }
 
@@ -1098,20 +1165,6 @@ static void set_idt_gate(uint8_t *idt, int vec, uint64_t h) {
 }
 
 // ---- thread records ----------------------------------------------------------
-// Fatal integrity failure: something the host side must be able to trust has
-// been tampered with (or gk has a bug). There is no safe way to continue.
-static void write_stderr(const char *s) {
-  ssize_t r = write(2, s, strlen(s));
-  (void)r;
-}
-static void gk_fatal(const char *what) __attribute__((noreturn));
-static void gk_fatal(const char *what) {
-  write_stderr("[gk] FATAL: ");
-  write_stderr(what);
-  write_stderr("\n");
-  abort();
-}
-
 static long gettid_raw(void) { return host_syscall(SYS_gettid, 0, 0, 0, 0, 0, 0); }
 
 // The calling thread's record, or NULL if it has none yet. tls_rec is user
@@ -1413,6 +1466,12 @@ static int map_handler_text(void) {
   }
   lo &= ~0xfffUL;
   hi = (hi + 64 + 0xfff) & ~0xfffUL;
+  // The addresses are resolved by the linker, so the layout assumption above
+  // is checked here rather than at compile time: if the ring-3 trampoline's
+  // page ever fell inside the supervisor span, every ring-3 exit would fault.
+  uintptr_t tramp = (uintptr_t)&gk_user_exit_tramp & ~0xfffUL;
+  if (tramp < hi && tramp + 0x1000 > lo)
+    gk_fatal("gk_user_exit_tramp shares a page with the supervisor handler text");
   // The handlers run in ring 0 and must be unreadable to ring 3, so map them
   // supervisor r-x. Register before mapping so map4k_root clears U.
   prot_add(lo, hi, GK_PROT_SUPER);
@@ -2170,9 +2229,13 @@ static long run_vcpu(gk_thread *t) {
           uint64_t pf_err = *(uint64_t *)(uintptr_t)pr.rsp;  // top of the #PF frame
           int pk = (pf_err & PF_ERR_PK) != 0;
           if (pk && repeat) {
-            if (G->dbg)
-              fprintf(stderr, "[gk] vcpu %d: protection-key violation at %#llx (err=%#llx)\n",
-                      t->id, (unsigned long long)cr2, (unsigned long long)pf_err);
+            if (G->dbg) {
+              gk_dbuf d = {.n = 0};
+              db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+              db_str(&d, ": protection-key violation at "); db_hex(&d, cr2);
+              db_str(&d, " (err="); db_hex(&d, pf_err); db_str(&d, ")");
+              db_flush(&d);
+            }
             G->fault_addr = cr2;
             return GK_EFAULT;
           }
@@ -2180,21 +2243,27 @@ static long run_vcpu(gk_thread *t) {
           int dm = demand_map(t, (uintptr_t)cr2);
           GK_HANDLER_LEAVE();
           if (dm < 0) {
-            if (G->dbg) {
+            if (G->dbg) {  // still the fault path: raw output only
               struct kvm_regs rr;
               ioctl(t->fd, KVM_GET_REGS, &rr);
               // The #PF frame on the guest stack: [err, rip, cs, rflags, rsp].
               uint64_t *frame = (uint64_t *)(uintptr_t)rr.rsp;
-              fprintf(stderr, "[gk] vcpu %d: unmappable fault cr2=%#llx rip=%#llx err=%#llx rsp=%#llx rax=%#llx\n",
-                      t->id, (unsigned long long)cr2, (unsigned long long)frame[1],
-                      (unsigned long long)frame[0], (unsigned long long)frame[4],
-                      (unsigned long long)rr.rax);
+              gk_dbuf d = {.n = 0};
+              db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+              db_str(&d, ": unmappable fault cr2="); db_hex(&d, cr2);
+              db_str(&d, " rip="); db_hex(&d, frame[1]);
+              db_str(&d, " err="); db_hex(&d, frame[0]);
+              db_str(&d, " rsp="); db_hex(&d, frame[4]);
+              db_str(&d, " rax="); db_hex(&d, rr.rax);
+              db_flush(&d);
               // Best-effort frame-pointer walk of the guest stack (host memory,
               // identity mapped); stops when the chain leaves the stack.
               uint64_t bp = rr.rbp, lo = frame[4], hi = frame[4] + (8UL << 20);
               for (int i = 0; i < 16 && bp >= lo && bp + 16 <= hi; i++) {
                 uint64_t *f = (uint64_t *)(uintptr_t)bp;
-                fprintf(stderr, "[gk]   frame %2d: ret=%#llx\n", i, (unsigned long long)f[1]);
+                db_str(&d, "[gk]   frame "); db_dec(&d, i);
+                db_str(&d, ": ret="); db_hex(&d, f[1]);
+                db_flush(&d);
                 if (f[0] <= bp) break;
                 bp = f[0];
               }
@@ -2208,8 +2277,12 @@ static long run_vcpu(gk_thread *t) {
           struct kvm_regs rr; struct kvm_sregs sr;
           ioctl(t->fd, KVM_GET_REGS, &rr);
           ioctl(t->fd, KVM_GET_SREGS, &sr);
-          if (G->dbg) fprintf(stderr, "[gk] fatal exception, handler_rax=%#llx cr2=%#llx\n",
-                             (unsigned long long)rr.rax, (unsigned long long)sr.cr2);
+          if (G->dbg) {
+            gk_dbuf d = {.n = 0};
+            db_str(&d, "[gk] fatal exception, handler_rax="); db_hex(&d, rr.rax);
+            db_str(&d, " cr2="); db_hex(&d, sr.cr2);
+            db_flush(&d);
+          }
           G->fault_addr = rr.rax;
           return GK_EFAULT;
         }
