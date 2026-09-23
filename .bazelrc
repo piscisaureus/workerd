@@ -96,6 +96,10 @@ build:no-perfetto --//src/workerd/util:use_perfetto=False
 build:no-perfetto --@v8//:v8_use_perfetto=False
 build:unix --config=perfetto
 
+# Build V8 with the sandbox enabled. V8 exports V8_ENABLE_SANDBOX through its public compilation
+# context, so workerd is compiled with the same object layouts as the V8 library.
+build --@v8//:v8_enable_sandbox=True
+
 # Increasing the optimization level of V8 significantly speeds up tests using V8 a lot, especially
 # python tests. This is useful for both CI and local development and enabled by default, but still
 # kept in a separate configuration to make it easy to disable.

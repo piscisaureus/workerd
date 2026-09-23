@@ -667,20 +667,20 @@ void ContextGlobal::setSchemaLoader(const capnp::SchemaLoader& schemaLoader) {
 }
 
 #ifdef V8_ENABLE_SANDBOX
-// These are disabled by default in workerd. We do not build workerd with
-// the V8_ENABLED_SANDBOX flag. If we do decide to enable it, we will need
-// additional setup to ensure that these are handled correctly on all platforms.
-// For now, keeping it simple. This bit will only be used in the internal
-// project.
+// V8 reports -1 as the key when sandbox hardware support (memory protection keys) is not
+// compiled in or not active; in that case there is nothing to switch and the scope is a no-op.
 static constexpr int kPkeyNoRestrictions = 0;
+static constexpr int kNoPkey = -1;
 MemoryProtectionKeyScope::MemoryProtectionKeyScope(Lock& js)
     : pkey(js.v8Isolate->GetMemoryProtectionKey()) {}
 
-MemoryProtectionKeyScope::PkeyScope::PkeyScope(int pkey): key(pkey), saved(pkey_get(key)) {
-  pkey_set(pkey, kPkeyNoRestrictions);
+MemoryProtectionKeyScope::PkeyScope::PkeyScope(int pkey)
+    : key(pkey),
+      saved(key == kNoPkey ? kPkeyNoRestrictions : pkey_get(key)) {
+  if (key != kNoPkey) pkey_set(key, kPkeyNoRestrictions);
 }
 MemoryProtectionKeyScope::PkeyScope::~PkeyScope() {
-  pkey_set(key, saved);
+  if (key != kNoPkey) pkey_set(key, saved);
 }
 #endif
 
