@@ -83,6 +83,52 @@ static long decommit_read(void *arg) {
 }
 
 
+// ---- arena churn -------------------------------------------------------------
+// A runtime creates and destroys arenas constantly (one per isolate). Each use
+// below commits one page in each of several backing windows of the arena and
+// writes and reads it, so the arena acquires memslots and private PD/PT pages
+// of its own, then decommits one page so a reflected unmap is in the mix too.
+struct churn_arena { unsigned char *base; size_t stride; int npages; unsigned seed; };
+
+static unsigned char *churn_page(const struct churn_arena *c, int i) {
+  return c->base + (size_t)i * c->stride + 4096 * (size_t)i;
+}
+
+static long churn_use(void *arg) {
+  struct churn_arena *c = arg;
+  long sum = 0;
+  for (int i = 0; i < c->npages; i++) {
+    unsigned char *p = churn_page(c, i);
+    if (mprotect(p, 4096, PROT_READ | PROT_WRITE) != 0) return -errno;
+    volatile unsigned char *b = p;
+    b[0] = (unsigned char)(c->seed + i);
+    b[4095] = (unsigned char)(c->seed ^ i);
+    sum += b[0] * 3 + b[4095];
+  }
+  if (mprotect(churn_page(c, c->npages - 1), 4096, PROT_NONE) != 0) return -errno;
+  return sum;
+}
+
+static long churn_want(const struct churn_arena *c) {
+  long sum = 0;
+  for (int i = 0; i < c->npages; i++)
+    sum += (unsigned char)(c->seed + i) * 3 + (unsigned char)(c->seed ^ i);
+  return sum;
+}
+
+// A thread that enters an arena and holds it active until told to leave, to
+// exercise gk_arena_destroy on an arena some other thread still uses.
+struct holder { gk_arena *a; pthread_barrier_t *b; long r; };
+static void *hold_arena(void *arg) {
+  struct holder *h = arg;
+  gk_arena_enter(h->a);
+  h->r = gk_run(read_byte, gk_arena_base(h->a));
+  pthread_barrier_wait(h->b);  // entered; main destroys the arena now
+  pthread_barrier_wait(h->b);  // destroyed; leave
+  gk_arena_enter(NULL);
+  return NULL;
+}
+
 // ---- multi-vCPU tests ------------------------------------------------------
 // Each host thread becomes its own vCPU. This worker runs compute plus a
 // forwarded write inside the guest, concurrently with the other threads.
@@ -566,7 +612,113 @@ int main(void) {
     if (!ok) ok10 = 0;
   }
 
-  int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10;
+  // Arena churn: create, use, destroy, then create and use a FRESH arena, many
+  // times over, alternating small (one-slot) and three-slot arenas. Every
+  // destroyed arena's slots, memslots and page-table pages must be recycled
+  // (bounded growth, and each new arena lands on the freed slot), the freed
+  // span must be a plain fault from the base root (no stale mapping), and an
+  // arena that lived through it all must be intact.
+  int ok11 = 1;
+  {
+    enum { CHURN = 50, PAGES = 4 };
+    gk_arena *keep = gk_arena_create(4096);  // lives across the churn
+    if (!keep || mprotect(gk_arena_base(keep), 4096, PROT_READ | PROT_WRITE) != 0) ok11 = 0;
+    else memset(gk_arena_base(keep), 0x33, 16);
+    gk_stats s1 = {0}, s2 = {0};
+    unsigned char *first_base = NULL;
+    int reused = 0, fresh_ok = 0, freed_faults = 0;
+    for (int it = 0; it < CHURN && ok11; it++) {
+      // Two arenas per iteration: one destroyed after use, then a fresh one
+      // (the guest entry into the fresh arena is what used to spin forever).
+      for (int k = 0; k < 2 && ok11; k++) {
+        int big = (it % 5 == 4);
+        size_t size = big ? 2 * SLOT + (64UL << 20) : (32UL << 20);
+        gk_arena *a = gk_arena_create(size);
+        if (!a) { printf("  churn %d.%d: create failed\n", it, k); ok11 = 0; break; }
+        unsigned char *base = gk_arena_base(a);
+        if (!first_base) first_base = base;
+        if (base == first_base) reused++;
+        // Pages of a big arena land in each of its three slots; of a small one,
+        // in separate 2MiB backing windows.
+        struct churn_arena c = {base, big ? (2 * SLOT / 3) & ~(size_t)0xfff : (2UL << 20),
+                                PAGES, (unsigned)(it * 2 + k)};
+        gk_arena *prev = gk_arena_enter(a);
+        long r = (it & 1) ? gk_run_here(churn_use, &c) : gk_run(churn_use, &c);
+        if (it % 7 != 3) gk_arena_enter(prev);  // sometimes destroy while still entered
+        if (r != churn_want(&c)) {
+          printf("  churn %d.%d: arena %p run -> %ld, want %ld (fault %#lx)\n", it, k,
+                 (void *)base, r, churn_want(&c), gk_fault_addr());
+          ok11 = 0;
+        } else if (k == 1) {
+          fresh_ok++;
+        }
+        gk_arena_destroy(a);
+        if (it % 7 == 3) gk_arena_enter(prev);
+        long rf = gk_run(read_byte, base);  // the freed span: a plain demand fault
+        if (rf != GK_EFAULT || gk_fault_addr() != (uintptr_t)base) {
+          printf("  churn %d.%d: freed span read -> %ld (fault %#lx), want GK_EFAULT at %p\n",
+                 it, k, rf, gk_fault_addr(), (void *)base);
+          ok11 = 0;
+        } else {
+          freed_faults++;
+        }
+        if (it == 0 && k == 0) gk_get_stats(&s1);
+      }
+    }
+    gk_get_stats(&s2);
+    gk_arena_enter(keep);
+    long rk = gk_run(read_byte, gk_arena_base(keep));
+    gk_arena_enter(NULL);
+    int bounded = s2.memslots <= s1.memslots + 4 && s2.memslot_ids <= s1.memslot_ids + 4 &&
+                  s2.pt_pages_used <= s1.pt_pages_used + 4 &&
+                  s2.pt_pages_total <= s1.pt_pages_total + 8 && s2.arenas == s1.arenas;
+    printf("arena churn: %d arenas created+destroyed, fresh arenas ran %d/%d, freed spans "
+           "faulted %d/%d, slot reused %d/%d, bystander reads %#lx; memslots %d -> %d, "
+           "memslot ids %d -> %d, page-table pages %ld -> %ld (free %ld, total %ld -> %ld) [%s]\n",
+           2 * CHURN, fresh_ok, CHURN, freed_faults, 2 * CHURN, reused, 2 * CHURN, rk,
+           s1.memslots, s2.memslots, s1.memslot_ids, s2.memslot_ids, s1.pt_pages_used,
+           s2.pt_pages_used, s2.pt_pages_free, s1.pt_pages_total, s2.pt_pages_total,
+           ok11 && bounded && reused == 2 * CHURN && rk == 0x33 ? "OK" : "FAIL");
+    if (!bounded || reused != 2 * CHURN || rk != 0x33) ok11 = 0;
+
+    // Destroying an arena another thread still has active must not recycle
+    // its tables (that thread's vCPU would run under someone else's), but the
+    // arena is gone all the same, and later arenas are unaffected.
+    gk_arena *z = gk_arena_create(4096);
+    pthread_barrier_t zb;
+    pthread_barrier_init(&zb, NULL, 2);
+    struct holder h = {z, &zb, -1};
+    pthread_t zt;
+    if (z && mprotect(gk_arena_base(z), 4096, PROT_READ | PROT_WRITE) == 0 &&
+        pthread_create(&zt, NULL, hold_arena, &h) == 0) {
+      pthread_barrier_wait(&zb);
+      gk_stats before, after;
+      gk_get_stats(&before);
+      fprintf(stderr, "(expected gk message follows: destroying an arena a thread still uses)\n");
+      gk_arena_destroy(z);
+      gk_get_stats(&after);
+      pthread_barrier_wait(&zb);
+      pthread_join(zt, NULL);
+      pthread_barrier_destroy(&zb);
+      gk_arena *z2 = gk_arena_create(4096);
+      struct churn_arena c = {gk_arena_base(z2), 2UL << 20, 1, 77};
+      gk_arena_enter(z2);
+      long rz = gk_run(churn_use, &c);
+      gk_arena_enter(NULL);
+      gk_arena_destroy(z2);
+      int okz = h.r == 0 && after.arenas == before.arenas - 1 &&
+                after.pt_pages_used == before.pt_pages_used && rz == churn_want(&c);
+      printf("arena destroyed while another thread uses it: tables kept (%ld -> %ld), "
+             "arenas %d -> %d, next arena runs -> %ld [%s]\n", before.pt_pages_used,
+             after.pt_pages_used, before.arenas, after.arenas, rz, okz ? "OK" : "FAIL");
+      if (!okz) ok11 = 0;
+    } else {
+      ok11 = 0;
+    }
+    gk_arena_destroy(keep);
+  }
+
+  int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

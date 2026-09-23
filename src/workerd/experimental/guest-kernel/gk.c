@@ -58,17 +58,24 @@ static uint64_t *g_pml4;             // base page-table root
 static uint8_t *g_pt_next, *g_pt_end;
 static uintptr_t g_pt_base;
 static size_t g_pt_bytes;
+static uint64_t *g_pt_free;          // freed page-table pages, linked through their first word
+static long g_pt_used, g_pt_free_n;  // pages handed out and not returned; pages on the free list
 static uint64_t g_gdt_va, g_idt_va;
-static int g_next_slot;
+static int g_next_slot;              // KVM memslot ids handed out, ever (see the region pool)
 static int g_run_size;
 static struct kvm_cpuid2 *g_cpuid;   // host CPUID, applied to every vCPU
 static const char *g_err;
 static unsigned long g_fault_addr;
 static int g_dbg;
 static gk_syscall_filter g_filter;
-static int g_next_cage_idx = 64;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static long g_demand_ok;
+// Bumped whenever page-table pages are returned to the allocator (an arena
+// was destroyed). A vCPU whose root is unchanged since it last entered the
+// guest may still hold TLB and paging-structure-cache entries derived from
+// tables that have since been freed and reused, so it flushes at its next
+// entry when it sees a new generation (see sync_cr3).
+static unsigned g_root_gen = 1;
 
 // ---- vCPU pool -------------------------------------------------------------
 // KVM never destroys a vCPU before the VM (closing its fd only drops a
@@ -105,6 +112,7 @@ typedef struct {
   uint64_t ist;            // exception stack + TSS region of this vCPU
   void *side_stack;        // host stack for gk_run_here's gk loop (see there)
   uint64_t loaded_cr3;
+  unsigned root_gen;       // g_root_gen as of this vCPU's last TLB flush (0: never)
   uint64_t last_fault;
   int fault_repeat;
   int pkru_ready;          // guest PKRU has been given its initial value
@@ -131,6 +139,8 @@ static __thread gk_vcpu tls;
 #define GK_SLOT_BITS 39
 #define GK_SLOT_BYTES (1UL << GK_SLOT_BITS)
 #define GK_MAX_ARENA_SLOTS 8   // 4TiB per arena; V8's largest sandbox reservation is ~1.34TB
+#define GK_USER_SLOTS 256      // PML4 slots 0..255 are the 47-bit user address space
+#define GK_FIRST_CAGE_SLOT 64  // arenas are placed from here up
 struct gk_arena {
   uintptr_t base;             // slot-aligned reservation start
   size_t size;                // usable size, as requested (page-rounded)
@@ -138,6 +148,11 @@ struct gk_arena {
   uint64_t *pml4;
   int slot0, nslots;          // the contiguous PML4 slots this arena owns
   uint64_t slot_entry[GK_MAX_ARENA_SLOTS];  // its private PDPT entry per slot
+  // Threads that currently have this arena active (gk_arena_enter, and guest
+  // threads that inherited it). gk_arena_destroy refuses to recycle the
+  // arena's page tables, slots and struct while any remain, since their
+  // vCPUs would otherwise run under tables that now belong to someone else.
+  int active_threads;
 };
 // Registry of live arenas, so demand paging can tell a fault inside the active
 // arena (backed, into that arena's root) from one inside any other arena (a
@@ -146,6 +161,9 @@ struct gk_arena {
 #define GK_MAX_ARENAS 4096
 static gk_arena *g_arenas[GK_MAX_ARENAS];
 static int g_arena_n;
+// Which PML4 slots live arenas own. A destroyed arena's slots are reused by
+// later arenas, so slot churn does not run through the user address space.
+static unsigned char g_slot_used[GK_USER_SLOTS];
 static gk_arena *arena_containing(uintptr_t a) {
   for (int i = 0; i < g_arena_n; i++)
     if (a >= g_arenas[i]->base && a < g_arenas[i]->end) return g_arenas[i];
@@ -184,14 +202,43 @@ static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
   return ret;
 }
 
-// Page-table page allocator over a fixed arena. Caller holds g_lock (except in
-// single-threaded gk_init).
+// Page-table page allocator over a fixed arena: a bump allocator with a free
+// list in front of it, so the tables of a destroyed arena serve the next one.
+// Freed pages are linked through their first word; the page is zeroed again
+// when handed out. Caller holds g_lock (except in single-threaded gk_init).
 static uint64_t *alloc_table(void) {
-  if (g_pt_next + 0x1000 > g_pt_end) return NULL;
-  uint64_t *p = (uint64_t *)g_pt_next;
+  uint64_t *p;
+  if (g_pt_free) {
+    p = g_pt_free;
+    g_pt_free = *(uint64_t **)p;
+    g_pt_free_n--;
+  } else {
+    if (g_pt_next + 0x1000 > g_pt_end) return NULL;
+    p = (uint64_t *)g_pt_next;
+    g_pt_next += 0x1000;
+  }
   memset(p, 0, 0x1000);
-  g_pt_next += 0x1000;
+  g_pt_used++;
   return p;
+}
+
+// Return a page-table page. The caller guarantees no root reaches it any more.
+static void free_table(uint64_t *p) {
+  *(uint64_t **)p = g_pt_free;
+  g_pt_free = p;
+  g_pt_free_n++;
+  g_pt_used--;
+}
+
+// Free a table and every table beneath it. `level` is the table's paging
+// level: 3 for a PDPT, 2 for a PD, 1 for a PT (whose entries are pages, not
+// tables). gk maps only 4KiB pages, so every present entry above level 1
+// points at a table. Caller holds g_lock.
+static void free_subtree(uint64_t *tbl, int level) {
+  if (level > 1)
+    for (int i = 0; i < 512; i++)
+      if (tbl[i] & PTE_P) free_subtree((uint64_t *)(uintptr_t)(tbl[i] & ~0xfffULL), level - 1);
+  free_table(tbl);
 }
 
 static uint64_t *next_table(uint64_t *tbl, int idx) {
@@ -285,11 +332,16 @@ static void unmap_range_all(uintptr_t s, uintptr_t e) {
 // Protection is not cached on the region; the PTE carries the live host
 // protection, re-read on every fault.
 //
-// Memslots are created once and never deleted. An identity memslot validly backs
-// its window whether or not the host currently has memory there, so mprotect and
-// munmap only need to drop the guest PTEs (see forward_syscall), not the memslot
-// -- and a delete is not free: KVM invalidates every nested-page-table root when
-// a memslot is removed, whereas adding an abutting memslot zaps nothing.
+// Memslots are created once and deleted only when the arena they lie in is
+// destroyed (see gk_arena_destroy). An identity memslot validly backs its
+// window whether or not the host currently has memory there, so mprotect and
+// munmap only need to drop the guest PTEs (see forward_syscall), not the
+// memslot -- and a delete is not free: KVM invalidates every nested-page-table
+// root when a memslot is removed, whereas adding an abutting memslot zaps
+// nothing. An arena's teardown is the exception because its address space is
+// given back for good: keeping its windows would let memslots grow without
+// bound under isolate churn (KVM allows ~32K per VM), so they are deleted and
+// their ids and pool nodes reused.
 //
 // TODO: 2MB windows over-back sparsely committed reservations. A production MMU
 // could track exact VMAs (cf. FreeBSD's vm_map RB tree, sys/vm, 2-clause BSD)
@@ -322,7 +374,9 @@ static gk_region *g_regions;      // treap root
 // added, abutting memslot invalidates nothing. See the backing-window note.)
 #define GK_MAX_REGIONS 65536
 static gk_region g_region_pool[GK_MAX_REGIONS];
-static int g_region_n;
+static int g_region_n;            // pool nodes ever taken
+static gk_region *g_region_free;  // nodes of deleted regions, linked through `l`
+static int g_region_live;         // regions currently in the treap (= live memslots)
 
 // xorshift32 PRNG for treap priorities. Caller holds g_lock.
 static unsigned gk_rand(void) {
@@ -380,11 +434,43 @@ static gk_region *region_succ(uintptr_t s) {
   return best;
 }
 
+// Unlink `node` (which is in the tree) by rotating it down to a leaf, keeping
+// the heap order among the others. Caller holds g_lock.
+static gk_region *treap_remove(gk_region *root, gk_region *node) {
+  if (!root) return NULL;
+  if (node->start < root->start) {
+    root->l = treap_remove(root->l, node);
+  } else if (node->start > root->start) {
+    root->r = treap_remove(root->r, node);
+  } else {
+    if (!root->l) return root->r;
+    if (!root->r) return root->l;
+    if (root->l->prio > root->r->prio) {
+      root = rot_r(root);
+      root->r = treap_remove(root->r, node);
+    } else {
+      root = rot_l(root);
+      root->l = treap_remove(root->l, node);
+    }
+  }
+  return root;
+}
+
 // Create one memslot-backed region for [s, e). Caller holds g_lock and has
-// ensured [s, e) does not overlap any existing region.
+// ensured [s, e) does not overlap any existing region. A pool node freed by a
+// region deletion is reused first, with the KVM memslot id it was created
+// with, so both are bounded by the peak number of live regions.
 static int region_add(uintptr_t s, uintptr_t e) {
-  if (g_region_n >= GK_MAX_REGIONS) return -1;
-  int slot = g_next_slot++;
+  gk_region *n;
+  int slot, recycled = g_region_free != NULL;
+  if (recycled) {
+    n = g_region_free;
+    slot = n->slot;
+  } else {
+    if (g_region_n >= GK_MAX_REGIONS) return -1;
+    n = &g_region_pool[g_region_n];
+    slot = g_next_slot;
+  }
   struct kvm_userspace_memory_region r = {.slot = (uint32_t)slot,
                                           .guest_phys_addr = s,
                                           .memory_size = e - s,
@@ -393,17 +479,71 @@ static int region_add(uintptr_t s, uintptr_t e) {
     if (g_dbg)
       fprintf(stderr, "[gk] memslot %d [%#lx,%#lx) failed: %s\n", slot,
               (unsigned long)s, (unsigned long)e, strerror(errno));
-    g_next_slot--;
-    return -1;
+    return -1;  // the node stays where it was (free list or untouched pool tail)
   }
-  gk_region *n = &g_region_pool[g_region_n++];
+  if (recycled) {
+    g_region_free = n->l;
+  } else {
+    g_region_n++;
+    g_next_slot++;
+  }
   memset(n, 0, sizeof *n);
   n->start = s;
   n->end = e;
   n->slot = slot;
   n->prio = gk_rand();
   g_regions = treap_insert(g_regions, n);
+  g_region_live++;
   return 0;
+}
+
+// Delete a region's memslot and drop it from the tree; its node (and memslot
+// id) go to the free list. Caller holds g_lock and has made sure no root maps
+// a page in the region any more, so the guest cannot reach it. Returns the
+// ioctl's result: on failure the region stays.
+static int region_remove(gk_region *n) {
+  struct kvm_userspace_memory_region r = {.slot = (uint32_t)n->slot,
+                                          .guest_phys_addr = n->start,
+                                          .memory_size = 0,
+                                          .userspace_addr = n->start};
+  if (ioctl(g_vmfd, KVM_SET_USER_MEMORY_REGION, &r) < 0) {
+    if (g_dbg)
+      fprintf(stderr, "[gk] memslot %d [%#lx,%#lx) delete failed: %s\n", n->slot,
+              (unsigned long)n->start, (unsigned long)n->end, strerror(errno));
+    return -1;
+  }
+  g_regions = treap_remove(g_regions, n);
+  g_region_live--;
+  n->l = g_region_free;
+  g_region_free = n;
+  return 0;
+}
+
+// The region with the smallest start at or beyond `s`, or NULL. Caller holds
+// g_lock.
+static gk_region *region_lower_bound(uintptr_t s) {
+  gk_region *n = g_regions, *best = NULL;
+  while (n) {
+    if (n->start >= s) { best = n; n = n->l; }
+    else n = n->r;
+  }
+  return best;
+}
+
+// Delete every region lying within [s, e). Regions never straddle a 512GiB
+// slot boundary (windows are created within host mappings and arena spans,
+// both of which lie within slots), so for a whole-slot range this is every
+// region that overlaps it; one that did straddle would be left alone. Returns
+// how many were deleted. Caller holds g_lock.
+static int region_remove_range(uintptr_t s, uintptr_t e) {
+  int n = 0;
+  gk_region *r = region_lower_bound(s);
+  while (r && r->start < e) {
+    gk_region *next = region_succ(r->start);
+    if (r->end <= e && region_remove(r) == 0) n++;
+    r = next;
+  }
+  return n;
 }
 
 // Ensure memslots back all of [s, e), rounded outward to GK_BACK_WIN windows.
@@ -763,6 +903,8 @@ static void vcpu_park(void) {
   pthread_mutex_unlock(&g_lock);
   if (g_dbg) fprintf(stderr, "[gk] vcpu %d parked\n", tls.id);
   tls.inited = 0;
+  // The thread is ending: it no longer counts as a user of its active arena.
+  gk_arena_enter(NULL);
 }
 
 // pthread key destructor: a host thread that entered the guest via gk_run is
@@ -919,6 +1061,7 @@ ready:
   tls.ist = ist;
   tls.side_stack = side_stack;
   tls.loaded_cr3 = (uint64_t)(uintptr_t)g_pml4;
+  tls.root_gen = 0;    // a fresh or reused vCPU flushes its TLB at first entry
   tls.last_fault = 0;
   tls.fault_repeat = 0;
   tls.pkru_ready = 0;  // a fresh or reused vCPU gets its PKRU at first entry
@@ -1073,7 +1216,6 @@ struct gk_clone_args {  // struct clone_args from <linux/sched.h>
 };
 typedef struct {
   struct kvm_regs regs;   // the guest child's initial registers
-  uint64_t *active_pml4;
   gk_arena *active_arena;
   void *host_stack;
   size_t host_stack_size;
@@ -1093,8 +1235,7 @@ static long child_entry(void *arg) {
   tls.guest_thread = 1;
   tls.host_stack = c.host_stack;
   tls.host_stack_size = c.host_stack_size;
-  tls.active_pml4 = c.active_pml4;
-  tls.active_arena = c.active_arena;
+  gk_arena_enter(c.active_arena);  // inherits the parent's arena, and counts as a user of it
   // The kernel already applied CLONE_SETTLS to this host thread, so vcpu_init
   // reads the guest child's TLS base straight from FS.
   if (vcpu_init(0) < 0) {
@@ -1167,7 +1308,6 @@ static long clone_thread(struct kvm_regs *r, long nr) {
   c->regs.rax = 0;          // the child's clone return value
   c->regs.rsp = child_sp;   // the stack the clone named
   c->regs.rip = r->rcx;     // straight to the guest's return address
-  c->active_pml4 = tls.active_pml4;
   c->active_arena = tls.active_arena;
   c->host_stack = hs;
   c->host_stack_size = GK_HOST_STACK;
@@ -1370,13 +1510,19 @@ static void arena_sync_root(gk_arena *a) {
 }
 
 // Point this vCPU's CR3 at the thread's active root, after bringing an active
-// arena's root up to date with the base root (see arena_sync_root).
+// arena's root up to date with the base root (see arena_sync_root). A changed
+// CR3 makes KVM flush the guest TLB; an unchanged one does not, so when
+// page-table pages were freed since this vCPU last flushed (g_root_gen moved),
+// the guest reloads CR3 itself (gk_flush_stub): the same root page may by now
+// be a different arena's, or its subtrees may have been rebuilt from recycled
+// tables, and the vCPU's cached translations would be stale.
 static int sync_cr3(void) {
   if (tls.active_arena) {
     pthread_mutex_lock(&g_lock);
     arena_sync_root(tls.active_arena);
     pthread_mutex_unlock(&g_lock);
   }
+  unsigned gen = __atomic_load_n(&g_root_gen, __ATOMIC_ACQUIRE);
   uint64_t want_cr3 = (uint64_t)(uintptr_t)tls.active_pml4;
   if (want_cr3 != tls.loaded_cr3) {
     struct kvm_sregs s;
@@ -1384,7 +1530,10 @@ static int sync_cr3(void) {
     s.cr3 = want_cr3;
     if (ioctl(tls.fd, KVM_SET_SREGS, &s) < 0) return -1;
     tls.loaded_cr3 = want_cr3;
+  } else if (tls.root_gen != gen) {
+    if (run_stub(gk_flush_stub, 0, 0, PORT_FLUSH, "flush") < 0) return -1;
   }
+  tls.root_gen = gen;
   return 0;
 }
 
@@ -1581,6 +1730,10 @@ static long run_vcpu(void) {
 // the next slots are tried when it is not. The reservation is PROT_NONE and
 // MAP_NORESERVE: it costs address space only, and its pages stay unmapped in
 // every root until the owner commits them and the guest touches them.
+//
+// Slots are taken from the lowest run of nslots that no live arena owns, so a
+// destroyed arena's slots serve later arenas: under isolate churn the slot
+// index would otherwise run off the end of the user address space.
 gk_arena *gk_arena_create(size_t size) {
   size = (size + 0xfff) & ~0xfffUL;
   if (size == 0) return NULL;
@@ -1590,10 +1743,13 @@ gk_arena *gk_arena_create(size_t size) {
   gk_arena *a = calloc(1, sizeof *a);
   if (!a) return NULL;
   pthread_mutex_lock(&g_lock);
-  // Slots 0..255 are the 47-bit user address space; leave room for the span.
   void *mem = MAP_FAILED;
   int idx;
-  for (idx = g_next_cage_idx; idx + nslots <= 256; idx++) {
+  for (idx = GK_FIRST_CAGE_SLOT; idx + nslots <= GK_USER_SLOTS; idx++) {
+    int free = 1;
+    for (int i = 0; i < nslots; i++)
+      if (g_slot_used[idx + i]) { free = 0; break; }
+    if (!free) continue;
     uintptr_t va = (uintptr_t)idx << GK_SLOT_BITS;
     mem = mmap((void *)va, span, PROT_NONE,
                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
@@ -1601,7 +1757,6 @@ gk_arena *gk_arena_create(size_t size) {
     if (mem != MAP_FAILED) { munmap(mem, span); mem = MAP_FAILED; }  // old kernel: hint only
   }
   if (mem == MAP_FAILED || g_arena_n >= GK_MAX_ARENAS) goto fail;
-  g_next_cage_idx = idx + nslots;
   a->base = (uintptr_t)mem;
   a->size = size;
   a->end = a->base + span;
@@ -1616,11 +1771,19 @@ gk_arena *gk_arena_create(size_t size) {
     if (!pdpt) goto fail;
     a->slot_entry[i] = ((uint64_t)(uintptr_t)pdpt) | PTE_P | PTE_W | PTE_U;
   }
+  // The span was free host address space, so any base-root PTE in it (from
+  // memory that once lived there) is stale; drop them so nothing maps into
+  // the reservation from outside the arena.
+  unmap_range_root(g_pml4, a->base, a->end);
   arena_sync_root(a);  // share the base root's other entries, own these slots
+  for (int i = 0; i < nslots; i++) g_slot_used[idx + i] = 1;
   g_arenas[g_arena_n++] = a;
   pthread_mutex_unlock(&g_lock);
   return a;
 fail:
+  for (int i = 0; i < GK_MAX_ARENA_SLOTS; i++)
+    if (a->slot_entry[i]) free_table((uint64_t *)(uintptr_t)(a->slot_entry[i] & ~0xfffULL));
+  if (a->pml4) free_table(a->pml4);
   pthread_mutex_unlock(&g_lock);
   if (mem != MAP_FAILED) munmap(mem, span);
   free(a);
@@ -1632,21 +1795,74 @@ size_t gk_arena_size(const gk_arena *a) { return a ? a->size : 0; }
 
 gk_arena *gk_arena_enter(gk_arena *a) {
   gk_arena *prev = tls.active_arena;
+  if (prev == a) return prev;
+  if (a) __atomic_fetch_add(&a->active_threads, 1, __ATOMIC_SEQ_CST);
   tls.active_arena = a;
   tls.active_pml4 = a ? a->pml4 : g_pml4;
+  if (prev) __atomic_fetch_sub(&prev->active_threads, 1, __ATOMIC_SEQ_CST);
   return prev;
 }
 
-// The arena's page-table pages (its root, PDPTs and whatever PD/PT pages
-// demand paging allocated beneath them) are not reclaimed: alloc_table is a
-// bump allocator. Its slots are not reused either.
+// Teardown reconciles gk and KVM with the reservation going away, in this
+// order, under g_lock:
+//  1. The arena leaves the registry, so a fault in its span is no longer an
+//     arena fault, and its span loses its protection keys.
+//  2. Every root stops mapping the span: the arena's private subtrees are
+//     freed whole (no other root reaches them), and any stale base-root PTEs
+//     in the span are cleared (other arena roots share those tables).
+//  3. Every memslot in the span is deleted. Nothing maps into the span at
+//     this point, so no vCPU can reach a memslot as it goes.
+//  4. Its slots are released for the next arena.
+// Only then, outside the lock, is the host reservation unmapped, so KVM never
+// holds a memslot over host memory that is gone while a guest PTE could still
+// lead there. The page-table pages return to the allocator and the slots and
+// memslot ids are reused, so arena churn is bounded in every resource.
+//
+// A thread that still has the arena active (a caller bug: the arena's memory
+// is being unmapped under it) keeps a root that must stay intact and private,
+// so in that case the tables, slots and struct are leaked instead of recycled;
+// the memslots and reservation still go.
 void gk_arena_destroy(gk_arena *a) {
   if (!a) return;
   if (tls.active_arena == a) gk_arena_enter(NULL);
   pthread_mutex_lock(&g_lock);
   for (int i = 0; i < g_arena_n; i++)
     if (g_arenas[i] == a) { g_arenas[i] = g_arenas[--g_arena_n]; break; }
+  if (pkey_set_range(a->base, a->end, 0) < 0 && g_dbg)
+    fprintf(stderr, "[gk] pkey table full; destroyed arena keeps stale keys\n");
+  int in_use = __atomic_load_n(&a->active_threads, __ATOMIC_SEQ_CST);
+  if (in_use > 0) {
+    fprintf(stderr, "[gk] gk_arena_destroy: arena [%#lx,%#lx) is still active on %d thread(s); "
+            "its page tables and slots are leaked\n", (unsigned long)a->base,
+            (unsigned long)a->end, in_use);
+  } else {
+    for (int i = 0; i < a->nslots; i++) {
+      free_subtree((uint64_t *)(uintptr_t)(a->slot_entry[i] & ~0xfffULL), 3);
+      a->slot_entry[i] = 0;
+      a->pml4[a->slot0 + i] = 0;
+    }
+    free_table(a->pml4);
+    __atomic_fetch_add(&g_root_gen, 1, __ATOMIC_RELEASE);
+  }
+  unmap_range_root(g_pml4, a->base, a->end);
+  int removed = region_remove_range(a->base, a->end);
+  if (in_use == 0)
+    for (int i = 0; i < a->nslots; i++) g_slot_used[a->slot0 + i] = 0;
   pthread_mutex_unlock(&g_lock);
+  if (g_dbg)
+    fprintf(stderr, "[gk] destroyed arena [%#lx,%#lx): %d memslots deleted, %ld tables in use\n",
+            (unsigned long)a->base, (unsigned long)a->end, removed, g_pt_used);
   munmap((void *)a->base, a->end - a->base);
-  free(a);
+  if (in_use == 0) free(a);
+}
+
+void gk_get_stats(gk_stats *s) {
+  pthread_mutex_lock(&g_lock);
+  s->memslots = g_region_live;
+  s->memslot_ids = g_next_slot;
+  s->arenas = g_arena_n;
+  s->pt_pages_used = g_pt_used;
+  s->pt_pages_free = g_pt_free_n;
+  s->pt_pages_total = (long)((g_pt_next - (uint8_t *)g_pt_base) >> 12);
+  pthread_mutex_unlock(&g_lock);
 }

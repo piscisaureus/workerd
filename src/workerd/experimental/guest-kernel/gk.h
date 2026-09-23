@@ -92,7 +92,25 @@ size_t gk_arena_size(const gk_arena *a);
 // when called from within forwarded code, immediately.
 gk_arena *gk_arena_enter(gk_arena *a);
 
+// Tear an arena down: its reservation is unmapped, every mapping and KVM
+// memslot inside it is removed, and its page tables and address-space slots
+// are recycled for later arenas, so creating and destroying arenas
+// indefinitely is bounded in every resource. The calling thread leaves the
+// arena if it is active there. No other thread may still have it active (or
+// be a guest thread that inherited it): such an arena's tables are leaked
+// rather than recycled, with a message on stderr.
 void gk_arena_destroy(gk_arena *a);
+
+// Resource counters, for tests and diagnostics.
+typedef struct {
+  int memslots;         // live KVM memslots
+  int memslot_ids;      // memslot ids ever handed out (bounded by peak live memslots)
+  int arenas;           // live arenas
+  long pt_pages_used;   // page-table pages in use, across all roots
+  long pt_pages_free;   // page-table pages on the free list
+  long pt_pages_total;  // page-table pages ever taken from the fixed PT area
+} gk_stats;
+void gk_get_stats(gk_stats *s);
 
 // Syscall policy. By default gk forwards every syscall to the host (blind
 // re-issue), which is fine for a spike but not for production. Install a filter
