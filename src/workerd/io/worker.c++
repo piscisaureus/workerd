@@ -20,6 +20,7 @@
 #include <workerd/io/wasm-instantiate-shim.embed.h>
 #include <workerd/io/worker.h>
 #include <workerd/jsg/async-context.h>
+#include <workerd/jsg/guest-run.h>
 #include <workerd/jsg/inspector.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/modules-new.h>
@@ -283,12 +284,51 @@ void addExceptionToTrace(jsg::Lock& js,
       kj::mv(errorInfo.message), kj::mv(errorInfo.stack));
 }
 
+// A JS exception caught by a v8::TryCatch, held so that it can be reported after that TryCatch
+// is gone. A startup phase that runs at guest ring 3 must catch its exceptions in a TryCatch
+// inside the guest (see jsg::runInGuest), but reporting them writes to the embedder's error
+// reporter, which may live on the host stack that the guest cannot write; so the phase captures
+// what its TryCatch caught here and the host reports it once the phase has returned. Both
+// handles are released under the isolate lock, like the phase's other handles.
+struct CaughtJsException {
+  // What the TryCatch caught, or none if it caught nothing.
+  kj::Maybe<jsg::V8Ref<v8::Value>> exception;
+  // The exception's v8::Message, if V8 produced one (v8::Message is not a v8::Data, so this
+  // cannot be a jsg::V8Ref).
+  v8::Global<v8::Message> message;
+
+  static CaughtJsException capture(jsg::Lock& js, v8::TryCatch& catcher) {
+    CaughtJsException result;
+    if (catcher.HasCaught()) {
+      result.exception = js.v8Ref(catcher.Exception());
+      auto message = catcher.Message();
+      if (!message.IsEmpty()) {
+        result.message.Reset(js.v8Isolate, message);
+      }
+    }
+    return result;
+  }
+
+  v8::Local<v8::Message> getMessage(jsg::Lock& js) {
+    return message.Get(js.v8Isolate);
+  }
+};
+
+// The outcome of one startup phase (see Worker::Worker): the limit enforcer's record of it and,
+// if the phase threw, the exception it threw. Returned out of the phase -- through
+// jsg::runInGuest's heap-allocated turn record when the phase ran in the guest -- for the host
+// to act on.
+struct StartupPhaseOutcome {
+  ExceptionOrDuration limitErrorOrTime = 0 * kj::NANOSECONDS;
+  kj::Maybe<CaughtJsException> thrown;
+};
+
 void reportStartupError(kj::StringPtr id,
     jsg::Lock& js,
     const kj::Maybe<std::unique_ptr<v8_inspector::V8Inspector>>& inspector,
     const IsolateLimitEnforcer& limitEnforcer,
     ExceptionOrDuration limitErrorOrTime,
-    v8::TryCatch& catcher,
+    CaughtJsException caught,
     kj::Maybe<Worker::ValidationErrorReporter&> errorReporter,
     kj::Maybe<kj::Exception>& permanentException,
     SpanParent parentSpan,
@@ -317,9 +357,9 @@ void reportStartupError(kj::StringPtr id,
         }
       }
       KJ_CASE_ONEOF_DEFAULT {
-        if (catcher.HasCaught()) {
+        KJ_IF_SOME(exceptionRef, caught.exception) {
           js.withinHandleScope([&] {
-            auto exception = catcher.Exception();
+            auto exception = exceptionRef.getHandle(js);
 
             permanentException = js.exceptionToKj(js.v8Ref(exception));
 
@@ -330,21 +370,21 @@ void reportStartupError(kj::StringPtr id,
               lines.add(kj::str("Uncaught ",
                   jsg::extractTunneledExceptionDescription(
                       KJ_ASSERT_NONNULL(permanentException).getDescription())));
-              jsg::JsMessage message(catcher.Message());
+              jsg::JsMessage message(caught.getMessage(js));
               message.addJsStackTrace(js, lines);
               e.addError(kj::strArray(lines, "\n"));
 
             } else KJ_IF_SOME(i, inspector) {
               auto limitScope = limitEnforcer.enterLoggingJs(js, limitErrorOrTime2);
               sendExceptionToInspector(js, *i.get(), UncaughtExceptionSource::INTERNAL,
-                  jsg::JsValue(exception), jsg::JsMessage(catcher.Message()));
+                  jsg::JsValue(exception), jsg::JsMessage(caught.getMessage(js)));
               // When the inspector is active, we don't want to throw here because then the inspector
               // won't be able to connect and the developer will never know what happened.
             } else {
               // We should never get here in production if we've validated scripts before deployment.
               // (unless this is a dynamic worker)
               kj::Vector<kj::String> lines;
-              jsg::JsMessage message(catcher.Message());
+              jsg::JsMessage message(caught.getMessage(js));
               message.addJsStackTrace(js, lines);
               auto trace = kj::strArray(lines, "; ");
               auto description = KJ_ASSERT_NONNULL(permanentException).getDescription();
@@ -1588,8 +1628,8 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
           }
         } catch (const jsg::JsExceptionThrown&) {
           reportStartupError(id, lock, isolate->impl->inspector, isolate->getLimitEnforcer(),
-              kj::mv(limitErrorOrTime), catcher, errorReporter, impl->permanentException,
-              parentSpan.addRef(), dynamicEnvBuilder != kj::none);
+              kj::mv(limitErrorOrTime), CaughtJsException::capture(lock, catcher), errorReporter,
+              impl->permanentException, parentSpan.addRef(), dynamicEnvBuilder != kj::none);
         }
       });
     });
@@ -1990,38 +2030,83 @@ Worker::Worker(kj::Own<const Script> scriptParam,
 
       // Enter the context for compiling and running the script.
       JSG_WITHIN_CONTEXT_SCOPE(lock, context, [&](jsg::Lock& js) {
-        v8::TryCatch catcher(lock.v8Isolate);
-        ExceptionOrDuration limitErrorOrTime = 0 * kj::NANOSECONDS;
+        // Startup runs as two phases under the same error handling: globals instantiation, then
+        // top-level execution, which runs at guest ring 3 when guest-kernel isolation is enabled
+        // (jsg::runInGuest). runStartupPhase() runs one phase under its own v8::TryCatch and
+        // returns what happened; reportIfThrown() then reports a thrown exception as a startup
+        // error, after which startup stops.
+        //
+        // The split between the two follows the guest-kernel host-frame wall: the frames above
+        // the in-guest phase are read-only to it. V8 records an exception by writing into the
+        // TryCatch that catches it, so the TryCatch must be inside the phase, while reporting the
+        // error writes to the embedder's error reporter, which may well be on the host stack, so
+        // that must happen here, once the phase has returned.
+        auto runStartupPhase = [&](auto&& phase) -> StartupPhaseOutcome {
+          v8::TryCatch catcher(lock.v8Isolate);
+          StartupPhaseOutcome outcome;
 
-        try {
           try {
-            currentSpan = maybeMakeSpan("lw:globals_instantiation"_kjc);
-
-            v8::Local<v8::Object> bindingsScope;
-            if (script->isModular()) {
-              // Use `env` variable.
-              bindingsScope = v8::Object::New(lock.v8Isolate);
-              if (!FeatureFlags::get(js).getDisableImportableEnv()) {
-                lock.setWorkerEnv(lock.v8Ref(bindingsScope));
-              }
-            } else {
-              // Use global-scope bindings.
-              bindingsScope = context->Global();
+            try {
+              phase(outcome.limitErrorOrTime);
+            } catch (const kj::Exception& e) {
+              lock.throwException(e.clone());
+              // lock.throwException() here will throw a jsg::JsExceptionThrown which we catch
+              // in the outer try/catch.
             }
+          } catch (const jsg::JsExceptionThrown&) {
+            outcome.thrown = CaughtJsException::capture(lock, catcher);
+          }
+          return outcome;
+        };
+        auto reportIfThrown = [&](StartupPhaseOutcome& outcome) -> bool {
+          KJ_IF_SOME(thrown, outcome.thrown) {
+            reportStartupError(script->id, lock, script->isolate->impl->inspector,
+                script->isolate->getLimitEnforcer(), kj::mv(outcome.limitErrorOrTime),
+                kj::mv(thrown), errorReporter, impl->permanentException, currentSpan,
+                script->getDynamicEnvBuilder() != kj::none);
+            return true;
+          }
+          return false;
+        };
 
-            // Load globals.
-            // const_cast OK because we hold the lock.
-            for (auto& global: const_cast<Script&>(*script).impl->globals) {
-              lock.v8Set(bindingsScope, global.name, global.value);
+        currentSpan = maybeMakeSpan("lw:globals_instantiation"_kjc);
+
+        // The globals and bindings are set up on the host: no user code runs here, and
+        // `compileBindings` is the embedder's callback, which may write to its own frames.
+        v8::Local<v8::Object> bindingsScope;
+        v8::Local<v8::Object> ctxExports;
+        auto globalsOutcome = runStartupPhase([&](ExceptionOrDuration&) {
+          if (script->isModular()) {
+            // Use `env` variable.
+            bindingsScope = v8::Object::New(lock.v8Isolate);
+            if (!FeatureFlags::get(js).getDisableImportableEnv()) {
+              lock.setWorkerEnv(lock.v8Ref(bindingsScope));
             }
+          } else {
+            // Use global-scope bindings.
+            bindingsScope = context->Global();
+          }
 
-            v8::Local<v8::Object> ctxExports = v8::Object::New(lock.v8Isolate);
+          // Load globals.
+          // const_cast OK because we hold the lock.
+          for (auto& global: const_cast<Script&>(*script).impl->globals) {
+            lock.v8Set(bindingsScope, global.name, global.value);
+          }
 
-            compileBindings(lock, script->isolate->getApi(), bindingsScope, ctxExports);
+          ctxExports = v8::Object::New(lock.v8Isolate);
 
-            // Execute script.
-            currentSpan = maybeMakeSpan("lw:top_level_execution"_kjc);
+          compileBindings(lock, script->isolate->getApi(), bindingsScope, ctxExports);
+        });
+        if (reportIfThrown(globalsOutcome)) return;
 
+        // Execute script.
+        currentSpan = maybeMakeSpan("lw:top_level_execution"_kjc);
+
+        // This is the first user code to run in the context, so it is the first that runs at
+        // guest ring 3; it writes only to the heap (`impl`, the isolate) and below its own
+        // frame, per jsg::runInGuest's host-frame wall.
+        auto runTopLevel = [&]() -> StartupPhaseOutcome {
+          return runStartupPhase([&](ExceptionOrDuration& limitErrorOrTime) {
             // Ensure that our worker top-level bootstrap has a temporary directory
             // storage scope. This is used to store temporary files created within
             // the top-level evaluation of the worker. With this instantiated on
@@ -2108,27 +2193,26 @@ Worker::Worker(kj::Own<const Script> scriptParam,
                 }
               }
             }
+          });
+        };
+        auto outcome = jsg::runInGuest(js, runTopLevel, [&](const kj::Exception& e) {
+          // Top-level execution faulted inside the guest. Condemn the isolate so no JS is ever
+          // run on it again (this thread holds the isolate lock, so a thread waiting for it
+          // finds the isolate condemned as soon as it acquires it); the exception then fails
+          // this constructor, whose failure path above disposes the context under the lock.
+          script->isolate->condemn(e.clone());
+        });
+        if (reportIfThrown(outcome)) return;
 
-            KJ_IF_SOME(s, startupTime) {
-              KJ_SWITCH_ONEOF(limitErrorOrTime) {
-                KJ_CASE_ONEOF(startupTimeElapsed, kj::Duration) {
-                  s = startupTimeElapsed;
-                }
-                KJ_CASE_ONEOF(limitError, kj::Exception) {}
-              }
-            } else {
+        KJ_IF_SOME(s, startupTime) {
+          KJ_SWITCH_ONEOF(outcome.limitErrorOrTime) {
+            KJ_CASE_ONEOF(startupTimeElapsed, kj::Duration) {
+              s = startupTimeElapsed;
             }
-            startupMetrics->done();
-          } catch (const kj::Exception& e) {
-            lock.throwException(e.clone());
-            // lock.throwException() here will throw a jsg::JsExceptionThrown which we catch
-            // in the outer try/catch.
+            KJ_CASE_ONEOF(limitError, kj::Exception) {}
           }
-        } catch (const jsg::JsExceptionThrown&) {
-          reportStartupError(script->id, lock, script->isolate->impl->inspector,
-              script->isolate->getLimitEnforcer(), kj::mv(limitErrorOrTime), catcher, errorReporter,
-              impl->permanentException, currentSpan, script->getDynamicEnvBuilder() != kj::none);
         }
+        startupMetrics->done();
       });
 
       // Reset this back to its default after startup execution
