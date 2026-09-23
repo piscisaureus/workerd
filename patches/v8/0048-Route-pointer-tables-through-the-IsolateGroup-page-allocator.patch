@@ -192,7 +192,7 @@ diff --git a/src/sandbox/segmented-table.cc b/src/sandbox/segmented-table.cc
  #include "src/utils/allocation.h"
  
  #ifdef V8_ENABLE_MEMORY_CORRUPTION_API
-@@ -13,9 +17,195 @@
+@@ -13,9 +17,200 @@
  
  namespace v8::internal {
  
@@ -226,10 +226,14 @@ diff --git a/src/sandbox/segmented-table.cc b/src/sandbox/segmented-table.cc
 +// for the subspace of the platform address space that backs a table
 +// otherwise: the whole reservation is taken from the embedder's page
 +// allocator up front, inaccessible, and the table's pages are handed out
-+// from it, so all of the table lies where the embedder put it. Only what the
-+// tables use is supported: no shared pages and no subspaces. A memory
-+// protection key, if given, is applied to the reservation and kept on freed
-+// pages as VirtualAddressSubspace does.
++// from it, so all of the table lies where the embedder put it. A table's
++// read-only segments are ordinary pages of the reservation too: Initialize()
++// allocates them through AllocatePages() with the reservation base as the
++// hint, which is honored because nothing else has been handed out yet, so
++// they need no separate handling here. Only what the tables use is
++// supported: no shared pages and no subspaces. A memory protection key, if
++// given, is applied to the reservation and kept on freed pages as
++// VirtualAddressSubspace does.
 +class EmbedderReservationAddressSpace final : public v8::VirtualAddressSpace {
 + public:
 +  // Reserves |size| bytes aligned to |alignment| from |page_allocator|.
@@ -306,7 +310,8 @@ diff --git a/src/sandbox/segmented-table.cc b/src/sandbox/segmented-table.cc
 +                              PagePermissions permissions,
 +                              SharedMemoryHandle handle,
 +                              uint64_t offset) override {
-+    return kNullAddress;
++    // The tables never map shared memory into their reservation.
++    UNREACHABLE();
 +  }
 +
 +  void FreeSharedPages(Address address, size_t size) override {
@@ -391,7 +396,7 @@ diff --git a/src/sandbox/segmented-table.cc b/src/sandbox/segmented-table.cc
    CHECK_NULL(vas_);
    CHECK_NULL(base_);
  
-@@ -37,7 +227,13 @@ void SegmentedTableBase::Initialize(size_t reservation_size,
+@@ -37,7 +232,13 @@
  #endif  // V8_HAS_PKU_JIT_WRITE_PROTECT
    }
  
