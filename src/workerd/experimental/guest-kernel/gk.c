@@ -52,6 +52,14 @@
 #define PORT_PKRU 0xFB
 #define PORT_FLUSH 0xFA
 
+// Reserved syscall number a ring-3 guest issues to leave the guest (see
+// gk_user_exit_tramp in gk_asm.S). Ring-3 code cannot execute OUT, so it cannot
+// use the PORT_EXIT hypercall the ring-0 path uses; it returns its result
+// through this sentinel syscall instead. Well above any real Linux syscall
+// number, so it never collides with a forwarded call. Keep in sync with the
+// literal in gk_asm.S.
+#define GK_EXIT_SYSCALL 0xF4240
+
 // ---- global platform state (set once by gk_init) ---------------------------
 static int g_kvm = -1, g_vmfd = -1;
 static uint64_t *g_pml4;             // base page-table root
@@ -116,6 +124,7 @@ typedef struct {
   uint64_t last_fault;
   int fault_repeat;
   int pkru_ready;          // guest PKRU has been given its initial value
+  int user_mode;           // the current invocation runs fn at ring 3 (gk_run_user)
   uint64_t *active_pml4;   // root this thread runs under
   gk_arena *active_arena;
   // Set for a thread the guest created via clone (see clone_thread): it runs
@@ -173,7 +182,10 @@ static gk_arena *arena_containing(uintptr_t a) {
 // Trampolines and exception handlers (gk_asm.S), in this binary's mapped text.
 extern void gk_syscall_tramp(void);
 extern void gk_syscall_tramp_resume(void);
+extern void gk_user_syscall_resume(void);
+extern void gk_user_launch(void);
 extern void gk_exit_tramp(void);
+extern void gk_user_exit_tramp(void);
 extern void gk_exc_de(void), gk_exc_ud(void), gk_exc_df(void), gk_exc_gp(void),
     gk_exc_pf(void);
 extern void gk_pkru_stub(void);
@@ -250,12 +262,80 @@ static uint64_t *next_table(uint64_t *tbl, int idx) {
   return (uint64_t *)(uintptr_t)(tbl[idx] & ~0xfffULL);
 }
 
+// ---- the supervisor/refuse registry ----------------------------------------
+// The guest's untrusted code runs in ring 3 (see gk_run_user), so it must not
+// be able to reach gk's own control structures even with arbitrary code
+// execution. Every guest page falls into one of three classes, decided by
+// address here and honored by map4k_root (leaf U bit) and demand_map:
+//
+//  KEEP (default)  the page is user-accessible (PTE_U set): the isolate arena,
+//                  the runtime .text/.data and glibc, the execution stack.
+//  SUPERVISOR      mapped present but with U cleared, so ring-0 (gk's fault and
+//                  syscall handlers, the CPU's descriptor-table walks) reaches
+//                  it while ring 3 faults: the handler text, the GDT/IDT page,
+//                  and each vCPU's IST/TSS/RSP0 region.
+//  REFUSE          never mapped into any guest root, so a fault there is a
+//                  genuine fault even though the host has the memory: the
+//                  page-table arena, each vCPU's kvm_run mmap, and the gk-loop
+//                  side and host stacks. Without this, ring-3 code could fault
+//                  gk's own page tables in as writable user memory and rewrite
+//                  the walls.
+//
+// A ring's access check ANDs the U bit down the whole path, so clearing U on
+// the leaf alone makes a page supervisor even though intermediate tables (which
+// user pages under the same 2MB/1GB share) keep U set. Ranges are disjoint and
+// address-sorted; lookups run on the fault path, so this is a static array with
+// a binary-search lookup and no allocation. Guarded by g_lock.
+#define GK_PROT_KEEP 0
+#define GK_PROT_SUPER 1
+#define GK_PROT_REFUSE 2
+#define GK_MAX_PROT_RANGES 8192
+typedef struct { uintptr_t start, end; int kind; } gk_prot_range;
+static gk_prot_range g_prot[GK_MAX_PROT_RANGES];
+static int g_prot_n;
+
+// The class of the page holding `addr` (GK_PROT_KEEP if unregistered). Caller
+// holds g_lock.
+static int prot_class(uintptr_t addr) {
+  int lo = 0, hi = g_prot_n;
+  while (lo < hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (addr < g_prot[mid].start) hi = mid;
+    else if (addr >= g_prot[mid].end) lo = mid + 1;
+    else return g_prot[mid].kind;
+  }
+  return GK_PROT_KEEP;
+}
+
+// Register [s, e) (page-aligned) as SUPER or REFUSE, keeping the array sorted by
+// start. The regions registered are fixed platform structures (allocated once
+// and, for pooled vCPUs, never freed), so ranges never overlap and are never
+// removed. Caller holds g_lock (or is single-threaded gk_init).
+static void prot_add(uintptr_t s, uintptr_t e, int kind) {
+  if (g_prot_n >= GK_MAX_PROT_RANGES) {
+    if (g_dbg) fprintf(stderr, "[gk] prot registry full; [%#lx,%#lx) unregistered\n",
+                       (unsigned long)s, (unsigned long)e);
+    return;
+  }
+  int i = 0;
+  while (i < g_prot_n && g_prot[i].start < s) i++;
+  memmove(&g_prot[i + 1], &g_prot[i], (size_t)(g_prot_n - i) * sizeof g_prot[0]);
+  g_prot[i] = (gk_prot_range){s, e, kind};
+  g_prot_n++;
+}
+
 // Four-level map of one page; guest-virtual == guest-physical == host-virtual.
 // `pkey` (0..15) is the page's protection key, placed in PTE bits 62:59; the
 // guest CPU checks it against the guest PKRU on every data access (with
 // CR4.PKE and CR0.WP set, see vcpu_init), which is what makes the guest's own
 // protection keys real. Key 0 is the default, unrestricted key.
+//
+// The leaf's U bit follows the supervisor/refuse registry: a SUPER page is
+// mapped with U cleared (ring 3 cannot reach it), a REFUSE page is never mapped
+// at all, and everything else is user-accessible. Caller holds g_lock.
 static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
+  int cls = prot_class(va & ~0xfffULL);
+  if (cls == GK_PROT_REFUSE) return -1;  // a control page: never reachable
   uint64_t *pdpt = next_table(root, (va >> 39) & 0x1ff);
   if (!pdpt) return -1;
   uint64_t *pd = next_table(pdpt, (va >> 30) & 0x1ff);
@@ -265,7 +345,8 @@ static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
   // `flags` is a protection bitmask: 1=read, 2=write, 4=execute. Honor it so
   // W^X holds: code is mapped executable but not writable, data writable but
   // not executable. KVM also enforces the host VMA's real protection.
-  uint64_t pte = (va & ~0xfffULL) | PTE_P | PTE_U;
+  uint64_t pte = (va & ~0xfffULL) | PTE_P;
+  if (cls != GK_PROT_SUPER) pte |= PTE_U;  // user pages only; supervisor clears U
   if (flags & 2) pte |= PTE_W;
   if (!(flags & 4)) pte |= PTE_NX;
   pte |= ((uint64_t)pkey << PTE_PKEY_SHIFT) & PTE_PKEY_MASK;
@@ -829,6 +910,19 @@ static int demand_map(uintptr_t addr) {
     }
     root = in->pml4;
   }
+  // Consult the supervisor/refuse registry. A REFUSE page (gk's page tables,
+  // kvm_run, the gk-loop stacks) is never mapped, so a fault there is genuine
+  // even though the host has the memory: this is what stops ring-3 code from
+  // faulting gk's own control memory in as ordinary user pages. A SUPER page
+  // (handler text, GDT/IDT, IST/TSS) is mapped with U cleared by map4k_root.
+  int cls = prot_class(page);
+  if (cls == GK_PROT_REFUSE) {
+    if (g_dbg)
+      fprintf(stderr, "[gk] vcpu %d: REFUSE fault %#lx (gk control region)\n", tls.id,
+              (unsigned long)page);
+    pthread_mutex_unlock(&g_lock);
+    return -1;
+  }
   int mapped = host_region(page, &rs, &re, &perms);
   if (!mapped) {
     // The page may lie just below a stack the kernel grows on demand (the main
@@ -866,6 +960,9 @@ static int demand_map(uintptr_t addr) {
     }
   }
   pthread_mutex_unlock(&g_lock);
+  if (g_dbg && cls == GK_PROT_SUPER)
+    fprintf(stderr, "[gk] vcpu %d: SUPER demand-map %#lx perms=%d (U cleared)\n", tls.id,
+            (unsigned long)page, perms);
   if (g_dbg && pkey != 0)
     fprintf(stderr, "[gk] vcpu %d demand-map %#lx perms=%d pkey=%d (PTE bits 62:59)\n",
             tls.id, (unsigned long)page, perms, pkey);
@@ -959,12 +1056,22 @@ static int vcpu_init(int flags) {
                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (ir == MAP_FAILED) { g_err = "mmap exception stack"; return -1; }
     pthread_mutex_lock(&g_lock);
+    // kvm_run is host/KVM shared state; the IST region holds the exception
+    // stack, TSS and RSP0 stack. Ring 3 must reach neither: refuse the former,
+    // map the latter supervisor (registered before mapping so U is cleared).
+    prot_add((uintptr_t)run, (uintptr_t)run + g_run_size, GK_PROT_REFUSE);
+    prot_add((uintptr_t)ir, (uintptr_t)ir + GK_IST_BYTES, GK_PROT_SUPER);
     int irc = mmu_map_range((uintptr_t)ir, (uintptr_t)ir + GK_IST_BYTES, 1 | 2);
     pthread_mutex_unlock(&g_lock);
     if (irc < 0) { g_err = "map exception stack"; return -1; }
     ist = (uint64_t)(uintptr_t)ir;
     uint8_t *tss = ir + GK_IST_BYTES - 0x1000;
     *(uint64_t *)(tss + 36) = (uint64_t)(uintptr_t)tss;  // IST1: stack top is just below the TSS
+    // RSP0: the ring-0 stack the CPU switches to on a ring-3 -> ring-0 gate that
+    // does not use an IST (all gk gates use IST1, so this is defensive). A
+    // dedicated page at the bottom of the region, disjoint from IST1's downward
+    // growth from just below the TSS.
+    *(uint64_t *)(tss + 4) = (uint64_t)(uintptr_t)ir + 0x1000;
     *(uint16_t *)(tss + 102) = 0x68;                     // I/O map base past the limit
   }
 
@@ -1011,7 +1118,7 @@ static int vcpu_init(int flags) {
   struct kvm_segment tr = {.base = ist + GK_IST_BYTES - 0x1000, .limit = 0x67,
                            .selector = 0x18, .type = 11, .present = 1};
   s.tr = tr;
-  s.gdt.base = g_gdt_va; s.gdt.limit = 3 * 8 - 1;
+  s.gdt.base = g_gdt_va; s.gdt.limit = 6 * 8 - 1;  // through the ring-3 descriptors (0x28)
   s.idt.base = g_idt_va; s.idt.limit = 256 * 16 - 1;
   if (ioctl(fd, KVM_SET_SREGS, &s) < 0) { g_err = "KVM_SET_SREGS"; return -1; }
 
@@ -1048,7 +1155,13 @@ static int vcpu_init(int flags) {
   struct { struct kvm_msrs h; struct kvm_msr_entry e[4]; } m = {0};
   m.h.nmsrs = 4;
   m.e[0].index = MSR_EFER; m.e[0].data = EFER_LME | EFER_LMA | EFER_SCE | EFER_NXE;
-  m.e[1].index = MSR_STAR; m.e[1].data = (uint64_t)0x08 << 32;
+  // STAR[47:32] = 0x08: SYSCALL enters ring-0 CS 0x08, SS 0x10.
+  // STAR[63:48] = 0x1b: SYSRET adds 8 and 16 to this and uses the result
+  // verbatim -- the RPL is not forced -- so the base must already carry RPL 3.
+  // SS = 0x1b + 8 = 0x23 (GDT index 4, ring-3 data), CS = 0x1b + 16 = 0x2b
+  // (GDT index 5, ring-3 code). A base of 0x18 (RPL 0) would return ring 3 with
+  // RPL-0 selectors, and the IRETQ off a ring-3 fault would then #GP on SS.
+  m.e[1].index = MSR_STAR; m.e[1].data = ((uint64_t)0x08 << 32) | ((uint64_t)0x1b << 48);
   m.e[2].index = MSR_LSTAR; m.e[2].data = (uintptr_t)&gk_syscall_tramp;
   m.e[3].index = MSR_SYSCALL_MASK; m.e[3].data = 0x3f7fd5;
   if (ioctl(fd, KVM_SET_MSRS, &m) < 4) { g_err = "KVM_SET_MSRS"; return -1; }
@@ -1065,6 +1178,8 @@ ready:
   tls.last_fault = 0;
   tls.fault_repeat = 0;
   tls.pkru_ready = 0;  // a fresh or reused vCPU gets its PKRU at first entry
+  tls.user_mode = 0;   // ring 0 unless enter_guest is asked for ring 3; guest
+                       // threads (child_entry) run at ring 0
   if (!tls.active_pml4) tls.active_pml4 = g_pml4;
   tls.inited = 1;
   // A gk_run thread gives its vCPU back when it ends (see vcpu_key_dtor).
@@ -1083,13 +1198,21 @@ static int map_handler_text(void) {
   uintptr_t hs[] = {
       (uintptr_t)&gk_exc_de, (uintptr_t)&gk_exc_ud, (uintptr_t)&gk_exc_df,
       (uintptr_t)&gk_exc_gp, (uintptr_t)&gk_exc_pf, (uintptr_t)&gk_syscall_tramp,
-      (uintptr_t)&gk_exit_tramp, (uintptr_t)&gk_pkru_stub, (uintptr_t)&gk_flush_stub};
+      (uintptr_t)&gk_exit_tramp, (uintptr_t)&gk_pkru_stub, (uintptr_t)&gk_flush_stub,
+      (uintptr_t)&gk_user_syscall_resume, (uintptr_t)&gk_user_launch};
+  // gk_user_exit_tramp is deliberately absent: it runs in ring 3, so it must
+  // stay a user page (its own page-aligned section, demand-paged as user r-x).
   uintptr_t lo = hs[0], hi = hs[0];
   for (size_t i = 1; i < sizeof hs / sizeof hs[0]; i++) {
     if (hs[i] < lo) lo = hs[i];
     if (hs[i] > hi) hi = hs[i];
   }
-  return mmu_map_range(lo & ~0xfffUL, (hi + 64 + 0xfff) & ~0xfffUL, 1 | 4);  // r-x
+  lo &= ~0xfffUL;
+  hi = (hi + 64 + 0xfff) & ~0xfffUL;
+  // The handlers run in ring 0 and must be unreadable to ring 3, so map them
+  // supervisor r-x. Register before mapping so map4k_root clears U.
+  prot_add(lo, hi, GK_PROT_SUPER);
+  return mmu_map_range(lo, hi, 1 | 4);  // r-x
 }
 
 int gk_init(void) {
@@ -1105,6 +1228,10 @@ int gk_init(void) {
                      MAP_SHARED | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (pt == MAP_FAILED) { g_err = "mmap PT arena"; return -1; }
   g_pt_next = pt; g_pt_end = pt + g_pt_bytes; g_pt_base = (uintptr_t)pt;
+  // The page-table arena is walked by the CPU through guest-physical addresses
+  // (it has memslots), never through guest-virtual PTEs. Refuse it so ring-3
+  // code cannot fault it in and rewrite the tables that enforce the arenas.
+  prot_add(g_pt_base, g_pt_base + g_pt_bytes, GK_PROT_REFUSE);
   g_pml4 = alloc_table();
 
   uint8_t *tables = mmap(NULL, 0x2000, PROT_READ | PROT_WRITE,
@@ -1112,10 +1239,26 @@ int gk_init(void) {
   if (tables == MAP_FAILED) { g_err = "mmap gdt/idt"; return -1; }
   g_gdt_va = (uintptr_t)tables;
   g_idt_va = (uintptr_t)tables + 0x1000;
+  // The GDT and IDT are read by the CPU (a supervisor access) during exception
+  // delivery and ring transitions; ring-3 code has no business touching them.
+  prot_add(g_gdt_va, g_gdt_va + 0x2000, GK_PROT_SUPER);
+  // GDT layout, in the order SYSCALL/SYSRET and the exception frames need:
+  //   0x08 ring-0 code64   (SYSCALL loads CS from STAR[47:32] = 0x08)
+  //   0x10 ring-0 data     (SYSCALL loads SS = 0x08 + 8)
+  //   0x18 unused          (TR's nominal selector; TR uses a cached descriptor)
+  //   0x20 ring-3 data     (SYSRET loads SS = STAR[63:48] + 8 = 0x1b + 8 = 0x23)
+  //   0x28 ring-3 code64   (SYSRET loads CS = STAR[63:48] + 16 = 0x1b + 16 = 0x2b)
+  // STAR[63:48] is 0x1b (RPL 3): SYSRET adds 8/16 and uses the RPL as-is, so
+  // ring 3 runs with SS 0x23 and CS 0x2b. The CPU reloads both from the GDT on
+  // the IRETQ that returns from a ring-3 fault, so the +8/+16 order, RPL and
+  // DPL=3 must all be exact.
   uint64_t *gdt = (uint64_t *)(uintptr_t)g_gdt_va;
   gdt[0] = 0;
-  gdt[1] = 0x00AF9A000000FFFFULL;
-  gdt[2] = 0x00CF92000000FFFFULL;
+  gdt[1] = 0x00AF9A000000FFFFULL;  // ring-0 code64 (DPL 0, L=1)
+  gdt[2] = 0x00CF92000000FFFFULL;  // ring-0 data   (DPL 0)
+  gdt[3] = 0;
+  gdt[4] = 0x00CFF2000000FFFFULL;  // ring-3 data   (DPL 3)
+  gdt[5] = 0x00AFFA000000FFFFULL;  // ring-3 code64 (DPL 3, L=1)
   uint8_t *idt = (uint8_t *)(uintptr_t)g_idt_va;
   memset(idt, 0, 0x1000);
   set_idt_gate(idt, 0, (uintptr_t)&gk_exc_de);
@@ -1146,6 +1289,14 @@ int gk_vcpu_count(void) { return atomic_load(&g_vcpus_created); }
 const char *gk_last_error(void) { return g_err; }
 unsigned long gk_fault_addr(void) { return g_fault_addr; }
 void gk_set_syscall_filter(gk_syscall_filter f) { g_filter = f; }
+
+// Test/diagnostic hook: hand out one supervisor page (the GDT) and one refused
+// page (the page-table arena), so a test can verify that ring-3 code faults on
+// gk's own control memory while its own user pages work.
+void gk_debug_control_addrs(unsigned long *super, unsigned long *refuse) {
+  if (super) *super = (unsigned long)g_gdt_va;
+  if (refuse) *refuse = (unsigned long)g_pt_base;
+}
 
 #define GK_EPERM 1
 #define GK_ENOMEM 12
@@ -1302,6 +1453,12 @@ static long clone_thread(struct kvm_regs *r, long nr) {
   void *hs = mmap(NULL, GK_HOST_STACK, PROT_READ | PROT_WRITE,
                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
   if (hs == MAP_FAILED) return -errno;
+  // A guest thread's host-side gk-loop stack should be REFUSE too, but it is
+  // unmapped when the thread exits (unlike the pooled side stack), so a bare
+  // registration would outlive it and wrongly refuse whatever later reuses the
+  // address. Registering it needs registry removal on thread exit, which is
+  // deferred with ring-3 guest threads: in this slice guest threads run at ring
+  // 0, so their host stack is not reachable by ring-3 code.
   gk_child *c = calloc(1, sizeof *c);
   if (!c) { munmap(hs, GK_HOST_STACK); return -12; }  // ENOMEM
   c->regs = *r;
@@ -1556,25 +1713,49 @@ static int prepare_entry(void) {
 }
 
 // Enter the guest at fn(arg) with a stack whose top (16-byte aligned) is
-// `stack_top`, and run it to completion. fn returns into gk_exit_tramp, which
-// hands its return value back through run_vcpu.
-static long enter_guest(long (*fn)(void *), void *arg, uint64_t stack_top) {
+// `stack_top`, and run it to completion. `user` selects the privilege level:
+//
+//  ring 0 (user == 0): RIP is set straight to fn, which runs privileged, and
+//    returns into gk_exit_tramp -> PORT_EXIT.
+//  ring 3 (user == 1): RIP is set to gk_user_launch, which SYSRETs down to fn
+//    at ring 3 (RCX = fn, R11 = flags). fn returns into gk_user_exit_tramp,
+//    which leaves the guest through the sentinel syscall. Untrusted code runs
+//    this way: it cannot execute privileged instructions, reload CR3 or reach
+//    the supervisor/refused pages, so the arena walls hold against it.
+//
+// Either way the return value comes back through run_vcpu.
+static long enter_guest(long (*fn)(void *), void *arg, uint64_t stack_top, int user) {
   uint64_t sp = stack_top - 8;
-  *(uint64_t *)sp = (uintptr_t)&gk_exit_tramp;
+  *(uint64_t *)sp = user ? (uintptr_t)&gk_user_exit_tramp : (uintptr_t)&gk_exit_tramp;
 
   struct kvm_regs regs = {0};
-  regs.rip = (uintptr_t)fn;
   regs.rsp = sp;
   regs.rdi = (uintptr_t)arg;
   regs.rflags = 0x2;
+  if (user) {
+    regs.rip = (uintptr_t)&gk_user_launch;
+    regs.rcx = (uintptr_t)fn;   // SYSRET target RIP
+    regs.r11 = 0x2;             // SYSRET target RFLAGS
+  } else {
+    regs.rip = (uintptr_t)fn;
+  }
   ioctl(tls.fd, KVM_SET_REGS, &regs);
+  tls.user_mode = user;
   return run_vcpu();
 }
 
 long gk_run(long (*fn)(void *), void *arg) {
   if (vcpu_init(GK_VCPU_HOST | GK_VCPU_STACK) < 0) return -1;
   if (prepare_entry() < 0) return -1;
-  return enter_guest(fn, arg, tls.stack_top);
+  return enter_guest(fn, arg, tls.stack_top, 0);
+}
+
+// Like gk_run, but fn runs at guest ring 3 (see enter_guest). Same private
+// guest stack, same fault/return reporting.
+long gk_run_user(long (*fn)(void *), void *arg) {
+  if (vcpu_init(GK_VCPU_HOST | GK_VCPU_STACK) < 0) return -1;
+  if (prepare_entry() < 0) return -1;
+  return enter_guest(fn, arg, tls.stack_top, 1);
 }
 
 // ---- gk_run_here: the guest on the caller's stack ---------------------------
@@ -1591,25 +1772,39 @@ long gk_run(long (*fn)(void *), void *arg) {
 // arriving then is handled on the side stack, where the thread is), so the gap
 // only guards against a host red-zone use around the switch itself.
 #define GK_HERE_SLACK 128
-typedef struct { long (*fn)(void *); void *arg; } gk_here_ctx;
+typedef struct { long (*fn)(void *); void *arg; int user; } gk_here_ctx;
 
 static long run_here(void *ctx, unsigned long caller_sp) {
   gk_here_ctx *c = ctx;
   uint64_t top = (caller_sp - GK_HERE_SLACK) & ~0xfULL;
-  return enter_guest(c->fn, c->arg, top);
+  return enter_guest(c->fn, c->arg, top, c->user);
 }
 
-long gk_run_here(long (*fn)(void *), void *arg) {
+static long run_here_common(long (*fn)(void *), void *arg, int user) {
   if (vcpu_init(GK_VCPU_HOST) < 0) return -1;
   if (!tls.side_stack) {
     void *ss = mmap(NULL, GK_SIDE_STACK, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
     if (ss == MAP_FAILED) { g_err = "mmap side stack"; return -1; }
     tls.side_stack = ss;
+    // The gk-loop side stack is host-only: refuse it so ring-3 code cannot
+    // reach the host frames running underneath it.
+    pthread_mutex_lock(&g_lock);
+    prot_add((uintptr_t)ss, (uintptr_t)ss + GK_SIDE_STACK, GK_PROT_REFUSE);
+    pthread_mutex_unlock(&g_lock);
   }
   if (prepare_entry() < 0) return -1;
-  gk_here_ctx c = {fn, arg};  // lives above caller_sp, out of the guest's way
+  gk_here_ctx c = {fn, arg, user};  // lives above caller_sp, out of the guest's way
   return gk_host_call_on_stack((char *)tls.side_stack + GK_SIDE_STACK, run_here, &c);
+}
+
+long gk_run_here(long (*fn)(void *), void *arg) {
+  return run_here_common(fn, arg, 0);
+}
+
+// Like gk_run_here, but fn runs at guest ring 3 (see enter_guest).
+long gk_run_here_user(long (*fn)(void *), void *arg) {
+  return run_here_common(fn, arg, 1);
 }
 
 // Run this thread's vCPU from its current register state until the guest exits
@@ -1634,7 +1829,16 @@ static long run_vcpu(void) {
         if (port == PORT_SYSCALL) {
           struct kvm_regs r;
           ioctl(tls.fd, KVM_GET_REGS, &r);
+          // A ring-3 guest leaves through the sentinel exit syscall (ring 3
+          // cannot use PORT_EXIT's OUT): its result is in RDI.
+          if (r.rax == GK_EXIT_SYSCALL) return (long)r.rdi;
           r.rax = (uint64_t)forward_syscall(&r);
+          // A ring-3 guest's syscall trampoline ran in ring 0; return it to
+          // ring 3 with SYSRET rather than the ring-0 jmp. forward_syscall left
+          // RCX/R11 (the SYSCALL-saved return RIP and flags) intact and may
+          // have already pointed RIP at a resume label; override it to the
+          // ring-3 one. Ring-0 guests keep RIP at the OUT so KVM completes it.
+          if (tls.user_mode) r.rip = (uintptr_t)&gk_user_syscall_resume;
           ioctl(tls.fd, KVM_SET_REGS, &r);
         } else if (port == PORT_EXIT) {
           struct kvm_regs r;

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <pthread.h>
 
@@ -407,6 +408,52 @@ static void *here_thread(void *arg) {
   return (void *)(uintptr_t)here_check("pthread");
 }
 
+// ---- guest ring-3 privilege split -------------------------------------------
+// gk_run_user runs fn at guest ring 3. Untrusted code runs there so that even
+// arbitrary code execution cannot breach the arena walls: ring-3 code cannot
+// run privileged instructions, reload CR3 or touch gk's supervisor/refused
+// pages. These probe every part of that split.
+
+// Returns its own CPL (CS.RPL) and records the CS selector through arg. Run at
+// ring 3, CPL is 3 and CS is the ring-3 code selector (0x2b).
+static long user_cpl(void *arg) {
+  unsigned short cs;
+  __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
+  if (arg) *(unsigned long *)arg = cs;
+  return (long)(cs & 3);
+}
+
+// Reads CR3 -- a privileged instruction, so #GP at ring 3. (A read, not a
+// write, so if isolation were broken and it ran at ring 0 it would be
+// harmless.)
+static long user_read_cr3(void *arg) {
+  (void)arg;
+  unsigned long v;
+  __asm__ __volatile__("mov %%cr3, %0" : "=r"(v));
+  return (long)v;
+}
+
+// Writes one byte at the address passed as arg, and reads it back. Against a
+// supervisor or refused address this faults; against a normal user page it
+// works.
+static long user_write_here(void *arg) {
+  volatile unsigned char *p = arg;
+  p[0] = 0x5a;
+  return p[0];
+}
+
+// A forwarded getpid(2) issued from ring 3: the syscall trampoline runs in ring
+// 0, the host forwards it, and SYSRET returns to ring 3 with the pid.
+static long user_getpid(void *arg) {
+  (void)arg;
+  long pid;
+  register long r10 __asm__("r10") = 0, r8 __asm__("r8") = 0, r9 __asm__("r9") = 0;
+  __asm__ __volatile__("syscall" : "=a"(pid)
+                       : "a"((long)SYS_getpid), "r"(r10), "r"(r8), "r"(r9)
+                       : "rcx", "r11", "memory");
+  return pid;
+}
+
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (gk_init() != 0) {
@@ -718,7 +765,82 @@ int main(void) {
     gk_arena_destroy(keep);
   }
 
-  int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11;
+  // ---- guest ring-3 privilege split -----------------------------------------
+  // The four core properties of gk_run_user. After each faulting case the
+  // process must survive to run the next assertion.
+  int ok12 = 1;
+  {
+    // 1. A trivial fn runs at ring 3 and returns its value.
+    unsigned long cs = 0;
+    long cpl = gk_run_user(user_cpl, &cs);
+    int p1 = (cpl == 3 && (cs & 3) == 3);
+    printf("  1. ring-3 execution: fn ran at CPL %ld (CS %#lx) [%s]\n", cpl, cs,
+           p1 ? "OK" : "FAIL");
+
+    // 2. A privileged instruction (mov %%cr3) #GPs -> GK_EFAULT, process survives.
+    long priv = gk_run_user(user_read_cr3, NULL);
+    unsigned long priv_fault = gk_fault_addr();
+    int p2 = (priv == GK_EFAULT);
+    printf("  2. ring-3 privileged mov %%cr3: %s (faulting rip %#lx), process survived [%s]\n",
+           priv == GK_EFAULT ? "#GP -> GK_EFAULT" : "DID NOT FAULT", priv_fault,
+           p2 ? "OK" : "FAIL");
+
+    // 3. Supervisor and refused addresses fault; a normal user page works.
+    unsigned long super = 0, refuse = 0;
+    gk_debug_control_addrs(&super, &refuse);
+    long ws = gk_run_user(user_write_here, (void *)super);
+    unsigned long fs = gk_fault_addr();
+    long wr = gk_run_user(user_write_here, (void *)refuse);
+    unsigned long fr = gk_fault_addr();
+    unsigned char *upage = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long wu = (upage != MAP_FAILED) ? gk_run_user(user_write_here, upage) : -1;
+    int p3 = ws == GK_EFAULT && fs == super && wr == GK_EFAULT && fr == refuse && wu == 0x5a;
+    printf("  3. ring-3 supervisor write @%#lx -> %s (fault %#lx); refused write @%#lx -> %s "
+           "(fault %#lx); own user page -> %#lx [%s]\n", super,
+           ws == GK_EFAULT ? "FAULT" : "WROTE", fs, refuse,
+           wr == GK_EFAULT ? "FAULT" : "WROTE", fr, wu, p3 ? "OK" : "FAIL");
+    if (upage != MAP_FAILED) munmap(upage, 4096);
+
+    // 4. A real syscall from ring 3 is forwarded and SYSRETs back with the result.
+    long pid = gk_run_user(user_getpid, NULL);
+    int p4 = (pid == (long)getpid());
+    printf("  4. ring-3 forwarded getpid: guest saw %ld, host getpid %ld [%s]\n", pid,
+           (long)getpid(), p4 ? "OK" : "FAIL");
+
+    ok12 = p1 && p2 && p3 && p4;
+  }
+  printf("guest ring-3 privilege split [%s]\n", ok12 ? "OK" : "FAIL");
+
+  // Ring 3 under an active arena: an arena page committed and used at ring 3
+  // works (the mprotect is forwarded and the vCPU SYSRETs back), while gk's own
+  // page tables remain unreachable.
+  int ok13 = 1;
+  {
+    gk_arena *ua = gk_arena_create(4096);
+    unsigned long refuse = 0;
+    gk_debug_control_addrs(NULL, &refuse);
+    if (!ua) {
+      ok13 = 0;
+      printf("ring-3 under arena: arena create failed [FAIL]\n");
+    } else {
+      unsigned char *base = gk_arena_base(ua);
+      struct ap w = {base, 0xC7};
+      gk_arena_enter(ua);
+      long rc = gk_run_user(commit_write, &w);                 // commit+write+read at ring 3
+      long rp = gk_run_user(user_write_here, (void *)refuse);  // gk page tables: must fault
+      unsigned long fp = gk_fault_addr();
+      gk_arena_enter(NULL);
+      gk_arena_destroy(ua);
+      ok13 = rc == 0xC7 && rp == GK_EFAULT && fp == refuse;
+      printf("ring-3 under arena: commit+write arena page -> %#lx, touch gk page tables -> %s "
+             "(fault %#lx) [%s]\n", rc, rp == GK_EFAULT ? "FAULT" : "REACHED", fp,
+             ok13 ? "OK" : "FAIL");
+    }
+  }
+
+  int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
+            ok12 && ok13;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

@@ -53,6 +53,28 @@ long gk_run(long (*fn)(void *), void *arg);
 // Return values and faults are reported exactly as by gk_run.
 long gk_run_here(long (*fn)(void *), void *arg);
 
+// Like gk_run / gk_run_here, but fn runs at guest ring 3 (user mode) instead of
+// ring 0. Untrusted code should run this way: at ring 3 it cannot execute
+// privileged instructions (CR3 reloads, wrmsr, in/out, ...), and it cannot read
+// or write gk's supervisor pages (handler text, GDT/IDT, exception stacks) or
+// gk's refused pages (the page tables themselves, kvm_run, the host-side gk
+// stacks). This makes the per-isolate page-table walls hold even against
+// arbitrary code execution inside an isolate: ring-3 code can neither reload
+// CR3 nor rewrite the supervisor page tables. Any such attempt faults and the
+// call returns GK_EFAULT (see gk_fault_addr); the process survives. Legitimate
+// syscalls are forwarded and the function returns to ring 3 as usual.
+//
+// This slice runs the top-level fn at ring 3; threads a ring-3 fn creates
+// (clone) currently still enter at ring 0. Arena/CR3 switching stays host-
+// driven in ring 0 and is unchanged.
+long gk_run_user(long (*fn)(void *), void *arg);
+long gk_run_here_user(long (*fn)(void *), void *arg);
+
+// Test/diagnostic: fills *super with the address of a gk supervisor page and
+// *refuse with the address of a gk refused page, so a test can confirm ring-3
+// code cannot reach either. Either pointer may be NULL.
+void gk_debug_control_addrs(unsigned long *super, unsigned long *refuse);
+
 #define GK_EFAULT (-1001)  // guest faulted; see gk_fault_addr()
 #define GK_ESHUTDOWN (-1002)  // guest triple-faulted or shut down
 
