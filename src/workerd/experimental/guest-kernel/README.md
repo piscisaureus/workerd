@@ -114,11 +114,25 @@ decides the overall cost.
 
 ## Running V8 inside gk (status)
 
-A separate spike links this library against workerd's V8 and enters an isolate
-inside the guest. With the demand-paged MMU plus `CR4.PKE` (glibc `pkey_set`
-uses `rdpkru`) and clearing the host PKRU (V8 write-protects its pointer tables
-with a protection key), V8 initializes, `v8::Isolate::New` completes, and
-hundreds of pages are demand-mapped correctly. The next barrier is a V8
-thread-local access during context/compile setup (V8 recorded stack/TLS state on
-the host thread but runs on the guest stack); resolving that is the remaining
-work before a script runs end to end. The spike is not part of this library.
+A separate spike links this library against workerd's V8 and runs an isolate
+inside the guest. With the demand-paged MMU it now **runs a JavaScript program
+end to end**: `v8::V8::Initialize`, `Isolate::New`, context creation, compile and
+execution all happen in guest ring 0, and the script returns the correct result.
+
+What it took, beyond the MMU:
+
+- `CR4.PKE` enabled and the host PKRU cleared: glibc `pkey_set` executes
+  `rdpkru`, and V8 write-protects its pointer tables with a protection key that
+  the host side must be able to back.
+- V8 runs its whole lifecycle inside the guest, so its recorded thread and TLS
+  state match where it executes (initializing on the host and running in the
+  guest tripped a thread-local null dereference).
+- `Isolate::SetStackLimit` for the guest stack: V8 auto-detects the stack via
+  `pthread_getattr_np`, which returns the OS thread's stack, not the guest
+  stack, so without this it reports a false stack overflow.
+
+Remaining: the JIT is not yet supported. With code generation enabled V8 writes
+to its executable code region and KVM cannot back the write, because V8 uses a
+write-protect (W^X / protection-key) scheme for code pages that the guest does
+not yet reflect. Running jitless works today. The spike is not part of this
+library.
