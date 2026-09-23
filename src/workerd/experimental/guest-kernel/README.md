@@ -136,10 +136,15 @@ What it took, beyond the MMU:
   `pthread_getattr_np`, which returns the OS thread's stack, not the guest
   stack, so without this it reports a false stack overflow.
 
-Remaining: the JIT. W^X for ordinary code works (see above), but with the JIT on
-V8's sandbox protects its code and code-pointer tables with a memory protection
-key, and KVM cannot back the guest's write to those pages: the guest flips its
-own PKRU, while KVM's host-side backing uses the host thread's PKRU. Closing that
-gap needs real PKU virtualization (reflect the guest protection-key state, or the
-page's key, into how the host backs the access). Running jitless works today. The
-spike is not part of this library.
+The JIT works too, run with `--no-memory-protection-keys`: V8 then protects its
+code with `mprotect` (which gk reflects into W^X) rather than a protection key,
+and a JIT-optimized hot loop runs to the correct result. So both jitless and
+JIT V8 run a JavaScript program end to end inside the guest.
+
+Remaining: V8's default memory-protection-key path. With MPK on, V8 protects its
+code and code-pointer tables with a protection key and flips its own PKRU to
+write them; but KVM backs the guest's write using the host thread's PKRU, so the
+write faults. Closing that needs real PKU virtualization: reflect the guest
+protection-key state (and the page's key in the guest PTE) into how the host
+backs the access, rather than relying on the host PKRU. The spike is not part of
+this library.
