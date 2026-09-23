@@ -428,12 +428,20 @@ static long forward_syscall(struct kvm_regs *r) {
     if (g_dbg) fprintf(stderr, "[gk] syscall %ld DENIED\n", nr);
     return -GK_EPERM;
   }
-  long ret = host_syscall(nr, a1, a2, a3, a4, a5, a6);
+  // pkey_mprotect strips to a plain mprotect: gk isolates via page tables and
+  // arenas, so V8's host-side protection keys are not needed, and stripping them
+  // lets KVM back the guest's writes (V8's default MPK code protection otherwise
+  // faults, because KVM backs the write using the host PKRU, not the guest's).
+  long ret;
+  if (nr == SYS_pkey_mprotect)
+    ret = host_syscall(SYS_mprotect, a1, a2, a3, 0, 0, 0);
+  else
+    ret = host_syscall(nr, a1, a2, a3, a4, a5, a6);
   // Reflect protection/mapping changes: drop the guest PTEs for the affected
   // range so the next access re-faults and demand-maps with the new host
   // permissions (this is what makes W^X and JIT code work), then flush this
   // vCPU's TLB. TODO: cross-vCPU shootdown for the multi-threaded case.
-  if (ret == 0 && (nr == SYS_mprotect || nr == SYS_munmap) && a2 > 0) {
+  if (ret == 0 && (nr == SYS_mprotect || nr == SYS_munmap || nr == SYS_pkey_mprotect) && a2 > 0) {
     pthread_mutex_lock(&g_lock);
     for (uintptr_t v = (uintptr_t)a1 & ~0xfffUL; v < (uintptr_t)a1 + (uintptr_t)a2; v += 0x1000)
       unmap4k_root(g_pml4, v);
