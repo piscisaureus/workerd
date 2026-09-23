@@ -491,9 +491,11 @@ void IoContext::logUncaughtException(
 
 void IoContext::logUncaughtExceptionAsync(
     UncaughtExceptionSource source, kj::Exception&& exception) {
-  if (getWorkerTracer() == kj::none && !worker->getIsolate().isInspectorEnabled()) {
-    // We don't need to take the isolate lock as neither inspecting nor tracing is enabled. We
-    // do still want to syslog if relevant, but we can do that without a lock.
+  if ((getWorkerTracer() == kj::none && !worker->getIsolate().isInspectorEnabled()) ||
+      worker->getIsolate().isCondemned()) {
+    // We don't need to take the isolate lock as neither inspecting nor tracing is enabled (or the
+    // isolate is condemned and must not be entered again, not even to report to them). We do
+    // still want to syslog if relevant, but we can do that without a lock.
     if (!jsg::isTunneledException(exception.getDescription()) &&
         !jsg::isDoNotLogException(exception.getDescription()) &&
         // TODO(soon): Figure out why client disconnects are getting logged here if we don't
@@ -1482,11 +1484,12 @@ struct GuestTurn {
 };
 #endif
 
-// Run one JS turn for the locked isolate `js`, inside the guest kernel when it is enabled and
-// directly otherwise.
+// Run one JS turn for `context` on its locked worker, inside the guest kernel when it is enabled
+// and directly otherwise.
 template <typename Func>
-void runJsTurn(jsg::Lock& js, Func&& body) {
+void runJsTurn(IoContext& context, Worker::Lock& workerLock, Func&& body) {
 #ifdef WORKERD_HAS_GUEST_KERNEL
+  jsg::Lock& js = workerLock;
   if (jsg::isGuestKernelEnabled() && guestTurnDepth > 0) {
     gk_arena* arena = guestArenaOf(js);
     if (arena != guestTurnArena) {
@@ -1509,10 +1512,35 @@ void runJsTurn(jsg::Lock& js, Func&& body) {
     // such attempt faults and gk_run_here_user returns GK_EFAULT.
     long result = gk_run_here_user(&GuestTurn<Func>::trampoline, &turn);
     if (result != 0) {
-      // The guest was abandoned mid-turn (its frames, locks and RAII state are gone), so there
-      // is no consistent state to unwind through.
-      KJ_LOG(FATAL, "guest-kernel: JS turn did not complete", result, gk_fault_addr());
-      abort();
+      // The guest faulted (or gk otherwise could not complete the turn) and control is back here
+      // without the turn's frames ever returning. gk_run_here_user() is an ordinary host-side
+      // call frame, so everything above it unwinds normally; everything the turn had on the
+      // stack below the guest boundary is abandoned and its destructors never run.
+      //
+      // The isolate is unusable from here on: V8 was interrupted at an arbitrary point (possibly
+      // mid-allocation or mid-JIT), and its per-thread state (HandleScope chain, v8::TryCatch
+      // chain, JS entry frames) still points into the abandoned frames. Condemn it so no further
+      // JS turn is run on it, abort this request's IoContext so its pending work is cancelled
+      // instead of re-entering the isolate, and fail the current request. The process and every
+      // other isolate carry on.
+      //
+      // TODO(guest-kernel): RAII state held by the abandoned frames leaks; there is no
+      //   bookkeeping that could release it. Known leaks per faulted turn:
+      //   - the IoContext::PendingEvent that runImpl's turn registers, so this IoContext is never
+      //     seen as idle by hang detection (moot once it is aborted and destroyed);
+      //   - the limit enforcer's enterJs() scope, so it never sees the matching exit;
+      //   - any kj::Own / jsg::Ref / IoOwn / file descriptor / KJ mutex lock the runnable's C++
+      //     frames held at the moment of the fault (a held KJ mutex would deadlock its next
+      //     locker). The test hook in ServiceWorkerGlobalScope::request() faults before any such
+      //     state is taken, so the test does not exercise that case;
+      //   - on the V8 side, the abandoned HandleScopes' handles, and the isolate itself, which is
+      //     never freed because nothing evicts a condemned isolate (see Worker::Isolate::condemn).
+      auto e = KJ_EXCEPTION(FAILED,
+          "guest-kernel: JS turn faulted inside the guest; the isolate has been condemned", result,
+          gk_fault_addr());
+      workerLock.getWorker().getIsolate().condemn(e.clone());
+      context.abort(e.clone());
+      kj::throwFatalException(kj::mv(e));
     }
 
     if (turn.jsExceptionThrown) {
@@ -1536,6 +1564,12 @@ void IoContext::runImpl(Runnable& runnable,
   KJ_IF_SOME(l, inputLock) {
     KJ_REQUIRE(l.isFor(KJ_ASSERT_NONNULL(actor).getInputGate()));
   }
+
+  // A condemned isolate (see Worker::Isolate::condemn()) must not even be locked, so refuse the
+  // turn before runInContextScope() enters it. This also covers exceptional turns, which only
+  // exist to report an exception to the inspector or tracer; logUncaughtExceptionAsync() skips
+  // them for a condemned isolate before getting here.
+  worker->getIsolate().requireNotCondemned();
 
   getIoChannelFactory().getTimer().syncTime();
 
@@ -1691,7 +1725,7 @@ void IoContext::runImpl(Runnable& runnable,
   };
 
   runInContextScope(lockType, kj::mv(inputLock),
-      [&](Worker::Lock& workerLock) { runJsTurn(workerLock, [&]() { turn(workerLock); }); });
+      [&](Worker::Lock& workerLock) { runJsTurn(*this, workerLock, [&]() { turn(workerLock); }); });
 }
 
 static constexpr auto kAsyncIoErrorMessage =

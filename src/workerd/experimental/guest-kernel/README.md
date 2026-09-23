@@ -18,6 +18,9 @@ build never globs these sources.
 - `gk_asm.S` — the in-guest trampolines and exception handlers.
 - `gk_test.c` — the test/example.
 - `Makefile` — `make run` builds and runs the test.
+- `fault-test.sh` / `fault-test.capnp` — end-to-end check against a built
+  workerd that a fault inside the guest during a JS turn fails only that
+  request and condemns only that isolate, and the process keeps serving.
 
 ## API
 

@@ -570,6 +570,10 @@ struct Worker::Isolate::Impl {
   // Set of error log lines that should not be logged again.
   kj::HashSet<kj::String> errorOnceDescriptions;
 
+  // See Worker::Isolate::condemn(). Guarded by its own mutex rather than the isolate lock because
+  // requireNotCondemned() runs before the isolate lock is taken.
+  kj::MutexGuarded<kj::Maybe<kj::Exception>> condemnedReason;
+
   // Atomically incremented upon every successful lock. The ThreadProgressCounter in Impl::Lock
   // registers a reference to `lockSuccessCounter` as the thread's progress counter during a lock
   // attempt. This allows watchdogs to see evidence of forward progress in other threads, even if
@@ -4543,6 +4547,24 @@ kj::Own<const Worker::Script> Worker::Isolate::newScript(kj::StringPtr scriptId,
 
 void Worker::Isolate::completedRequest() const {
   limitEnforcer->completedRequest(id);
+}
+
+void Worker::Isolate::condemn(kj::Exception reason) const {
+  auto locked = impl->condemnedReason.lockExclusive();
+  if (*locked == kj::none) {
+    KJ_LOG(ERROR, "isolate condemned; it will not run JS again", id, reason);
+    *locked = kj::mv(reason);
+  }
+}
+
+void Worker::Isolate::requireNotCondemned() const {
+  KJ_IF_SOME(reason, *impl->condemnedReason.lockShared()) {
+    kj::throwFatalException(reason.clone());
+  }
+}
+
+bool Worker::Isolate::isCondemned() const {
+  return *impl->condemnedReason.lockShared() != kj::none;
 }
 
 bool Worker::Isolate::isInspectorEnabled() const {
