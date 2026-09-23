@@ -22,9 +22,11 @@
 #define PTE_P (1UL << 0)
 #define PTE_W (1UL << 1)
 #define PTE_U (1UL << 2)
+#define PTE_WALL (1UL << 9)      // CPU-ignored software bit: W withheld by the host-frame wall
 #define PTE_NX (1UL << 63)
 #define PTE_PKEY_SHIFT 59        // bits 62:59 hold the page's protection key
 #define PTE_PKEY_MASK (0xfUL << PTE_PKEY_SHIFT)
+#define GK_MAP_WALLED 8          // map4k_root flag: host-writable page, W withheld (PTE_WALL)
 #define PF_ERR_WR (1UL << 1)     // #PF error code: the access was a write
 #define PF_ERR_PK (1UL << 5)     // #PF error code: protection-key violation
 #define CR0_PE (1UL << 0)
@@ -545,23 +547,33 @@ static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
   // `flags` is a protection bitmask: 1=read, 2=write, 4=execute. Honor it so
   // W^X holds: code is mapped executable but not writable, data writable but
   // not executable. KVM also enforces the host VMA's real protection.
+  // GK_MAP_WALLED marks a page the host allows writes to whose W this vCPU's
+  // host-frame wall withholds: it is mapped without W and tagged PTE_WALL so
+  // wall_lower can give W back in place.
   uint64_t pte = (va & ~0xfffULL) | PTE_P;
   if (cls != GK_PROT_SUPER) pte |= PTE_U;  // user pages only; supervisor clears U
   if (flags & 2) pte |= PTE_W;
+  if (flags & GK_MAP_WALLED) pte |= PTE_WALL;
   if (!(flags & 4)) pte |= PTE_NX;
   pte |= ((uint64_t)pkey << PTE_PKEY_SHIFT) & PTE_PKEY_MASK;
   pt[(va >> 12) & 0x1ff] = pte;
   return 0;
 }
 
-// Clear the PTEs of [s, e) (page-aligned) in a root, to reflect an mprotect,
-// munmap or fixed mmap. Walks the hierarchy and skips a whole 512GiB, 1GiB or
-// 2MiB range at once where no table exists beneath it, so reflecting a change
-// over a large, sparsely committed reservation costs in proportion to what is
-// mapped, not to the range. Leaves intermediate tables in place. Caller holds
-// G->lock.
+// What a page-table walk over a range does to each leaf PTE it reaches.
+enum {
+  PTE_OP_UNMAP,       // clear the entry: reflect an mprotect, munmap or fixed mmap
+  PTE_OP_WALL_RAISE,  // present and writable: withhold W, tag PTE_WALL (see wall_raise)
+  PTE_OP_WALL_LOWER,  // present and PTE_WALL: give W back, untag (see wall_lower)
+};
+
+// Apply `op` to the leaf PTEs of [s, e) (page-aligned) in a root. Walks the
+// hierarchy and skips a whole 512GiB, 1GiB or 2MiB range at once where no
+// table exists beneath it, so a walk over a large, sparsely committed
+// reservation costs in proportion to what is mapped, not to the range. Leaves
+// intermediate tables in place and never allocates. Caller holds G->lock.
 #define GK_NEXT_BOUNDARY(v, bits) ((((v) >> (bits)) + 1) << (bits))
-static void unmap_range_root(uint64_t *root, uintptr_t s, uintptr_t e) {
+static void pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op) {
   for (uintptr_t v = s; v < e;) {
     uint64_t pml4e = root[(v >> 39) & 0x1ff];
     if (!(pml4e & PTE_P)) { v = GK_NEXT_BOUNDARY(v, 39); continue; }
@@ -572,25 +584,49 @@ static void unmap_range_root(uint64_t *root, uintptr_t s, uintptr_t e) {
     uint64_t pde = pd[(v >> 21) & 0x1ff];
     if (!(pde & PTE_P)) { v = GK_NEXT_BOUNDARY(v, 21); continue; }
     uint64_t *pt = (uint64_t *)(uintptr_t)(pde & ~0xfffULL);
-    pt[(v >> 12) & 0x1ff] = 0;
+    uint64_t *pte = &pt[(v >> 12) & 0x1ff];
+    switch (op) {
+      case PTE_OP_UNMAP:
+        *pte = 0;
+        break;
+      case PTE_OP_WALL_RAISE:
+        if ((*pte & (PTE_P | PTE_W)) == (PTE_P | PTE_W)) *pte = (*pte & ~PTE_W) | PTE_WALL;
+        break;
+      case PTE_OP_WALL_LOWER:
+        if ((*pte & (PTE_P | PTE_WALL)) == (PTE_P | PTE_WALL)) *pte = (*pte & ~PTE_WALL) | PTE_W;
+        break;
+    }
     v += 0x1000;
   }
 }
 
-// Reflect a host protection or mapping change over [s, e) into every root that
-// may hold PTEs for it: the base root (whose subtrees every arena root shares
-// for addresses outside arenas) and each arena whose reservation the range
-// overlaps (their private subtrees are reachable from no other root). A stale
-// PTE over a page the host has decommitted would otherwise make the guest's
-// next access an unrecoverable KVM_RUN EFAULT rather than a demand fault.
-// Caller holds G->lock.
-static void unmap_range_all(uintptr_t s, uintptr_t e) {
-  unmap_range_root(G->pml4, s, e);
+// Apply `op` over [s, e) in every root that may hold PTEs for it: the base
+// root (whose subtrees every arena root shares for addresses outside arenas)
+// and each arena whose reservation the range overlaps (their private subtrees
+// are reachable from no other root). Caller holds G->lock.
+static void pte_range_all(uintptr_t s, uintptr_t e, int op) {
+  pte_range_root(G->pml4, s, e, op);
   for (int i = 0; i < G->arena_n; i++) {
     gk_arena *a = G->arenas[i];
     uintptr_t lo = s > a->base ? s : a->base, hi = e < a->end ? e : a->end;
-    if (lo < hi) unmap_range_root(a->pml4, lo, hi);
+    if (lo < hi) pte_range_root(a->pml4, lo, hi, op);
   }
+}
+
+// Reflect a host protection or mapping change over [s, e) by dropping every
+// PTE any root holds for it (see pte_range_all), so the guest's next access
+// demand-faults and re-derives the mapping from the host. A stale PTE over a
+// page the host has decommitted would otherwise make that access an
+// unrecoverable KVM_RUN EFAULT rather than a demand fault. Caller holds
+// G->lock.
+static void unmap_range_all(uintptr_t s, uintptr_t e) {
+  pte_range_all(s, e, PTE_OP_UNMAP);
+}
+
+// The same for one root only: an arena root being built or torn down, whose
+// private subtree no other root reaches. Caller holds G->lock.
+static void unmap_range_root(uint64_t *root, uintptr_t s, uintptr_t e) {
+  pte_range_root(root, s, e, PTE_OP_UNMAP);
 }
 
 // ---- the MMU layer: interval-tree memslot manager --------------------------
@@ -1143,9 +1179,12 @@ static int demand_map(gk_thread *t, uintptr_t addr) {
   // Inside this vCPU's host-frame wall the page is mapped without write
   // permission whatever the host has: readable (a conservative GC scan reads
   // the caller's frames) but not writable by the turn. A write fault there
-  // never reaches this point (see run_vcpu), so only reads are mapped.
-  if (page >= t->ro_lo && page < t->ro_hi) perms &= ~2;
-  int r = map4k_root(root, page, (uint64_t)perms, pkey);  // honor R/W/X for W^X
+  // never reaches this point (see run_vcpu), so only reads are mapped. A page
+  // the host does allow writes to is tagged PTE_WALL, so that wall_lower can
+  // give W back in place instead of the page re-faulting after the turn.
+  uint64_t flags = (uint64_t)perms;
+  if (page >= t->ro_lo && page < t->ro_hi && (perms & 2)) flags = (flags & ~2ULL) | GK_MAP_WALLED;
+  int r = map4k_root(root, page, flags, pkey);  // honor R/W/X for W^X
   if (r >= 0) {
     G->demand_ok++;
     // A base-root mapping that populated a fresh top-level entry is not yet in
@@ -2256,33 +2295,40 @@ static int stack_wall_bounds(gk_thread *t, uintptr_t caller_sp, uintptr_t top,
   return 0;
 }
 
-// Raise the wall for this thread's turn: record the window and drop the PTEs
-// every root holds for it, so that pages the host (or an earlier turn) left
-// mapped writable re-fault under the window's read-only policy. The drop uses
-// the same discipline as a host decommit (unmap_range_all: base root and any
-// arena root sharing the range), which keeps the guest's next access a demand
-// fault rather than a stale-PTE access. This vCPU's TLB may still hold
-// writable translations of those pages from an earlier turn, so it is flushed
-// too; no other vCPU's translations are touched, as the wall is this vCPU's
-// alone (see above).
+// Raise the wall for this thread's turn: record the window and withhold write
+// permission on every writable PTE any root holds for it, tagging each one
+// PTE_WALL (pte_range_all: the base root and any arena root sharing the range,
+// the same set a host decommit is reflected into). The PTEs stay present, so
+// the few caller-stack pages a turn touches keep their translations from turn
+// to turn; dropping them instead would make each one re-fault every turn, and
+// every demand fault reads /proc/self/maps, which is long in this process.
+// Pages in the window that are not mapped yet fault in without W through
+// demand_map. This vCPU's TLB may still hold writable translations of the
+// window from an earlier turn, so it is flushed too; no other vCPU's
+// translations are touched, as the wall is this vCPU's alone (see above).
 static int wall_raise(gk_thread *t, uintptr_t lo, uintptr_t hi) {
   if (lo >= hi) return 0;
   pthread_mutex_lock(&G->lock);
   t->ro_lo = lo;
   t->ro_hi = hi;
-  unmap_range_all(lo, hi);
+  pte_range_all(lo, hi, PTE_OP_WALL_RAISE);
   pthread_mutex_unlock(&G->lock);
   return run_stub(t, gk_flush_stub, 0, 0, PORT_FLUSH, "flush");
 }
 
-// Lower the wall after the turn: drop the read-only PTEs so the next guest
-// entry on this thread (a ring-0 run, or a turn with a different window)
-// re-derives the pages' mappings from the host protection, and clear the
-// window.
+// Lower the wall after the turn: give write permission back to every PTE the
+// wall withheld it from (those tagged PTE_WALL, by wall_raise or by demand_map
+// during the turn) and clear the window. A page the host allows no write on
+// was never tagged and stays as it is, so the window's PTEs again mirror the
+// host protection. This vCPU's TLB is not flushed: its read-only translations
+// of the window are what the next ring-3 turn wants anyway (wall_raise
+// flushes before the window can differ), and a ring-0 run in between that
+// writes through one takes a spurious #PF, which the fault path resolves by
+// re-mapping against the now-writable PTE.
 static void wall_lower(gk_thread *t) {
   if (t->ro_lo >= t->ro_hi) return;
   pthread_mutex_lock(&G->lock);
-  unmap_range_all(t->ro_lo, t->ro_hi);
+  pte_range_all(t->ro_lo, t->ro_hi, PTE_OP_WALL_LOWER);
   t->ro_lo = t->ro_hi = 0;
   pthread_mutex_unlock(&G->lock);
 }
