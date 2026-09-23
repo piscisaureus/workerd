@@ -59,13 +59,24 @@ long gk_run_here(long (*fn)(void *), void *arg);
 // or write gk's supervisor pages (handler text, GDT/IDT, exception stacks, and
 // gk's own control data: the arena registry, page-table allocator, memslot
 // tree, per-thread records and the rest) or gk's refused pages (the page
-// tables themselves, kvm_run, the host-side gk stacks). This makes the
-// per-isolate page-table walls hold even against arbitrary code execution
-// inside an isolate: ring-3 code can neither reload CR3 nor rewrite the
-// supervisor page tables, nor the bookkeeping that selects them. Any such
-// attempt faults and the call returns GK_EFAULT (see gk_fault_addr); the
-// process survives. Legitimate syscalls are forwarded and the function returns
-// to ring 3 as usual.
+// tables themselves, kvm_run, the host-side gk stacks). Any such attempt
+// faults and the call returns GK_EFAULT (see gk_fault_addr); the process
+// survives. Legitimate syscalls are forwarded and the function returns to
+// ring 3 as usual.
+//
+// What this guarantees, and what it does not. The ring-3 wall protects two
+// things against arbitrary code execution inside an isolate: every other
+// isolate's arena (ring-3 code can neither reload CR3 nor rewrite the page
+// tables or the bookkeeping that selects them, so the per-isolate walls hold),
+// and gk's own control state listed above. It does not protect the shared,
+// non-arena memory of the runtime: the C++/KJ heap, glibc, and every guest
+// thread's stack -- including the stack of the thread that called
+// gk_run_here_user, which fn runs on -- are ordinary user-mapped pages that
+// ring-3 code can read and write. A sandbox escape that gains arbitrary code
+// execution can therefore corrupt shared runtime state, and via a host return
+// address on that shared stack may reach host execution. Containing that
+// requires keeping the runtime's own memory (or at least its stacks and
+// control-flow data) out of ring 3's reach, which is remaining work.
 //
 // Threads created inside the guest run at their creator's privilege: a thread
 // a ring-3 fn creates (clone/clone3) starts at ring 3 too, and so do its own

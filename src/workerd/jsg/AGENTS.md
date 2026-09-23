@@ -18,7 +18,7 @@ Macro-driven C++/V8 binding layer: declares C++ types as JS-visible resources/st
 | `promise.h`      | `jsg::Promise<T>` wrapping KJ promises ↔ JS promises; resolver pairs, coroutine integration                                |
 | `modules.h`      | Legacy `ModuleRegistry`: ESM/CJS module resolution, evaluation, top-level await handling                                    |
 | `modules-new.h`  | New module registry (`jsg::modules::ModuleRegistry`): URL-based specifiers, shareable across isolate replicas, gated by the `new_module_registry` compat flag via `workerd::isNewModuleRegistryEnabled()`. Full reference: `docs/reference/detail/new-module-registry.md` |
-| `setup.h`        | `V8System`, `IsolateBase`, `JsgConfig`; process-level V8 init; `JSG_DECLARE_ISOLATE_TYPE`                                   |
+| `setup.h`        | `V8System`, `IsolateBase`, `JsgConfig`; process-level V8 init; `JSG_DECLARE_ISOLATE_TYPE`; guest-kernel isolate placement (`GuestArena`, `ArenaPageAllocator`, `IsolatePlacement`, `newIsolateGroup()`) |
 | `function.h`     | `jsg::Function<Sig>` wrapping C++ callables ↔ JS functions                                                                 |
 | `memory.h`       | `MemoryTracker`, `JSG_MEMORY_INFO` macro; heap snapshot support                                                             |
 | `rtti.capnp`     | Cap'n Proto schema for type introspection; consumed by `types/` for TS generation                                           |
@@ -61,6 +61,42 @@ class MyType: public jsg::Object {
 - `jsg::Lock&` is the JS execution context; thread via method params
 - `TypeHandler<T>&` as trailing param gives manual conversion access
 - Compat flags param on `JSG_RESOURCE_TYPE` gates members conditionally
+
+## GUEST-KERNEL ISOLATE PLACEMENT (experimental)
+
+When workerd is built with the guest kernel (`WORKERD_HAS_GUEST_KERNEL`, see
+`src/workerd/experimental/guest-kernel/`) and `WORKERD_EXPERIMENTAL_GUEST_KERNEL` is set
+(`jsg::isGuestKernelEnabled()`), each isolate's memory is placed in a private KVM arena so that
+guest execution for one isolate cannot address another's. The pieces, all in `setup.{h,c++}` and
+`jsg.{h,c++}`:
+
+| Piece                                      | Role                                                                                                                                                                                                                                       |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GuestArena`                               | Owns one `gk_arena`: a PROT_NONE reservation with its own guest page-table root. Holds the isolate group's V8 sandbox, and hands the reservation's unused tail to V8 through an `ArenaPageAllocator`. Must outlive the group placed in it. |
+| `ArenaPageAllocator`                       | A `v8::PageAllocator` over the arena tail. Routes V8's out-of-sandbox memory -- trusted range, code range, the isolate's pointer tables, and the cppgc heap -- into the arena, so it gets the same hardware isolation as the sandbox.     |
+| `IsolatePlacement` / `newIsolateGroup()`   | Where a new isolate lives: its `v8::IsolateGroup` plus, with gk enabled, the `GuestArena` holding that group. `newIsolateGroup()` creates a fresh group per isolate in a new private arena; otherwise it returns the default shared group. |
+| `GuestArenaScope` (entered by `jsg::Lock`) | Makes the locked isolate's arena the thread's active one (`gk_arena_enter`) for the lock's lifetime and restores the previous arena afterwards, so locks on different isolates nest. A no-op for isolates without an arena.               |
+
+Invariants:
+
+- **`jsg::Lock` enters the isolate's arena.** `Lock` holds a `GuestArenaScope` declared after the
+  V8 `Locker`, so the arena is entered once the isolate is locked and left before it is unlocked.
+  Any guest execution for an isolate (the JS turn `IoContext::runImpl` runs via
+  `gk_run_here_user`) MUST happen under that isolate's `jsg::Lock`; that is what makes the
+  isolate's sandbox addressable from the guest, and every other isolate's unaddressable.
+- **One arena per isolate group, one group per isolate.** Isolates created through
+  `newIsolateGroup()` never share a group (or a sandbox) with another isolate when gk is enabled.
+- **The arena outlives the group.** V8 adopts the arena's reservation for the sandbox and never
+  unmaps it; `IsolateBase` owns the `GuestArena` and destroys it after the isolate.
+- **The guest wall is per arena, not per process.** It isolates arenas from each other and
+  protects gk's control state; the shared runtime memory (C++/KJ heap, thread stacks) stays
+  user-mapped. See `experimental/guest-kernel/gk.h` for the exact guarantee.
+
+`gk_init()` must run before V8 starts (it maps the address space as it is then);
+`server/workerd.c++` does this at startup when the environment variable is set.
+`guest-arena-test.c++` is the real-V8 check that each isolate's sandbox, code, bytecode, cppgc
+objects and pointer tables lie in its own arena and fault from the guest, at ring 0 and ring 3,
+under another isolate's lock.
 
 ## Errors
 

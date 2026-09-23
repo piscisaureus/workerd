@@ -85,6 +85,16 @@ hardware:
   ring-3 escape with an arbitrary write can neither rewrite the walls nor
   redirect a thread to another root. The test writes to each structure from
   ring 3 and checks the fault, then reads and writes from ring 0.
+
+  This is the extent of the guarantee: cross-arena isolation and gk's own
+  control state hold against arbitrary code execution inside an isolate. The
+  shared, non-arena runtime memory does not: the C++/KJ heap, glibc, and every
+  vCPU's guest stack (including the caller's stack that `gk_run_here_user` runs
+  the turn on) are user-mapped and readable and writable from ring 3. A sandbox
+  escape that reaches arbitrary code execution can therefore corrupt shared
+  runtime state and, through a host return address on that shared stack, may
+  reach host execution. Keeping the runtime's own memory out of ring 3's reach
+  is remaining work (see Limitations).
 - **Threads as vCPUs.** Each host thread that enters the guest gets its own
   vCPU, stack and TLS base, sharing the VM and memory. Four threads run in the
   guest concurrently, and two threads each locked into their own arena run at
@@ -128,7 +138,13 @@ hardware:
   is left keyless (the `pkey_mprotect` reaches the host as a plain `mprotect`) so
   KVM's page backing never pkey-faults. A single switch (`GK_VIRTUALIZE_PKEYS`)
   turns the whole scheme off, since gk already isolates by page-table root and
-  does not depend on the keys for security.
+  does not depend on the keys for security. One exception: in workerd the
+  pointer tables live in the arena tail (V8 patch 0048) and are keyed by a
+  `pkey_mprotect` that V8 issues directly on the host during isolate
+  initialization, outside any guest entry, so gk never sees that call, does not
+  learn the key, and does not reflect it into the guest PTEs for those pages.
+  The tables are still isolated by the arena's page-table root; only the key is
+  not virtualized for them.
 - **Guest on the caller's stack.** `gk_run(fn)` runs the guest on a private
   per-vCPU stack. `gk_run_here(fn)` instead runs it on the calling thread's own
   stack -- the guest's `rsp` continues from the call site, as a native call of
@@ -163,6 +179,14 @@ decides the overall cost.
 
 ## Limitations (remaining work)
 
+- **The shared runtime memory is reachable from ring 3.** The ring-3 wall
+  covers other isolates' arenas and gk's control state, not the runtime's own
+  memory: the C++/KJ heap, glibc, and every guest thread's stack (the JS turn
+  runs on the calling thread's stack, above host frames) are user-mapped. Code
+  execution inside an isolate can corrupt that shared state and, via a host
+  return address on the stack, potentially reach host execution. Confining it
+  needs the runtime's memory, or at least its stacks and control-flow data, kept
+  out of ring 3's reach.
 - **No cross-vCPU TLB shootdown IPIs yet.** Adding mappings needs none (a
   not-present entry has nothing stale to flush), which is why dynamic `mmap`
   and per-thread stacks work across vCPUs. Removing or shrinking a mapping
@@ -214,9 +238,11 @@ What it took, beyond the MMU:
 The JIT works too, with V8's default configuration (no special flags): a
 JIT-optimized hot loop runs to the correct result across repeated runs. W^X plus
 mprotect reflection handles the code pages that flip between writable and
-executable, and the protection keys V8's sandbox uses on its code and pointer
-tables are virtualized into the guest (see the PKU point above), so the isolate
-runs with the sandbox enabled and its keys honored, not stripped.
+executable, and the protection keys V8's sandbox assigns from inside the guest
+are virtualized into it (see the PKU point above, including the exception for
+the pointer tables, which are keyed from the host and so are isolated by the
+arena's root only), so the isolate runs with the sandbox enabled and its keys
+honored, not stripped.
 
 V8 also runs **multi-threaded** now, with its default platform: the background
 GC/compiler worker threads V8 spawns are intercepted at `clone`/`clone3` and
