@@ -100,6 +100,11 @@ build:unix --config=perfetto
 # context, so workerd is compiled with the same object layouts as the V8 library.
 build --@v8//:v8_enable_sandbox=True
 
+# Give each V8 IsolateGroup its own pointer-compression cage (and sandbox) instead of a single
+# shared cage, so isolates can be placed in separate address regions. This defines
+# V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES; IsolateGroup::Create() is a no-op for behavior until used.
+build --@v8//:v8_enable_pointer_compression_shared_cage=False
+
 # Increasing the optimization level of V8 significantly speeds up tests using V8 a lot, especially
 # python tests. This is useful for both CI and local development and enabled by default, but still
 # kept in a separate configuration to make it easy to disable.
