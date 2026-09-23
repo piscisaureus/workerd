@@ -6,11 +6,12 @@ isolate a private memory arena backed by a separate guest page-table root. The
 goal is per-isolate, hardware-enforced memory isolation with no fixed cap on
 the number of isolates, using upstream KVM rather than a bespoke hypervisor.
 
-This is a research prototype. It is x86-64 Linux only, needs read/write access
-to `/dev/kvm` (no root, no kernel module), and is built with the included
-Makefile rather than Bazel. It is not wired into the workerd runtime; the
-`BUILD.bazel` here only marks the directory as its own package so the runtime
-build never globs these sources.
+This is a research prototype. It is x86-64 Linux only and needs read/write
+access to `/dev/kvm` (no root, no kernel module). The library builds and runs
+standalone with the included Makefile (`make run`); on x86-64 Linux it is also
+built as a Bazel `cc_library` and wired into the workerd runtime behind the
+`WORKERD_EXPERIMENTAL_GUEST_KERNEL` environment variable, which runs each
+isolate's JS turn at guest ring 3.
 
 ## Files
 
@@ -21,6 +22,12 @@ build never globs these sources.
 - `fault-test.sh` / `fault-test.capnp` — end-to-end check against a built
   workerd that a fault inside the guest during a JS turn fails only that
   request and condemns only that isolate, and the process keeps serving.
+- `surface-test.sh` / `surface-test.capnp` / `surface-test.js` / `add.wasm` /
+  `oob.wasm` — end-to-end check against a built workerd that a broad V8 surface
+  (Wasm including an out-of-bounds trap, WebCrypto, irregexp and a JIT-heavy
+  loop) runs correctly with the worker's JS turn at guest ring 3, and that a
+  Wasm bounds violation surfaces as a `WebAssembly.RuntimeError` rather than a
+  guest fault.
 
 ## API
 
@@ -184,8 +191,6 @@ decides the overall cost.
   involved; see the signal-safety note in `gk.c`.) A production MMU could track
   exact VMAs (see the FreeBSD `sys/vm` note in `gk.c`) for density and add
   per-range cross-vCPU shootdowns; both are refinements, not correctness fixes.
-- **Not integrated with the workerd build.** Integrating with V8's cage would
-  require the V8 sandbox to be enabled in the build first.
 
 ## Running V8 inside gk (status)
 
