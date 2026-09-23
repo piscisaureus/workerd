@@ -28,7 +28,6 @@
 #define CR4_OSXMMEXCPT (1UL << 10)
 #define CR4_OSXSAVE (1UL << 18)
 #define CR4_PKE (1UL << 22)
-#define CR4_PKE (1UL << 22)
 #define EFER_LME (1UL << 8)
 #define EFER_LMA (1UL << 10)
 #define EFER_SCE (1UL << 0)
@@ -168,103 +167,213 @@ static void unmap4k_root(uint64_t *root, uint64_t va) {
   pt[(va >> 12) & 0x1ff] = 0;
 }
 
-// ---- the MMU layer: chunk-based memslot manager ----------------------------
-// guest-physical == host-virtual everywhere. KVM memslots map guest-physical to
-// host-virtual; we create one memslot per fixed, aligned CHUNK of the address
-// space, on demand. Because chunks are aligned and disjoint, memslots never
-// overlap (KVM rejects overlapping memslots), and every mapped PTE is guaranteed
-// to have a backing memslot -- without one KVM takes the MMIO/emulation path and
-// KVM_RUN returns EFAULT.
+// ---- the MMU layer: interval-tree memslot manager --------------------------
+// guest-physical == host-virtual everywhere, so a KVM memslot maps a range of
+// guest-physical to the identical host-virtual range. Backed ranges ("regions")
+// are tracked in an interval tree (a treap keyed by start) of non-overlapping
+// [start, end) windows; every mapped PTE must have a backing memslot, or KVM
+// takes the MMIO/emulation path and KVM_RUN returns EFAULT.
 //
-// TODO: this fixed-chunk scheme is deliberately simple and was chosen to get V8
-// running. A production MMU should track the guest's VMAs in an interval tree
-// (cf. FreeBSD sys/vm vm_map, 2-clause BSD) and create/split/merge memslots that
-// follow mmap/mprotect/munmap exactly: reflecting protection changes, freeing
-// memslots and PTEs on unmap, and issuing cross-vCPU TLB shootdowns. It should
-// also cache /proc/self/maps lookups rather than reparsing per fault. Revisit
-// the algorithm and pick something more optimal then.
-#define GK_CHUNK (32UL << 20)
-#define GK_CHUNK_MASK (GK_CHUNK - 1)
-#define GK_CHUNK_SLOTS (1 << 16)  // open-addressing hash set (power of two)
-static uintptr_t g_chunk[GK_CHUNK_SLOTS];  // chunk base, or 0 for empty
+// Memory is backed one aligned GK_BACK_WIN window at a time (region_ensure
+// rounds outward to the window), rather than one memslot per exact host mapping.
+// This is a correctness workaround, not just a speed choice, and it is not fully
+// understood: with tight, exact-bounds memslots that get created and extended
+// page by page as brk/mmap grow a live mapping under the running guest, the
+// memory being grown ends up corrupted (glibc's heap aborts in sysmalloc). The
+// failure is deterministic and the guest is single-vCPU here, and at the abort
+// every mapped page still has a correct backing memslot -- so this looks like an
+// ordering effect in how KVM applies an on-demand memslot creation next to
+// memory the guest is actively using, not a missing or wrong mapping. Backing a
+// whole aligned window on first touch makes such creations rare: a mapping's
+// later growth lands inside a memslot that already exists, so we do not mutate
+// the memory topology mid-operation. It reduces how often we create memslots
+// under the live guest rather than proving that operation safe.
+// TODO: root-cause the on-demand memslot-creation hazard (KVM memslot update /
+// EPT invalidation ordering) so exact-bounds VMA tracking can be used safely.
+//
+// Because everything is identity-mapped an oversized window that spills into an
+// unmapped hole is harmless: the guest never has a PTE there, so KVM never
+// faults it in. Protection is not cached on the region; the PTE carries the live
+// host protection, re-read on every fault.
+//
+// Memslots are created once and never deleted: an identity memslot validly backs
+// its window whether or not the host currently has memory there, so mprotect and
+// munmap only need to drop the guest PTEs (see forward_syscall), not the memslot.
+//
+// TODO: 2MB windows over-back sparsely committed reservations. A production MMU
+// could track exact VMAs (cf. FreeBSD's vm_map RB tree, sys/vm, 2-clause BSD)
+// once the hazard above is understood, and issue cross-vCPU TLB shootdowns.
+#define GK_BACK_WIN (2UL << 20)   // memslot backing granularity (2MB, aligned)
+typedef struct gk_region {
+  uintptr_t start, end;   // [start, end), GK_BACK_WIN-aligned
+  int slot;               // KVM memslot id backing this region
+  unsigned prio;          // treap heap priority
+  struct gk_region *l, *r;
+} gk_region;
+static gk_region *g_regions;      // treap root
 
-static int chunk_has(uintptr_t base) {
-  size_t i = (base / GK_CHUNK) & (GK_CHUNK_SLOTS - 1);
-  for (size_t n = 0; n < GK_CHUNK_SLOTS; n++, i = (i + 1) & (GK_CHUNK_SLOTS - 1)) {
-    if (g_chunk[i] == 0) return 0;
-    if (g_chunk[i] == base) return 1;
+// xorshift32 PRNG for treap priorities. Caller holds g_lock.
+static unsigned gk_rand(void) {
+  static unsigned s = 0x9e3779b9u;
+  s ^= s << 13;
+  s ^= s >> 17;
+  s ^= s << 5;
+  return s;
+}
+
+// Treap: BST ordered by `start`, max-heap ordered by `prio`.
+static gk_region *rot_r(gk_region *n) {
+  gk_region *l = n->l;
+  n->l = l->r;
+  l->r = n;
+  return l;
+}
+static gk_region *rot_l(gk_region *n) {
+  gk_region *r = n->r;
+  n->r = r->l;
+  r->l = n;
+  return r;
+}
+static gk_region *treap_insert(gk_region *root, gk_region *node) {
+  if (!root) return node;
+  if (node->start < root->start) {
+    root->l = treap_insert(root->l, node);
+    if (root->l->prio > root->prio) root = rot_r(root);
+  } else {
+    root->r = treap_insert(root->r, node);
+    if (root->r->prio > root->prio) root = rot_l(root);
+  }
+  return root;
+}
+
+// The region containing `addr`, or NULL. Caller holds g_lock.
+static gk_region *region_find(uintptr_t addr) {
+  gk_region *n = g_regions;
+  while (n) {
+    if (addr < n->start) n = n->l;
+    else if (addr >= n->end) n = n->r;
+    else return n;
+  }
+  return NULL;
+}
+
+// The region with the smallest start strictly greater than `s`, or NULL (the
+// in-order successor of `s` in the start-ordered tree). Caller holds g_lock.
+static gk_region *region_succ(uintptr_t s) {
+  gk_region *n = g_regions, *best = NULL;
+  while (n) {
+    if (n->start > s) { best = n; n = n->l; }
+    else n = n->r;
+  }
+  return best;
+}
+
+// Create one memslot-backed region for [s, e). Caller holds g_lock and has
+// ensured [s, e) does not overlap any existing region.
+static int region_add(uintptr_t s, uintptr_t e) {
+  int slot = g_next_slot++;
+  struct kvm_userspace_memory_region r = {.slot = (uint32_t)slot,
+                                          .guest_phys_addr = s,
+                                          .memory_size = e - s,
+                                          .userspace_addr = s};
+  if (ioctl(g_vmfd, KVM_SET_USER_MEMORY_REGION, &r) < 0) {
+    if (g_dbg)
+      fprintf(stderr, "[gk] memslot %d [%#lx,%#lx) failed: %s\n", slot,
+              (unsigned long)s, (unsigned long)e, strerror(errno));
+    g_next_slot--;
+    return -1;
+  }
+  gk_region *n = calloc(1, sizeof *n);
+  if (!n) {
+    r.memory_size = 0;
+    ioctl(g_vmfd, KVM_SET_USER_MEMORY_REGION, &r);
+    g_next_slot--;
+    return -1;
+  }
+  n->start = s;
+  n->end = e;
+  n->slot = slot;
+  n->prio = gk_rand();
+  g_regions = treap_insert(g_regions, n);
+  return 0;
+}
+
+// Ensure memslots back all of [s, e), rounded outward to GK_BACK_WIN windows.
+// Additive: existing regions are kept and only the gaps between them get fresh
+// memslots. Caller holds g_lock.
+static int region_ensure(uintptr_t s, uintptr_t e) {
+  s &= ~(GK_BACK_WIN - 1);
+  e = (e + GK_BACK_WIN - 1) & ~(GK_BACK_WIN - 1);
+  while (s < e) {
+    gk_region *have = region_find(s);
+    if (have) {  // already backed; skip past it
+      s = have->end;
+      continue;
+    }
+    uintptr_t gap_end = e;
+    gk_region *nx = region_succ(s);  // stop the new region before the next one
+    if (nx && nx->start < gap_end) gap_end = nx->start;
+    if (region_add(s, gap_end) < 0) return -1;
+    s = gap_end;
   }
   return 0;
 }
-static void chunk_put(uintptr_t base) {
-  size_t i = (base / GK_CHUNK) & (GK_CHUNK_SLOTS - 1);
-  for (size_t n = 0; n < GK_CHUNK_SLOTS; n++, i = (i + 1) & (GK_CHUNK_SLOTS - 1)) {
-    if (g_chunk[i] == 0) { g_chunk[i] = base; return; }
-    if (g_chunk[i] == base) return;
-  }
-}
 
-// Ensure a KVM memslot backs the chunk containing `va`. Caller holds g_lock.
-static int mmu_ensure_chunk(uintptr_t va) {
-  uintptr_t base = va & ~GK_CHUNK_MASK;
-  if (base == 0) return 0;  // the [0, GK_CHUNK) chunk is never used
-  if (chunk_has(base)) return 0;
-  struct kvm_userspace_memory_region r = {.slot = (uint32_t)g_next_slot,
-                                          .guest_phys_addr = base,
-                                          .memory_size = GK_CHUNK,
-                                          .userspace_addr = base};
-  if (ioctl(g_vmfd, KVM_SET_USER_MEMORY_REGION, &r) < 0) return -1;
-  g_next_slot++;
-  chunk_put(base);
-  return 0;
-}
-
-// Map one guest page into a root, creating its chunk memslot first. Caller
-// holds g_lock.
-static int mmu_map_into(uint64_t *root, uintptr_t va, uint64_t flags) {
-  if (mmu_ensure_chunk(va) < 0) return -1;
-  return map4k_root(root, va, flags);
-}
-static int mmu_map(uintptr_t va, uint64_t flags) {
-  return mmu_map_into(g_pml4, va, flags);
-}
-static int mmu_map_range(uintptr_t s, uintptr_t e, uint64_t flags) {
-  for (uintptr_t v = s & ~0xfffUL; v < e; v += 0x1000)
-    if (mmu_map(v, flags) < 0) return -1;
-  return 0;
-}
-
-// Is the host page at `page` currently accessible (committed)? V8 reserves huge
-// PROT_NONE regions and commits sub-ranges; we must map only committed pages.
-// TODO: reparsing /proc/self/maps per fault is O(regions); cache it.
-// Returns 0 if the page is not host-accessible, else bit0=readable, bit1=writable.
-static int host_page_perms(uintptr_t page) {
+// Look up the host mapping containing `page` in /proc/self/maps. V8 reserves
+// huge PROT_NONE regions and commits sub-ranges; only committed pages may be
+// mapped. On success sets [*rs, *re) to the mapping's bounds and *perms to its
+// protection (bit0=r, bit1=w, bit2=x) and returns 1; returns 0 if `page` is
+// not mapped.
+static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms) {
   FILE *f = fopen("/proc/self/maps", "r");
   if (!f) return 0;
-  char line[512]; uintptr_t s, e; char perms[8] = {0}; int p = 0;
+  char line[512]; uintptr_t s, e; char p[8] = {0}; int found = 0;
   while (fgets(line, sizeof line, f)) {
-    if (sscanf(line, "%lx-%lx %7s", &s, &e, perms) >= 3 && page >= s && page < e) {
-      if (perms[0] == 'r') p |= 1;
-      if (perms[1] == 'w') p |= 2;
-      if (perms[2] == 'x') p |= 4;
+    if (sscanf(line, "%lx-%lx %7s", &s, &e, p) >= 3 && page >= s && page < e) {
+      int m = 0;
+      if (p[0] == 'r') m |= 1;
+      if (p[1] == 'w') m |= 2;
+      if (p[2] == 'x') m |= 4;
+      *rs = s; *re = e; *perms = m;
+      found = 1;
       break;
     }
   }
   fclose(f);
-  return p;
+  return found;
+}
+
+// Eager-map [s, e) into the base root with PTE protection `perms`, backing the
+// containing GK_BACK_WIN windows so later demand faults in the same region find
+// an existing memslot. Caller holds g_lock.
+static int mmu_map_range(uintptr_t s, uintptr_t e, int perms) {
+  if (region_ensure(s, e) < 0) return -1;
+  for (uintptr_t v = s & ~0xfffUL; v < e; v += 0x1000)
+    if (map4k_root(g_pml4, v, (uint64_t)perms) < 0) return -1;
+  return 0;
 }
 
 // Handle a guest page fault: if the faulting page is host-accessible, back it
 // with a memslot and PTE so the guest can retry. Caller must not hold g_lock.
+//
+// The PTE always carries the page's *current* host protection, re-read from
+// /proc/self/maps on every fault, so mprotect/mmap protection changes are
+// honored even if a syscall reflection missed them; a stale read-only PTE on a
+// page the host has made writable would silently drop guest writes.
 static int demand_map(uintptr_t addr) {
   uintptr_t page = addr & ~0xfffUL;
   // A fault at an arena address is a cross-arena access (each arena's own cage
   // is fully mapped in its root); refuse it to preserve isolation.
   if (addr_in_any_arena(page)) return -1;
-  int p = host_page_perms(page);
-  if (!(p & 1)) return -1;  // not host-readable: a genuine fault
+  uintptr_t rs, re; int perms;
+  if (!host_region(page, &rs, &re, &perms) || !(perms & 1))
+    return -1;  // not host-readable: a genuine fault
   pthread_mutex_lock(&g_lock);
-  int r = mmu_map(page, (uint64_t)p);  // honor R/W/X for W^X
+  if (!region_find(page) && region_ensure(page, page + 1) < 0) {
+    pthread_mutex_unlock(&g_lock);
+    return -1;
+  }
+  int r = map4k_root(g_pml4, page, (uint64_t)perms);  // honor R/W/X for W^X
   if (r >= 0) g_demand_ok++;
   pthread_mutex_unlock(&g_lock);
   return r;
@@ -396,8 +505,7 @@ int gk_init(void) {
 
   // The page-table arena is read by the CPU page walker via guest-physical
   // addresses, so it needs memslots (but no PTEs of its own).
-  for (uintptr_t v = g_pt_base; v < g_pt_base + g_pt_bytes; v += GK_CHUNK)
-    if (mmu_ensure_chunk(v) < 0) { g_err = "memslot for PT arena"; return -1; }
+  if (region_ensure(g_pt_base, g_pt_base + g_pt_bytes) < 0) { g_err = "memslot for PT arena"; return -1; }
   // GDT/IDT and the handler text must be present before the first fault.
   if (mmu_map_range(g_gdt_va, g_gdt_va + 0x2000, 1 | 2) < 0) { g_err = "map gdt/idt"; return -1; }
   if (map_handler_text() < 0) { g_err = "map handler text"; return -1; }
@@ -428,22 +536,29 @@ static long forward_syscall(struct kvm_regs *r) {
     if (g_dbg) fprintf(stderr, "[gk] syscall %ld DENIED\n", nr);
     return -GK_EPERM;
   }
-  // pkey_mprotect strips to a plain mprotect: gk isolates via page tables and
-  // arenas, so V8's host-side protection keys are not needed, and stripping them
-  // lets KVM back the guest's writes (V8's default MPK code protection otherwise
-  // faults, because KVM backs the write using the host PKRU, not the guest's).
+  // Isolates are separated by page-table roots, not host protection keys, so
+  // reduce pkey_mprotect to a plain mprotect: the guest PTEs carry the R/W/X
+  // perms and no host-side pkey needs to be assigned.
   long ret;
   if (nr == SYS_pkey_mprotect)
     ret = host_syscall(SYS_mprotect, a1, a2, a3, 0, 0, 0);
   else
     ret = host_syscall(nr, a1, a2, a3, a4, a5, a6);
-  // Reflect protection/mapping changes: drop the guest PTEs for the affected
-  // range so the next access re-faults and demand-maps with the new host
-  // permissions (this is what makes W^X and JIT code work), then flush this
-  // vCPU's TLB. TODO: cross-vCPU shootdown for the multi-threaded case.
-  if (ret == 0 && (nr == SYS_mprotect || nr == SYS_munmap || nr == SYS_pkey_mprotect) && a2 > 0) {
+  // Reflect protection/mapping changes by clearing the guest PTEs for the
+  // affected range so the next access re-faults and demand-maps with the new
+  // host permissions (this is what makes W^X and JIT code work), then flush this
+  // vCPU's TLB. The memslot backing is left in place: guest-physical equals
+  // host-virtual, so a memslot validly covers its range whether or not the host
+  // currently has memory there, and if the range is later remapped at the same
+  // address the same memslot backs it. Deleting and recreating memslots here
+  // instead corrupts memory the guest is actively using.
+  // TODO: cross-vCPU shootdown for the multi-threaded case.
+  if (ret == 0 &&
+      (nr == SYS_mprotect || nr == SYS_munmap || nr == SYS_pkey_mprotect) &&
+      a2 > 0) {
     pthread_mutex_lock(&g_lock);
-    for (uintptr_t v = (uintptr_t)a1 & ~0xfffUL; v < (uintptr_t)a1 + (uintptr_t)a2; v += 0x1000)
+    for (uintptr_t v = (uintptr_t)a1 & ~0xfffUL;
+         v < (uintptr_t)a1 + (uintptr_t)a2; v += 0x1000)
       unmap4k_root(g_pml4, v);
     pthread_mutex_unlock(&g_lock);
     struct kvm_sregs s;
@@ -577,8 +692,9 @@ gk_arena *gk_arena_create(size_t size) {
   a->pml4 = alloc_table();
   a->cage_idx = (int)((va >> 39) & 0x1ff);
   memcpy(a->pml4, g_pml4, 0x1000);  // share the base root's top-level entries
+  if (region_ensure(va, va + size) < 0) { free(a); pthread_mutex_unlock(&g_lock); return NULL; }
   for (uint64_t v = va; v < va + size; v += 0x1000)
-    if (mmu_map_into(a->pml4, v, 1 | 2) < 0) { free(a); pthread_mutex_unlock(&g_lock); return NULL; }
+    if (map4k_root(a->pml4, v, 1 | 2) < 0) { free(a); pthread_mutex_unlock(&g_lock); return NULL; }
   a->cage_entry = a->pml4[a->cage_idx];  // remember the private cage subtree
   if (g_arena_n < GK_MAX_ARENAS) {
     g_arenas[g_arena_n].base = va;

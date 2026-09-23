@@ -63,9 +63,11 @@ hardware:
 - **Demand-paged MMU.** The guest's memory is backed lazily. On a guest page
   fault the in-guest `#PF` handler hypercalls; the host checks the faulting
   address against its own address space and, if committed, backs it with a KVM
-  memslot and a PTE, then the handler `iretq`s to retry. Memslots are created
-  per aligned 32 MiB chunk, so they never overlap and every mapped page is
-  backed. Faults into another arena's region are refused, preserving isolation.
+  memslot and a PTE, then the handler `iretq`s to retry. Backed ranges are
+  tracked in an interval tree (a treap keyed by start) of non-overlapping
+  windows, so every mapped page has a backing memslot. Memory is backed one
+  aligned 2 MiB window at a time; memslots are created once and never deleted.
+  Faults into another arena's region are refused, preserving isolation.
 - **W^X.** Pages are mapped with their host protection: executable pages are not
   writable and writable pages are not executable (NX is enabled in the guest).
   `mprotect` and `munmap` are reflected by dropping the affected guest PTEs and
@@ -109,11 +111,19 @@ decides the overall cost.
 - **Dynamic mappings** that land in a fresh top-level (PML4) entry after an
   arena is created are not reflected into that arena's root. Allocations near
   existing mappings are, because the subtrees are shared.
-- **The MMU is a fixed-chunk scheme.** It reparses `/proc/self/maps` per fault
-  and flushes the whole TLB on each `mprotect`/`munmap`, and only the faulting
-  thread's TLB (no cross-vCPU shootdown). A production MMU should track VMAs in
-  an interval tree (see the FreeBSD `sys/vm` note in `gk.c`) and follow
-  `mmap`/`mprotect`/`munmap` precisely with per-range shootdowns.
+- **The MMU backs whole 2 MiB windows, not exact VMAs.** It reparses
+  `/proc/self/maps` per fault, flushes the whole TLB on each `mprotect`/`munmap`,
+  and only the faulting thread's TLB (no cross-vCPU shootdown). Backing is done
+  in aligned 2 MiB windows rather than exact mapping bounds as a workaround for a
+  hazard that is not yet root-caused: creating tight, exact-bounds memslots and
+  extending them page by page as `brk`/`mmap` grow a live mapping under the
+  running guest deterministically corrupts the memory being grown (glibc's heap,
+  in practice), even though the final backing is consistent. Backing a whole
+  window on first touch makes on-demand memslot creation rare rather than proving
+  it safe; the likely culprit is KVM's handling of an incremental memslot update
+  next to memory the guest is using. A production MMU should track exact VMAs
+  (see the FreeBSD `sys/vm` note in `gk.c`) once that hazard is understood, and
+  follow `mmap`/`mprotect`/`munmap` with per-range shootdowns.
 - **Not integrated with the workerd build.** Integrating with V8's cage would
   require the V8 sandbox to be enabled in the build first.
 
