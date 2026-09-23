@@ -61,6 +61,20 @@ hardware:
   consulted. A decommit is reflected into every arena root, so a stale writable
   entry never survives. This is the isolate-cage primitive; one arena per V8
   isolate holds that isolate's sandbox/cage.
+- **Ring-3 execution and supervisor control data.** `gk_run_user` /
+  `gk_run_here_user` run untrusted code at guest ring 3, where it cannot execute
+  privileged instructions or reload `CR3`. Everything ring 0 relies on is kept
+  out of its reach by a page-class registry consulted whenever a page is mapped:
+  supervisor pages (handler text, GDT/IDT, exception stacks) are mapped with the
+  user bit clear, and refused pages (the page tables, `kvm_run`, gk's host-side
+  stacks) are never mapped at all. gk's own bookkeeping -- the arena registry and
+  structs, the page-table allocator, the memslot tree and its node pool, the
+  registry itself, the vCPU pool and the per-thread records -- lives in one
+  page-padded supervisor control block, and a thread's record is found through a
+  thread-local index that is validated against the thread's kernel tid, so a
+  ring-3 escape with an arbitrary write can neither rewrite the walls nor
+  redirect a thread to another root. The test writes to each structure from
+  ring 3 and checks the fault, then reads and writes from ring 0.
 - **Threads as vCPUs.** Each host thread that enters the guest gets its own
   vCPU, stack and TLS base, sharing the VM and memory. Four threads run in the
   guest concurrently, and two threads each locked into their own arena run at

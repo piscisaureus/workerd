@@ -56,13 +56,16 @@ long gk_run_here(long (*fn)(void *), void *arg);
 // Like gk_run / gk_run_here, but fn runs at guest ring 3 (user mode) instead of
 // ring 0. Untrusted code should run this way: at ring 3 it cannot execute
 // privileged instructions (CR3 reloads, wrmsr, in/out, ...), and it cannot read
-// or write gk's supervisor pages (handler text, GDT/IDT, exception stacks) or
-// gk's refused pages (the page tables themselves, kvm_run, the host-side gk
-// stacks). This makes the per-isolate page-table walls hold even against
-// arbitrary code execution inside an isolate: ring-3 code can neither reload
-// CR3 nor rewrite the supervisor page tables. Any such attempt faults and the
-// call returns GK_EFAULT (see gk_fault_addr); the process survives. Legitimate
-// syscalls are forwarded and the function returns to ring 3 as usual.
+// or write gk's supervisor pages (handler text, GDT/IDT, exception stacks, and
+// gk's own control data: the arena registry, page-table allocator, memslot
+// tree, per-thread records and the rest) or gk's refused pages (the page
+// tables themselves, kvm_run, the host-side gk stacks). This makes the
+// per-isolate page-table walls hold even against arbitrary code execution
+// inside an isolate: ring-3 code can neither reload CR3 nor rewrite the
+// supervisor page tables, nor the bookkeeping that selects them. Any such
+// attempt faults and the call returns GK_EFAULT (see gk_fault_addr); the
+// process survives. Legitimate syscalls are forwarded and the function returns
+// to ring 3 as usual.
 //
 // This slice runs the top-level fn at ring 3; threads a ring-3 fn creates
 // (clone) currently still enter at ring 0. Arena/CR3 switching stays host-
@@ -74,6 +77,27 @@ long gk_run_here_user(long (*fn)(void *), void *arg);
 // *refuse with the address of a gk refused page, so a test can confirm ring-3
 // code cannot reach either. Either pointer may be NULL.
 void gk_debug_control_addrs(unsigned long *super, unsigned long *refuse);
+
+// Test/diagnostic: the address of one of gk's own control structures. They all
+// live in supervisor memory, so ring-3 code faults on them while ring-0 code
+// and the host can use them. GK_CTL_SCRATCH is a word reserved for tests to
+// write; the others are live structures and must only be probed, never written.
+enum {
+  GK_CTL_SCRATCH,      // a scratch word in the control block
+  GK_CTL_ARENAS,       // the arena registry
+  GK_CTL_ARENA_POOL,   // the arena structs (page-table roots, slot entries)
+  GK_CTL_PROT,         // the supervisor/refuse registry
+  GK_CTL_REGIONS,      // the memslot interval tree's root
+  GK_CTL_REGION_POOL,  // its node pool
+  GK_CTL_PT_ALLOC,     // the page-table page allocator's free list
+  GK_CTL_THREADS,      // the per-thread records (active root, vCPU, ring)
+  GK_CTL_VCPU_POOL,    // the parked-vCPU pool
+  GK_CTL_PKEYS,        // the protection-key ranges
+  GK_CTL_ROOT,         // the base page-table root pointer
+  GK_CTL_FILTER,       // the syscall filter
+  GK_CTL_COUNT
+};
+unsigned long gk_debug_ctl_addr(int which);
 
 #define GK_EFAULT (-1001)  // guest faulted; see gk_fault_addr()
 #define GK_ESHUTDOWN (-1002)  // guest triple-faulted or shut down
@@ -131,6 +155,7 @@ typedef struct {
   long pt_pages_used;   // page-table pages in use, across all roots
   long pt_pages_free;   // page-table pages on the free list
   long pt_pages_total;  // page-table pages ever taken from the fixed PT area
+  int prot_ranges;      // ranges in the supervisor/refuse registry
 } gk_stats;
 void gk_get_stats(gk_stats *s);
 

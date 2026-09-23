@@ -599,10 +599,17 @@ int main(void) {
   // Thread churn must not grow the vCPU count: 200 iterations of 3 guest-
   // spawned threads may add at most 3 vCPUs (peak concurrency), and 20
   // sequential host threads entering via gk_run may add at most 1.
+  // Each guest thread's host stack is registered in the supervisor/refuse
+  // registry while it lives, so the registry must not grow with the churn
+  // either: at most two ranges (kvm_run, exception stack) per vCPU added.
   int before = gk_vcpu_count();
+  gk_stats sp1 = {0}, sp2 = {0};
+  gk_get_stats(&sp1);
   struct churn ch = {.iters = 200, .per_iter = 3, .bad = 0};
   long churned = gk_run(churn_in_guest, &ch);
   int after_guest = gk_vcpu_count();
+  gk_get_stats(&sp2);
+  int prot_bounded = sp2.prot_ranges - sp1.prot_ranges <= 2 * (after_guest - before);
   int ok8_host = 1;
   for (int i = 0; i < 20; i++) {
     pthread_t t;
@@ -613,10 +620,10 @@ int main(void) {
   }
   int after_host = gk_vcpu_count();
   int ok8 = (churned == 0) && ch.bad == 0 && (after_guest - before) <= 3 &&
-            (after_host - after_guest) <= 1 && ok8_host;
-  printf("vCPU pooling: %d guest threads churned, vCPUs %d -> %d; 20 host threads "
-         "churned, vCPUs -> %d [%s]\n", ch.iters * ch.per_iter, before, after_guest,
-         after_host, ok8 ? "OK" : "FAIL");
+            (after_host - after_guest) <= 1 && ok8_host && prot_bounded;
+  printf("vCPU pooling: %d guest threads churned, vCPUs %d -> %d, registry ranges %d -> %d; "
+         "20 host threads churned, vCPUs -> %d [%s]\n", ch.iters * ch.per_iter, before,
+         after_guest, sp1.prot_ranges, sp2.prot_ranges, after_host, ok8 ? "OK" : "FAIL");
 
   // Memory protection keys, enforced by the guest CPU against the guest PKRU.
   struct pk pk = {0};
@@ -839,8 +846,66 @@ int main(void) {
     }
   }
 
+  // ---- gk's control data is supervisor memory --------------------------------
+  // The structures that decide which root a thread runs under (the arena
+  // registry and structs, the page-table allocator, the memslot tree and its
+  // node pool, the supervisor/refuse registry, the thread records, the vCPU
+  // pool, ...) must be unreachable from ring 3 even though the host has the
+  // memory, or a ring-3 escape with an arbitrary write could rewrite them.
+  // Each is written from ring 3, on the base root and under an arena, expecting
+  // a fault at that address with the process surviving; then the scratch word
+  // is written from ring 0 and read by the host, showing ring 0 keeps access.
+  int ok14 = 1;
+  {
+    static const char *const names[GK_CTL_COUNT] = {
+        "scratch word", "arena registry", "arena structs", "supervisor/refuse registry",
+        "memslot tree root", "memslot node pool", "page-table allocator", "thread records",
+        "vCPU pool", "protection-key ranges", "base root pointer", "syscall filter"};
+    int faulted = 0;
+    for (int i = 0; i < GK_CTL_COUNT; i++) {
+      unsigned long a = gk_debug_ctl_addr(i);
+      long w = gk_run_user(user_write_here, (void *)a);
+      unsigned long f = gk_fault_addr();
+      if (a != 0 && w == GK_EFAULT && f == a) {
+        faulted++;
+      } else {
+        printf("  ring-3 write to %s @%#lx -> %s (fault %#lx) [FAIL]\n", names[i], a,
+               w == GK_EFAULT ? "FAULT" : "WROTE", f);
+        ok14 = 0;
+      }
+    }
+    // The same under an active arena, from ring 3 on the caller's stack (the
+    // production path), against the arena structs.
+    gk_arena *ca = gk_arena_create(4096);
+    unsigned long pool = gk_debug_ctl_addr(GK_CTL_ARENA_POOL);
+    long wa = -1;
+    unsigned long fa = 0;
+    if (ca) {
+      gk_arena_enter(ca);
+      wa = gk_run_here_user(user_write_here, (void *)pool);
+      fa = gk_fault_addr();
+      gk_arena_enter(NULL);
+      gk_arena_destroy(ca);
+    }
+    // Ring 0 (trusted code under gk_run_here / gk_run) reads and writes it.
+    volatile unsigned char *scratch = (void *)gk_debug_ctl_addr(GK_CTL_SCRATCH);
+    scratch[0] = 0;
+    long r0w = gk_run_here(user_write_here, (void *)scratch);  // writes 0x5a
+    int host_sees = scratch[0] == 0x5a;
+    long r0r = gk_run(read_byte, (void *)scratch);
+    // The process survived every fault: ring 3 still runs normally.
+    long cpl = gk_run_user(user_cpl, NULL);
+    ok14 = ok14 && ca && wa == GK_EFAULT && fa == pool && r0w == 0x5a && host_sees &&
+           r0r == 0x5a && cpl == 3;
+    printf("gk control data: ring-3 writes faulted %d/%d (base root), under arena -> %s "
+           "(fault %#lx == arena structs %#lx); ring-0 write -> %#lx, host sees %s, ring-0 "
+           "read -> %#lx; ring 3 afterwards at CPL %ld [%s]\n", faulted, GK_CTL_COUNT,
+           wa == GK_EFAULT ? "FAULT" : "WROTE", fa, pool, r0w, host_sees ? "0x5a" : "WRONG", r0r,
+           cpl, ok14 ? "OK" : "FAIL");
+  }
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
-            ok12 && ok13;
+            ok12 && ok13 && ok14;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }
