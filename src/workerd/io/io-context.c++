@@ -1432,20 +1432,34 @@ namespace {
 
 #ifdef WORKERD_HAS_GUEST_KERNEL
 // Experimental guest-kernel isolation (see experimental/guest-kernel/gk.h): when
-// WORKERD_EXPERIMENTAL_GUEST_KERNEL is set, each JS turn runs inside the KVM guest via
-// gk_run_here(). The guest boundary is not a C++ call frame, so an exception thrown inside the
-// turn cannot unwind across it; the trampoline catches everything in the guest and the host
-// side re-throws it, so callers observe the same exceptions as without the guest.
-
-bool isGuestKernelEnabled() {
-  static const bool enabled = getenv("WORKERD_EXPERIMENTAL_GUEST_KERNEL") != nullptr;
-  return enabled;
-}
+// jsg::isGuestKernelEnabled(), each JS turn runs inside the KVM guest via gk_run_here(). The
+// guest boundary is not a C++ call frame, so an exception thrown inside the turn cannot unwind
+// across it; the trampoline catches everything in the guest and the host side re-throws it, so
+// callers observe the same exceptions as without the guest.
+//
+// The turn runs under the isolate lock, whose jsg::Lock has already made the isolate's arena
+// the thread's active one (jsg::GuestArenaScope), so the guest enters with that arena's
+// page-table root and can address this isolate's sandbox and no other's.
 
 // Depth of guest-kernel turns on this thread. A turn can re-enter runImpl (for example, a
 // destructor run during JS may enter another IoContext's scope); such nested turns already
 // execute in the guest and must not call gk_run_here() again from inside it.
 thread_local uint guestTurnDepth = 0;
+
+// The arena the outermost guest turn on this thread entered the guest with. A nested turn runs
+// inside that same guest entry, so it must belong to an isolate with the same arena: switching
+// the guest's page-table root from inside the guest is not supported yet, and a nested turn for
+// another isolate would run with that isolate's sandbox unaddressable. Such turns are detected
+// and counted here rather than supported.
+thread_local gk_arena* guestTurnArena = nullptr;
+std::atomic<uint> nestedGuestTurnArenaMismatches{0};
+
+gk_arena* guestArenaOf(jsg::Lock& js) {
+  KJ_IF_SOME(arena, jsg::IsolateBase::from(js.v8Isolate).getGuestArena()) {
+    return arena.get();
+  }
+  return nullptr;
+}
 
 template <typename Func>
 struct GuestTurn {
@@ -1468,13 +1482,25 @@ struct GuestTurn {
 };
 #endif
 
-// Run one JS turn, inside the guest kernel when it is enabled and directly otherwise.
+// Run one JS turn for the locked isolate `js`, inside the guest kernel when it is enabled and
+// directly otherwise.
 template <typename Func>
-void runJsTurn(Func&& body) {
+void runJsTurn(jsg::Lock& js, Func&& body) {
 #ifdef WORKERD_HAS_GUEST_KERNEL
-  if (isGuestKernelEnabled() && guestTurnDepth == 0) {
+  if (jsg::isGuestKernelEnabled() && guestTurnDepth > 0) {
+    gk_arena* arena = guestArenaOf(js);
+    if (arena != guestTurnArena) {
+      uint count = ++nestedGuestTurnArenaMismatches;
+      KJ_LOG(FATAL,
+          "guest-kernel: nested JS turn for an isolate in a different arena than the enclosing "
+          "guest turn; its sandbox is not addressable from the guest",
+          arena, guestTurnArena, count);
+    }
+  } else if (jsg::isGuestKernelEnabled()) {
     ++guestTurnDepth;
     KJ_DEFER(--guestTurnDepth);
+    guestTurnArena = guestArenaOf(js);
+    KJ_DEFER(guestTurnArena = nullptr);
 
     GuestTurn<Func> turn{body};
     long result = gk_run_here(&GuestTurn<Func>::trampoline, &turn);
@@ -1661,7 +1687,7 @@ void IoContext::runImpl(Runnable& runnable,
   };
 
   runInContextScope(lockType, kj::mv(inputLock),
-      [&](Worker::Lock& workerLock) { runJsTurn([&]() { turn(workerLock); }); });
+      [&](Worker::Lock& workerLock) { runJsTurn(workerLock, [&]() { turn(workerLock); }); });
 }
 
 static constexpr auto kAsyncIoErrorMessage =

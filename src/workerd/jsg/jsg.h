@@ -40,6 +40,11 @@ using kj::uint;
 using ssize_t = long long;
 #endif
 
+// A guest-kernel memory arena (experimental/guest-kernel/gk.h). Only ever non-null in builds
+// that link gk (WORKERD_HAS_GUEST_KERNEL) with guest-kernel isolation enabled at runtime; kept
+// opaque here so that gk.h stays out of the JSG headers.
+struct gk_arena;
+
 namespace workerd::jsg {
 kj::String stringifyHandle(v8::Local<v8::Value> value);
 }
@@ -2696,6 +2701,26 @@ class MemoryProtectionKeyScope final {
   friend class Lock;
 };
 
+// Makes the isolate's guest-kernel arena (IsolateBase::getGuestArena()), if it has one, the
+// calling thread's active arena for the scope's lifetime, and restores the previously active
+// arena afterwards so that locks on different isolates nest. While the scope is active, guest
+// execution on this thread can address this isolate's V8 sandbox and no other isolate's. A no-op
+// when the isolate has no arena, which is always the case unless guest-kernel isolation is
+// enabled (see setup.h).
+class GuestArenaScope final {
+ public:
+  explicit GuestArenaScope(v8::Isolate* isolate);
+  ~GuestArenaScope() noexcept(false);
+  KJ_DISALLOW_COPY_AND_MOVE(GuestArenaScope);
+
+ private:
+  // The arena that was active before this scope entered the isolate's, meaningful only when
+  // `entered` is set. It is legitimately null (the base root with no private arena), so it is
+  // not a kj::Maybe.
+  gk_arena* previous = nullptr;
+  bool entered = false;
+};
+
 // Represents an isolate lock, which allows the current thread to execute JavaScript code within
 // an isolate. A thread must lock an isolate -- obtaining an instance of `Lock` -- before it can
 // manipulate JavaScript objects or execute JavaScript code inside the isolate.
@@ -3334,6 +3359,9 @@ class Lock {
 
   v8::Locker locker;
   v8::Isolate::Scope isolateScope;
+  // Declared after the V8 lock so that the isolate's guest-kernel arena is entered once the
+  // isolate is locked and left before it is unlocked.
+  GuestArenaScope guestArenaScope;
 
   void* previousData;
 

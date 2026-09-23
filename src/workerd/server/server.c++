@@ -5785,7 +5785,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     }
   }
 
-  auto isolateGroup = v8::IsolateGroup::GetDefault();
+  auto isolatePlacement = jsg::newIsolateGroup();
   kj::Array<Worker::Api::InboundListener> listeners;
   KJ_IF_SOME(l, inboundListeners.find(name)) {
     listeners = KJ_MAP(listener, l) {
@@ -5797,8 +5797,8 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     };
   }
   auto api = kj::heap<WorkerdApi>(globalContext->v8System, def.featureFlags, extensions,
-      limitEnforcer->getCreateParams(), isolateGroup, kj::mv(jsgobserver), *memoryCacheProvider,
-      pythonConfig, kj::mv(listeners));
+      limitEnforcer->getCreateParams(), kj::mv(isolatePlacement), kj::mv(jsgobserver),
+      *memoryCacheProvider, pythonConfig, kj::mv(listeners));
 
   auto inspectorPolicy = Worker::Isolate::InspectorPolicy::DISALLOW;
   if (inspectorOverride != kj::none) {

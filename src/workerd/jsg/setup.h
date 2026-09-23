@@ -95,11 +95,71 @@ class V8System {
       JitCodeEventTracking);
 };
 
+// Whether experimental guest-kernel isolation (experimental/guest-kernel/gk.h) is enabled for
+// this process: the build links gk (WORKERD_HAS_GUEST_KERNEL) and the environment variable
+// WORKERD_EXPERIMENTAL_GUEST_KERNEL is set. Whoever enables it is responsible for calling
+// gk_init() before any isolate is created. Always false where gk is not built in.
+bool isGuestKernelEnabled();
+
+// A private guest-kernel memory arena holding one isolate group's V8 sandbox. The arena is a
+// PROT_NONE reservation with its own guest page-table root: while it is a thread's active arena
+// (see GuestArenaScope, entered by jsg::Lock), guest execution on that thread can address the
+// sandbox placed in it, and while any other arena (or none) is active, that sandbox is unmapped
+// and unaddressable, enforced by the hardware.
+//
+// The arena must outlive the isolate group placed in it: V8 adopts the reservation for the
+// group's sandbox and, on teardown, decommits inside it but never unmaps it; destroying the
+// arena releases the reservation.
+class GuestArena final {
+ public:
+  // Takes ownership of `arena`, which must have been created by gk_arena_create().
+  explicit GuestArena(gk_arena* arena): arena(arena) {}
+  ~GuestArena() noexcept(false);
+  KJ_DISALLOW_COPY_AND_MOVE(GuestArena);
+
+  gk_arena* get() const {
+    return arena;
+  }
+  // The arena's reservation, [base(), base() + size()).
+  void* base() const;
+  size_t size() const;
+
+ private:
+  gk_arena* arena;
+};
+
+// Where a new isolate lives: its v8::IsolateGroup and, when guest-kernel isolation is enabled,
+// the arena holding that group's sandbox (see newIsolateGroup()). Converts implicitly from a
+// bare v8::IsolateGroup for callers that place an isolate in an existing group without an arena.
+struct IsolatePlacement {
+  v8::IsolateGroup group;
+  kj::Maybe<kj::Own<GuestArena>> arena;
+
+  IsolatePlacement(v8::IsolateGroup group): group(kj::mv(group)) {}
+  IsolatePlacement(v8::IsolateGroup group, kj::Own<GuestArena> arena)
+      : group(kj::mv(group)),
+        arena(kj::mv(arena)) {}
+};
+
+// Creates the isolate group for a new isolate. With guest-kernel isolation enabled this is a
+// fresh group whose sandbox is placed in a new private arena, so that the isolate's memory is
+// unaddressable from any other isolate's guest execution. Otherwise it is the default group,
+// shared by all isolates, exactly as when gk is not built in.
+IsolatePlacement newIsolateGroup();
+
 // Base class of Isolate<T> containing parts that don't need to be templated, to avoid code
 // bloat.
 class IsolateBase {
  public:
   static IsolateBase& from(v8::Isolate* isolate);
+
+  // The guest-kernel arena holding this isolate's sandbox, if guest-kernel isolation is enabled.
+  kj::Maybe<GuestArena&> getGuestArena() {
+    KJ_IF_SOME(a, guestArena) {
+      return *a;
+    }
+    return kj::none;
+  }
 
   // Unwraps a JavaScript exception as a kj::Exception.
   virtual kj::Exception unwrapException(
@@ -431,6 +491,9 @@ class IsolateBase {
   using Item = kj::OneOf<GlobalToDelete, RefToDelete, kj::Own<void>>;
 
   V8System& v8System;
+  // Declared before the isolate so that it is destroyed after the isolate (and with it the
+  // isolate group whose sandbox the arena holds) has been disposed; see GuestArena.
+  kj::Maybe<kj::Own<GuestArena>> guestArena;
   // TODO(cleanup): After v8 13.4 is fully released we can inline this into `newIsolate`
   //                and remove this member.
   std::unique_ptr<class v8::CppHeap> cppHeap;
@@ -585,7 +648,7 @@ class IsolateBase {
       v8::Isolate::CreateParams&& createParams,
       kj::Own<IsolateObserver> observer,
       kj::Own<ExternalStringAllocator> externalStringAllocator,
-      v8::IsolateGroup group);
+      IsolatePlacement placement);
   ~IsolateBase() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(IsolateBase);
 
@@ -701,17 +764,18 @@ class Isolate: public IsolateBase {
   // and should be instantiated with `instantiateTypeWrapper` before `newContext` is called on
   // a jsg::Lock of this Isolate.
   //
-  // If using v8 sandboxing, the group argument controls which isolates share a
+  // If using v8 sandboxing, the placement's group controls which isolates share a
   // sandbox, and which are isolated (as much as possible) in the event of a
   // heap corruption attack. Note: The isolates in a group are limited to at
   // most 4Gbytes of V8 heap in all.  Groups can be created with
   // v8::IsolateGroup::Create().  (If using V8 pointer compression, this
   // requires the enable_pointer_compression_multiple_cages build flag for V8.)
-  // Pass v8::IsolateGroup::Default() as the group to put all isolates in the
-  // same group.
+  // Pass v8::IsolateGroup::Default() as the placement to put all isolates in the
+  // same group, or jsg::newIsolateGroup() to place the isolate as the process's
+  // isolation settings dictate.
   template <typename MetaConfiguration>
   explicit Isolate(V8System& system,
-      v8::IsolateGroup group,
+      IsolatePlacement placement,
       MetaConfiguration&& configuration,
       kj::Own<IsolateObserver> observer,
       kj::Own<ExternalStringAllocator> externalStringAllocator = defaultExternalStringAllocator(),
@@ -721,7 +785,7 @@ class Isolate: public IsolateBase {
             kj::mv(createParams),
             kj::mv(observer),
             kj::mv(externalStringAllocator),
-            group) {
+            kj::mv(placement)) {
     wrappers.resize(1);
     registerTypeHandlers();
     if (instantiateTypeWrapper) {

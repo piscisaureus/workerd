@@ -12,6 +12,10 @@
 #include <workerd/jsg/util.h>
 #include <workerd/util/thread-scopes.h>
 
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <workerd/experimental/guest-kernel/gk.h>
+#endif
+
 #ifdef V8_ENABLE_SANDBOX
 #include <sys/mman.h>
 #endif
@@ -138,10 +142,28 @@ void Data::moveFromTraced(Data& other, v8::TracedReference<v8::Data>& otherTrace
   other.tracedHandle = kj::none;
 }
 
+GuestArenaScope::GuestArenaScope(v8::Isolate* isolate) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  KJ_IF_SOME(arena, IsolateBase::from(isolate).getGuestArena()) {
+    previous = gk_arena_enter(arena.get());
+    entered = true;
+  }
+#endif
+}
+
+GuestArenaScope::~GuestArenaScope() noexcept(false) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (entered) {
+    gk_arena_enter(previous);
+  }
+#endif
+}
+
 Lock::Lock(v8::Isolate* v8Isolate)
     : v8Isolate(v8Isolate),
       locker(v8Isolate),
       isolateScope(v8Isolate),
+      guestArenaScope(v8Isolate),
       previousData(v8Isolate->GetData(SET_DATA_LOCK)),
       warningsLogged(IsolateBase::from(v8Isolate).areWarningsLogged()) {
   if (previousData != nullptr) {

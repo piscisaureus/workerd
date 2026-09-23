@@ -136,7 +136,14 @@ wd_cc_library(
         "//src/workerd/util:thread-scopes",
         "@capnp-cpp//src/kj",
         "@workerd-v8//:v8",
-    ],
+    ] + select({
+        # Experimental guest-kernel isolation is x86-64 Linux only; the dep and
+        # its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 wd_cc_library(
@@ -317,8 +324,23 @@ wd_cc_library(
         "rtti-test.c++",
         "url-test.c++",
         "multiple-typewrappers-test.c++",
+        "guest-arena-test.c++",
     ],
 )]
+
+# Proves that per-isolate guest-kernel arenas make one isolate's sandbox unaddressable from
+# another's guest execution. The test body is compiled only where gk is (x86-64 Linux); there it
+# also skips itself when gk cannot initialize (no /dev/kvm).
+kj_test(
+    src = "guest-arena-test.c++",
+    local_defines = ["JSG_IMPLEMENTATION"],
+    deps = [":jsg"] + select({
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
+)
 
 # Moved out as macro-meta-test does not depend on V8 or JSG proper, this makes the test much
 # smaller.

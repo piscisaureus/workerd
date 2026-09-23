@@ -17,6 +17,12 @@
 #if !_WIN32
 #include <cxxabi.h>
 #include <ucontext.h>
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <workerd/experimental/guest-kernel/gk.h>
+
+#include <cstdlib>
+#endif
 #endif
 
 #ifdef WORKERD_ICU_DATA_EMBED
@@ -423,15 +429,83 @@ static v8::Isolate* newIsolate(
     return v8::Isolate::New(group, params);
   });
 }
+
+#if defined(WORKERD_HAS_GUEST_KERNEL) && defined(V8_ENABLE_SANDBOX)
+// The reservation an isolate group needs when its sandbox is placed in embedder memory (see
+// v8::IsolateGroup::CreateParams): the sandbox itself plus the guard regions on both sides and
+// the additional trailing guard region. With the 128 GB sandbox this build configures
+// (v8_sandbox_size_log2=37 in .bazelrc, exported to embedder code as
+// V8_SANDBOX_SIZE_LOG2_OVERRIDE) that is 128 + 2 * 64 + 224 = 480 GiB, which fits in a single
+// 512 GiB gk arena slot. The assertion pins that layout: a different sandbox size changes the
+// number of slots each arena occupies (and gk caps that), so revisit it deliberately.
+constexpr size_t GUEST_ARENA_RESERVATION_SIZE = v8::internal::kSandboxSize +
+    2 * v8::internal::kSandboxGuardRegionSize + v8::internal::kAdditionalTrailingGuardRegionSize;
+static_assert(v8::internal::kSandboxSizeLog2 == 37 &&
+        GUEST_ARENA_RESERVATION_SIZE == 480ull * 1024 * 1024 * 1024,
+    "guest-kernel arenas are laid out for a 128 GB V8 sandbox (480 GiB reservation)");
+#endif
 }  // namespace
+
+bool isGuestKernelEnabled() {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  static const bool enabled = getenv("WORKERD_EXPERIMENTAL_GUEST_KERNEL") != nullptr;
+  return enabled;
+#else
+  return false;
+#endif
+}
+
+GuestArena::~GuestArena() noexcept(false) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  gk_arena_destroy(arena);
+#endif
+}
+
+void* GuestArena::base() const {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  return gk_arena_base(arena);
+#else
+  return nullptr;
+#endif
+}
+
+size_t GuestArena::size() const {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  return gk_arena_size(arena);
+#else
+  return 0;
+#endif
+}
+
+IsolatePlacement newIsolateGroup() {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (isGuestKernelEnabled()) {
+#ifdef V8_ENABLE_SANDBOX
+    gk_arena* arena = gk_arena_create(GUEST_ARENA_RESERVATION_SIZE);
+    KJ_REQUIRE(arena != nullptr, "guest-kernel: failed to create an isolate arena");
+    auto guestArena = kj::heap<GuestArena>(arena);
+    // The arena base is 512 GiB-slot aligned, which satisfies V8's 4 GiB sandbox alignment.
+    v8::IsolateGroup::CreateParams params;
+    params.sandbox_reservation = guestArena->base();
+    params.sandbox_reservation_size = guestArena->size();
+    return IsolatePlacement(v8::IsolateGroup::Create(params), kj::mv(guestArena));
+#else
+    KJ_FAIL_REQUIRE("guest-kernel isolation requires a V8 build with the sandbox enabled");
+#endif
+  }
+#endif
+  return v8::IsolateGroup::GetDefault();
+}
+
 IsolateBase::IsolateBase(V8System& system,
     v8::Isolate::CreateParams&& createParams,
     kj::Own<IsolateObserver> observer,
     kj::Own<ExternalStringAllocator> externalStringAllocator,
-    v8::IsolateGroup group)
+    IsolatePlacement placement)
     : v8System(system),
+      guestArena(kj::mv(placement.arena)),
       cppHeap(newCppHeap(const_cast<V8PlatformWrapper*>(system.platformWrapper.get()))),
-      ptr(newIsolate(kj::mv(createParams), cppHeap.release(), group)),
+      ptr(newIsolate(kj::mv(createParams), cppHeap.release(), placement.group)),
       externalMemoryTarget(kj::arc<ExternalMemoryTarget>(ptr)),
       envAsyncContextKey(kj::arc<AsyncContextFrame::StorageKey>()),
       exportsAsyncContextKey(kj::arc<AsyncContextFrame::StorageKey>()),
