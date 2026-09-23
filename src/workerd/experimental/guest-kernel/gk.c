@@ -20,6 +20,7 @@
 #define PTE_P (1UL << 0)
 #define PTE_W (1UL << 1)
 #define PTE_U (1UL << 2)
+#define PTE_NX (1UL << 63)
 #define CR0_PE (1UL << 0)
 #define CR0_PG (1UL << 31)
 #define CR4_PAE (1UL << 5)
@@ -31,6 +32,7 @@
 #define EFER_LME (1UL << 8)
 #define EFER_LMA (1UL << 10)
 #define EFER_SCE (1UL << 0)
+#define EFER_NXE (1UL << 11)
 
 #define MSR_EFER 0xc0000080
 #define MSR_STAR 0xc0000081
@@ -144,13 +146,26 @@ static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags) {
   if (!pd) return -1;
   uint64_t *pt = next_table(pd, (va >> 21) & 0x1ff);
   if (!pt) return -1;
-  // TODO: honor `flags` per-region once mprotect is reflected into the guest
-  // page tables. For now map everything writable; V8 writes pages whose host
-  // mapping momentarily reads as non-writable, and KVM still enforces the host
-  // VMA's real protection when backing the page.
-  (void)flags;
-  pt[(va >> 12) & 0x1ff] = (va & ~0xfffULL) | PTE_P | PTE_U | PTE_W;
+  // `flags` is a protection bitmask: 1=read, 2=write, 4=execute. Honor it so
+  // W^X holds: code is mapped executable but not writable, data writable but
+  // not executable. KVM also enforces the host VMA's real protection.
+  uint64_t pte = (va & ~0xfffULL) | PTE_P | PTE_U;
+  if (flags & 2) pte |= PTE_W;
+  if (!(flags & 4)) pte |= PTE_NX;
+  pt[(va >> 12) & 0x1ff] = pte;
   return 0;
+}
+
+// Clear one page's PTE in a root (used to reflect mprotect/munmap). Caller holds
+// g_lock. Leaves intermediate tables in place.
+static void unmap4k_root(uint64_t *root, uint64_t va) {
+  if (!(root[(va >> 39) & 0x1ff] & PTE_P)) return;
+  uint64_t *pdpt = (uint64_t *)(uintptr_t)(root[(va >> 39) & 0x1ff] & ~0xfffULL);
+  if (!(pdpt[(va >> 30) & 0x1ff] & PTE_P)) return;
+  uint64_t *pd = (uint64_t *)(uintptr_t)(pdpt[(va >> 30) & 0x1ff] & ~0xfffULL);
+  if (!(pd[(va >> 21) & 0x1ff] & PTE_P)) return;
+  uint64_t *pt = (uint64_t *)(uintptr_t)(pd[(va >> 21) & 0x1ff] & ~0xfffULL);
+  pt[(va >> 12) & 0x1ff] = 0;
 }
 
 // ---- the MMU layer: chunk-based memslot manager ----------------------------
@@ -231,6 +246,7 @@ static int host_page_perms(uintptr_t page) {
     if (sscanf(line, "%lx-%lx %7s", &s, &e, perms) >= 3 && page >= s && page < e) {
       if (perms[0] == 'r') p |= 1;
       if (perms[1] == 'w') p |= 2;
+      if (perms[2] == 'x') p |= 4;
       break;
     }
   }
@@ -248,7 +264,7 @@ static int demand_map(uintptr_t addr) {
   int p = host_page_perms(page);
   if (!(p & 1)) return -1;  // not host-readable: a genuine fault
   pthread_mutex_lock(&g_lock);
-  int r = mmu_map(page, PTE_W);
+  int r = mmu_map(page, (uint64_t)p);  // honor R/W/X for W^X
   if (r >= 0) g_demand_ok++;
   pthread_mutex_unlock(&g_lock);
   return r;
@@ -283,7 +299,7 @@ static int vcpu_init(void) {
                       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
   if (stk == MAP_FAILED) { g_err = "mmap guest stack"; return -1; }
   pthread_mutex_lock(&g_lock);
-  int mrc = mmu_map_range((uintptr_t)stk, (uintptr_t)stk + stksz, PTE_W);
+  int mrc = mmu_map_range((uintptr_t)stk, (uintptr_t)stk + stksz, 1 | 2);  // rw, NX
   pthread_mutex_unlock(&g_lock);
   if (mrc < 0) { g_err = "map guest stack"; return -1; }
 
@@ -292,7 +308,7 @@ static int vcpu_init(void) {
   s.cr3 = (uint64_t)(uintptr_t)g_pml4;
   s.cr4 = CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_OSXSAVE | CR4_PKE;
   s.cr0 = CR0_PE | CR0_PG;
-  s.efer = EFER_LME | EFER_LMA | EFER_SCE;
+  s.efer = EFER_LME | EFER_LMA | EFER_SCE | EFER_NXE;
   struct kvm_segment cs = {.base = 0, .limit = 0xffffffff, .selector = 0x08,
                            .type = 11, .present = 1, .s = 1, .l = 1, .g = 1};
   struct kvm_segment ds = {.base = 0, .limit = 0xffffffff, .selector = 0x10,
@@ -314,7 +330,7 @@ static int vcpu_init(void) {
 
   struct { struct kvm_msrs h; struct kvm_msr_entry e[4]; } m = {0};
   m.h.nmsrs = 4;
-  m.e[0].index = MSR_EFER; m.e[0].data = EFER_LME | EFER_LMA | EFER_SCE;
+  m.e[0].index = MSR_EFER; m.e[0].data = EFER_LME | EFER_LMA | EFER_SCE | EFER_NXE;
   m.e[1].index = MSR_STAR; m.e[1].data = (uint64_t)0x08 << 32;
   m.e[2].index = MSR_LSTAR; m.e[2].data = (uintptr_t)&gk_syscall_tramp;
   m.e[3].index = MSR_SYSCALL_MASK; m.e[3].data = 0x3f7fd5;
@@ -343,7 +359,7 @@ static int map_handler_text(void) {
     if (hs[i] < lo) lo = hs[i];
     if (hs[i] > hi) hi = hs[i];
   }
-  return mmu_map_range(lo & ~0xfffUL, (hi + 64 + 0xfff) & ~0xfffUL, PTE_W);
+  return mmu_map_range(lo & ~0xfffUL, (hi + 64 + 0xfff) & ~0xfffUL, 1 | 4);  // r-x
 }
 
 int gk_init(void) {
@@ -383,7 +399,7 @@ int gk_init(void) {
   for (uintptr_t v = g_pt_base; v < g_pt_base + g_pt_bytes; v += GK_CHUNK)
     if (mmu_ensure_chunk(v) < 0) { g_err = "memslot for PT arena"; return -1; }
   // GDT/IDT and the handler text must be present before the first fault.
-  if (mmu_map_range(g_gdt_va, g_gdt_va + 0x2000, PTE_W) < 0) { g_err = "map gdt/idt"; return -1; }
+  if (mmu_map_range(g_gdt_va, g_gdt_va + 0x2000, 1 | 2) < 0) { g_err = "map gdt/idt"; return -1; }
   if (map_handler_text() < 0) { g_err = "map handler text"; return -1; }
 
   size_t nent = 128;
@@ -413,6 +429,19 @@ static long forward_syscall(struct kvm_regs *r) {
     return -GK_EPERM;
   }
   long ret = host_syscall(nr, a1, a2, a3, a4, a5, a6);
+  // Reflect protection/mapping changes: drop the guest PTEs for the affected
+  // range so the next access re-faults and demand-maps with the new host
+  // permissions (this is what makes W^X and JIT code work), then flush this
+  // vCPU's TLB. TODO: cross-vCPU shootdown for the multi-threaded case.
+  if (ret == 0 && (nr == SYS_mprotect || nr == SYS_munmap) && a2 > 0) {
+    pthread_mutex_lock(&g_lock);
+    for (uintptr_t v = (uintptr_t)a1 & ~0xfffUL; v < (uintptr_t)a1 + (uintptr_t)a2; v += 0x1000)
+      unmap4k_root(g_pml4, v);
+    pthread_mutex_unlock(&g_lock);
+    struct kvm_sregs s;
+    ioctl(tls.fd, KVM_GET_SREGS, &s);
+    ioctl(tls.fd, KVM_SET_SREGS, &s);  // reload CR3 -> flush non-global TLB
+  }
   if (g_dbg) fprintf(stderr, "[gk] syscall %ld -> %ld\n", nr, ret);
   return ret;
 }
@@ -541,7 +570,7 @@ gk_arena *gk_arena_create(size_t size) {
   a->cage_idx = (int)((va >> 39) & 0x1ff);
   memcpy(a->pml4, g_pml4, 0x1000);  // share the base root's top-level entries
   for (uint64_t v = va; v < va + size; v += 0x1000)
-    if (mmu_map_into(a->pml4, v, PTE_W) < 0) { free(a); pthread_mutex_unlock(&g_lock); return NULL; }
+    if (mmu_map_into(a->pml4, v, 1 | 2) < 0) { free(a); pthread_mutex_unlock(&g_lock); return NULL; }
   a->cage_entry = a->pml4[a->cage_idx];  // remember the private cage subtree
   if (g_arena_n < GK_MAX_ARENAS) {
     g_arenas[g_arena_n].base = va;

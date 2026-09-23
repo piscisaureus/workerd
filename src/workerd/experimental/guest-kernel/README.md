@@ -66,6 +66,11 @@ hardware:
   memslot and a PTE, then the handler `iretq`s to retry. Memslots are created
   per aligned 32 MiB chunk, so they never overlap and every mapped page is
   backed. Faults into another arena's region are refused, preserving isolation.
+- **W^X.** Pages are mapped with their host protection: executable pages are not
+  writable and writable pages are not executable (NX is enabled in the guest).
+  `mprotect` and `munmap` are reflected by dropping the affected guest PTEs and
+  flushing the TLB, so the next access re-maps with the new protection. This is
+  what lets code that flips pages between writable and executable work.
 
 Enabling SSE and AVX in the guest (`CR4.OSFXSR`, `OSXSAVE`, and `XCR0`) is
 required before compiled code and glibc, which use those instructions, will
@@ -104,11 +109,11 @@ decides the overall cost.
 - **Dynamic mappings** that land in a fresh top-level (PML4) entry after an
   arena is created are not reflected into that arena's root. Allocations near
   existing mappings are, because the subtrees are shared.
-- **The MMU is a fixed-chunk scheme.** It maps everything writable and reparses
-  `/proc/self/maps` per fault. A production MMU should track VMAs in an interval
-  tree (see the FreeBSD `sys/vm` note in `gk.c`) and create memslots that follow
-  `mmap`/`mprotect`/`munmap` exactly, honoring per-page protection and issuing
-  cross-vCPU TLB shootdowns.
+- **The MMU is a fixed-chunk scheme.** It reparses `/proc/self/maps` per fault
+  and flushes the whole TLB on each `mprotect`/`munmap`, and only the faulting
+  thread's TLB (no cross-vCPU shootdown). A production MMU should track VMAs in
+  an interval tree (see the FreeBSD `sys/vm` note in `gk.c`) and follow
+  `mmap`/`mprotect`/`munmap` precisely with per-range shootdowns.
 - **Not integrated with the workerd build.** Integrating with V8's cage would
   require the V8 sandbox to be enabled in the build first.
 
@@ -131,8 +136,10 @@ What it took, beyond the MMU:
   `pthread_getattr_np`, which returns the OS thread's stack, not the guest
   stack, so without this it reports a false stack overflow.
 
-Remaining: the JIT is not yet supported. With code generation enabled V8 writes
-to its executable code region and KVM cannot back the write, because V8 uses a
-write-protect (W^X / protection-key) scheme for code pages that the guest does
-not yet reflect. Running jitless works today. The spike is not part of this
-library.
+Remaining: the JIT. W^X for ordinary code works (see above), but with the JIT on
+V8's sandbox protects its code and code-pointer tables with a memory protection
+key, and KVM cannot back the guest's write to those pages: the guest flips its
+own PKRU, while KVM's host-side backing uses the host thread's PKRU. Closing that
+gap needs real PKU virtualization (reflect the guest protection-key state, or the
+page's key, into how the host backs the access). Running jitless works today. The
+spike is not part of this library.
