@@ -1447,17 +1447,34 @@ kj::PromiseForResult<Func, Worker::Lock&> IoContext::runSingle(
     } else {
       struct RunnableImpl: public Runnable {
         Func func;
+#ifdef WORKERD_HAS_GUEST_KERNEL
+        // Under the guest-kernel host-frame wall (see IoContext::runJsTurn / gk.h), run()
+        // executes at guest ring 3 and this RunnableImpl, on the caller's stack above the guest
+        // boundary, is read-only for the turn, so the result cannot be written into this frame.
+        // Hold it on the C++ heap (a KEEP/RW mapping, outside the wall) and read it back
+        // host-side after the turn returns.
+        kj::Own<kj::Maybe<Result>> result = kj::heap<kj::Maybe<Result>>();
+#else
         kj::Maybe<Result> result;
+#endif
 
         RunnableImpl(Func&& func): func(kj::fwd<Func>(func)) {}
         void run(Worker::Lock& lock) override {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+          *result = func(lock);
+#else
           result = func(lock);
+#endif
         }
       };
 
       RunnableImpl runnable{kj::fwd<Func>(func)};
       runImpl(runnable, lock, kj::mv(inputLock), Runnable::Exceptional(false));
+#ifdef WORKERD_HAS_GUEST_KERNEL
+      KJ_IF_SOME(r, *runnable.result) {
+#else
       KJ_IF_SOME(r, runnable.result) {
+#endif
         return kj::mv(r);
       } else {
         KJ_UNREACHABLE;

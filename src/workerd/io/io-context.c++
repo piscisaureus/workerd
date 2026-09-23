@@ -510,6 +510,22 @@ void IoContext::logUncaughtExceptionAsync(
 
   struct RunnableImpl: public Runnable {
     UncaughtExceptionSource source;
+#ifdef WORKERD_HAS_GUEST_KERNEL
+    // Under the guest-kernel host-frame wall (see runJsTurn / gk.h), run() executes at guest
+    // ring 3 and this RunnableImpl, on the caller's stack above the guest boundary, is read-only
+    // for the turn. logUncaughtException() moves the exception out, which writes to the
+    // moved-from object; keep it on the C++ heap (a KEEP/RW mapping, outside the wall) so that
+    // write does not land on the walled stack.
+    kj::Own<kj::Exception> exception;
+
+    RunnableImpl(UncaughtExceptionSource source, kj::Exception&& exception)
+        : source(source),
+          exception(kj::heap<kj::Exception>(kj::mv(exception))) {}
+    void run(Worker::Lock& lock) override {
+      // TODO(soon): Add logUncaughtException to jsg::Lock.
+      lock.logUncaughtException(source, kj::mv(*exception));
+    }
+#else
     kj::Exception exception;
 
     RunnableImpl(UncaughtExceptionSource source, kj::Exception&& exception)
@@ -519,6 +535,7 @@ void IoContext::logUncaughtExceptionAsync(
       // TODO(soon): Add logUncaughtException to jsg::Lock.
       lock.logUncaughtException(source, kj::mv(exception));
     }
+#endif
   };
 
   // Make sure this is logged even if another exception occurs trying to log it to the devtools inspector,
@@ -1469,6 +1486,8 @@ struct GuestTurn {
   kj::Maybe<kj::Exception> exception;
   bool jsExceptionThrown = false;
 
+  GuestTurn(Func& body): body(body) {}
+
   static long trampoline(void* ptr) {
     auto& turn = *reinterpret_cast<GuestTurn*>(ptr);
     try {
@@ -1505,7 +1524,12 @@ void runJsTurn(IoContext& context, Worker::Lock& workerLock, Func&& body) {
     guestTurnArena = guestArenaOf(js);
     KJ_DEFER(guestTurnArena = nullptr);
 
-    GuestTurn<Func> turn{body};
+    // The trampoline runs in-guest and records the turn's outcome (a thrown JS exception or a
+    // tunneled C++ exception) by writing GuestTurn's fields. Under the host-frame wall this
+    // runJsTurn frame, above the guest boundary, is read-only to the turn, so that record must
+    // not live on the walled stack: allocate GuestTurn on the C++ heap (a KEEP/RW mapping,
+    // outside the wall) and read it back host-side after the turn returns.
+    auto turn = kj::heap<GuestTurn<Func>>(body);
     // Run the JS turn (V8, JIT, and the C++ runtime it calls) at guest ring 3. Combined with the
     // per-isolate page-table arena entered at the jsg::Lock, this means arbitrary code execution in
     // V8 cannot reload CR3, run privileged instructions, or touch gk's supervisor/refused pages: any
@@ -1516,7 +1540,7 @@ void runJsTurn(IoContext& context, Worker::Lock& workerLock, Func&& body) {
     // arbitrary code execution can still corrupt shared state and, through a host return address
     // on the stack, potentially reach host execution. See gk.h; containing that is remaining
     // work.
-    long result = gk_run_here_user(&GuestTurn<Func>::trampoline, &turn);
+    long result = gk_run_here_user(&GuestTurn<Func>::trampoline, turn.get());
     if (result != 0) {
       // The guest faulted (or gk otherwise could not complete the turn) and control is back here
       // without the turn's frames ever returning. gk_run_here_user() is an ordinary host-side
@@ -1551,10 +1575,10 @@ void runJsTurn(IoContext& context, Worker::Lock& workerLock, Func&& body) {
       kj::throwFatalException(kj::mv(e));
     }
 
-    if (turn.jsExceptionThrown) {
+    if (turn->jsExceptionThrown) {
       throw jsg::JsExceptionThrown();
     }
-    KJ_IF_SOME(e, turn.exception) {
+    KJ_IF_SOME(e, turn->exception) {
       kj::throwFatalException(kj::mv(e));
     }
     return;
