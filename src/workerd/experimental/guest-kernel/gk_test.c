@@ -545,6 +545,84 @@ static void *wall_thread(void *arg) {
   return (void *)(uintptr_t)wall_check("pthread");
 }
 
+// ---- a host-side decommit under an installed PTE ----------------------------
+// The host can change a mapping without the change passing through the guest
+// (a decommit issued by another host thread, say): the guest's PTE for the page
+// then outlives its backing, and the guest's next access fails in KVM_RUN
+// rather than as a guest #PF. It must end the turn like any other fault, with
+// GK_EFAULT at the page, and leave the thread's vCPU usable, so that the next
+// turn on the thread runs normally instead of failing in its turn.
+
+// Pull the backing from under `page` on the host side: a fixed PROT_NONE
+// mapping replaces it, and gk sees no forwarded syscall.
+static void host_decommit(void *page) {
+  mmap(page, 4096, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+}
+
+// One page: committed and written by a guest turn (installing its PTE),
+// decommitted from the host side, then read by a guest turn, then a plain
+// computation as the next turn on the thread. `run` is gk_run_here_user or
+// gk_run_here.
+struct backing { long write, read, next; unsigned long fault; };
+static void backing_probe(long (*run)(long (*)(void *), void *), void *page,
+                          struct backing *b) {
+  struct ap w = {page, 0x5a};
+  b->write = run(commit_write, &w);
+  host_decommit(page);
+  b->read = run(read_byte, page);
+  b->fault = gk_fault_addr();
+  b->next = run(test_compute, (void *)100);
+}
+
+static int backing_ok(const struct backing *b, unsigned long want_fault, long want_next) {
+  return b->write == 0x5a && b->read == GK_EFAULT && b->fault == want_fault &&
+         b->next == want_next;
+}
+
+// Runs the checks on one thread: an arena page at ring 3 on the caller's stack
+// (the production path) and at ring 0, both reported at the page; then a page
+// outside any arena, where the address cannot be recovered and the fault is
+// reported at the faulting instruction (in read_byte) instead. Returns 1 if
+// every check held.
+static long host_decommit_check(const char *who) {
+  long want_next = 0;
+  for (long i = 0; i < 100; i++) want_next += i * i;
+  gk_arena *a = gk_arena_create(1UL << 20);
+  if (!a) {
+    printf("host-side decommit (%s): no arena [FAIL]\n", who);
+    return 0;
+  }
+  unsigned char *p3 = gk_arena_base(a), *p0 = p3 + 4096;
+  struct backing u, k, h;
+  gk_arena_enter(a);
+  backing_probe(gk_run_here_user, p3, &u);
+  backing_probe(gk_run_here, p0, &k);
+  gk_arena_enter(NULL);
+  gk_arena_destroy(a);  // takes the decommitted pages with it
+  void *hp = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  backing_probe(gk_run_here_user, hp, &h);
+  munmap(hp, 4096);
+  int ok_u = backing_ok(&u, (unsigned long)(uintptr_t)p3, want_next);
+  int ok_k = backing_ok(&k, (unsigned long)(uintptr_t)p0, want_next);
+  unsigned long rb = (unsigned long)(uintptr_t)read_byte;
+  int ok_h = h.write == 0x5a && h.read == GK_EFAULT && h.fault >= rb && h.fault < rb + 64 &&
+             h.next == want_next;
+  int ok = ok_u && ok_k && ok_h;
+  printf("host-side decommit (%s): arena page at ring 3 -> %s (fault %#lx, page %p), next turn "
+         "%ld; at ring 0 -> %s (fault %#lx, page %p), next turn %ld; page outside arenas -> %s "
+         "(fault %#lx, read_byte %#lx), next turn %ld; want next %ld [%s]\n",
+         who, u.read == GK_EFAULT ? "FAULT" : "READ", u.fault, (void *)p3, u.next,
+         k.read == GK_EFAULT ? "FAULT" : "READ", k.fault, (void *)p0, k.next,
+         h.read == GK_EFAULT ? "FAULT" : "READ", h.fault, rb, h.next, want_next,
+         ok ? "OK" : "FAIL");
+  return ok;
+}
+
+static void *host_decommit_thread(void *arg) {
+  (void)arg;
+  return (void *)(uintptr_t)host_decommit_check("pthread");
+}
+
 // ---- guest ring-3 privilege split -------------------------------------------
 // gk_run_user runs fn at guest ring 3. Untrusted code runs there so that even
 // arbitrary code execution cannot breach the arena walls: ring-3 code cannot
@@ -1254,8 +1332,20 @@ int main(void) {
     if ((uintptr_t)rv != 1) ok16 = 0;
   }
 
+  // ---- a host-side decommit under an installed PTE ---------------------------
+  // A page whose backing the host pulls without the guest seeing it faults at
+  // the page and leaves the vCPU usable for the next turn (see
+  // host_decommit_check). On the main thread and on a pthread.
+  int ok17 = host_decommit_check("main thread") == 1;
+  {
+    pthread_t t; void *rv = NULL;
+    pthread_create(&t, NULL, host_decommit_thread, NULL);
+    pthread_join(t, &rv);
+    if ((uintptr_t)rv != 1) ok17 = 0;
+  }
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
-            ok12 && ok13 && ok14 && ok15 && ok16;
+            ok12 && ok13 && ok14 && ok15 && ok16 && ok17;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

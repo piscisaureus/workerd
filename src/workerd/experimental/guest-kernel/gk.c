@@ -125,6 +125,7 @@ typedef struct gk_thread {
   unsigned root_gen;       // G->root_gen as of this vCPU's last TLB flush (0: never)
   uint64_t last_fault;
   int fault_repeat;
+  int backing_retries;     // host-backing faults recovered this invocation (see run_vcpu)
   int pkru_ready;          // guest PKRU has been given its initial value
   int user_mode;           // the current invocation runs fn at ring 3 (gk_run_user)
   // The host-frame wall of a ring-3 gk_run_here_user turn (see run_here):
@@ -1303,6 +1304,19 @@ static void thread_key_dtor(void *p) {
 // created itself already has the stack its clone named (see clone_thread), so
 // it passes nothing.
 #define GK_VCPU_STACK 2
+
+// Load the flat ring-0 code and data descriptors (GDT indices 1 and 2) into
+// s's CS and SS/DS/ES: the privilege every guest entry starts at, and the one
+// the stubs and handlers need.
+static void sregs_ring0(struct kvm_sregs *s) {
+  struct kvm_segment cs = {.base = 0, .limit = 0xffffffff, .selector = 0x08,
+                           .type = 11, .present = 1, .s = 1, .l = 1, .g = 1};
+  struct kvm_segment ds = {.base = 0, .limit = 0xffffffff, .selector = 0x10,
+                           .type = 3, .present = 1, .s = 1, .db = 1, .g = 1};
+  s->cs = cs;
+  s->ds = s->es = s->ss = ds;
+}
+
 static int vcpu_init(gk_thread *t, int flags) {
   if (t->inited) return 0;
   int id, fd, reused = 0;
@@ -1381,17 +1395,12 @@ static int vcpu_init(gk_thread *t, int flags) {
   // for a user-mode process.
   s.cr0 = CR0_PE | CR0_WP | CR0_PG;
   s.efer = EFER_LME | EFER_LMA | EFER_SCE | EFER_NXE;
-  struct kvm_segment cs = {.base = 0, .limit = 0xffffffff, .selector = 0x08,
-                           .type = 11, .present = 1, .s = 1, .l = 1, .g = 1};
-  struct kvm_segment ds = {.base = 0, .limit = 0xffffffff, .selector = 0x10,
-                           .type = 3, .present = 1, .s = 1, .db = 1, .g = 1};
-  s.cs = cs;
-  s.ds = s.es = s.ss = ds;
+  sregs_ring0(&s);
   uint64_t fsbase = 0, gsbase = 0;
   host_syscall(SYS_arch_prctl, 0x1003, (long)&fsbase, 0, 0, 0, 0);  // ARCH_GET_FS
   host_syscall(SYS_arch_prctl, 0x1004, (long)&gsbase, 0, 0, 0, 0);  // ARCH_GET_GS
-  s.fs = ds; s.fs.base = fsbase;
-  s.gs = ds; s.gs.base = gsbase;
+  s.fs = s.ds; s.fs.base = fsbase;
+  s.gs = s.ds; s.gs.base = gsbase;
   // TR comes from the vCPU's cached descriptor, set here; the GDT has no TSS
   // entry because the guest never executes ltr (iretq reloads only CS and SS).
   struct kvm_segment tr = {.base = ist + GK_IST_BYTES - 0x1000, .limit = 0x67,
@@ -1456,6 +1465,7 @@ ready:
   t->root_gen = 0;    // a fresh or reused vCPU flushes its TLB at first entry
   t->last_fault = 0;
   t->fault_repeat = 0;
+  t->backing_retries = 0;
   t->pkru_ready = 0;  // a fresh or reused vCPU gets its PKRU at first entry
   t->user_mode = 0;   // ring 0 until enter_guest or child_entry selects ring 3
   if (!t->active_pml4) t->active_pml4 = G->pml4;
@@ -2085,6 +2095,7 @@ static int prepare_entry(gk_thread *t) {
   }
   t->last_fault = 0;  // fault-repeat tracking is per guest invocation
   t->fault_repeat = 0;
+  t->backing_retries = 0;
   return 0;
 }
 
@@ -2327,20 +2338,115 @@ long gk_run_here_user(long (*fn)(void *), void *arg) {
   return run_here_common(fn, arg, 1);
 }
 
+// ---- host-backing faults ----------------------------------------------------
+// KVM_RUN fails with EFAULT when the guest accesses a page whose PTE is in
+// place but whose host backing is gone: the host side replaced or decommitted
+// the mapping (a fixed mmap or mprotect to PROT_NONE, an munmap) without the
+// change passing through a forwarded syscall, so the PTE was never dropped
+// (see unmap_range_all). KVM cannot back the guest-physical page, and the run
+// stops on the faulting instruction with the vCPU at whatever privilege the
+// guest had, not in a handler. The access was an EPT violation, not a guest
+// #PF, so guest CR2 still holds the previous demand fault's address, and this
+// kernel's kvm_run carries no address for it either.
+//
+// Inside an arena the fault is turned into the guest #PF it would have been
+// had the change been reflected: every PTE of the arena is dropped from the
+// arena root (a late version of the one-page drop a reflected decommit does),
+// the vCPU's TLB is flushed from the host, and the instruction is restarted.
+// Its access now demand-faults with CR2 exact, and demand_map applies the
+// host's current protection: a decommitted page is refused and the turn ends
+// with GK_EFAULT at that address through the path every genuine fault takes; a
+// page the host merely downgraded is remapped with what it has, and a write to
+// it then fails through the fault-repeat limit; a page the host has meanwhile
+// recommitted is mapped and the turn simply goes on. Another vCPU under the
+// same arena root demand-faults its pages back. The retries are bounded per
+// invocation in case the host keeps pulling pages from under the guest.
+// Returns 1 to retry KVM_RUN, 0 to give the fault up (host_backing_fail).
+#define GK_BACKING_RETRIES 3
+static int host_backing_retry(gk_thread *t) {
+  gk_arena *a = t->active_arena;
+  if (!a || t->backing_retries >= GK_BACKING_RETRIES) return 0;
+  t->backing_retries++;
+  pthread_mutex_lock(&G->lock);
+  unmap_range_root(a->pml4, a->base, a->end);
+  pthread_mutex_unlock(&G->lock);
+  // Only a CR3 change makes KVM flush the guest TLB (see flush_tlb), and the
+  // stopped vCPU may be at ring 3, where it cannot run the flush stub: swing
+  // CR3 through the base root and back to the arena's.
+  struct kvm_sregs s;
+  ioctl(t->fd, KVM_GET_SREGS, &s);
+  s.cr3 = (uint64_t)(uintptr_t)G->pml4;
+  if (ioctl(t->fd, KVM_SET_SREGS, &s) < 0) return 0;
+  t->loaded_cr3 = s.cr3;  // so sync_cr3 restores the arena root if the next call fails
+  s.cr3 = (uint64_t)(uintptr_t)a->pml4;
+  if (ioctl(t->fd, KVM_SET_SREGS, &s) < 0) return 0;
+  t->loaded_cr3 = s.cr3;
+  if (G->dbg) {  // fault path: raw output only
+    gk_dbuf d = {.n = 0};
+    db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+    db_str(&d, ": host backing gone under an arena PTE; retrying as a guest fault (");
+    db_dec(&d, t->backing_retries); db_str(&d, ")");
+    db_flush(&d);
+  }
+  return 1;
+}
+
+// A KVM_RUN failure that is not retried (no arena is active, so there is no
+// bounded set of PTEs to drop; the retries are used up; or errno is not
+// EFAULT). Reports EFAULT as GK_EFAULT like any other fault; the address is
+// the faulting instruction's, the closest thing to the access's address KVM
+// leaves behind (a kernel that fills kvm_run.memory_fault supplies the page
+// itself). Other errnos stay -1: they are not guest faults.
+//
+// Either way the vCPU is then put back into the state a turn's end leaves it
+// in, so the next entry on this thread runs a normal turn: ring 0, since the
+// stubs and handlers run privileged (run_stub's code page is supervisor, so a
+// vCPU left at ring 3 faults on its first instruction there), and no event
+// pending, since a fault taken during exception delivery would be requeued
+// and delivered at the next entry. The registers are set afresh by every
+// entry.
+static long host_backing_fail(gk_thread *t, int err) {
+  struct kvm_regs r; struct kvm_sregs s;
+  ioctl(t->fd, KVM_GET_REGS, &r);
+  ioctl(t->fd, KVM_GET_SREGS, &s);
+  uint64_t addr = r.rip;
+  int exact = 0;
+#ifdef KVM_EXIT_MEMORY_FAULT
+  if (t->run->exit_reason == KVM_EXIT_MEMORY_FAULT) {
+    addr = t->run->memory_fault.gpa;  // guest-physical == host-virtual
+    exact = 1;
+  }
+#endif
+  if (G->dbg) {  // fault path: raw output only
+    gk_dbuf d = {.n = 0};
+    db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+    db_str(&d, ": KVM_RUN failed, errno "); db_dec(&d, err);
+    if (err == EFAULT)
+      db_str(&d, exact ? ": host backing gone at " : ": host backing gone under an access at rip ");
+    else
+      db_str(&d, ": rip ");
+    db_hex(&d, addr);
+    db_str(&d, " (cr2 "); db_hex(&d, s.cr2); db_str(&d, " is the previous demand fault)");
+    db_flush(&d);
+  }
+  sregs_ring0(&s);
+  ioctl(t->fd, KVM_SET_SREGS, &s);
+  struct kvm_vcpu_events ev = {0};
+  ioctl(t->fd, KVM_SET_VCPU_EVENTS, &ev);
+  if (err != EFAULT) return -1;
+  G->fault_addr = addr;
+  return GK_EFAULT;
+}
+
 // Run this thread's vCPU from its current register state until the guest exits
 // (via gk_exit_tramp) or faults.
 static long run_vcpu(gk_thread *t) {
   for (;;) {
     if (ioctl(t->fd, KVM_RUN, 0) < 0) {
-      if (errno == EINTR) continue;
-      if (G->dbg) {
-        struct kvm_regs rr; struct kvm_sregs sr;
-        ioctl(t->fd, KVM_GET_REGS, &rr); ioctl(t->fd, KVM_GET_SREGS, &sr);
-        fprintf(stderr, "[gk] KVM_RUN errno=%d rip=%#llx cr2=%#llx (demand ok=%ld)\n",
-                errno, (unsigned long long)rr.rip, (unsigned long long)sr.cr2,
-                G->demand_ok);
-      }
-      return -1;
+      int err = errno;
+      if (err == EINTR) continue;
+      if (err == EFAULT && host_backing_retry(t)) continue;
+      return host_backing_fail(t, err);
     }
     switch (t->run->exit_reason) {
       case KVM_EXIT_IO: {

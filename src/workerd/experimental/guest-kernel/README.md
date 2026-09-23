@@ -69,8 +69,12 @@ hardware:
   memory is unmapped, and from the base root all arena memory is: a guest access
   to another arena's range faults at that address before the host mapping is even
   consulted. A decommit is reflected into every arena root, so a stale writable
-  entry never survives. This is the isolate-cage primitive; one arena per V8
-  isolate holds that isolate's sandbox/cage.
+  entry never survives. A decommit the guest never sees (issued from the host
+  side, by a thread outside the guest) leaves the entry in place, and the
+  guest's next access fails in `KVM_RUN` instead; gk drops the arena's entries
+  and restarts the access, so it faults at the page like any other genuine
+  fault, and the thread's next turn runs normally. This is the isolate-cage
+  primitive; one arena per V8 isolate holds that isolate's sandbox/cage.
 - **Ring-3 execution and supervisor control data.** `gk_run_user` /
   `gk_run_here_user` run untrusted code at guest ring 3, where it cannot execute
   privileged instructions or reload `CR3`. Everything ring 0 relies on is kept

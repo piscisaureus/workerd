@@ -131,6 +131,13 @@ unsigned long gk_debug_ctl_addr(int which);
 #define GK_ESHUTDOWN (-1002)  // guest triple-faulted or shut down
 
 // The guest-virtual address of the last fault reported by gk_run.
+//
+// A page the host side decommits or unmaps without the change passing through
+// a forwarded syscall (another host thread's mmap, say) faults on the guest's
+// next access too. Inside an arena that fault is reported at the page like any
+// other; outside one, where gk cannot recover the access's address, it is the
+// address of the faulting instruction instead. Either way the calling thread's
+// next gk_run runs normally.
 unsigned long gk_fault_addr(void);
 
 // The number of KVM vCPUs created so far. vCPUs of ended threads are pooled
