@@ -8,6 +8,7 @@
 #include <workerd/io/io-gate.h>
 #include <workerd/io/tracer.h>
 #include <workerd/io/worker.h>
+#include <workerd/jsg/guest-run.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/setup.h>
 #include <workerd/util/autogate.h>
@@ -16,12 +17,6 @@
 #include <workerd/util/thread-scopes.h>
 #include <workerd/util/uncaught-exception-source.h>
 #include <workerd/util/use-perfetto-categories.h>
-
-#ifdef WORKERD_HAS_GUEST_KERNEL
-#include <workerd/experimental/guest-kernel/gk.h>
-
-#include <cstdlib>
-#endif
 
 #include <kj/debug.h>
 
@@ -1449,142 +1444,19 @@ void IoContext::runInContextScope(Worker::LockType lockType,
 
 namespace {
 
-#ifdef WORKERD_HAS_GUEST_KERNEL
-// Experimental guest-kernel isolation (see experimental/guest-kernel/gk.h): when
-// jsg::isGuestKernelEnabled(), each JS turn runs inside the KVM guest via gk_run_here(). The
-// guest boundary is not a C++ call frame, so an exception thrown inside the turn cannot unwind
-// across it; the trampoline catches everything in the guest and the host side re-throws it, so
-// callers observe the same exceptions as without the guest.
-//
-// The turn runs under the isolate lock, whose jsg::Lock has already made the isolate's arena
-// the thread's active one (jsg::GuestArenaScope), so the guest enters with that arena's
-// page-table root and can address this isolate's sandbox and no other's.
-
-// Depth of guest-kernel turns on this thread. A turn can re-enter runImpl (for example, a
-// destructor run during JS may enter another IoContext's scope); such nested turns already
-// execute in the guest and must not call gk_run_here() again from inside it.
-thread_local uint guestTurnDepth = 0;
-
-// The arena the outermost guest turn on this thread entered the guest with. A nested turn runs
-// inside that same guest entry, so it must belong to an isolate with the same arena: switching
-// the guest's page-table root from inside the guest is not supported yet, and a nested turn for
-// another isolate would run with that isolate's sandbox unaddressable. Such turns are detected
-// and counted here rather than supported.
-thread_local gk_arena* guestTurnArena = nullptr;
-std::atomic<uint> nestedGuestTurnArenaMismatches{0};
-
-gk_arena* guestArenaOf(jsg::Lock& js) {
-  KJ_IF_SOME(arena, jsg::IsolateBase::from(js.v8Isolate).getGuestArena()) {
-    return arena.get();
-  }
-  return nullptr;
-}
-
-template <typename Func>
-struct GuestTurn {
-  Func& body;
-  kj::Maybe<kj::Exception> exception;
-  bool jsExceptionThrown = false;
-
-  GuestTurn(Func& body): body(body) {}
-
-  static long trampoline(void* ptr) {
-    auto& turn = *reinterpret_cast<GuestTurn*>(ptr);
-    try {
-      turn.body();
-    } catch (const jsg::JsExceptionThrown&) {
-      // The pending exception stays on the isolate; only the C++ signal must be re-raised.
-      turn.jsExceptionThrown = true;
-    } catch (...) {
-      turn.exception = kj::getCaughtExceptionAsKj();
-    }
-    return 0;
-  }
-};
-#endif
-
 // Run one JS turn for `context` on its locked worker, inside the guest kernel when it is enabled
-// and directly otherwise.
+// and directly otherwise (see jsg::runInGuest).
 template <typename Func>
 void runJsTurn(IoContext& context, Worker::Lock& workerLock, Func&& body) {
-#ifdef WORKERD_HAS_GUEST_KERNEL
-  jsg::Lock& js = workerLock;
-  if (jsg::isGuestKernelEnabled() && guestTurnDepth > 0) {
-    gk_arena* arena = guestArenaOf(js);
-    if (arena != guestTurnArena) {
-      uint count = ++nestedGuestTurnArenaMismatches;
-      KJ_LOG(FATAL,
-          "guest-kernel: nested JS turn for an isolate in a different arena than the enclosing "
-          "guest turn; its sandbox is not addressable from the guest",
-          arena, guestTurnArena, count);
-    }
-  } else if (jsg::isGuestKernelEnabled()) {
-    ++guestTurnDepth;
-    KJ_DEFER(--guestTurnDepth);
-    guestTurnArena = guestArenaOf(js);
-    KJ_DEFER(guestTurnArena = nullptr);
-
-    // The trampoline runs in-guest and records the turn's outcome (a thrown JS exception or a
-    // tunneled C++ exception) by writing GuestTurn's fields. Under the host-frame wall this
-    // runJsTurn frame, above the guest boundary, is read-only to the turn, so that record must
-    // not live on the walled stack: allocate GuestTurn on the C++ heap (a KEEP/RW mapping,
-    // outside the wall) and read it back host-side after the turn returns.
-    auto turn = kj::heap<GuestTurn<Func>>(body);
-    // Run the JS turn (V8, JIT, and the C++ runtime it calls) at guest ring 3. Combined with the
-    // per-isolate page-table arena entered at the jsg::Lock, this means arbitrary code execution in
-    // V8 cannot reload CR3, run privileged instructions, or touch gk's supervisor/refused pages: any
-    // such attempt faults and gk_run_here_user returns GK_EFAULT. That confines it to this
-    // isolate's arena and keeps it out of gk's control state, but not out of the shared runtime
-    // memory (the C++/KJ heap, glibc, and this thread's stack, which the turn runs on and which
-    // holds the host frames below the guest boundary): those are user-mapped, so an escape to
-    // arbitrary code execution can still corrupt shared state and, through a host return address
-    // on the stack, potentially reach host execution. See gk.h; containing that is remaining
-    // work.
-    long result = gk_run_here_user(&GuestTurn<Func>::trampoline, turn.get());
-    if (result != 0) {
-      // The guest faulted (or gk otherwise could not complete the turn) and control is back here
-      // without the turn's frames ever returning. gk_run_here_user() is an ordinary host-side
-      // call frame, so everything above it unwinds normally; everything the turn had on the
-      // stack below the guest boundary is abandoned and its destructors never run.
-      //
-      // The isolate is unusable from here on: V8 was interrupted at an arbitrary point (possibly
-      // mid-allocation or mid-JIT), and its per-thread state (HandleScope chain, v8::TryCatch
-      // chain, JS entry frames) still points into the abandoned frames. Condemn it so no further
-      // JS turn is run on it, abort this request's IoContext so its pending work is cancelled
-      // instead of re-entering the isolate, and fail the current request. The process and every
-      // other isolate carry on.
-      //
-      // TODO(guest-kernel): RAII state held by the abandoned frames leaks; there is no
-      //   bookkeeping that could release it. Known leaks per faulted turn:
-      //   - the IoContext::PendingEvent that runImpl's turn registers, so this IoContext is never
-      //     seen as idle by hang detection (moot once it is aborted and destroyed);
-      //   - the limit enforcer's enterJs() scope, so it never sees the matching exit;
-      //   - any kj::Own / jsg::Ref / IoOwn / file descriptor / KJ mutex lock the runnable's C++
-      //     frames held at the moment of the fault (a held KJ mutex would deadlock its next
-      //     locker). The test hook in ServiceWorkerGlobalScope::request() faults before any such
-      //     state is taken, so the test does not exercise that case;
-      //   - on the V8 side, the abandoned HandleScopes' handles, and the isolate itself, which is
-      //     never freed because nothing evicts a condemned isolate (see Worker::Isolate::condemn).
-      auto e = KJ_EXCEPTION(FAILED,
-          "guest-kernel: JS turn faulted inside the guest; the isolate has been condemned", result,
-          gk_fault_addr());
-      // Condemned while this thread still holds the isolate lock (`workerLock`), so a thread
-      // waiting for the lock finds the isolate condemned as soon as it acquires it.
-      workerLock.getWorker().getIsolate().condemn(e.clone());
-      context.abort(e.clone());
-      kj::throwFatalException(kj::mv(e));
-    }
-
-    if (turn->jsExceptionThrown) {
-      throw jsg::JsExceptionThrown();
-    }
-    KJ_IF_SOME(e, turn->exception) {
-      kj::throwFatalException(kj::mv(e));
-    }
-    return;
-  }
-#endif
-  body();
+  jsg::runInGuest(workerLock, body, [&](const kj::Exception& e) {
+    // The turn faulted inside the guest. Condemn the isolate so no further JS turn is run on it
+    // -- while this thread still holds the isolate lock (`workerLock`), so a thread waiting for
+    // the lock finds the isolate condemned as soon as it acquires it -- and abort this request's
+    // IoContext so its pending work is cancelled instead of re-entering the isolate. The
+    // exception then fails the current request.
+    workerLock.getWorker().getIsolate().condemn(e.clone());
+    context.abort(e.clone());
+  });
 }
 
 }  // namespace
