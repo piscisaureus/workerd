@@ -391,7 +391,9 @@ static long __attribute__((noinline)) here_check(const char *who) {
                      (unsigned long)h.frame, want_deep);
     for (int i = 0; i < n; i++) want_sum += (unsigned char)buf[i]; }
   int in_stack = h.frame >= lo && h.frame < hi;
-  int just_below = h.frame < caller && caller - h.frame < 4096;
+  // gk_run_here leaves a page plus a red zone of slack between the switch
+  // point and the guest's first frame, so "just below" is within two pages.
+  int just_below = h.frame < caller && caller - h.frame < 2 * 4096;
   int ok = in_stack && just_below && h.deep == want_deep && r == want_sum && h.len > 0;
   printf("gk_run_here (%s): thread stack [%#lx,%#lx), caller local %#lx, guest frame %#lx "
          "(%ld bytes below caller, %s), deep recursion %s, checksum %ld %s [%s]\n",
@@ -406,6 +408,141 @@ static long __attribute__((noinline)) here_check(const char *who) {
 static void *here_thread(void *arg) {
   (void)arg;
   return (void *)(uintptr_t)here_check("pthread");
+}
+
+// ---- the host-frame wall (ring 3 on the caller's stack) ---------------------
+// gk_run_here_user maps the caller's stack above the turn's entry read-only for
+// the turn, so ring-3 code cannot overwrite the host frames it will return
+// into. A ring-3 fn therefore reports through heap memory (arg points to a
+// calloc'd struct), never by assigning a caller-frame local. The turn runs on a
+// deep host call chain, mirroring a production turn (the KJ event loop down
+// through runImpl/runJsTurn); see wall_descend.
+struct wall {
+  uintptr_t host_frame;  // in: a local in the host caller frame just above the switch point
+  long host_intact;      // out (host-side): the host-frame local was not clobbered by the turn
+  uintptr_t frame;       // out: the fn's own frame pointer
+  uintptr_t boundary;    // out: the first page boundary at or above the fn's entry rsp
+  uintptr_t target;      // out: the address the fn stored to (where a fault is expected)
+  long host_val;         // out: what the fn read at host_frame (reads of walled frames work)
+  long tls_ok;           // out: a TLS variable was written and read back
+  long deep;             // out: the deep recursion's result (the working stack is writable)
+  int which;             // in: 0 store at the wall's first page, 1 store in the host caller frame,
+                         //     2 store in the entry slack (below the wall)
+};
+static __thread long wall_tls;
+static long user_cpl(void *arg);  // defined with the ring-3 privilege tests below
+static long wall_fn(void *arg);
+
+// Depth of the host call chain synthesised above a ring-3 turn's switch point.
+// 24 frames of ~512 bytes push it about three pages below the top of the stack,
+// so the wall has whole pages of host frames to protect even on a pthread,
+// whose static TLS block (which stays writable) sits close above the switch
+// point on a shallow chain. See wall_descend.
+#define WALL_DEPTH 24
+static volatile long wall_sink;
+
+// Run the turn under a chain of WALL_DEPTH real host frames, so more than a page
+// of host frames sits between the guest's entry and the top of the stack. On a
+// shallow chain -- a pthread whose gk_run_here_user call lands within a page of
+// its static TLS block at the top of the stack -- there is no whole page below
+// the TLS to wall and the window is legitimately empty; that sub-page case is an
+// accepted limitation, because the acute target is a production turn, which runs
+// on a deep chain like the one synthesised here. At the deepest frame the
+// address of a live local is recorded as host_frame: a genuine host caller frame
+// (one gk returns into) that the wall must hold read-only. The volatile pad,
+// touched after the nested call, keeps each level a distinct non-tail frame and
+// leaves the turn's return value exactly intact.
+static long __attribute__((noinline)) wall_descend(int depth, struct wall *w) {
+  volatile char pad[512];
+  pad[0] = (char)depth;
+  pad[sizeof pad - 1] = (char)~depth;
+  long r;
+  if (depth <= 0) {
+    volatile long host_local = 0x1111;  // a host caller frame just above the switch point
+    w->host_frame = (uintptr_t)&host_local;
+    r = gk_run_here_user(wall_fn, w);
+    w->host_intact = host_local == 0x1111;
+  } else {
+    r = wall_descend(depth - 1, w);
+  }
+  wall_sink = pad[0] + pad[sizeof pad - 1];  // touch the pad; forbid a tail call
+  return r;
+}
+
+static long __attribute__((noinline)) wall_fn(void *arg) {
+  struct wall *w = arg;
+  uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+  // The entry rsp is two words above the frame pointer (return address, saved
+  // rbp); the wall starts at the first page boundary at or above it.
+  uintptr_t entry = frame + 16;
+  w->frame = frame;
+  w->boundary = (entry + 0xfff) & ~0xfffUL;
+  w->host_val = *(volatile long *)w->host_frame;  // read a walled host frame: reads work
+  wall_tls = 42;  // TLS (atop a pthread's stack mapping) stays writable
+  w->tls_ok = wall_tls == 42;
+  w->deep = deep(DEEP_DEPTH, 1);  // ~1.5MB of stores below the entry
+  switch (w->which) {
+    case 0: w->target = w->boundary; break;      // the wall's first page
+    case 1: w->target = w->host_frame; break;    // a host caller frame the wall covers
+    default: w->target = entry + 64; break;      // entry slack: below the wall, used by neither
+  }
+  *(volatile unsigned long *)w->target = 0x4b1d;
+  return (long)*(volatile unsigned long *)w->target;
+}
+
+// Runs the wall checks on one thread (the main thread's TLS lives in ld.so's
+// mapping; a pthread's sits at the top of its stack mapping, just above the host
+// frames the wall covers). Returns 1 if every check held.
+static long __attribute__((noinline)) wall_check(const char *who) {
+  struct wall *w = calloc(1, sizeof *w);
+  if (!w) return 0;
+  long want_deep = deep(DEEP_DEPTH, 1);
+
+  // 1. A store at the wall's first page (at or above the guest's entry rsp)
+  //    faults there; meanwhile the turn's read of a walled host frame, its TLS
+  //    write and its deep recursion below the entry all worked.
+  w->which = 0;
+  long r0 = wall_descend(WALL_DEPTH, w);
+  unsigned long f0 = gk_fault_addr();
+  int reads_ok = w->host_val == 0x1111 && w->tls_ok && w->deep == want_deep;
+  uintptr_t disp_frame = w->frame, disp_boundary = w->boundary;
+  int ok0 = r0 == GK_EFAULT && f0 == w->boundary && w->boundary > w->frame && reads_ok;
+  // 2. A store into a host caller frame the wall covers -- the kind of frame
+  //    whose return address an escape would target -- faults there and leaves
+  //    the host local untouched.
+  w->which = 1;
+  w->target = 0;
+  long r1 = wall_descend(WALL_DEPTH, w);
+  unsigned long f1 = gk_fault_addr();
+  uintptr_t disp_host = w->host_frame;
+  int intact = w->host_intact;
+  int ok1 = r1 == GK_EFAULT && f1 == disp_host && intact;
+  // 3. Ring 0 on the caller's stack has no wall: a store just above the entry
+  //    (in the slack, which neither host nor guest uses) succeeds.
+  volatile long ring0_local = 0x2222;  // a live, readable host frame for wall_fn's read
+  w->host_frame = (uintptr_t)&ring0_local;
+  w->which = 2;
+  long r2 = gk_run_here(wall_fn, w);
+  int ok2 = r2 == 0x4b1d && w->deep == want_deep;
+  // 4. The process survived both faults: ring 3 on the caller's stack still runs
+  //    a full turn.
+  long cpl = gk_run_here_user(user_cpl, NULL);
+  int ok = ok0 && ok1 && ok2 && cpl == 3;
+  printf("host-frame wall (%s): guest frame %#lx, wall from %#lx, host caller frame %#lx; ring-3 "
+         "store at wall -> %s (fault %#lx), into host caller frame -> %s (fault %#lx, local %s), "
+         "reads/TLS/recursion %s; ring-0 store above entry -> %#lx; ring 3 after at CPL %ld "
+         "[%s]\n",
+         who, (unsigned long)disp_frame, (unsigned long)disp_boundary, (unsigned long)disp_host,
+         r0 == GK_EFAULT ? "FAULT" : "WROTE", f0, r1 == GK_EFAULT ? "FAULT" : "WROTE", f1,
+         intact ? "intact" : "CLOBBERED", reads_ok ? "ok" : "BROKEN", r2, cpl, ok ? "OK" : "FAIL");
+  free(w);
+  return ok;
+}
+
+
+static void *wall_thread(void *arg) {
+  (void)arg;
+  return (void *)(uintptr_t)wall_check("pthread");
 }
 
 // ---- guest ring-3 privilege split -------------------------------------------
@@ -1104,8 +1241,21 @@ int main(void) {
            cpl, ok14 ? "OK" : "FAIL");
   }
 
+  // ---- the host-frame wall ---------------------------------------------------
+  // A ring-3 turn on the caller's stack cannot write the host frames above its
+  // entry (it faults, the process survives), while it can still read them,
+  // write TLS and use its own stack; ring 0 is unaffected. On the main thread
+  // and on a pthread, whose TLS block the wall must stop below.
+  int ok16 = wall_check("main thread") == 1;
+  {
+    pthread_t t; void *rv = NULL;
+    pthread_create(&t, NULL, wall_thread, NULL);
+    pthread_join(t, &rv);
+    if ((uintptr_t)rv != 1) ok16 = 0;
+  }
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
-            ok12 && ok13 && ok14 && ok15;
+            ok12 && ok13 && ok14 && ok15 && ok16;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

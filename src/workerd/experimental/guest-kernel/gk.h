@@ -64,19 +64,31 @@ long gk_run_here(long (*fn)(void *), void *arg);
 // survives. Legitimate syscalls are forwarded and the function returns to
 // ring 3 as usual.
 //
-// What this guarantees, and what it does not. The ring-3 wall protects two
+// What this guarantees, and what it does not. The ring-3 wall protects three
 // things against arbitrary code execution inside an isolate: every other
 // isolate's arena (ring-3 code can neither reload CR3 nor rewrite the page
 // tables or the bookkeeping that selects them, so the per-isolate walls hold),
-// and gk's own control state listed above. It does not protect the shared,
-// non-arena memory of the runtime: the C++/KJ heap, glibc, and every guest
-// thread's stack -- including the stack of the thread that called
-// gk_run_here_user, which fn runs on -- are ordinary user-mapped pages that
-// ring-3 code can read and write. A sandbox escape that gains arbitrary code
-// execution can therefore corrupt shared runtime state, and via a host return
-// address on that shared stack may reach host execution. Containing that
-// requires keeping the runtime's own memory (or at least its stacks and
-// control-flow data) out of ring 3's reach, which is remaining work.
+// gk's own control state listed above, and -- for gk_run_here_user -- the host
+// frames on the calling thread's stack. fn runs on that stack directly below
+// the frames of gk_run_here_user and its callers, whose return addresses and
+// saved registers the host reloads when the turn ends; for the length of the
+// turn the caller's stack above fn's entry frame (up to the thread's stack top,
+// or its TLS block on a pthread) is mapped read-only to the guest, so a store
+// there faults and the call returns GK_EFAULT with gk_fault_addr the store's
+// address. fn and everything it calls must therefore write only below its
+// entry: results go back through memory fn's caller owns elsewhere (arg may
+// point to the heap, never to a caller-frame local that fn will assign).
+// Reads of the caller's frames still work, so a conservative GC that scans
+// the whole thread stack is unaffected.
+//
+// It does not protect the shared, non-arena memory of the runtime: the C++/KJ
+// heap, glibc, and every guest thread's stack -- including the parts of the
+// calling thread's stack that fn itself uses, and other threads' stacks, whose
+// host frames the wall of their own turn does not hold against this thread --
+// are ordinary user-mapped pages that ring-3 code can read and write. A
+// sandbox escape that gains arbitrary code execution can therefore still
+// corrupt shared runtime state; containing that requires keeping the runtime's
+// own memory out of ring 3's reach, which is remaining work.
 //
 // Threads created inside the guest run at their creator's privilege: a thread
 // a ring-3 fn creates (clone/clone3) starts at ring 3 too, and so do its own

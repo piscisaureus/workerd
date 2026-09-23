@@ -1,6 +1,7 @@
 // gk implementation. See gk.h.
 #define _GNU_SOURCE
 #include "gk.h"
+#include <dlfcn.h>
 #include <errno.h>
 #include <string.h>
 
@@ -24,6 +25,7 @@
 #define PTE_NX (1UL << 63)
 #define PTE_PKEY_SHIFT 59        // bits 62:59 hold the page's protection key
 #define PTE_PKEY_MASK (0xfUL << PTE_PKEY_SHIFT)
+#define PF_ERR_WR (1UL << 1)     // #PF error code: the access was a write
 #define PF_ERR_PK (1UL << 5)     // #PF error code: protection-key violation
 #define CR0_PE (1UL << 0)
 #define CR0_WP (1UL << 16)
@@ -125,6 +127,14 @@ typedef struct gk_thread {
   int fault_repeat;
   int pkru_ready;          // guest PKRU has been given its initial value
   int user_mode;           // the current invocation runs fn at ring 3 (gk_run_user)
+  // The host-frame wall of a ring-3 gk_run_here_user turn (see run_here):
+  // [ro_lo, ro_hi), page-aligned, is the caller's stack above the guest's
+  // entry, which this vCPU maps read-only and whose write faults are genuine.
+  // Empty (0, 0) outside such a turn. Written only by the owning thread.
+  uintptr_t ro_lo, ro_hi;
+  // stack_wall_bounds' cache: the host mapping [wall_map_lo, wall_map_hi)
+  // that held the previous turn's switch point, and the wall's end within it.
+  uintptr_t wall_map_lo, wall_map_hi, wall_end;
   uint64_t *active_pml4;   // root this thread runs under
   gk_arena *active_arena;
   // Set for a thread the guest created via clone (see clone_thread): it runs
@@ -230,6 +240,11 @@ struct gk_ctl {
   unsigned long fault_addr;
   int dbg;
   gk_syscall_filter filter;
+  // glibc's _dl_get_tls_static_info (GLIBC_PRIVATE, resolved at gk_init; NULL
+  // if absent): the size of a thread's static TLS block, which on a pthread
+  // sits at the top of the stack mapping and must stay outside the host-frame
+  // wall (see stack_wall_bounds).
+  void (*tls_static_info)(size_t *, size_t *);
   pthread_mutex_t lock;
   long demand_ok;
   // Bumped whenever page-table pages are returned to the allocator (an arena
@@ -1124,6 +1139,11 @@ static int demand_map(gk_thread *t, uintptr_t addr) {
     return -1;
   }
   int pkey = pkey_lookup(page);
+  // Inside this vCPU's host-frame wall the page is mapped without write
+  // permission whatever the host has: readable (a conservative GC scan reads
+  // the caller's frames) but not writable by the turn. A write fault there
+  // never reaches this point (see run_vcpu), so only reads are mapped.
+  if (page >= t->ro_lo && page < t->ro_hi) perms &= ~2;
   int r = map4k_root(root, page, (uint64_t)perms, pkey);  // honor R/W/X for W^X
   if (r >= 0) {
     G->demand_ok++;
@@ -1489,6 +1509,10 @@ int gk_init(void) {
   G->pkeys_held = 1;
   prot_add(GK_CTL_START, GK_CTL_END, GK_PROT_SUPER);
   G->dbg = getenv("GK_DEBUG") != NULL;
+  *(void **)&G->tls_static_info = dlsym(RTLD_DEFAULT, "_dl_get_tls_static_info");
+  if (!G->tls_static_info)
+    fprintf(stderr, "[gk] _dl_get_tls_static_info not found: gk_run_here_user builds no "
+                    "host-frame wall on pthread stacks\n");
   G->kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
   if (G->kvm < 0) { G->err = "open /dev/kvm"; return -1; }
   if (ioctl(G->kvm, KVM_GET_API_VERSION, 0) != 12) { G->err = "KVM API != 12"; return -1; }
@@ -2124,15 +2148,135 @@ long gk_run_user(long (*fn)(void *), void *arg) {
 //
 // GK_HERE_SLACK separates the guest's first frame from the switch point. No
 // host frame is ever built below caller_sp while the guest runs (a signal
-// arriving then is handled on the side stack, where the thread is), so the gap
-// only guards against a host red-zone use around the switch itself.
-#define GK_HERE_SLACK 128
+// arriving then is handled on the side stack, where the thread is), so a
+// red-zone's worth of gap guards the switch itself. The rest of the slack is
+// a whole page, so that the host frames above caller_sp and the guest's own
+// stack never share a page: the host-frame wall below is page-granular.
+#define GK_HERE_SLACK (4096 + 128)
 typedef struct { gk_thread *t; long (*fn)(void *); void *arg; int user; } gk_here_ctx;
+
+// ---- the host-frame wall --------------------------------------------------
+// A ring-3 fn on the caller's stack sits directly below the host frames it
+// will eventually return into: gk_host_call_on_stack's saved rbp and return
+// address at caller_sp, and above them run_here_common, gk_run_here_user and
+// every caller up to the thread's start. Those frames are ordinary user pages,
+// so arbitrary ring-3 code could overwrite a return address there and, once
+// the turn ends cleanly and the host frames unwind, run at host privilege.
+//
+// For the length of a ring-3 turn, the caller's stack from the first page
+// boundary above the guest's entry rsp up to the top of the stack (ro_hi) is
+// therefore read-only to the guest: demand_map maps pages in the window
+// without write permission, and a write fault inside it is genuine (see
+// run_vcpu). Reads keep working, which a conservative GC scan that walks the
+// whole thread stack needs. Legitimate turn code writes only below its entry
+// frame; a store above it is a wall violation and ends the turn with
+// GK_EFAULT.
+//
+// The window is per vCPU: it walls the turn's own writes. Another thread's
+// vCPU maps the same shared base subtree with its own (empty) window, so its
+// writes to this thread's frames are not walled; that is the cross-thread
+// residual of the shared-runtime model, not this wall's job.
+
+// The thread pointer (the fs base): a pthread's TCB, which glibc places at the
+// top of the thread's stack mapping, with its static TLS block just below.
+static uintptr_t thread_pointer(void) {
+  uintptr_t tp;
+  __asm__ __volatile__("mov %%fs:0, %0" : "=r"(tp));
+  return tp;
+}
+
+// Compute the wall for a turn entered at rsp `top` from a host switch point
+// at caller_sp: [*lo, *hi) is page-aligned and empty if nothing can be walled.
+// *hi is the end of the host mapping holding the stack, clamped below the
+// TCB and static TLS when they sit on that mapping (a pthread; the main
+// thread's live in ld.so's own mapping): the turn writes TLS and glibc writes
+// the TCB, so those must stay writable. Runs on the host before the turn.
+//
+// The mapping lookup reads /proc/self/maps, which is long in a process with
+// many mappings and lists the stack last, so its result is cached on the
+// thread record and reused while the switch point stays inside the same
+// mapping (a thread's stack top and TLS never move; a switch point elsewhere,
+// say on a fiber stack, is looked up afresh).
+static int stack_wall_bounds(gk_thread *t, uintptr_t caller_sp, uintptr_t top,
+                             uintptr_t *lo, uintptr_t *hi) {
+  *lo = *hi = 0;
+  if (caller_sp < t->wall_map_lo || caller_sp >= t->wall_map_hi) {
+    uintptr_t rs, re; int perms;
+    if (!host_region(caller_sp & ~0xfffUL, &rs, &re, &perms)) return -1;
+    uintptr_t end = re;
+    uintptr_t tp = thread_pointer();
+    if (tp > caller_sp && tp < re) {
+      if (!G->tls_static_info) {
+        end = 0;  // cannot place the TLS: no wall (warned at init)
+      } else {
+        size_t size = 0, align = 0;
+        G->tls_static_info(&size, &align);
+        uintptr_t tls_lo = (tp - size) & ~0xfffUL;
+        if (tls_lo < end) end = tls_lo;
+      }
+    }
+    t->wall_map_lo = rs;
+    t->wall_map_hi = re;
+    t->wall_end = end;
+    if (G->dbg)
+      fprintf(stderr, "[gk] vcpu %d: stack mapping [%#lx,%#lx) tp=%#lx caller_sp=%#lx -> wall end %#lx\n",
+              t->id, (unsigned long)rs, (unsigned long)re, (unsigned long)tp,
+              (unsigned long)caller_sp, (unsigned long)end);
+  }
+  uintptr_t first = (top + 0xfffUL) & ~0xfffUL;
+  if (first >= t->wall_end) return 0;
+  *lo = first;
+  *hi = t->wall_end;
+  return 0;
+}
+
+// Raise the wall for this thread's turn: record the window and drop the PTEs
+// every root holds for it, so that pages the host (or an earlier turn) left
+// mapped writable re-fault under the window's read-only policy. The drop uses
+// the same discipline as a host decommit (unmap_range_all: base root and any
+// arena root sharing the range), which keeps the guest's next access a demand
+// fault rather than a stale-PTE access. This vCPU's TLB may still hold
+// writable translations of those pages from an earlier turn, so it is flushed
+// too; no other vCPU's translations are touched, as the wall is this vCPU's
+// alone (see above).
+static int wall_raise(gk_thread *t, uintptr_t lo, uintptr_t hi) {
+  if (lo >= hi) return 0;
+  pthread_mutex_lock(&G->lock);
+  t->ro_lo = lo;
+  t->ro_hi = hi;
+  unmap_range_all(lo, hi);
+  pthread_mutex_unlock(&G->lock);
+  return run_stub(t, gk_flush_stub, 0, 0, PORT_FLUSH, "flush");
+}
+
+// Lower the wall after the turn: drop the read-only PTEs so the next guest
+// entry on this thread (a ring-0 run, or a turn with a different window)
+// re-derives the pages' mappings from the host protection, and clear the
+// window.
+static void wall_lower(gk_thread *t) {
+  if (t->ro_lo >= t->ro_hi) return;
+  pthread_mutex_lock(&G->lock);
+  unmap_range_all(t->ro_lo, t->ro_hi);
+  t->ro_lo = t->ro_hi = 0;
+  pthread_mutex_unlock(&G->lock);
+}
 
 static long run_here(void *ctx, unsigned long caller_sp) {
   gk_here_ctx *c = ctx;
   uint64_t top = (caller_sp - GK_HERE_SLACK) & ~0xfULL;
-  return enter_guest(c->t, c->fn, c->arg, top, c->user);
+  if (!c->user) return enter_guest(c->t, c->fn, c->arg, top, 0);
+  uintptr_t lo, hi;
+  if (stack_wall_bounds(c->t, caller_sp, top, &lo, &hi) < 0) {
+    G->err = "gk_run_here_user: caller stack not in /proc/self/maps";
+    return -1;
+  }
+  if (wall_raise(c->t, lo, hi) < 0) {
+    wall_lower(c->t);
+    return -1;
+  }
+  long r = enter_guest(c->t, c->fn, c->arg, top, 1);
+  wall_lower(c->t);
+  return r;
 }
 
 static long run_here_common(long (*fn)(void *), void *arg, int user) {
@@ -2234,6 +2378,21 @@ static long run_vcpu(gk_thread *t) {
               db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
               db_str(&d, ": protection-key violation at "); db_hex(&d, cr2);
               db_str(&d, " (err="); db_hex(&d, pf_err); db_str(&d, ")");
+              db_flush(&d);
+            }
+            G->fault_addr = cr2;
+            return GK_EFAULT;
+          }
+          // A write into this turn's host-frame wall (see run_here) is the wall
+          // holding: genuine, whatever the host protection of the page. Reads
+          // there fall through and are mapped without write permission.
+          if ((pf_err & PF_ERR_WR) && cr2 >= t->ro_lo && cr2 < t->ro_hi) {
+            if (G->dbg) {
+              gk_dbuf d = {.n = 0};
+              db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+              db_str(&d, ": write into the host-frame wall at "); db_hex(&d, cr2);
+              db_str(&d, " (wall ["); db_hex(&d, t->ro_lo); db_str(&d, ", ");
+              db_hex(&d, t->ro_hi); db_str(&d, "), err="); db_hex(&d, pf_err); db_str(&d, ")");
               db_flush(&d);
             }
             G->fault_addr = cr2;
