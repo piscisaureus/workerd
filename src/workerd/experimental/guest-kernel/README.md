@@ -93,6 +93,16 @@ hardware:
   KVM's page backing never pkey-faults. A single switch (`GK_VIRTUALIZE_PKEYS`)
   turns the whole scheme off, since gk already isolates by page-table root and
   does not depend on the keys for security.
+- **Guest on the caller's stack.** `gk_run(fn)` runs the guest on a private
+  per-vCPU stack. `gk_run_here(fn)` instead runs it on the calling thread's own
+  stack -- the guest's `rsp` continues from the call site, as a native call of
+  `fn` would -- so stack-derived state stays valid across the host/guest
+  boundary. An embedder whose conservative GC scans from a frame pointer captured
+  on the host, or whose stack-limit check auto-detects the OS thread stack (both
+  true of V8 in workerd), then sees the same stack the guest runs on. gk's own
+  `KVM_RUN` loop moves to a side stack so it never collides with the guest, and
+  the main thread's growable stack is expanded on demand by a probe syscall,
+  since a guest access alone does not trip the kernel's stack growth.
 
 Enabling SSE and AVX in the guest (`CR4.OSFXSR`, `OSXSAVE`, and `XCR0`) is
 required before compiled code and glibc, which use those instructions, will

@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <linux/kvm.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -87,15 +88,18 @@ static long g_demand_ok;
 // Instead a vCPU whose thread ends is parked here and handed to the next thread
 // that needs one; a vCPU may be driven by a different host thread on each
 // KVM_RUN. Live vCPUs are therefore bounded by peak concurrent guest threads.
-// The pool holds the eager-mapped guest stack too, when the vCPU had one, so
-// stacks are recycled rather than leaked. Guarded by g_lock.
+// The pool holds the eager-mapped guest stack and the gk_run_here side stack
+// too, when the vCPU had them, so stacks are recycled rather than leaked.
+// Guarded by g_lock.
 #define GK_MAX_VCPUS 4096
 #define GK_IST_BYTES (64UL << 10)   // per-vCPU exception stack, TSS in its last page
+#define GK_SIDE_STACK (512UL << 10) // host-side stack for gk_run_here's gk loop
 typedef struct {
   int fd, id;
   struct kvm_run *run;
   uint64_t stack_top;   // 0 if the vCPU has no private guest stack
   uint64_t ist;         // its exception stack + TSS region (see vcpu_init)
+  void *side_stack;     // NULL if the vCPU has no gk_run_here side stack
 } gk_parked_vcpu;
 static gk_parked_vcpu g_parked[GK_MAX_VCPUS];
 static int g_parked_n;
@@ -110,6 +114,7 @@ typedef struct {
   struct kvm_run *run;
   uint64_t stack_top;
   uint64_t ist;            // exception stack + TSS region of this vCPU
+  void *side_stack;        // host stack for gk_run_here's gk loop (see there)
   uint64_t loaded_cr3;
   uint64_t last_fault;
   int fault_repeat;
@@ -146,6 +151,9 @@ extern long gk_host_clone_raw(long nr, long a1, long a2, long a3, long a4,
                               long a5);
 extern void gk_host_unmapself_exit(void *addr, size_t len, long code)
     __attribute__((noreturn));
+extern long gk_host_call_on_stack(void *stack_top,
+                                  long (*f)(void *ctx, unsigned long caller_sp),
+                                  void *ctx);
 
 // ---- helpers ---------------------------------------------------------------
 static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
@@ -575,7 +583,20 @@ static int demand_map(uintptr_t addr) {
   if (addr_in_any_arena(page)) return -1;
   uintptr_t rs, re; int perms;
   pthread_mutex_lock(&g_lock);
-  if (!host_region(page, &rs, &re, &perms) || !(perms & 1)) {
+  int mapped = host_region(page, &rs, &re, &perms);
+  if (!mapped) {
+    // The page may lie just below a stack the kernel grows on demand (the main
+    // thread's, which gk_run_here runs the guest on). Natively the thread's own
+    // access would grow it; a guest access never reaches the host's fault
+    // handler, so ask the kernel to fault the page here. rt_sigprocmask with a
+    // NULL `set` changes nothing, but writing the old mask to `oldset` = page
+    // makes the kernel's copy_to_user grow a VM_GROWSDOWN stack exactly as a
+    // native write would (and return EFAULT, not a signal, if it cannot).
+    // Ordinary unmapped addresses just fail the probe.
+    host_syscall(SYS_rt_sigprocmask, SIG_BLOCK, 0, (long)page, 8, 0, 0);
+    mapped = host_region(page, &rs, &re, &perms);
+  }
+  if (!mapped || !(perms & 1)) {
     pthread_mutex_unlock(&g_lock);
     return -1;  // not host-readable: a genuine fault
   }
@@ -616,6 +637,7 @@ static void vcpu_park(void) {
     p->run = tls.run;
     p->stack_top = tls.stack_top;
     p->ist = tls.ist;
+    p->side_stack = tls.side_stack;
   } else {  // cannot happen with KVM_CAP_MAX_VCPUS <= GK_MAX_VCPUS; be safe
     munmap(tls.run, g_run_size);
     close(tls.fd);
@@ -638,18 +660,24 @@ static void vcpu_key_dtor(void *p) {
 // reused when one is available (see the vCPU pool); otherwise a new one is
 // created. Either way the segment bases, CR3 and FPU are programmed for the
 // calling thread, so a reused vCPU carries nothing over from its last thread
-// except its id. The guest stack is only needed for threads entering through
-// gk_run; a thread the guest created itself already has the stack its clone
-// named (see clone_thread).
-static int vcpu_init(int with_stack) {
+// except its id. `flags`: GK_VCPU_HOST for a host thread entering through
+// gk_run or gk_run_here (its vCPU is parked when the thread ends), plus
+// GK_VCPU_STACK when it needs the private guest stack (gk_run). A thread the
+// guest created itself already has the stack its clone named (see
+// clone_thread) and ends through the exit syscall, so it passes neither.
+#define GK_VCPU_HOST 1
+#define GK_VCPU_STACK 2
+static int vcpu_init(int flags) {
   if (tls.inited) return 0;
   int id, fd, reused = 0;
   struct kvm_run *run = NULL;
   uint64_t stack_top = 0, ist = 0;
+  void *side_stack = NULL;
   pthread_mutex_lock(&g_lock);
   if (g_parked_n > 0) {
     gk_parked_vcpu *p = &g_parked[--g_parked_n];
     fd = p->fd; id = p->id; run = p->run; stack_top = p->stack_top; ist = p->ist;
+    side_stack = p->side_stack;
     reused = 1;
   }
   pthread_mutex_unlock(&g_lock);
@@ -682,10 +710,11 @@ static int vcpu_init(int with_stack) {
 
   // A private guest stack for this vCPU, eager-mapped so interrupt delivery
   // (which pushes a frame) never itself faults. A parked vCPU may bring one
-  // along; it is kept (and parked again later) even if this thread has no use
-  // for it, so stacks are neither leaked nor left with dangling PTEs.
+  // along (and a gk_run_here side stack); they are kept (and parked again
+  // later) even if this thread has no use for them, so stacks are neither
+  // leaked nor left with dangling PTEs.
   const size_t stksz = 2 * 1024 * 1024;
-  if (with_stack && stack_top == 0) {
+  if ((flags & GK_VCPU_STACK) && stack_top == 0) {
     uint8_t *stk = mmap(NULL, stksz, PROT_READ | PROT_WRITE,
                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (stk == MAP_FAILED) { g_err = "mmap guest stack"; return -1; }
@@ -770,6 +799,7 @@ ready:
   tls.run = run;
   tls.stack_top = stack_top;
   tls.ist = ist;
+  tls.side_stack = side_stack;
   tls.loaded_cr3 = (uint64_t)(uintptr_t)g_pml4;
   tls.last_fault = 0;
   tls.fault_repeat = 0;
@@ -777,7 +807,7 @@ ready:
   if (!tls.active_pml4) tls.active_pml4 = g_pml4;
   tls.inited = 1;
   // A gk_run thread gives its vCPU back when it ends (see vcpu_key_dtor).
-  if (with_stack) pthread_setspecific(g_vcpu_key, &tls);
+  if (flags & GK_VCPU_HOST) pthread_setspecific(g_vcpu_key, &tls);
   if (g_dbg)
     fprintf(stderr, "[gk] vcpu %d %s by tid %ld\n", id, reused ? "reused" : "created",
             host_syscall(SYS_gettid, 0, 0, 0, 0, 0, 0));
@@ -847,7 +877,7 @@ int gk_init(void) {
   g_run_size = ioctl(g_kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
   if (pthread_key_create(&g_vcpu_key, vcpu_key_dtor) != 0) { g_err = "pthread_key_create"; return -1; }
 
-  return vcpu_init(1);  // bring up the calling thread's vCPU
+  return vcpu_init(GK_VCPU_HOST | GK_VCPU_STACK);  // bring up the calling thread's vCPU
 }
 
 int gk_vcpu_count(void) { return atomic_load(&g_vcpus_created); }
@@ -1225,8 +1255,9 @@ static int sync_cr3(void) {
   return 0;
 }
 
-long gk_run(long (*fn)(void *), void *arg) {
-  if (vcpu_init(1) < 0) return -1;
+// Ready this thread's vCPU for a guest invocation: its root, its PKRU on first
+// entry, and the per-invocation fault-repeat tracking.
+static int prepare_entry(void) {
   if (sync_cr3() < 0) return -1;
   uint32_t hp = host_pkru();
   host_pkru_allow_all();
@@ -1239,7 +1270,14 @@ long gk_run(long (*fn)(void *), void *arg) {
   }
   tls.last_fault = 0;  // fault-repeat tracking is per guest invocation
   tls.fault_repeat = 0;
-  uint64_t sp = tls.stack_top - 8;
+  return 0;
+}
+
+// Enter the guest at fn(arg) with a stack whose top (16-byte aligned) is
+// `stack_top`, and run it to completion. fn returns into gk_exit_tramp, which
+// hands its return value back through run_vcpu.
+static long enter_guest(long (*fn)(void *), void *arg, uint64_t stack_top) {
+  uint64_t sp = stack_top - 8;
   *(uint64_t *)sp = (uintptr_t)&gk_exit_tramp;
 
   struct kvm_regs regs = {0};
@@ -1249,6 +1287,47 @@ long gk_run(long (*fn)(void *), void *arg) {
   regs.rflags = 0x2;
   ioctl(tls.fd, KVM_SET_REGS, &regs);
   return run_vcpu();
+}
+
+long gk_run(long (*fn)(void *), void *arg) {
+  if (vcpu_init(GK_VCPU_HOST | GK_VCPU_STACK) < 0) return -1;
+  if (prepare_entry() < 0) return -1;
+  return enter_guest(fn, arg, tls.stack_top);
+}
+
+// ---- gk_run_here: the guest on the caller's stack ---------------------------
+// The guest starts with rsp just below the point where gk_host_call_on_stack
+// switched this thread away from its stack, so it grows down into the thread's
+// stack exactly as a native call from gk_run_here would. Meanwhile the host
+// side (run_vcpu, forward_syscall, demand_map) runs on the vCPU's side stack,
+// so its frames can never land on top of the guest's. The two stacks are host
+// memory either way: the guest demand-pages the thread stack as it descends,
+// and demand_map grows the main thread's stack when the kernel would have.
+//
+// GK_HERE_SLACK separates the guest's first frame from the switch point. No
+// host frame is ever built below caller_sp while the guest runs (a signal
+// arriving then is handled on the side stack, where the thread is), so the gap
+// only guards against a host red-zone use around the switch itself.
+#define GK_HERE_SLACK 128
+typedef struct { long (*fn)(void *); void *arg; } gk_here_ctx;
+
+static long run_here(void *ctx, unsigned long caller_sp) {
+  gk_here_ctx *c = ctx;
+  uint64_t top = (caller_sp - GK_HERE_SLACK) & ~0xfULL;
+  return enter_guest(c->fn, c->arg, top);
+}
+
+long gk_run_here(long (*fn)(void *), void *arg) {
+  if (vcpu_init(GK_VCPU_HOST) < 0) return -1;
+  if (!tls.side_stack) {
+    void *ss = mmap(NULL, GK_SIDE_STACK, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+    if (ss == MAP_FAILED) { g_err = "mmap side stack"; return -1; }
+    tls.side_stack = ss;
+  }
+  if (prepare_entry() < 0) return -1;
+  gk_here_ctx c = {fn, arg};  // lives above caller_sp, out of the guest's way
+  return gk_host_call_on_stack((char *)tls.side_stack + GK_SIDE_STACK, run_here, &c);
 }
 
 // Run this thread's vCPU from its current register state until the guest exits

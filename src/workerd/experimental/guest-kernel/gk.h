@@ -40,6 +40,19 @@ const char *gk_last_error(void);
 // inside the guest inherits its creator's.
 long gk_run(long (*fn)(void *), void *arg);
 
+// Like gk_run, but fn runs on the calling thread's own stack rather than on a
+// private guest stack: the guest's rsp starts just below gk_run_here's frame
+// and grows down into the thread's stack, as a native call of fn would. This
+// keeps stack-derived state valid across the host/guest boundary: a
+// conservative GC that scans from an address captured on the host (workerd's
+// __builtin_frame_address(0)) up through fn's frames, and a stack limit V8
+// derives from pthread_getattr_np, both describe the stack fn actually uses.
+// The thread's stack is demand-paged into the guest as fn descends, including
+// the main thread's kernel-grown stack. gk's own host-side loop runs on a
+// separate per-vCPU side stack meanwhile, so it never overwrites fn's frames.
+// Return values and faults are reported exactly as by gk_run.
+long gk_run_here(long (*fn)(void *), void *arg);
+
 #define GK_EFAULT (-1001)  // guest faulted; see gk_fault_addr()
 #define GK_ESHUTDOWN (-1002)  // guest triple-faulted or shut down
 

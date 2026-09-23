@@ -262,6 +262,80 @@ static long pk_teardown(void *arg) {
   return v;
 }
 
+// ---- gk_run_here: the guest on the caller's stack ---------------------------
+// The guest function records where its own frame is, then does real work on
+// that stack: a deep non-tail recursion (well over a megabyte of stack, so on
+// the main thread the kernel-grown stack must grow under the guest), snprintf
+// into a local buffer, and a forwarded write. Returns a checksum.
+struct here { uintptr_t frame; long deep; long len; };
+
+static long __attribute__((noinline)) deep(long depth, long acc) {
+  volatile char pad[1024];
+  pad[0] = (char)depth;
+  pad[1023] = (char)acc;
+  if (depth == 0) return acc + pad[0];
+  long r = deep(depth - 1, acc ^ (depth * 7));
+  return r + pad[1023];
+}
+#define DEEP_DEPTH 1500  // ~1.5 MB of stack
+
+static long here_fn(void *arg) {
+  struct here *h = arg;
+  h->frame = (uintptr_t)__builtin_frame_address(0);
+  h->deep = deep(DEEP_DEPTH, 1);
+  char buf[256];
+  h->len = snprintf(buf, sizeof buf, "guest on the caller's stack: frame %#lx, deep=%ld\n",
+                    (unsigned long)h->frame, h->deep);
+  write(1, buf, (size_t)h->len);
+  long sum = 0;
+  for (long i = 0; i < h->len; i++) sum += (unsigned char)buf[i];
+  return sum;
+}
+
+// The range of the calling thread's stack, as V8 would learn it.
+static int thread_stack(uintptr_t *lo, uintptr_t *hi) {
+  pthread_attr_t a;
+  void *addr; size_t size;
+  if (pthread_getattr_np(pthread_self(), &a) != 0) return 0;
+  int ok = pthread_attr_getstack(&a, &addr, &size) == 0;
+  pthread_attr_destroy(&a);
+  *lo = (uintptr_t)addr; *hi = (uintptr_t)addr + size;
+  return ok;
+}
+
+// Runs the caller's-stack check on one thread (the main thread's stack is
+// kernel-grown; a pthread's is a fixed mapping). Returns 1 if every check held.
+static long __attribute__((noinline)) here_check(const char *who) {
+  uintptr_t lo, hi;
+  if (!thread_stack(&lo, &hi)) return 0;
+  volatile char marker = 0;
+  uintptr_t caller = (uintptr_t)&marker;  // a local of the frame calling gk_run_here
+  struct here h = {0};
+  long r = gk_run_here(here_fn, &h);
+  long want_deep = deep(DEEP_DEPTH, 1);
+  long want_sum = 0;
+  { char buf[256];
+    int n = snprintf(buf, sizeof buf, "guest on the caller's stack: frame %#lx, deep=%ld\n",
+                     (unsigned long)h.frame, want_deep);
+    for (int i = 0; i < n; i++) want_sum += (unsigned char)buf[i]; }
+  int in_stack = h.frame >= lo && h.frame < hi;
+  int just_below = h.frame < caller && caller - h.frame < 4096;
+  int ok = in_stack && just_below && h.deep == want_deep && r == want_sum && h.len > 0;
+  printf("gk_run_here (%s): thread stack [%#lx,%#lx), caller local %#lx, guest frame %#lx "
+         "(%ld bytes below caller, %s), deep recursion %s, checksum %ld %s [%s]\n",
+         who, (unsigned long)lo, (unsigned long)hi, (unsigned long)caller,
+         (unsigned long)h.frame, (long)(caller - h.frame),
+         in_stack && just_below ? "on the caller's stack" : "NOT on the caller's stack",
+         h.deep == want_deep ? "ok" : "WRONG", r, r == want_sum ? "ok" : "WRONG",
+         ok ? "OK" : "FAIL");
+  return ok;
+}
+
+static void *here_thread(void *arg) {
+  (void)arg;
+  return (void *)(uintptr_t)here_check("pthread");
+}
+
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (gk_init() != 0) {
@@ -403,7 +477,27 @@ int main(void) {
          pk_w1 == GK_EFAULT ? "FAULT" : "allowed", pk_r2 == GK_EFAULT ? "FAULT" : "allowed",
          pk_r3, pk_inh, pk_end, ok9 ? "OK" : "FAIL");
 
-  int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9;
+  // gk_run_here runs the guest on the calling thread's stack: on the main
+  // thread (kernel-grown stack) and on a pthread (fixed mapping). gk_run, by
+  // contrast, runs it on a private stack outside the thread's stack range.
+  int ok10 = here_check("main thread") == 1;
+  {
+    pthread_t t; void *rv = NULL;
+    pthread_create(&t, NULL, here_thread, NULL);
+    pthread_join(t, &rv);
+    if ((uintptr_t)rv != 1) ok10 = 0;
+  }
+  {
+    uintptr_t lo, hi;
+    struct here h = {0};
+    long r = gk_run(here_fn, &h);
+    int ok = thread_stack(&lo, &hi) && r > 0 && !(h.frame >= lo && h.frame < hi);
+    printf("gk_run: guest frame %#lx is outside the thread stack [%#lx,%#lx) [%s]\n",
+           (unsigned long)h.frame, (unsigned long)lo, (unsigned long)hi, ok ? "OK" : "FAIL");
+    if (!ok) ok10 = 0;
+  }
+
+  int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

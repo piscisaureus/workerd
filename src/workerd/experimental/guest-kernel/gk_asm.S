@@ -122,4 +122,26 @@ gk_host_unmapself_exit:
     syscall
     hlt
 
+// long gk_host_call_on_stack(void *stack_top,
+//                            long (*f)(void *ctx, unsigned long caller_sp),
+//                            void *ctx)
+// Calls f(ctx, caller_sp) with rsp switched to `stack_top` (16-byte aligned),
+// then switches back and returns f's result. `caller_sp` is the lowest address
+// this thread's original stack is in use down to at the moment of the switch:
+// everything below it is free for the guest (see gk_run_here). The frame
+// pointer holds the original rsp across the call, as f must preserve it.
+    .globl gk_host_call_on_stack
+    .type gk_host_call_on_stack, @function
+gk_host_call_on_stack:
+    pushq %rbp
+    movq %rsp, %rbp    /* original stack: [saved rbp][return address]... */
+    movq %rdi, %rsp    /* now on the side stack; ABI-aligned for the call below */
+    movq %rsi, %rax
+    movq %rdx, %rdi    /* ctx */
+    movq %rbp, %rsi    /* caller_sp */
+    call *%rax
+    movq %rbp, %rsp    /* back to the original stack */
+    popq %rbp
+    ret
+
     .section .note.GNU-stack,"",@progbits
