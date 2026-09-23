@@ -5,6 +5,9 @@
 #include "server.h"
 
 #include <workerd/api/unsafe.h>
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <workerd/experimental/guest-kernel/gk.h>
+#endif
 #include <workerd/io/compatibility-date.capnp.h>
 #include <workerd/io/compatibility-date.h>
 #include <workerd/io/release-version.embed.h>
@@ -1218,6 +1221,17 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
                               : config.getStructuredLogging()) {
         context.enableStructuredLogging();
       }
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+      // Experimental: run isolate code inside a KVM guest (guest ring 0). Must
+      // happen before the V8 platform starts its worker threads and before
+      // V8::Initialize reserves the sandbox/cage. Off unless the env var is set.
+      if (getenv("WORKERD_EXPERIMENTAL_GUEST_KERNEL") != nullptr) {
+        KJ_REQUIRE(gk_init() >= 0, "guest-kernel: gk_init() failed",
+            kj::StringPtr(gk_last_error() != nullptr ? gk_last_error() : "unknown"));
+        KJ_LOG(WARNING, "guest-kernel isolation enabled (experimental)");
+      }
+#endif
 
       auto platform = jsg::defaultPlatform(0);
       WorkerdPlatform v8Platform(*platform);
