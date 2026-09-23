@@ -69,6 +69,7 @@ PATCHES = [
     "0044-Allow-external-code-space-with-multiple-pointer-compression-cages.patch",
     "0045-Allow-placing-an-IsolateGroup-sandbox-in-an-embedder-reservation.patch",
     "0046-Make-the-sandbox-size-a-build-time-flag.patch",
+    "0047-Per-IsolateGroup-page-allocator-for-out-of-sandbox-memory.patch",
 ]
 
 http_archive(
