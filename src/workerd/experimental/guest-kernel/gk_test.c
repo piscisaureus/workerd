@@ -57,6 +57,31 @@ static long read_byte(void *arg) {
   return (long)*p;
 }
 
+// ---- arena tests -------------------------------------------------------------
+// An arena is a PROT_NONE reservation: its owner commits pages with mprotect,
+// which the guest issues as a forwarded syscall, and the guest's first access
+// then demand-pages the committed page into the active arena's root.
+struct ap { void *page; unsigned char val; };
+
+// Runs in the guest: commit one page (mprotect RW), write a byte, read it back.
+static long commit_write(void *arg) {
+  struct ap *p = arg;
+  if (mprotect(p->page, 4096, PROT_READ | PROT_WRITE) != 0) return -errno;
+  volatile unsigned char *b = p->page;
+  b[0] = p->val;
+  return b[0];
+}
+
+// Runs in the guest: decommit a page (mprotect PROT_NONE), then read it. The
+// read must fault: the decommit has to be reflected into the arena root, or a
+// stale PTE would let it through (as a KVM_RUN EFAULT, or worse, silently).
+static long decommit_read(void *arg) {
+  struct ap *p = arg;
+  if (mprotect(p->page, 4096, PROT_NONE) != 0) return -errno;
+  volatile unsigned char *b = p->page;
+  return b[0];
+}
+
 
 // ---- multi-vCPU tests ------------------------------------------------------
 // Each host thread becomes its own vCPU. This worker runs compute plus a
@@ -358,26 +383,67 @@ int main(void) {
   int ok2 = (r > 0);
   printf("libc in guest: checksum %ld [%s]\n", r, ok2 ? "OK" : "FAIL");
 
-  // Arena isolation: two isolates, each with a private cage.
-  gk_arena *A = gk_arena_create(4096);
-  gk_arena *B = gk_arena_create(4096);
+  // Arena isolation with demand paging: two isolates, each a PROT_NONE
+  // reservation paged into its own root only while active. A is larger than
+  // two 512GiB PML4 slots (as V8's largest sandbox reservation is), so it
+  // spans three; B is small. Nothing is touched until the guest commits a page.
+  const size_t SLOT = 1UL << 39;
+  gk_arena *A = gk_arena_create(2 * SLOT + (64UL << 20));
+  gk_arena *B = gk_arena_create(1UL << 20);
   int ok3 = 0;
   if (A && B) {
-    memset(gk_arena_base(A), 0xAA, 16);  // host fills each cage
-    memset(gk_arena_base(B), 0xBB, 16);
+    unsigned char *ab = gk_arena_base(A), *bb = gk_arena_base(B);
+    unsigned char *a2 = ab + SLOT + 4096;      // a page in A's second slot
+    unsigned char *a3 = ab + 2 * SLOT + 8192;  // and one in its third
+    int layout = gk_arena_size(A) >= 2 * SLOT + (64UL << 20) && ((uintptr_t)ab % SLOT) == 0 &&
+                 ((uintptr_t)bb % SLOT) == 0 && (bb < ab || bb >= ab + 3 * SLOT);
+    struct ap wa = {ab, 0xA1}, wa2 = {a2, 0xA2}, wa3 = {a3, 0xA4}, wb = {bb, 0xB1},
+              wa_re = {ab, 0xA3};
     gk_arena_enter(A);
-    long ra = gk_run(read_byte, gk_arena_base(A));  // A reads its own cage
-    long rb = gk_run(read_byte, gk_arena_base(B));  // A reaches for B's cage
+    long ra = gk_run(commit_write, &wa);     // commit, write, read a page of A
+    long ra2 = gk_run(commit_write, &wa2);   // same, in A's second slot
+    long ra3 = gk_run_here(commit_write, &wa3);  // and its third, on the caller's stack
+    long ra_b = gk_run(read_byte, bb);       // B's memory under A: must fault
+    unsigned long fa_b = gk_fault_addr();
+    gk_arena_enter(B);
+    long rb = gk_run(commit_write, &wb);     // B commits and uses its own page
+    long rb_a = gk_run(read_byte, ab);       // A's (committed) page under B: must fault
+    unsigned long fa_a = gk_fault_addr();
     gk_arena_enter(NULL);
-    printf("under arena A: read A's cage -> 0x%lx, read B's cage -> %s\n",
-           ra, rb == GK_EFAULT ? "FAULT" : "readable");
-    if (rb == GK_EFAULT)
-      printf("  (hardware blocked it; fault at 0x%lx == B's base 0x%lx)\n",
-             gk_fault_addr(), (unsigned long)(uintptr_t)gk_arena_base(B));
-    ok3 = (ra == 0xAA) && (rb == GK_EFAULT) &&
-          (gk_fault_addr() == (uintptr_t)gk_arena_base(B));
+    long r0_a = gk_run(read_byte, ab);       // base root: neither arena is reachable
+    unsigned long f0_a = gk_fault_addr();
+    long r0_b = gk_run(read_byte, bb);
+    unsigned long f0_b = gk_fault_addr();
+    gk_arena_enter(A);
+    long ra_again = gk_run(read_byte, ab);   // A's pages are back, in all three slots
+    long ra2_again = gk_run(read_byte, a2);
+    long ra3_again = gk_run(read_byte, a3);
+    long rdec = gk_run(decommit_read, &wa);  // decommit is reflected into A's root
+    unsigned long fdec = gk_fault_addr();
+    long rrec = gk_run(commit_write, &wa_re);  // recommit: usable again
+    gk_arena_enter(NULL);
+    int host_sees = ab[0] == 0xA3 && a2[0] == 0xA2 && a3[0] == 0xA4 && bb[0] == 0xB1;  // same memory on the host
+    printf("arenas: A = [%p, +%zu) over 3 slots, B = [%p, +%zu)\n", (void *)ab, gk_arena_size(A),
+           (void *)bb, gk_arena_size(B));
+    printf("  under A: commit+write A -> %#lx, A's 2nd slot -> %#lx, 3rd slot -> %#lx, "
+           "read B -> %s (fault %#lx)\n", ra, ra2, ra3, ra_b == GK_EFAULT ? "FAULT" : "readable", fa_b);
+    printf("  under B: commit+write B -> %#lx, read A -> %s (fault %#lx)\n", rb,
+           rb_a == GK_EFAULT ? "FAULT" : "readable", fa_a);
+    printf("  base root: read A -> %s (fault %#lx), read B -> %s (fault %#lx)\n",
+           r0_a == GK_EFAULT ? "FAULT" : "readable", f0_a, r0_b == GK_EFAULT ? "FAULT" : "readable",
+           f0_b);
+    printf("  back in A: read A -> %#lx, 2nd slot -> %#lx, 3rd slot -> %#lx, decommit+read -> %s "
+           "(fault %#lx), recommit+write -> %#lx, host sees %s\n", ra_again, ra2_again, ra3_again,
+           rdec == GK_EFAULT ? "FAULT" : "readable", fdec, rrec, host_sees ? "same bytes" : "WRONG");
+    ok3 = layout && ra == 0xA1 && ra2 == 0xA2 && ra3 == 0xA4 && ra_b == GK_EFAULT &&
+          fa_b == (uintptr_t)bb && rb == 0xB1 && rb_a == GK_EFAULT && fa_a == (uintptr_t)ab &&
+          r0_a == GK_EFAULT && f0_a == (uintptr_t)ab && r0_b == GK_EFAULT && f0_b == (uintptr_t)bb &&
+          ra_again == 0xA1 && ra2_again == 0xA2 && ra3_again == 0xA4 && rdec == GK_EFAULT &&
+          fdec == (uintptr_t)ab && rrec == 0xA3 && host_sees;
+  } else {
+    printf("arenas: create failed (A=%p B=%p)\n", (void *)A, (void *)B);
   }
-  printf("arena isolation [%s]\n", ok3 ? "OK" : "FAIL");
+  printf("arena isolation, demand-paged, multi-slot [%s]\n", ok3 ? "OK" : "FAIL");
 
   // Multi-vCPU concurrency: N threads each run in the guest at once.
   enum { NT = 4 };
@@ -392,9 +458,12 @@ int main(void) {
          ok4 ? "OK" : "FAIL");
 
   // Per-thread arenas running concurrently, each isolated from the other.
+  // The host commits and fills one page of each; each thread's first guest
+  // access demand-pages it into that thread's arena root.
   gk_arena *X = gk_arena_create(4096), *Y = gk_arena_create(4096);
   int ok5 = 0;
-  if (X && Y) {
+  if (X && Y && mprotect(gk_arena_base(X), 4096, PROT_READ | PROT_WRITE) == 0 &&
+      mprotect(gk_arena_base(Y), 4096, PROT_READ | PROT_WRITE) == 0) {
     memset(gk_arena_base(X), 0x11, 16);
     memset(gk_arena_base(Y), 0x22, 16);
     pthread_barrier_t bar;

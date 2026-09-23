@@ -64,17 +64,25 @@ unsigned long gk_fault_addr(void);
 // guest threads, not by the number of threads ever created.
 int gk_vcpu_count(void);
 
-// Per-isolate memory arena: a region with its own page-table root. While an
-// arena is active, other arenas' memory is unmapped and unaddressable. This is
-// the isolate-cage primitive; in workerd one arena would hold one isolate's V8
-// cage.
+// Per-isolate memory arena: a large PROT_NONE reservation with its own
+// page-table root. The arena's owner commits and decommits sub-ranges with
+// mprotect (or fixed mmap/munmap), as V8 does for its sandbox; a committed
+// page is demand-paged into the arena's root the first time the guest touches
+// it while the arena is active, with the protection the host mapping has at
+// that moment. While an arena is active, every other arena's memory is
+// unmapped and unaddressable, and from the base root (no arena active) all
+// arena memory is. This is the isolate-cage primitive; in workerd one arena
+// holds one isolate's V8 sandbox reservation.
 typedef struct gk_arena gk_arena;
 
-// Create an arena of at least `size` bytes. Returns NULL on failure.
+// Create an arena of at least `size` bytes. The reservation is placed on a
+// 512GiB boundary and may span several of those units (V8's sandbox
+// reservation can exceed one); nothing in it is accessible until committed.
+// Returns NULL on failure.
 gk_arena *gk_arena_create(size_t size);
 
-// The base address of an arena's memory (valid on host and, when the arena is
-// active, in the guest at the same address).
+// The base address of an arena's reservation (the same address on the host
+// and, when the arena is active, in the guest) and its usable size.
 void *gk_arena_base(const gk_arena *a);
 size_t gk_arena_size(const gk_arena *a);
 

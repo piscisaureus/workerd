@@ -50,9 +50,17 @@ hardware:
   `write` runs unmodified inside the guest. `malloc`'s `mmap`/`brk` are
   forwarded and the new memory is mapped into the guest on the fly; TLS works
   because the guest FS base is set to the host's.
-- **Arena isolation.** Two arenas act as two isolates. Under arena A's root,
-  A's cage is readable and B's cage is not merely denied but unmapped: touching
-  it faults, and the fault address equals B's base.
+- **Arena isolation.** Two arenas act as two isolates. An arena is a large
+  `PROT_NONE` reservation spanning one or more aligned 512 GiB page-table slots,
+  with its own root that shares the runtime's subtrees but owns those slots
+  privately. Its memory is demand-paged into the arena's root only while the
+  arena is active, with the protection the owner has committed (via forwarded
+  `mprotect`) at that moment; uncommitted pages fault. Under arena A's root, B's
+  memory is unmapped, and from the base root all arena memory is: a guest access
+  to another arena's range faults at that address before the host mapping is even
+  consulted. A decommit is reflected into every arena root, so a stale writable
+  entry never survives. This is the isolate-cage primitive; one arena per V8
+  isolate holds that isolate's sandbox/cage.
 - **Threads as vCPUs.** Each host thread that enters the guest gets its own
   vCPU, stack and TLS base, sharing the VM and memory. Four threads run in the
   guest concurrently, and two threads each locked into their own arena run at

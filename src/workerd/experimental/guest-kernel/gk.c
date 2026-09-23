@@ -67,17 +67,6 @@ static unsigned long g_fault_addr;
 static int g_dbg;
 static gk_syscall_filter g_filter;
 static int g_next_cage_idx = 64;
-// Registry of arena cage regions, so demand paging can refuse faults into any
-// arena (each arena's own cage is pre-mapped in its root, so a fault at an
-// arena address is always a cross-arena access that must stay isolated).
-#define GK_MAX_ARENAS 4096
-static struct { uintptr_t base, end; } g_arenas[GK_MAX_ARENAS];
-static int g_arena_n;
-static int addr_in_any_arena(uintptr_t a) {
-  for (int i = 0; i < g_arena_n; i++)
-    if (a >= g_arenas[i].base && a < g_arenas[i].end) return 1;
-  return 0;
-}
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static long g_demand_ok;
 
@@ -130,13 +119,38 @@ typedef struct {
 } gk_vcpu;
 static __thread gk_vcpu tls;
 
+// An arena is a PROT_NONE host reservation spanning whole PML4 slots (512GiB
+// each), demand-paged into its private page-table root only while it is a
+// vCPU's active arena. The root shares the base root's top-level entries for
+// everything outside the arena (refreshed at each guest entry, see sync_cr3),
+// but each of the arena's slots points at a PDPT owned by this arena alone, so
+// no other root can ever reach the arena's pages. Nothing is mapped up front:
+// the owner (V8) commits sub-ranges with mprotect through forwarded syscalls,
+// and the guest's first access to a committed page installs its PTE under the
+// arena's private subtree with the page's current host protection.
+#define GK_SLOT_BITS 39
+#define GK_SLOT_BYTES (1UL << GK_SLOT_BITS)
+#define GK_MAX_ARENA_SLOTS 8   // 4TiB per arena; V8's largest sandbox reservation is ~1.34TB
 struct gk_arena {
-  void *base;
-  size_t size;
+  uintptr_t base;             // slot-aligned reservation start
+  size_t size;                // usable size, as requested (page-rounded)
+  uintptr_t end;              // base + nslots * GK_SLOT_BYTES: the whole reservation
   uint64_t *pml4;
-  int cage_idx;         // PML4 index owned privately by this arena
-  uint64_t cage_entry;  // its private cage subtree entry
+  int slot0, nslots;          // the contiguous PML4 slots this arena owns
+  uint64_t slot_entry[GK_MAX_ARENA_SLOTS];  // its private PDPT entry per slot
 };
+// Registry of live arenas, so demand paging can tell a fault inside the active
+// arena (backed, into that arena's root) from one inside any other arena (a
+// cross-arena access, refused), and so protection changes can be reflected
+// into every arena root they touch. Guarded by g_lock.
+#define GK_MAX_ARENAS 4096
+static gk_arena *g_arenas[GK_MAX_ARENAS];
+static int g_arena_n;
+static gk_arena *arena_containing(uintptr_t a) {
+  for (int i = 0; i < g_arena_n; i++)
+    if (a >= g_arenas[i]->base && a < g_arenas[i]->end) return g_arenas[i];
+  return NULL;
+}
 
 // Trampolines and exception handlers (gk_asm.S), in this binary's mapped text.
 extern void gk_syscall_tramp(void);
@@ -212,16 +226,43 @@ static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
   return 0;
 }
 
-// Clear one page's PTE in a root (used to reflect mprotect/munmap). Caller holds
-// g_lock. Leaves intermediate tables in place.
-static void unmap4k_root(uint64_t *root, uint64_t va) {
-  if (!(root[(va >> 39) & 0x1ff] & PTE_P)) return;
-  uint64_t *pdpt = (uint64_t *)(uintptr_t)(root[(va >> 39) & 0x1ff] & ~0xfffULL);
-  if (!(pdpt[(va >> 30) & 0x1ff] & PTE_P)) return;
-  uint64_t *pd = (uint64_t *)(uintptr_t)(pdpt[(va >> 30) & 0x1ff] & ~0xfffULL);
-  if (!(pd[(va >> 21) & 0x1ff] & PTE_P)) return;
-  uint64_t *pt = (uint64_t *)(uintptr_t)(pd[(va >> 21) & 0x1ff] & ~0xfffULL);
-  pt[(va >> 12) & 0x1ff] = 0;
+// Clear the PTEs of [s, e) (page-aligned) in a root, to reflect an mprotect,
+// munmap or fixed mmap. Walks the hierarchy and skips a whole 512GiB, 1GiB or
+// 2MiB range at once where no table exists beneath it, so reflecting a change
+// over a large, sparsely committed reservation costs in proportion to what is
+// mapped, not to the range. Leaves intermediate tables in place. Caller holds
+// g_lock.
+#define GK_NEXT_BOUNDARY(v, bits) ((((v) >> (bits)) + 1) << (bits))
+static void unmap_range_root(uint64_t *root, uintptr_t s, uintptr_t e) {
+  for (uintptr_t v = s; v < e;) {
+    uint64_t pml4e = root[(v >> 39) & 0x1ff];
+    if (!(pml4e & PTE_P)) { v = GK_NEXT_BOUNDARY(v, 39); continue; }
+    uint64_t *pdpt = (uint64_t *)(uintptr_t)(pml4e & ~0xfffULL);
+    uint64_t pdpte = pdpt[(v >> 30) & 0x1ff];
+    if (!(pdpte & PTE_P)) { v = GK_NEXT_BOUNDARY(v, 30); continue; }
+    uint64_t *pd = (uint64_t *)(uintptr_t)(pdpte & ~0xfffULL);
+    uint64_t pde = pd[(v >> 21) & 0x1ff];
+    if (!(pde & PTE_P)) { v = GK_NEXT_BOUNDARY(v, 21); continue; }
+    uint64_t *pt = (uint64_t *)(uintptr_t)(pde & ~0xfffULL);
+    pt[(v >> 12) & 0x1ff] = 0;
+    v += 0x1000;
+  }
+}
+
+// Reflect a host protection or mapping change over [s, e) into every root that
+// may hold PTEs for it: the base root (whose subtrees every arena root shares
+// for addresses outside arenas) and each arena whose reservation the range
+// overlaps (their private subtrees are reachable from no other root). A stale
+// PTE over a page the host has decommitted would otherwise make the guest's
+// next access an unrecoverable KVM_RUN EFAULT rather than a demand fault.
+// Caller holds g_lock.
+static void unmap_range_all(uintptr_t s, uintptr_t e) {
+  unmap_range_root(g_pml4, s, e);
+  for (int i = 0; i < g_arena_n; i++) {
+    gk_arena *a = g_arenas[i];
+    uintptr_t lo = s > a->base ? s : a->base, hi = e < a->end ? e : a->end;
+    if (lo < hi) unmap_range_root(a->pml4, lo, hi);
+  }
 }
 
 // ---- the MMU layer: interval-tree memslot manager --------------------------
@@ -626,13 +667,28 @@ void *__wrap_realloc(void *p, size_t n) { gk_guard_alloc("realloc"); return __re
 // protection is read under g_lock, the same lock a protection-changing syscall
 // holds across its host call and PTE clearing (see forward_syscall), so another
 // vCPU cannot change a page's protection between this read and the PTE install.
+//
+// Which root gets the PTE depends on where the page lies. Inside this vCPU's
+// active arena, the PTE goes under that arena's private subtree, so the page
+// is reachable from that root only; the host protection re-read below is what
+// the arena's owner committed the page with (uncommitted pages are PROT_NONE
+// and refused). Inside any other arena the fault is refused outright: that is
+// a cross-arena access, and it must stay unaddressable even though the host
+// could back it. Outside every arena the PTE goes into the base root, whose
+// subtrees all arena roots share.
 static int demand_map(uintptr_t addr) {
   uintptr_t page = addr & ~0xfffUL;
-  // A fault at an arena address is a cross-arena access (each arena's own cage
-  // is fully mapped in its root); refuse it to preserve isolation.
-  if (addr_in_any_arena(page)) return -1;
   uintptr_t rs, re; int perms;
   pthread_mutex_lock(&g_lock);
+  uint64_t *root = g_pml4;
+  gk_arena *in = arena_containing(page);
+  if (in) {
+    if (in != tls.active_arena) {
+      pthread_mutex_unlock(&g_lock);
+      return -1;  // another arena's memory: refuse, whatever the host has there
+    }
+    root = in->pml4;
+  }
   int mapped = host_region(page, &rs, &re, &perms);
   if (!mapped) {
     // The page may lie just below a stack the kernel grows on demand (the main
@@ -655,8 +711,20 @@ static int demand_map(uintptr_t addr) {
     return -1;
   }
   int pkey = pkey_lookup(page);
-  int r = map4k_root(g_pml4, page, (uint64_t)perms, pkey);  // honor R/W/X for W^X
-  if (r >= 0) g_demand_ok++;
+  int r = map4k_root(root, page, (uint64_t)perms, pkey);  // honor R/W/X for W^X
+  if (r >= 0) {
+    g_demand_ok++;
+    // A base-root mapping that populated a fresh top-level entry is not yet in
+    // the active arena's root (which copied the base root's entries at entry,
+    // see sync_cr3); carry it over now so the retry does not fault again. The
+    // index cannot be one of the arena's own slots: the page is outside every
+    // arena.
+    gk_arena *a = tls.active_arena;
+    if (root == g_pml4 && a) {
+      int idx = (int)((page >> 39) & 0x1ff);
+      if (a->pml4[idx] != g_pml4[idx]) a->pml4[idx] = g_pml4[idx];
+    }
+  }
   pthread_mutex_unlock(&g_lock);
   if (g_dbg && pkey != 0)
     fprintf(stderr, "[gk] vcpu %d demand-map %#lx perms=%d pkey=%d (PTE bits 62:59)\n",
@@ -1169,11 +1237,13 @@ static long forward_syscall(struct kvm_regs *r) {
   // calling thread.
   //
   // Protection/mapping changes are reflected by clearing the guest PTEs for the
-  // affected range so the next access re-faults and demand-maps with the new
-  // host permissions (this is what makes W^X and JIT code work), then flushing
-  // this vCPU's TLB. The host call and the PTE clearing happen under g_lock so
-  // a demand fault on another vCPU cannot install a PTE with the old protection
-  // in between. The memslot backing is left in place: guest-physical equals
+  // affected range, in the base root and in every arena root the range
+  // overlaps (see unmap_range_all), so the next access re-faults and
+  // demand-maps with the new host permissions (this is what makes W^X, JIT code
+  // and V8's commit/decommit of sandbox pages work), then flushing this vCPU's
+  // TLB. The host call and the PTE clearing happen under g_lock so a demand
+  // fault on another vCPU cannot install a PTE with the old protection in
+  // between. The memslot backing is left in place: guest-physical equals
   // host-virtual, so a memslot validly covers its range whether or not the host
   // currently has memory there, and if the range is later remapped at the same
   // address the same memslot backs it. Deleting the memslot here would be
@@ -1209,7 +1279,7 @@ static long forward_syscall(struct kvm_regs *r) {
       if ((nr == SYS_munmap || nr == SYS_mmap) && pkey_set_range(rs, re, 0) < 0 && g_dbg)
         fprintf(stderr, "[gk] pkey table full; [%#lx,%#lx) keeps a stale key\n",
                 (unsigned long)rs, (unsigned long)re);
-      for (uintptr_t v = rs; v < re; v += 0x1000) unmap4k_root(g_pml4, v);
+      unmap_range_all(rs, re);
     }
     pthread_mutex_unlock(&g_lock);
     flush_tlb(r);
@@ -1283,16 +1353,28 @@ static int guest_pkru_update(uint32_t keep, uint32_t set, uint32_t *out) {
   return 0;
 }
 
-// Point this vCPU's CR3 at the thread's active root. Refreshes the active
-// arena's shared (non-cage) entries from the base root so it sees every mapping
-// added since the arena was created, keeping its cage.
+// Refresh an arena root's shared entries from the base root so it sees every
+// mapping added since it was last synced, and put the arena's private PDPT
+// entries back in its own slots. Entry by entry, with 8-byte stores, never
+// touching the arena's slots: another vCPU may be running under this root at
+// the same time (two threads in one arena), and its page walker must never
+// see a torn entry or a transiently absent slot. Caller holds g_lock.
+static void arena_sync_root(gk_arena *a) {
+  for (int i = 0; i < 512; i++) {
+    if (i >= a->slot0 && i < a->slot0 + a->nslots) continue;
+    if (a->pml4[i] != g_pml4[i]) __atomic_store_n(&a->pml4[i], g_pml4[i], __ATOMIC_RELAXED);
+  }
+  for (int i = 0; i < a->nslots; i++)
+    if (a->pml4[a->slot0 + i] != a->slot_entry[i])
+      __atomic_store_n(&a->pml4[a->slot0 + i], a->slot_entry[i], __ATOMIC_RELAXED);
+}
+
+// Point this vCPU's CR3 at the thread's active root, after bringing an active
+// arena's root up to date with the base root (see arena_sync_root).
 static int sync_cr3(void) {
   if (tls.active_arena) {
-    gk_arena *a = tls.active_arena;
     pthread_mutex_lock(&g_lock);
-    uint64_t saved = a->pml4[a->cage_idx];
-    memcpy(a->pml4, g_pml4, 0x1000);
-    a->pml4[a->cage_idx] = saved ? saved : a->cage_entry;
+    arena_sync_root(tls.active_arena);
     pthread_mutex_unlock(&g_lock);
   }
   uint64_t want_cr3 = (uint64_t)(uintptr_t)tls.active_pml4;
@@ -1490,36 +1572,62 @@ static long run_vcpu(void) {
 }
 
 // ---- arenas ----------------------------------------------------------------
+// The reservation must own whole PML4 slots: an arena root's private entry for
+// a slot hides everything else in that 512GiB from the arena, so no other
+// mapping may share it. The kernel would place a free-address mmap next to the
+// libraries and stacks at the top of the address space, in a slot the whole
+// process lives in; instead the span is asked for at a slot-aligned address
+// with MAP_FIXED_NOREPLACE, which succeeds only if the entire span is free, and
+// the next slots are tried when it is not. The reservation is PROT_NONE and
+// MAP_NORESERVE: it costs address space only, and its pages stay unmapped in
+// every root until the owner commits them and the guest touches them.
 gk_arena *gk_arena_create(size_t size) {
   size = (size + 0xfff) & ~0xfffUL;
-  if (size == 0 || size > (1UL << 39)) return NULL;
-  pthread_mutex_lock(&g_lock);
-  uint64_t va = (uint64_t)(g_next_cage_idx) << 39;
-  void *mem = mmap((void *)(uintptr_t)va, size, PROT_READ | PROT_WRITE,
-                   MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-  if (mem == MAP_FAILED || (uintptr_t)mem != va) { pthread_mutex_unlock(&g_lock); return NULL; }
-  g_next_cage_idx++;
+  if (size == 0) return NULL;
+  int nslots = (int)((size + GK_SLOT_BYTES - 1) >> GK_SLOT_BITS);
+  if (nslots > GK_MAX_ARENA_SLOTS) return NULL;
+  size_t span = (size_t)nslots << GK_SLOT_BITS;
   gk_arena *a = calloc(1, sizeof *a);
-  if (!a) { munmap(mem, size); pthread_mutex_unlock(&g_lock); return NULL; }
-  a->base = mem;
-  a->size = size;
-  a->pml4 = alloc_table();
-  a->cage_idx = (int)((va >> 39) & 0x1ff);
-  memcpy(a->pml4, g_pml4, 0x1000);  // share the base root's top-level entries
-  if (region_ensure(va, va + size) < 0) { free(a); pthread_mutex_unlock(&g_lock); return NULL; }
-  for (uint64_t v = va; v < va + size; v += 0x1000)
-    if (map4k_root(a->pml4, v, 1 | 2, 0) < 0) { free(a); pthread_mutex_unlock(&g_lock); return NULL; }
-  a->cage_entry = a->pml4[a->cage_idx];  // remember the private cage subtree
-  if (g_arena_n < GK_MAX_ARENAS) {
-    g_arenas[g_arena_n].base = va;
-    g_arenas[g_arena_n].end = va + size;
-    g_arena_n++;
+  if (!a) return NULL;
+  pthread_mutex_lock(&g_lock);
+  // Slots 0..255 are the 47-bit user address space; leave room for the span.
+  void *mem = MAP_FAILED;
+  int idx;
+  for (idx = g_next_cage_idx; idx + nslots <= 256; idx++) {
+    uintptr_t va = (uintptr_t)idx << GK_SLOT_BITS;
+    mem = mmap((void *)va, span, PROT_NONE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    if (mem != MAP_FAILED && (uintptr_t)mem == va) break;
+    if (mem != MAP_FAILED) { munmap(mem, span); mem = MAP_FAILED; }  // old kernel: hint only
   }
+  if (mem == MAP_FAILED || g_arena_n >= GK_MAX_ARENAS) goto fail;
+  g_next_cage_idx = idx + nslots;
+  a->base = (uintptr_t)mem;
+  a->size = size;
+  a->end = a->base + span;
+  a->slot0 = idx;
+  a->nslots = nslots;
+  a->pml4 = alloc_table();
+  if (!a->pml4) goto fail;
+  // One private PDPT per slot, allocated now so the entry never changes; the
+  // PD and PT pages beneath it are allocated as pages demand-fault in.
+  for (int i = 0; i < nslots; i++) {
+    uint64_t *pdpt = alloc_table();
+    if (!pdpt) goto fail;
+    a->slot_entry[i] = ((uint64_t)(uintptr_t)pdpt) | PTE_P | PTE_W | PTE_U;
+  }
+  arena_sync_root(a);  // share the base root's other entries, own these slots
+  g_arenas[g_arena_n++] = a;
   pthread_mutex_unlock(&g_lock);
   return a;
+fail:
+  pthread_mutex_unlock(&g_lock);
+  if (mem != MAP_FAILED) munmap(mem, span);
+  free(a);
+  return NULL;
 }
 
-void *gk_arena_base(const gk_arena *a) { return a ? a->base : NULL; }
+void *gk_arena_base(const gk_arena *a) { return a ? (void *)a->base : NULL; }
 size_t gk_arena_size(const gk_arena *a) { return a ? a->size : 0; }
 
 gk_arena *gk_arena_enter(gk_arena *a) {
@@ -1529,9 +1637,16 @@ gk_arena *gk_arena_enter(gk_arena *a) {
   return prev;
 }
 
+// The arena's page-table pages (its root, PDPTs and whatever PD/PT pages
+// demand paging allocated beneath them) are not reclaimed: alloc_table is a
+// bump allocator. Its slots are not reused either.
 void gk_arena_destroy(gk_arena *a) {
   if (!a) return;
   if (tls.active_arena == a) gk_arena_enter(NULL);
-  munmap(a->base, a->size);
+  pthread_mutex_lock(&g_lock);
+  for (int i = 0; i < g_arena_n; i++)
+    if (g_arenas[i] == a) { g_arenas[i] = g_arenas[--g_arena_n]; break; }
+  pthread_mutex_unlock(&g_lock);
+  munmap((void *)a->base, a->end - a->base);
   free(a);
 }
