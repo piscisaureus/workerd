@@ -492,8 +492,10 @@ static_assert(v8::internal::kSandboxSizeLog2 == 37 &&
 
 // With the layout above the arena's tail (see GUEST_ARENA_SLOT_SIZE) is the top 32 GiB of a
 // single slot. It must hold the trusted range (1 GiB at 4 GiB alignment; it is the first
-// allocation, and the tail starts 4 GiB-aligned), the code range (up to 512 MiB) and the cppgc
-// heap.
+// allocation, and the tail starts 4 GiB-aligned), the code range (up to 512 MiB), the isolate's
+// pointer tables (about 1.75 GiB of reservations: the external, shared external and cpp heap
+// pointer tables at 512 MiB each, the trusted and shared trusted pointer tables at 64 MiB each
+// and the JS dispatch table at 128 MiB) and the cppgc heap.
 constexpr size_t GUEST_ARENA_TAIL_SIZE =
     GUEST_ARENA_SLOT_SIZE - GUEST_ARENA_RESERVATION_SIZE % GUEST_ARENA_SLOT_SIZE;
 static_assert(GUEST_ARENA_TAIL_SIZE >= 8ull * 1024 * 1024 * 1024 &&

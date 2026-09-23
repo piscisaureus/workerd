@@ -1,0 +1,428 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Wed, 23 Sep 2026 12:00:00 +0000
+Subject: Route pointer tables through the IsolateGroup page allocator
+
+An isolate's pointer tables (external pointer, cpp heap pointer,
+trusted pointer and JS dispatch tables, plus the shared external and
+trusted pointer tables it owns) are out-of-sandbox memory like the
+code range and trusted range, but each table reserves its backing as
+a subspace of the process-wide platform virtual address space. An
+embedder that supplies v8::IsolateGroup::CreateParams::page_allocator
+to place a group's out-of-sandbox memory therefore still finds the
+tables at addresses V8 picks.
+
+Let SegmentedTableBase::Initialize() take an optional embedder page
+allocator. When given, the table's reservation is taken from it (as
+inaccessible pages, at the table's alignment) and managed by a small
+VirtualAddressSpace over that reservation, which hands out and frees
+the table's segments through the allocator's SetPermissions and
+DecommitPages. It applies a memory protection key to the reservation
+and to decommitted pages as VirtualAddressSubspace does, so
+write-protected tables keep working with PKU-based thread isolation.
+Isolate::Init() passes the group's embedder allocator to every table
+it initializes; with none supplied nothing changes.
+
+diff --git a/include/v8-isolate.h b/include/v8-isolate.h
+--- a/include/v8-isolate.h
++++ b/include/v8-isolate.h
+@@ -272,10 +272,13 @@ class V8_EXPORT IsolateGroup {
+ 
+     /**
+      * When set, the memory that the group keeps outside of its sandbox (and
+-     * pointer compression cage), i.e. the code range and the trusted range,
+-     * is allocated through this page allocator instead of the platform's page
+-     * allocator. This lets an embedder that manages the address space itself
+-     * decide where a group's out-of-sandbox memory lives.
++     * pointer compression cage) is allocated through this page allocator
++     * instead of the platform's page allocator: the code range, the trusted
++     * range, and the pointer tables of the group's isolates (the external
++     * pointer, cpp heap pointer, trusted pointer and JS dispatch tables,
++     * including the shared ones). This lets an embedder that manages the
++     * address space itself decide where a group's out-of-sandbox memory
++     * lives.
+      *
+      * The allocator must outlive the group. V8 calls AllocatePages (with a
+      * hint that may be ignored, but the requested alignment must be honored),
+@@ -285,9 +288,8 @@ class V8_EXPORT IsolateGroup {
+      * enabled.
+      *
+      * Memory that V8 obtains for the group in other ways is not affected: the
+-     * sandbox itself, pointer tables backed by the platform's virtual address
+-     * space, and ordinary malloc'ed memory. A CppHeap attached to an isolate
+-     * of the group has its own page allocator; see
++     * sandbox itself and ordinary malloc'ed memory. A CppHeap attached to an
++     * isolate of the group has its own page allocator; see
+      * CppHeapCreateParams::page_allocator to place it alongside.
+      */
+     v8::PageAllocator* page_allocator = nullptr;
+diff --git a/src/execution/isolate.cc b/src/execution/isolate.cc
+--- a/src/execution/isolate.cc
++++ b/src/execution/isolate.cc
+@@ -6320,8 +6320,11 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
+     // process refers to these data structures.
+     isolate_data_.external_reference_table()->InitIsolateIndependent(
+         isolate_group()->external_ref_table());
++    // The pointer tables are out-of-sandbox memory of the group: an embedder
++    // that places that memory gets to place them too.
+ #ifdef V8_COMPRESS_POINTERS
+-    external_pointer_table().Initialize();
++    external_pointer_table().Initialize(
++        isolate_group()->embedder_page_allocator());
+     external_pointer_table().InitializeSpace(
+         heap()->read_only_external_pointer_space());
+     external_pointer_table().AttachSpaceToReadOnlySegments(
+@@ -6330,12 +6333,14 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
+         heap()->young_external_pointer_space());
+     external_pointer_table().InitializeSpace(
+         heap()->old_external_pointer_space());
+-    cpp_heap_pointer_table().Initialize();
++    cpp_heap_pointer_table().Initialize(
++        isolate_group()->embedder_page_allocator());
+     cpp_heap_pointer_table().InitializeSpace(heap()->cpp_heap_pointer_space());
+ #endif  // V8_COMPRESS_POINTERS
+ 
+ #ifdef V8_ENABLE_SANDBOX
+-    trusted_pointer_table().Initialize();
++    trusted_pointer_table().Initialize(
++        isolate_group()->embedder_page_allocator());
+     trusted_pointer_table().InitializeSpace(
+         heap()->read_only_trusted_pointer_space());
+     trusted_pointer_table().AttachSpaceToReadOnlySegments(
+@@ -6405,7 +6410,7 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
+   }
+ #endif  // V8_EXTERNAL_CODE_SPACE
+ 
+-  js_dispatch_table().Initialize();
++  js_dispatch_table().Initialize(isolate_group()->embedder_page_allocator());
+ 
+   isolate_data_.external_reference_table()->Init(this);
+ 
+@@ -6413,7 +6418,8 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
+   if (owns_shareable_data()) {
+     isolate_data_.shared_external_pointer_table_ = new ExternalPointerTable();
+     shared_external_pointer_space_ = new ExternalPointerTable::Space();
+-    shared_external_pointer_table().Initialize();
++    shared_external_pointer_table().Initialize(
++        isolate_group()->embedder_page_allocator());
+     shared_external_pointer_table().InitializeSpace(
+         shared_external_pointer_space());
+   } else {
+@@ -6429,7 +6435,8 @@ bool Isolate::Init(SnapshotData* startup_snapshot_data,
+   if (owns_shareable_data()) {
+     isolate_data_.shared_trusted_pointer_table_ = new TrustedPointerTable();
+     shared_trusted_pointer_space_ = new TrustedPointerTable::Space();
+-    shared_trusted_pointer_table().Initialize();
++    shared_trusted_pointer_table().Initialize(
++        isolate_group()->embedder_page_allocator());
+     shared_trusted_pointer_table().InitializeSpace(
+         shared_trusted_pointer_space());
+   } else {
+diff --git a/src/init/isolate-group.h b/src/init/isolate-group.h
+--- a/src/init/isolate-group.h
++++ b/src/init/isolate-group.h
+@@ -129,8 +129,9 @@ class V8_EXPORT_PRIVATE IsolateGroup final {
+   // (see v8::IsolateGroup::CreateParams for the requirements). Aborts if a
+   // reservation is given but the sandbox is disabled or the platform cannot
+   // adopt embedder memory. When |embedder_page_allocator| is non-null, the
+-  // group's out-of-sandbox memory (code range, trusted range) is allocated
+-  // through it instead of the platform page allocator.
++  // group's out-of-sandbox memory (code range, trusted range, and the pointer
++  // tables of its isolates) is allocated through it instead of the platform
++  // page allocator.
+   static IsolateGroup* New(Address sandbox_reservation_base,
+                            size_t sandbox_reservation_size,
+                            v8::PageAllocator* embedder_page_allocator);
+@@ -159,6 +160,13 @@ class V8_EXPORT_PRIVATE IsolateGroup final {
+                                     : GetPlatformPageAllocator();
+   }
+ 
++  // The allocator the embedder supplied for the group's out-of-sandbox memory,
++  // or null when it supplied none (see
++  // v8::IsolateGroup::CreateParams::page_allocator).
++  v8::PageAllocator* embedder_page_allocator() const {
++    return embedder_page_allocator_;
++  }
++
+   v8::PageAllocator* read_only_page_allocator() const {
+     if (read_only_page_allocator_) {
+       return read_only_page_allocator_.get();
+diff --git a/src/sandbox/external-entity-table-inl.h b/src/sandbox/external-entity-table-inl.h
+--- a/src/sandbox/external-entity-table-inl.h
++++ b/src/sandbox/external-entity-table-inl.h
+@@ -46,9 +46,10 @@ bool ExternalEntityTable<Entry, size>::Space::Contains(uint32_t index) {
+ }
+ 
+ template <typename Entry, size_t size>
+-void ExternalEntityTable<Entry, size>::Initialize() {
++void ExternalEntityTable<Entry, size>::Initialize(
++    v8::PageAllocator* embedder_page_allocator) {
+   Base::Initialize(size, kSegmentSize * kNumReadOnlySegments,
+-                   Entry::IsWriteProtected);
++                   Entry::IsWriteProtected, embedder_page_allocator);
+ }
+ 
+ template <typename Entry, size_t size>
+diff --git a/src/sandbox/external-entity-table.h b/src/sandbox/external-entity-table.h
+--- a/src/sandbox/external-entity-table.h
++++ b/src/sandbox/external-entity-table.h
+@@ -235,8 +235,9 @@ class V8_EXPORT_PRIVATE ExternalEntityTable
+   static constexpr bool kSupportsCompaction = false;
+ 
+   // Initializes the table by reserving the backing memory, allocating an
+-  // initial segment, and populating the freelist.
+-  void Initialize();
++  // initial segment, and populating the freelist. The memory comes from
++  // |embedder_page_allocator| if non-null, see SegmentedTableBase::Initialize.
++  void Initialize(v8::PageAllocator* embedder_page_allocator = nullptr);
+ 
+   // Deallocates all memory associated with this table.
+   void TearDown();
+diff --git a/src/sandbox/segmented-table.cc b/src/sandbox/segmented-table.cc
+--- a/src/sandbox/segmented-table.cc
++++ b/src/sandbox/segmented-table.cc
+@@ -5,6 +5,10 @@
+ #include "src/sandbox/segmented-table.h"
+ 
+ #include "src/base/emulated-virtual-address-subspace.h"
++#include "src/base/platform/memory-protection-key.h"
++#include "src/base/platform/mutex.h"
++#include "src/base/region-allocator.h"
++#include "src/base/utils/random-number-generator.h"
+ #include "src/utils/allocation.h"
+ 
+ #ifdef V8_ENABLE_MEMORY_CORRUPTION_API
+@@ -13,9 +17,195 @@
+ 
+ namespace v8::internal {
+ 
+-void SegmentedTableBase::Initialize(size_t reservation_size,
+-                                    size_t read_only_reservation_size,
+-                                    bool wants_write_protection) {
++#ifdef V8_TARGET_ARCH_64_BIT
++namespace {
++
++v8::PageAllocator::Permission ToPageAllocatorPermission(
++    PagePermissions permissions) {
++  switch (permissions) {
++    case PagePermissions::kNoAccess:
++      return v8::PageAllocator::kNoAccess;
++    case PagePermissions::kRead:
++      return v8::PageAllocator::kRead;
++    case PagePermissions::kReadWrite:
++      return v8::PageAllocator::kReadWrite;
++    case PagePermissions::kReadWriteExecute:
++      return v8::PageAllocator::kReadWriteExecute;
++    case PagePermissions::kReadExecute:
++      return v8::PageAllocator::kReadExecute;
++    default:
++      // Other combinations are currently not supported.
++      UNREACHABLE();
++  }
++}
++
++// The virtual address space of a table whose backing memory the embedder
++// places (see v8::IsolateGroup::CreateParams::page_allocator). It stands in
++// for the subspace of the platform address space that backs a table
++// otherwise: the whole reservation is taken from the embedder's page
++// allocator up front, inaccessible, and the table's pages are handed out
++// from it, so all of the table lies where the embedder put it. Only what the
++// tables use is supported: no shared pages and no subspaces. A memory
++// protection key, if given, is applied to the reservation and kept on freed
++// pages as VirtualAddressSubspace does.
++class EmbedderReservationAddressSpace final : public v8::VirtualAddressSpace {
++ public:
++  // Reserves |size| bytes aligned to |alignment| from |page_allocator|.
++  // Returns null if the reservation fails.
++  static std::unique_ptr<EmbedderReservationAddressSpace> Create(
++      v8::PageAllocator* page_allocator, size_t size, size_t alignment,
++      std::optional<MemoryProtectionKeyId> pkey) {
++    void* base = page_allocator->AllocatePages(nullptr, size, alignment,
++                                               v8::PageAllocator::kNoAccess);
++    if (!base) return nullptr;
++    return std::unique_ptr<EmbedderReservationAddressSpace>(
++        new EmbedderReservationAddressSpace(
++            page_allocator, reinterpret_cast<Address>(base), size, pkey));
++  }
++
++  ~EmbedderReservationAddressSpace() override {
++    CHECK(page_allocator_->FreePages(reinterpret_cast<void*>(base()), size()));
++  }
++
++  void SetRandomSeed(int64_t seed) override {
++    base::MutexGuard guard(&mutex_);
++    rng_.SetSeed(seed);
++  }
++
++  Address RandomPageAddress() override {
++    base::MutexGuard guard(&mutex_);
++    Address addr = base() + (static_cast<uint64_t>(rng_.NextInt64()) % size());
++    return RoundDown(addr, allocation_granularity());
++  }
++
++  Address AllocatePages(Address hint, size_t size, size_t alignment,
++                        PagePermissions permissions) override {
++    base::MutexGuard guard(&mutex_);
++    Address address = region_allocator_.AllocateRegion(hint, size, alignment);
++    if (address == base::RegionAllocator::kAllocationFailure) {
++      return kNullAddress;
++    }
++    // Reserved pages are inaccessible; changing their permissions in place
++    // keeps the protection key they carry.
++    if (!SetPagePermissions(address, size, permissions)) {
++      CHECK_EQ(size, region_allocator_.FreeRegion(address));
++      return kNullAddress;
++    }
++    return address;
++  }
++
++  void FreePages(Address address, size_t size) override {
++    base::MutexGuard guard(&mutex_);
++    CHECK_EQ(size, region_allocator_.FreeRegion(address));
++    CHECK(page_allocator_->DecommitPages(reinterpret_cast<void*>(address),
++                                         size));
++    ApplyKey(address, size);
++  }
++
++  bool SetPagePermissions(Address address, size_t size,
++                          PagePermissions permissions) override {
++    return page_allocator_->SetPermissions(
++        reinterpret_cast<void*>(address), size,
++        ToPageAllocatorPermission(permissions));
++  }
++
++  bool AllocateGuardRegion(Address address, size_t size) override {
++    base::MutexGuard guard(&mutex_);
++    // Reserved pages are inaccessible already, so only the region is marked.
++    return region_allocator_.AllocateRegionAt(address, size);
++  }
++
++  void FreeGuardRegion(Address address, size_t size) override {
++    base::MutexGuard guard(&mutex_);
++    CHECK_EQ(size, region_allocator_.FreeRegion(address));
++  }
++
++  Address AllocateSharedPages(Address hint, size_t size,
++                              PagePermissions permissions,
++                              SharedMemoryHandle handle,
++                              uint64_t offset) override {
++    return kNullAddress;
++  }
++
++  void FreeSharedPages(Address address, size_t size) override {
++    UNREACHABLE();
++  }
++
++  std::optional<MemoryProtectionKeyId> ActiveMemoryProtectionKey() override {
++    return pkey_;
++  }
++
++  bool CanAllocateSubspaces() override { return false; }
++
++  std::unique_ptr<v8::VirtualAddressSpace> AllocateSubspace(
++      Address hint, size_t size, size_t alignment,
++      PagePermissions max_page_permissions,
++      std::optional<MemoryProtectionKeyId> key,
++      std::optional<SharedMemoryHandle> handle) override {
++    UNREACHABLE();
++  }
++
++  bool RecommitPages(Address address, size_t size,
++                     PagePermissions permissions) override {
++    return page_allocator_->RecommitPages(
++        reinterpret_cast<void*>(address), size,
++        ToPageAllocatorPermission(permissions));
++  }
++
++  bool DiscardSystemPages(Address address, size_t size) override {
++    return page_allocator_->DiscardSystemPages(
++        reinterpret_cast<void*>(address), size);
++  }
++
++  bool DecommitPages(Address address, size_t size) override {
++    if (!page_allocator_->DecommitPages(reinterpret_cast<void*>(address),
++                                        size)) {
++      return false;
++    }
++    ApplyKey(address, size);
++    return true;
++  }
++
++ private:
++  EmbedderReservationAddressSpace(v8::PageAllocator* page_allocator,
++                                  Address base, size_t size,
++                                  std::optional<MemoryProtectionKeyId> pkey)
++      : VirtualAddressSpace(page_allocator->CommitPageSize(),
++                            page_allocator->AllocatePageSize(), base, size,
++                            PagePermissions::kReadWrite),
++        page_allocator_(page_allocator),
++        region_allocator_(base, size, page_allocator->AllocatePageSize()),
++        pkey_(pkey) {
++    ApplyKey(base, size);
++  }
++
++  // Tags the inaccessible pages at [address, address + size) with the
++  // protection key, if there is one. Decommitting pages replaces them with
++  // fresh ones that carry no key, so this is redone after every decommit.
++  void ApplyKey(Address address, size_t size) {
++    if (!pkey_) return;
++#if V8_HAS_PKU_SUPPORT
++    CHECK(base::MemoryProtectionKey::HasMemoryProtectionKeyAPIs());
++    CHECK(base::MemoryProtectionKey::SetPermissionsAndKey(
++        {address, size}, PagePermissions::kNoAccess, *pkey_));
++#else
++    UNREACHABLE();
++#endif  // V8_HAS_PKU_SUPPORT
++  }
++
++  v8::PageAllocator* const page_allocator_;
++  base::Mutex mutex_;
++  base::RegionAllocator region_allocator_;
++  base::RandomNumberGenerator rng_;
++  const std::optional<MemoryProtectionKeyId> pkey_;
++};
++
++}  // namespace
++#endif  // V8_TARGET_ARCH_64_BIT
++
++void SegmentedTableBase::Initialize(
++    size_t reservation_size, size_t read_only_reservation_size,
++    bool wants_write_protection, v8::PageAllocator* embedder_page_allocator) {
+   CHECK_NULL(vas_);
+   CHECK_NULL(base_);
+ 
+@@ -37,7 +227,13 @@ void SegmentedTableBase::Initialize(size_t reservation_size,
+ #endif  // V8_HAS_PKU_JIT_WRITE_PROTECT
+   }
+ 
+-  if (root_space->CanAllocateSubspaces()) [[likely]] {
++  if (embedder_page_allocator) {
++    CHECK(IsAligned(reservation_size,
++                    embedder_page_allocator->AllocatePageSize()));
++    vas_ = EmbedderReservationAddressSpace::Create(
++               embedder_page_allocator, reservation_size, kAlignment, pkey)
++               .release();
++  } else if (root_space->CanAllocateSubspaces()) [[likely]] {
+     auto subspace = root_space->AllocateSubspace(
+         VirtualAddressSpace::kNoHint, reservation_size, kAlignment,
+         PagePermissions::kReadWrite, pkey);
+diff --git a/src/sandbox/segmented-table.h b/src/sandbox/segmented-table.h
+--- a/src/sandbox/segmented-table.h
++++ b/src/sandbox/segmented-table.h
+@@ -60,9 +60,14 @@ class V8_EXPORT_PRIVATE SegmentedTableBase {
+   SegmentedTableBase(const SegmentedTableBase&) = delete;
+   SegmentedTableBase& operator=(const SegmentedTableBase&) = delete;
+ 
+-  // Initializes the table by reserving the backing memory.
++  // Initializes the table by reserving the backing memory: from
++  // |embedder_page_allocator| if non-null (the allocator an embedder supplied
++  // for an isolate group's out-of-sandbox memory, see
++  // v8::IsolateGroup::CreateParams::page_allocator), else from the platform's
++  // virtual address space.
+   void Initialize(size_t reservation_size, size_t read_only_reservation_size,
+-                  bool wants_write_protection);
++                  bool wants_write_protection,
++                  v8::PageAllocator* embedder_page_allocator = nullptr);
+ 
+   // Deallocates all memory associated with this table.
+   void TearDown();

@@ -106,9 +106,10 @@ bool isGuestKernelEnabled();
 // A v8::PageAllocator that hands out pages from a fixed address range that is already reserved
 // as inaccessible (PROT_NONE) anonymous memory and stays reserved for the allocator's lifetime:
 // the unused tail of a guest-kernel arena (see GuestArena). V8 uses one per isolate group for
-// the memory it keeps outside of the sandbox -- the trusted range, the code range and the
-// cppgc heap (v8::IsolateGroup::CreateParams::page_allocator and
-// v8::CppHeapCreateParams::page_allocator) -- so that those live in the isolate's arena too.
+// the memory it keeps outside of the sandbox -- the trusted range, the code range, the
+// isolate's pointer tables and the cppgc heap (v8::IsolateGroup::CreateParams::page_allocator
+// and v8::CppHeapCreateParams::page_allocator) -- so that those live in the isolate's arena
+// too.
 //
 // Allocation is a first-fit search of a sorted free list of address ranges; V8's placement
 // hints are ignored, the requested alignment is honored. Pages are made accessible or
@@ -183,8 +184,8 @@ class ArenaPageAllocator final: public v8::PageAllocator {
 // gk reserves arenas in whole 512 GiB page-table slots, so the reservation extends past the
 // requested size to the end of the last slot. That tail is arena memory like the rest, only
 // not part of the sandbox; it is handed to V8 through an ArenaPageAllocator for the group's
-// out-of-sandbox memory (trusted range, code range, cppgc heap), which thereby gets the same
-// hardware isolation as the sandbox.
+// out-of-sandbox memory (trusted range, code range, pointer tables, cppgc heap), which thereby
+// gets the same hardware isolation as the sandbox.
 //
 // The arena must outlive the isolate group placed in it: V8 adopts the reservation for the
 // group's sandbox and, on teardown, decommits inside it but never unmaps it; destroying the

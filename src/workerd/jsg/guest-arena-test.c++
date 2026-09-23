@@ -4,11 +4,11 @@
 
 // Per-isolate guest-kernel arenas (see GuestArena in setup.h): each isolate created through
 // jsg::newIsolateGroup() gets its own IsolateGroup, whose V8 sandbox lives in a private gk
-// arena and whose out-of-sandbox memory (trusted range, code range, cppgc heap) lives in that
-// arena's tail, and the isolate lock makes that arena the thread's active one. This is the
-// real-V8 counterpart of gk_test.c's arena-isolation test: guest execution under one isolate's
-// lock can touch that isolate's ArrayBuffer memory, JIT code, bytecode and cppgc objects, and
-// takes a hardware fault on another isolate's.
+// arena and whose out-of-sandbox memory (trusted range, code range, cppgc heap, pointer
+// tables) lives in that arena's tail, and the isolate lock makes that arena the thread's active
+// one. This is the real-V8 counterpart of gk_test.c's arena-isolation test: guest execution
+// under one isolate's lock can touch that isolate's ArrayBuffer memory, JIT code, bytecode,
+// cppgc objects and pointer tables, and takes a hardware fault on another isolate's.
 
 #include "jsg-test.h"
 
@@ -19,6 +19,7 @@
 #include <cppgc/garbage-collected.h>
 #include <cppgc/persistent.h>
 #include <v8-cppgc.h>
+#include <v8-internal.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -194,6 +195,74 @@ void probeOutOfSandboxMemory(OutOfSandboxMemory& memory, bool reachable) {
   expect(&touchByte, &memory.cppgcObject->fill, BUFFER_FILL);
 }
 
+// The base addresses of an isolate's pointer tables, which V8 keeps outside of the sandbox and
+// which an isolate group's page allocator places in the arena's tail. They are read from the
+// isolate's data area at the offsets that V8's public API layout guarantees (the same way its
+// inline API locates the external pointer table). Every table starts with a read-only segment
+// that is mapped from the moment the table is initialized, so each base is a readable page.
+struct PointerTables {
+  void* externalPointerTable = nullptr;
+  void* sharedExternalPointerTable = nullptr;
+  void* cppHeapPointerTable = nullptr;
+  void* trustedPointerTable = nullptr;
+  void* sharedTrustedPointerTable = nullptr;
+  void* jsDispatchTable = nullptr;
+
+  template <typename Func>
+  void forEach(Func&& func) {
+    func("external pointer table", externalPointerTable);
+    func("shared external pointer table", sharedExternalPointerTable);
+    func("cpp heap pointer table", cppHeapPointerTable);
+    func("trusted pointer table", trustedPointerTable);
+    func("shared trusted pointer table", sharedTrustedPointerTable);
+    func("JS dispatch table", jsDispatchTable);
+  }
+};
+
+PointerTables getPointerTables(v8::Isolate* isolate) {
+  using Internals = v8::internal::Internals;
+  auto root = reinterpret_cast<uintptr_t>(isolate);
+  // A table embedded in the isolate data: its base pointer is its first field.
+  auto tableBase = [&](int tableOffset) {
+    return *reinterpret_cast<void**>(
+        root + tableOffset + Internals::kExternalEntityTableBasePointerOffset);
+  };
+  // A shared table, which the isolate data points to.
+  auto sharedTableBase = [&](int tableAddressOffset) {
+    auto table = *reinterpret_cast<uintptr_t*>(root + tableAddressOffset);
+    return *reinterpret_cast<void**>(table + Internals::kExternalEntityTableBasePointerOffset);
+  };
+  PointerTables tables;
+  tables.externalPointerTable = tableBase(Internals::kIsolateExternalPointerTableOffset);
+  tables.sharedExternalPointerTable =
+      sharedTableBase(Internals::kIsolateSharedExternalPointerTableAddressOffset);
+  tables.cppHeapPointerTable = tableBase(Internals::kIsolateCppHeapPointerTableOffset);
+  tables.trustedPointerTable = tableBase(Internals::kIsolateTrustedPointerTableOffset);
+  tables.sharedTrustedPointerTable =
+      sharedTableBase(Internals::kIsolateSharedTrustedPointerTableAddressOffset);
+  tables.jsDispatchTable = tableBase(Internals::kIsolateJSDispatchTableOffset);
+  // V8's own accessor for the external pointer table must agree with the layout used above.
+  KJ_ASSERT(tables.externalPointerTable == Internals::GetExternalPointerTableBase(isolate));
+  KJ_ASSERT(
+      tables.sharedExternalPointerTable == Internals::GetSharedExternalPointerTableBase(isolate));
+  return tables;
+}
+
+// From the guest, the first page of each of `tables` is readable when its isolate's arena is
+// active, and unaddressable when `reachable` is false. The host is never confined, so the
+// expected byte is read directly.
+void probePointerTables(PointerTables& tables, bool reachable) {
+  tables.forEach([&](kj::StringPtr name, void* base) {
+    long result = gk_run_here(&readByte, base);
+    if (reachable) {
+      KJ_EXPECT(result == *static_cast<unsigned char*>(base), name, base, result);
+    } else {
+      KJ_EXPECT(result == GK_EFAULT, name, base, result);
+      KJ_EXPECT(gk_fault_addr() == reinterpret_cast<uintptr_t>(base), name, base);
+    }
+  });
+}
+
 // Positive control: one JS turn run inside the guest under an isolate's lock, allocating heap
 // objects and typed arrays in that isolate's sandbox and touching them. Exceptions must not
 // unwind across the guest boundary, so the result is reported through the struct.
@@ -363,6 +432,48 @@ KJ_TEST("each isolate's memory lives in its own guest-kernel arena") {
   // With no lock held the thread is back on the base root, from which neither is reachable.
   probeOutOfSandboxMemory(memoryA, false);
   probeOutOfSandboxMemory(memoryB, false);
+
+  // Part 3: the pointer tables, also in the arena's tail. Each isolate owns its shared tables
+  // too, as it is alone in its group.
+  auto tablesA = getPointerTables(a.getIsolate());
+  auto tablesB = getPointerTables(b.getIsolate());
+  KJ_LOG(INFO, "pointer tables", tablesA.externalPointerTable, tablesA.sharedExternalPointerTable,
+      tablesA.cppHeapPointerTable, tablesA.trustedPointerTable, tablesA.sharedTrustedPointerTable,
+      tablesA.jsDispatchTable, tablesB.externalPointerTable, tablesB.sharedExternalPointerTable,
+      tablesB.cppHeapPointerTable, tablesB.trustedPointerTable, tablesB.sharedTrustedPointerTable,
+      tablesB.jsDispatchTable);
+
+  // Every table of an isolate lies in its own arena's tail, outside its sandbox and outside the
+  // other isolate's arena, and no two tables share a base.
+  auto expectTablesInTail = [](GuestArena& own, GuestArena& other, PointerTables& tables) {
+    kj::Vector<void*> bases;
+    tables.forEach([&](kj::StringPtr name, void* base) {
+      KJ_EXPECT(base != nullptr, name);
+      KJ_EXPECT(inTail(own, base), name, base);
+      KJ_EXPECT(!contains(own, base), name, base);
+      KJ_EXPECT(!inTail(other, base), name, base);
+      KJ_EXPECT(!contains(other, base), name, base);
+      for (void* seen: bases) KJ_EXPECT(seen != base, name, base);
+      bases.add(base);
+    });
+  };
+  expectTablesInTail(arenaA, arenaB, tablesA);
+  expectTablesInTail(arenaB, arenaA, tablesB);
+
+  // Under A's lock (arena A active): A's tables are readable from the guest, B's fault. Mirror
+  // under B's lock.
+  a.runInLockScope([&](ArenaIsolate::Lock& lock) {
+    probePointerTables(tablesA, true);
+    probePointerTables(tablesB, false);
+  });
+  b.runInLockScope([&](ArenaIsolate::Lock& lock) {
+    probePointerTables(tablesB, true);
+    probePointerTables(tablesA, false);
+  });
+
+  // With no lock held the thread is back on the base root, from which neither is reachable.
+  probePointerTables(tablesA, false);
+  probePointerTables(tablesB, false);
 }
 
 #else
