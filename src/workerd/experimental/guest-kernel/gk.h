@@ -195,6 +195,7 @@ typedef struct {
   long wall_flushed;    // host-frame walls raised with a TLB flush
   long wall_skipped;    // host-frame walls raised without one, the flush being provably unneeded
   long global_pages;    // PTEs installed as global (shared runtime pages whose TLB entries survive a root switch)
+  long neighbor_pages;  // PTEs installed ahead of a fault, for pages adjacent to a demand-faulted one
   long root_switches;   // guest entries that loaded a different page-table root (an arena switch)
 } gk_stats;
 void gk_get_stats(gk_stats *s);
@@ -207,6 +208,15 @@ void gk_get_stats(gk_stats *s);
 // re-installs the PTE. With gk_stats.demand_faults a test can thus tell which
 // translations survive what. Not for production use.
 void gk_debug_drop_pte(unsigned long addr);
+
+// Test/diagnostic: register [addr, addr+len), rounded out to pages, as a
+// supervisor (GK_DEBUG_PROT_SUPER) or refused (GK_DEBUG_PROT_REFUSE) range, or
+// unregister exactly such a range again (GK_DEBUG_PROT_KEEP), so a test can
+// put a page of either class where it wants one. The range must be the
+// caller's own memory and must not overlap a range gk registered. Any PTE a
+// root holds for it is dropped on registration. Not for production use.
+enum { GK_DEBUG_PROT_KEEP, GK_DEBUG_PROT_SUPER, GK_DEBUG_PROT_REFUSE };
+void gk_debug_protect_range(unsigned long addr, size_t len, int kind);
 
 // Syscall policy. By default gk forwards every syscall to the host (blind
 // re-issue), which is fine for a spike but not for production. Install a filter

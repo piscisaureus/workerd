@@ -231,7 +231,10 @@ decides the overall cost.
   arena is created are not reflected into that arena's root. Allocations near
   existing mappings are, because the subtrees are shared.
 - **The MMU backs whole 2 MiB windows, not exact VMAs.** It reparses
-  `/proc/self/maps` per fault, flushes the whole TLB on each `mprotect`/`munmap`,
+  `/proc/self/maps` per fault (each read also settles the fault's aligned
+  64 KiB neighborhood, see `demand_map_neighbors` in `gk.c`, so a growing
+  mapping costs a read per 16 pages rather than per page), flushes the whole
+  TLB on each `mprotect`/`munmap`,
   and only the faulting thread's TLB (no cross-vCPU shootdown). Backing in aligned
   2 MiB windows rather than exact mapping bounds is a **cost** choice, not a
   correctness one: exact per-page memslots are safe, but each memslot create

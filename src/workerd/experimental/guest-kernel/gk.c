@@ -229,6 +229,8 @@ _Static_assert(GK_MAX_PROT_RANGES >= 2 * GK_MAX_VCPUS + 512,
 
 // A memslot-backed window (see the MMU layer below).
 #define GK_BACK_WIN (2UL << 20)   // memslot backing granularity (2MB, aligned)
+// The neighborhood a demand fault maps around its page (see demand_map_neighbors).
+#define GK_NEIGHBOR_WIN (64UL << 10)  // 16 pages, aligned; within one GK_BACK_WIN
 #define GK_MAX_REGIONS 65536
 typedef struct gk_region {
   uintptr_t start, end;   // [start, end), GK_BACK_WIN-aligned
@@ -274,6 +276,7 @@ struct gk_ctl {
   long demand_ok;
   long wall_flushed, wall_skipped;  // wall_raise: TLB flushes done / provably unneeded (see there)
   long global_pages;                // PTEs installed with PTE_G (see the global-pages section)
+  long neighbor_pages;              // PTEs installed ahead of a fault (see demand_map_neighbors)
   atomic_long root_switches;        // guest entries that loaded another root (enter_guest)
   // Bumped whenever page-table pages are returned to the allocator (an arena
   // was destroyed). A vCPU whose root is unchanged since it last entered the
@@ -712,6 +715,21 @@ static long pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
     v += 0x1000;
   }
   return n;
+}
+
+// The leaf PTE a root holds for the page of `va`, or 0 if no table on the way
+// down exists. Never allocates. Caller holds G->lock.
+static uint64_t pte_lookup(const uint64_t *root, uintptr_t va) {
+  uint64_t pml4e = root[(va >> 39) & 0x1ff];
+  if (!(pml4e & PTE_P)) return 0;
+  const uint64_t *pdpt = (const uint64_t *)(uintptr_t)(pml4e & ~0xfffULL);
+  uint64_t pdpte = pdpt[(va >> 30) & 0x1ff];
+  if (!(pdpte & PTE_P)) return 0;
+  const uint64_t *pd = (const uint64_t *)(uintptr_t)(pdpte & ~0xfffULL);
+  uint64_t pde = pd[(va >> 21) & 0x1ff];
+  if (!(pde & PTE_P)) return 0;
+  const uint64_t *pt = (const uint64_t *)(uintptr_t)(pde & ~0xfffULL);
+  return pt[(va >> 12) & 0x1ff];
 }
 
 // Apply `op` over [s, e) in every root that may hold PTEs for it: the base
@@ -1241,6 +1259,69 @@ void *__wrap_realloc(void *p, size_t n) { gk_guard_alloc("realloc"); return __re
 #define GK_HANDLER_LEAVE() ((void)0)
 #endif
 
+// Map the pages around a just-mapped user page ahead of their own faults, from
+// the same /proc/self/maps read that mapped it. That read is the bulk of a
+// demand fault's cost (the kernel renders every mapping of a V8-sized process
+// up to the one asked for), and it describes the whole host mapping [rs, re)
+// with `perms`, so one read can settle a neighborhood of pages rather than
+// one. The neighborhood is the GK_NEIGHBOR_WIN-aligned window holding `page`,
+// clipped to the host mapping: it is aligned, so it never leaves the 2MB
+// backing window of `page` or crosses a 512GiB slot, and everything in it that
+// gets a PTE is host-backed at exactly `perms` under the same G->lock hold
+// that read them. Nothing here is cached beyond the read: a later host change
+// is reflected or recovered for these PTEs exactly as for a page the guest
+// faulted itself (unmap_range_all, reprotect_range_all, host_backing_retry).
+//
+// This is an optimization, never a widening: a page is mapped only when it
+// would have been mapped the same way by its own fault under demand_map's
+// rules, and skipped otherwise, to fault on its own later.
+//  * Its class is KEEP: SUPER and REFUSE pages are left to their own faults
+//    (a REFUSE page is refused there; a SUPER page is mapped with U cleared).
+//  * It lies in the same arena as `page`, or like `page` in none, so it goes
+//    into the same root: an arena page never lands in the base root, and no
+//    other arena's page is mapped at all. (Aligned windows cannot straddle an
+//    arena boundary anyway; the check is per page regardless.)
+//  * Its backing window has a memslot; none is created here.
+//  * It has no PTE in the root yet: an existing entry may be carrying wall or
+//    protection state that a reflection maintains in place, and is left alone.
+//  * It is in no other vCPU's host-frame wall window. Such a page is that
+//    vCPU's caller stack, which only that vCPU's own faults should map, and
+//    they map it without W. A page in this vCPU's own window is mapped the
+//    way its own read fault would be: without W, tagged PTE_WALL.
+//  * Its protection key is looked up per page, like the global-pages
+//    decision, which map4k_root re-checks itself.
+// Faults counted in demand_faults are the guest's own; pages mapped here are
+// counted in neighbor_pages. Caller holds G->lock; `root`, `in`, `rs`, `re`,
+// `perms` and `sp` are demand_map's for the page it just mapped.
+static void demand_map_neighbors(gk_thread *t, uintptr_t page, uint64_t *root, gk_arena *in,
+                                 uintptr_t rs, uintptr_t re, int perms, uintptr_t sp) {
+  uintptr_t lo = page & ~(GK_NEIGHBOR_WIN - 1), hi = lo + GK_NEIGHBOR_WIN;
+  if (lo < rs) lo = rs;
+  if (hi > re) hi = re;
+  // The mapping is the interrupted code's stack, or this vCPU's ring-3 stack:
+  // the same for every page of it (see demand_map).
+  int stack_map = (rs < t->wall_map_hi && re > t->wall_map_lo) || (sp >= rs && sp < re);
+  for (uintptr_t v = lo; v < hi; v += 0x1000) {
+    if (v == page) continue;
+    if (prot_class(v) != GK_PROT_KEEP) continue;
+    if (arena_containing(v) != in) continue;
+    if (!region_find(v)) continue;
+    if (pte_lookup(root, v) & PTE_P) continue;
+    int foreign_wall = 0;
+    for (int i = 0; i < G->thread_n && !foreign_wall; i++) {
+      gk_thread *o = &G->threads[i];
+      if (o != t && v >= o->ro_lo && v < o->ro_hi) foreign_wall = 1;
+    }
+    if (foreign_wall) continue;
+    int walled = v >= t->ro_lo && v < t->ro_hi;
+    uint64_t flags = (uint64_t)perms;
+    if (walled && (perms & 2)) flags = (flags & ~2ULL) | GK_MAP_WALLED;
+    if (!in && !walled && !stack_map) flags |= GK_MAP_GLOBAL;
+    if (map4k_root(root, v, flags, pkey_lookup(v)) < 0) continue;
+    G->neighbor_pages++;
+  }
+}
+
 // Handle a guest page fault: if the faulting page is host-accessible, back it
 // with a memslot and PTE so the guest can retry. Caller must not hold G->lock.
 //
@@ -1333,6 +1414,10 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
   int r = map4k_root(root, page, flags, pkey);  // honor R/W/X for W^X
   if (r >= 0) {
     G->demand_ok++;
+    // Settle the page's neighborhood from the same read (an aligned window,
+    // so it shares the page's top-level entry, which the carry-over below
+    // covers).
+    if (cls == GK_PROT_KEEP) demand_map_neighbors(t, page, root, in, rs, re, perms, sp);
     // A base-root mapping that populated a fresh top-level entry is not yet in
     // the active arena's root (which copied the base root's entries at entry,
     // see sync_cr3); carry it over now so the retry does not fault again. The
@@ -3120,6 +3205,7 @@ void gk_get_stats(gk_stats *s) {
   s->wall_flushed = G->wall_flushed;
   s->wall_skipped = G->wall_skipped;
   s->global_pages = G->global_pages;
+  s->neighbor_pages = G->neighbor_pages;
   s->root_switches = atomic_load_explicit(&G->root_switches, memory_order_relaxed);
   pthread_mutex_unlock(&G->lock);
 }
@@ -3132,5 +3218,19 @@ void gk_debug_drop_pte(unsigned long addr) {
   uintptr_t page = (uintptr_t)addr & ~0xfffUL;
   pthread_mutex_lock(&G->lock);
   unmap_range_all(page, page + 0x1000);
+  pthread_mutex_unlock(&G->lock);
+}
+
+// Test/diagnostic hook (see gk.h): register or unregister a page-aligned range
+// of the caller's own memory in the supervisor/refuse registry, so a test can
+// place a SUPER or REFUSE page wherever it wants one. Registering drops any
+// PTE a root holds for the range, as gk's own registrations do.
+void gk_debug_protect_range(unsigned long addr, size_t len, int kind) {
+  uintptr_t s = (uintptr_t)addr & ~0xfffUL, e = ((uintptr_t)addr + len + 0xfffUL) & ~0xfffUL;
+  if (s >= e) return;
+  pthread_mutex_lock(&G->lock);
+  if (kind == GK_DEBUG_PROT_SUPER) prot_add(s, e, GK_PROT_SUPER);
+  else if (kind == GK_DEBUG_PROT_REFUSE) prot_add(s, e, GK_PROT_REFUSE);
+  else prot_remove(s, e);
   pthread_mutex_unlock(&G->lock);
 }

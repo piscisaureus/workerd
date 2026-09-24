@@ -1073,6 +1073,214 @@ static long global_check(void) {
   return ok;
 }
 
+// ---- demand-fault neighborhoods ----------------------------------------------
+// A demand fault maps the pages around its page from the same /proc/self/maps
+// read, within an aligned 64 KiB window clipped to the host mapping (see
+// demand_map_neighbors in gk.c). Checks, with gk_stats' demand_faults and
+// neighbor_pages, that pages in the window are then usable with no fault of
+// their own while pages past the window still fault; that a protection
+// boundary inside the window stops it (the other side faults on its own and
+// keeps its own protection); that inside an arena the window stays within the
+// committed range and the pre-mapped pages stay unreachable from every other
+// root; and that a REFUSE or SUPER page inside the window is left to its own
+// fault (refused, or mapped supervisor-only). Every region is fresh, its PTEs
+// dropped and the vCPU's TLB flushed before counting, so that an earlier
+// test's leftovers at a reused address cannot perturb the counts.
+#define NB_PAGE 4096UL
+#define NB_WIN (64UL << 10)
+enum { NB_PAGES = 16 };
+
+// Drops the PTEs of [p, p+len) in every root, then flushes this vCPU's TLB.
+static void nb_fresh(void *p, size_t len, void *dummy) {
+  for (size_t off = 0; off < len; off += NB_PAGE) gk_debug_drop_pte((unsigned long)p + off);
+  struct dp d = {dummy, global_shared};
+  gk_run(flush_then_read, &d);
+}
+
+// A 64 KiB-aligned window inside a fresh mapping, with a page to spare on
+// either side. Returns the mapping (512 KiB) and sets *win.
+static unsigned char *nb_region(unsigned char **win) {
+  unsigned char *m = mmap(NULL, 8 * NB_WIN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED) return NULL;
+  *win = (unsigned char *)(((uintptr_t)m + 2 * NB_WIN - 1) & ~(NB_WIN - 1));
+  return m;
+}
+
+static long neighborhood_check(void) {
+  void *dummy = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  gk_stats a, b;
+#define NB_DELTA(field) ((b).field - (a).field)
+#define P(i) (w + (i) * NB_PAGE)
+
+  // 1. The window: one fault maps its 16 pages; the pages just outside it on
+  //    either side still fault, each mapping its own window.
+  unsigned char *w, *m1 = nb_region(&w);
+  int ok1 = 0;
+  long f1 = -1, n1 = -1, f1b = -1, f1c = -1, f1d = -1, n1c = -1;
+  if (m1) {
+    nb_fresh(m1, 8 * NB_WIN, dummy);
+    gk_get_stats(&a);
+    long r = gk_run(read_byte, P(5));
+    gk_get_stats(&b);
+    f1 = NB_DELTA(demand_faults); n1 = NB_DELTA(neighbor_pages);
+    gk_get_stats(&a);
+    long r0 = gk_run(read_byte, P(0)), r6 = gk_run(read_byte, P(6)), r15 = gk_run(read_byte, P(15));
+    struct ap wr = {P(7), 0x5e};
+    long rw = gk_run(write_byte, &wr);
+    gk_get_stats(&b);
+    f1b = NB_DELTA(demand_faults);
+    gk_get_stats(&a);
+    long r16 = gk_run(read_byte, P(16));
+    gk_get_stats(&b);
+    f1c = NB_DELTA(demand_faults); n1c = NB_DELTA(neighbor_pages);
+    gk_get_stats(&a);
+    long rm1 = gk_run(read_byte, P(-1));
+    gk_get_stats(&b);
+    f1d = NB_DELTA(demand_faults);
+    ok1 = r == 0 && f1 == 1 && n1 == NB_PAGES - 1 && r0 == 0 && r6 == 0 && r15 == 0 &&
+          rw == 0x5e && P(7)[0] == 0x5e && f1b == 0 && r16 == 0 && f1c == 1 &&
+          n1c == NB_PAGES - 1 && rm1 == 0 && f1d == 1;
+  }
+  printf("neighborhood: fault at page 5 -> %ld fault, %ld neighbors; pages 0, 6, 15 read and 7 "
+         "written with %ld faults; page 16 -> %ld fault (%ld neighbors), page -1 -> %ld fault "
+         "[%s]\n", f1, n1, f1b, f1c, n1c, f1d, ok1 ? "OK" : "FAIL");
+
+  // 2. A protection boundary inside the window: pages 8..15 are read-only on
+  //    the host, a mapping of their own. A fault at page 1 maps pages 0..7
+  //    only; page 8 faults on its own and maps 9..15 read-only, so a write to
+  //    page 12 faults and page 16 (writable again) faults on its own.
+  unsigned char *m2 = nb_region(&w);
+  int ok2 = 0;
+  long f2 = -1, n2 = -1, f2b = -1, f2c = -1, n2c = -1, f2d = -1, wf = -1, f2e = -1;
+  unsigned long wfa = 0;
+  if (m2 && mprotect(P(8), 8 * NB_PAGE, PROT_READ) == 0) {
+    nb_fresh(m2, 8 * NB_WIN, dummy);
+    gk_get_stats(&a);
+    long r1 = gk_run(read_byte, P(1));
+    gk_get_stats(&b);
+    f2 = NB_DELTA(demand_faults); n2 = NB_DELTA(neighbor_pages);
+    gk_get_stats(&a);
+    long r3 = gk_run(read_byte, P(3));
+    gk_get_stats(&b);
+    f2b = NB_DELTA(demand_faults);
+    gk_get_stats(&a);
+    long r8 = gk_run(read_byte, P(8));
+    gk_get_stats(&b);
+    f2c = NB_DELTA(demand_faults); n2c = NB_DELTA(neighbor_pages);
+    gk_get_stats(&a);
+    long r12 = gk_run(read_byte, P(12));
+    gk_get_stats(&b);
+    f2d = NB_DELTA(demand_faults);
+    struct ap wr = {P(12), 0x33};
+    wf = gk_run(write_byte, &wr);
+    wfa = gk_fault_addr();
+    gk_get_stats(&a);
+    long r16 = gk_run(read_byte, P(16));
+    gk_get_stats(&b);
+    f2e = NB_DELTA(demand_faults);
+    ok2 = r1 == 0 && f2 == 1 && n2 == 7 && r3 == 0 && f2b == 0 && r8 == 0 && f2c == 1 &&
+          n2c == 7 && r12 == 0 && f2d == 0 && wf == GK_EFAULT && wfa == (uintptr_t)P(12) &&
+          P(12)[0] == 0 && r16 == 0 && f2e == 1;
+  }
+  printf("neighborhood, protection boundary: fault at page 1 -> %ld fault, %ld neighbors; page 3 "
+         "%ld faults; read-only page 8 -> %ld fault, %ld neighbors; page 12 %ld faults, write "
+         "-> %s (fault %#lx); page 16 -> %ld fault [%s]\n", f2, n2, f2b, f2c, n2c, f2d,
+         wf == GK_EFAULT ? "FAULT" : "WROTE", wfa, f2e, ok2 ? "OK" : "FAIL");
+
+  // 3. In an arena: pages 0..23 committed, so a fault at page 17 maps 16..23
+  //    and page 24 is refused as before; the pre-mapped pages are reachable
+  //    from the arena's root only.
+  gk_arena *A = gk_arena_create(4 * NB_WIN), *B = gk_arena_create(4096);
+  int ok3 = 0;
+  long f3 = -1, n3 = -1, f3b = -1, x24 = 0, x0 = 0, xb = 0, f3c = -1, va = -1;
+  unsigned long fx24 = 0, fx0 = 0, fxb = 0;
+  if (A && B && mprotect(gk_arena_base(A), 24 * NB_PAGE, PROT_READ | PROT_WRITE) == 0) {
+    w = gk_arena_base(A);
+    gk_arena_enter(A);
+    gk_get_stats(&a);
+    long r17 = gk_run(read_byte, P(17));
+    gk_get_stats(&b);
+    f3 = NB_DELTA(demand_faults); n3 = NB_DELTA(neighbor_pages);
+    gk_get_stats(&a);
+    long r16 = gk_run(read_byte, P(16)), r23 = gk_run(read_byte, P(23));
+    gk_get_stats(&b);
+    f3b = NB_DELTA(demand_faults);
+    x24 = gk_run(read_byte, P(24));
+    fx24 = gk_fault_addr();
+    gk_arena_enter(NULL);
+    x0 = gk_run(read_byte, P(20));
+    fx0 = gk_fault_addr();
+    gk_arena_enter(B);
+    xb = gk_run(read_byte, P(20));
+    fxb = gk_fault_addr();
+    gk_arena_enter(A);
+    gk_get_stats(&a);
+    va = gk_run(read_byte, P(20));
+    gk_get_stats(&b);
+    f3c = NB_DELTA(demand_faults);
+    gk_arena_enter(NULL);
+    ok3 = r17 == 0 && f3 == 1 && n3 == 7 && r16 == 0 && r23 == 0 && f3b == 0 &&
+          x24 == GK_EFAULT && fx24 == (uintptr_t)P(24) && x0 == GK_EFAULT &&
+          fx0 == (uintptr_t)P(20) && xb == GK_EFAULT && fxb == (uintptr_t)P(20) && va == 0 &&
+          f3c == 0;
+  }
+  if (A) gk_arena_destroy(A);
+  if (B) gk_arena_destroy(B);
+  printf("neighborhood, arena: fault at page 17 of 24 committed -> %ld fault, %ld neighbors; "
+         "pages 16, 23 %ld faults; page 24 -> %s (fault %#lx); page 20 from the base root -> "
+         "%s (fault %#lx), from another arena -> %s (fault %#lx), back in the arena -> %ld "
+         "(%ld faults) [%s]\n", f3, n3, f3b, x24 == GK_EFAULT ? "FAULT" : "READ", fx24,
+         x0 == GK_EFAULT ? "FAULT" : "READ", fx0, xb == GK_EFAULT ? "FAULT" : "READ", fxb, va,
+         f3c, ok3 ? "OK" : "FAIL");
+
+  // 4. A REFUSE page (8) and a SUPER page (9) inside the window: a ring-3
+  //    fault at page 1 maps the other 13; page 8 is still refused, page 9
+  //    faults on its own and comes up supervisor-only, page 10 is usable from
+  //    ring 3 with no fault.
+  unsigned char *m4 = nb_region(&w);
+  int ok4 = 0;
+  long f4 = -1, n4 = -1, x8 = 0, f4b = -1, r9 = -1, x9 = 0, r10 = -1, f4c = -1;
+  unsigned long fx8 = 0, fx9 = 0;
+  if (m4) {
+    gk_debug_protect_range((unsigned long)P(8), NB_PAGE, GK_DEBUG_PROT_REFUSE);
+    gk_debug_protect_range((unsigned long)P(9), NB_PAGE, GK_DEBUG_PROT_SUPER);
+    nb_fresh(m4, 8 * NB_WIN, dummy);
+    gk_get_stats(&a);
+    long r1 = gk_run_user(read_byte, P(1));
+    gk_get_stats(&b);
+    f4 = NB_DELTA(demand_faults); n4 = NB_DELTA(neighbor_pages);
+    x8 = gk_run(read_byte, P(8));
+    fx8 = gk_fault_addr();
+    gk_get_stats(&a);
+    r9 = gk_run(read_byte, P(9));
+    gk_get_stats(&b);
+    f4b = NB_DELTA(demand_faults);
+    x9 = gk_run_user(read_byte, P(9));
+    fx9 = gk_fault_addr();
+    gk_get_stats(&a);
+    r10 = gk_run_user(read_byte, P(10));
+    gk_get_stats(&b);
+    f4c = NB_DELTA(demand_faults);
+    gk_debug_protect_range((unsigned long)P(8), NB_PAGE, GK_DEBUG_PROT_KEEP);
+    gk_debug_protect_range((unsigned long)P(9), NB_PAGE, GK_DEBUG_PROT_KEEP);
+    ok4 = r1 == 0 && f4 == 1 && n4 == NB_PAGES - 3 && x8 == GK_EFAULT && fx8 == (uintptr_t)P(8) &&
+          r9 == 0 && f4b == 1 && x9 == GK_EFAULT && fx9 == (uintptr_t)P(9) && r10 == 0 && f4c == 0;
+  }
+  printf("neighborhood, class boundary: ring-3 fault at page 1 -> %ld fault, %ld neighbors; "
+         "REFUSE page 8 -> %s (fault %#lx); SUPER page 9 from ring 0 -> %ld (%ld fault), from "
+         "ring 3 -> %s (fault %#lx); page 10 from ring 3 -> %ld (%ld faults) [%s]\n", f4, n4,
+         x8 == GK_EFAULT ? "FAULT" : "READ", fx8, r9, f4b, x9 == GK_EFAULT ? "FAULT" : "READ",
+         fx9, r10, f4c, ok4 ? "OK" : "FAIL");
+
+#undef P
+#undef NB_DELTA
+  if (m1) munmap(m1, 8 * NB_WIN);
+  if (m2) munmap(m2, 8 * NB_WIN);
+  if (m4) munmap(m4, 8 * NB_WIN);
+  if (dummy != MAP_FAILED) munmap(dummy, 4096);
+  return ok1 && ok2 && ok3 && ok4;
+}
+
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (gk_init() != 0) {
@@ -1706,8 +1914,13 @@ int main(void) {
   // not, and gk's own flush drops global entries too (see global_check).
   int ok20 = global_check() == 1;
 
+  // ---- demand-fault neighborhoods --------------------------------------------
+  // One fault maps the aligned 64 KiB window around its page; window, VMA,
+  // arena and class boundaries hold (see neighborhood_check).
+  int ok21 = neighborhood_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
-            ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20;
+            ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }
