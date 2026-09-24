@@ -145,9 +145,12 @@ hardware:
   writable and writable pages are not executable (NX is enabled in the guest,
   and `CR0.WP` is set so the ring-0 guest cannot write a read-only page either).
   `mprotect` and `munmap` are reflected into the affected guest PTEs and the
-  TLB is flushed (the guest toggles `CR4.PGE`, which drops global entries too;
-  re-setting identical control registers through KVM does not flush, and a
-  `CR3` reload would keep the global entries). A plain `mprotect` that leaves the
+  TLB is flushed (the guest runs `INVPCID` type 2, or toggles `CR4.PGE` on a
+  CPU without `INVPCID`; either drops global entries too. `INVPCID` is not
+  intercepted under nested paging, so that flush costs one VM exit where the
+  two intercepted `CR4` writes cost three. Re-setting identical control
+  registers through KVM does not flush, and a `CR3` reload would keep the
+  global entries). A plain `mprotect` that leaves the
   range readable rewrites the PTEs the guest already has, in place, to the
   protection the syscall itself just set; `munmap`, a fixed `mmap`, an
   `mprotect` to `PROT_NONE` and `pkey_mprotect` drop them, so the next access

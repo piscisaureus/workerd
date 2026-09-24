@@ -278,6 +278,8 @@ struct gk_ctl {
   long global_pages;                // PTEs installed with PTE_G (see the global-pages section)
   long neighbor_pages;              // PTEs installed ahead of a fault (see demand_map_neighbors)
   atomic_long root_switches;        // guest entries that loaded another root (enter_guest)
+  atomic_long tlb_flushes;          // full flushes run on a vCPU, on any path (see flush_run)
+  void (*flush_stub)(void);         // the flush stub for this CPU (see flush_stub_select)
   // Bumped whenever page-table pages are returned to the allocator (an arena
   // was destroyed). A vCPU whose root is unchanged since it last entered the
   // guest may still hold TLB and paging-structure-cache entries derived from
@@ -365,6 +367,8 @@ extern void gk_exc_de(void), gk_exc_ud(void), gk_exc_df(void), gk_exc_gp(void),
     gk_exc_pf(void);
 extern void gk_pkru_stub(void);
 extern void gk_flush_stub(void);
+extern void gk_flush_stub_invpcid(void);
+extern const unsigned char gk_invpcid_desc[16];
 // Host-side helpers for guest thread creation (gk_asm.S); never run in the guest.
 extern long gk_host_clone_raw(long nr, long a1, long a2, long a3, long a4,
                               long a5);
@@ -594,8 +598,9 @@ static void prot_remove(uintptr_t s, uintptr_t e) {
 //    turns drops the vCPU's stack translations regardless, so wall_raise's
 //    flush-skip argument only ever has to carry turns with no switch between.
 //
-// Every TLB flush gk does itself includes global entries: gk_flush_stub
-// toggles CR4.PGE, which the CPU defines to drop every entry, global or not.
+// Every TLB flush gk does itself includes global entries: the flush stub
+// (see flush_run) runs INVPCID type 2 or toggles CR4.PGE, either of which the
+// CPU defines to drop every entry, global or not.
 // So a reflected mprotect/munmap, a wall raise and the root_gen flush all drop
 // them, and a changed shared PTE never leaves a stale global entry on the vCPU
 // that changed it; other vCPUs are not shot down, with or without global pages
@@ -1777,6 +1782,7 @@ static int map_handler_text(void) {
       (uintptr_t)&gk_exc_de, (uintptr_t)&gk_exc_ud, (uintptr_t)&gk_exc_df,
       (uintptr_t)&gk_exc_gp, (uintptr_t)&gk_exc_pf, (uintptr_t)&gk_syscall_tramp,
       (uintptr_t)&gk_exit_tramp, (uintptr_t)&gk_pkru_stub, (uintptr_t)&gk_flush_stub,
+      (uintptr_t)&gk_flush_stub_invpcid, (uintptr_t)gk_invpcid_desc,
       (uintptr_t)&gk_user_syscall_resume, (uintptr_t)&gk_user_launch,
       (uintptr_t)&gk_launch_cr3, (uintptr_t)&gk_user_launch_cr3,
       (uintptr_t)&gk_user_child_launch};
@@ -1799,6 +1805,27 @@ static int map_handler_text(void) {
   // supervisor r-x. Register before mapping so map4k_root clears U.
   prot_add(lo, hi, GK_PROT_SUPER);
   return mmu_map_range(lo, hi, 1 | 4);  // r-x
+}
+
+// Pick the TLB flush stub (see gk_asm.S): INVPCID when the CPUID every vCPU
+// gets (the host's, as KVM supports it) carries it in leaf 7 EBX bit 10 --
+// KVM then lets the guest execute it natively under nested paging, one VM
+// exit per flush -- and the CR4.PGE toggle otherwise, three. GK_NO_INVPCID in
+// the environment forces the toggle, so the fallback stays testable on a CPU
+// that has both. Both stubs drop every entry, global ones included (see the
+// global-pages section).
+static void flush_stub_select(void) {
+  G->flush_stub = gk_flush_stub;
+  for (unsigned i = 0; i < GK_CPUID->nent && !getenv("GK_NO_INVPCID"); i++) {
+    const struct kvm_cpuid_entry2 *e = &GK_CPUID->entries[i];
+    if (e->function == 7 && e->index == 0 && (e->ebx & (1u << 10))) {
+      G->flush_stub = gk_flush_stub_invpcid;
+      break;
+    }
+  }
+  if (G->dbg)
+    fprintf(stderr, "[gk] TLB flush stub: %s\n",
+            G->flush_stub == gk_flush_stub_invpcid ? "invpcid" : "cr4.pge toggle");
 }
 
 int gk_init(void) {
@@ -1874,6 +1901,7 @@ int gk_init(void) {
 
   GK_CPUID->nent = GK_CPUID_ENTRIES;
   if (ioctl(G->kvm, KVM_GET_SUPPORTED_CPUID, GK_CPUID) < 0) { G->err = "GET_SUPPORTED_CPUID"; return -1; }
+  flush_stub_select();
   G->run_size = ioctl(G->kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
   // Register exchange through kvm_run (see regs_get) when KVM offers it for
   // both register sets; GK_NO_SYNC_REGS in the environment forces the ioctls.
@@ -2011,14 +2039,20 @@ static int run_stub(gk_thread *t, void (*stub)(void), uint64_t rdi, uint64_t rsi
   }
 }
 
+// Flush this vCPU's whole TLB, global entries included, by running the flush
+// stub gk_init selected (see flush_stub_select). Every full flush gk does
+// goes through here, so gk_stats.tlb_flushes counts them all. No ioctl does
+// this from the host: KVM flushes the guest TLB only when KVM_SET_SREGS
+// changes a control register, and re-setting the same values is a no-op.
+static int flush_run(gk_thread *t) {
+  atomic_fetch_add_explicit(&G->tlb_flushes, 1, memory_order_relaxed);
+  return run_stub(t, G->flush_stub, 0, 0, PORT_FLUSH, "flush");
+}
+
 // Flush this vCPU's TLB from a syscall exit, whose register snapshot is `r`:
-// the guest reloads its CR3 (gk_flush_stub) and resumes after the hypercall.
-// No ioctl does this from the host: KVM flushes the guest TLB only when
-// KVM_SET_SREGS changes a control register, and re-setting the same values is
-// a no-op.
+// the guest runs the flush stub and resumes after the hypercall.
 static void flush_tlb(gk_thread *t, struct kvm_regs *r) {
-  if (run_stub(t, gk_flush_stub, 0, 0, PORT_FLUSH, "flush") == 0)
-    r->rip = (uintptr_t)&gk_syscall_tramp_resume;
+  if (flush_run(t) == 0) r->rip = (uintptr_t)&gk_syscall_tramp_resume;
 }
 
 // ---- guest thread creation -------------------------------------------------
@@ -2428,7 +2462,7 @@ static void arena_sync_root(gk_arena *a) {
 //
 // A CR3 load drops every non-global translation. An unchanged CR3 drops
 // nothing, so when page-table pages were freed since this vCPU last flushed
-// (G->root_gen moved), the guest flushes explicitly (gk_flush_stub): the same
+// (G->root_gen moved), the guest flushes explicitly (flush_run): the same
 // root page may by now be a different arena's, or its subtrees may have been
 // rebuilt from recycled tables, and the vCPU's cached translations would be
 // stale. The freed tables were an arena's private ones, whose translations are
@@ -2448,7 +2482,7 @@ static int sync_cr3(gk_thread *t, uint64_t *load) {
   if (s.cr3 != want_cr3) {
     *load = want_cr3;
   } else if (t->root_gen != gen) {
-    if (run_stub(t, gk_flush_stub, 0, 0, PORT_FLUSH, "flush") < 0) return -1;
+    if (flush_run(t) < 0) return -1;
   }
   t->root_gen = gen;
   return 0;
@@ -2525,7 +2559,12 @@ static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t st
   } else {
     regs.rip = (uintptr_t)fn;
   }
-  if (cr3) atomic_fetch_add_explicit(&G->root_switches, 1, memory_order_relaxed);
+  if (cr3) {
+    atomic_fetch_add_explicit(&G->root_switches, 1, memory_order_relaxed);
+    if (G->dbg)
+      fprintf(stderr, "[gk] vcpu %d: root switch to %#llx (%s)\n", t->id,
+              (unsigned long long)cr3, t->active_arena ? "arena" : "base");
+  }
   regs_set(t, &regs);
   t->user_mode = user;
   return run_vcpu(t);
@@ -2670,7 +2709,7 @@ static int stack_wall_bounds(gk_thread *t, uintptr_t caller_sp, uintptr_t top,
 // unnecessary (below); no other vCPU's translations are touched, as the wall
 // is this vCPU's alone (see above).
 //
-// The flush (a KVM_RUN of gk_flush_stub, and the cold-TLB page walks the next
+// The flush (a KVM_RUN of the flush stub, and the cold-TLB page walks the next
 // turn then starts with) is a large share of a turn's fixed cost, and on the
 // steady-state path it flushes nothing that matters: the turns of an event
 // loop enter at the same call depth, one after another, with nothing else
@@ -2720,7 +2759,7 @@ static int wall_raise(gk_thread *t, uintptr_t lo, uintptr_t hi) {
   t->prev_ro_lo = lo;
   t->prev_ro_hi = hi;
   if (skip) return 0;
-  if (run_stub(t, gk_flush_stub, 0, 0, PORT_FLUSH, "flush") < 0) {
+  if (flush_run(t) < 0) {
     t->prev_ro_lo = t->prev_ro_hi = 0;  // TLB state unknown: the next wall flushes
     return -1;
   }
@@ -3226,6 +3265,8 @@ void gk_get_stats(gk_stats *s) {
   s->global_pages = G->global_pages;
   s->neighbor_pages = G->neighbor_pages;
   s->root_switches = atomic_load_explicit(&G->root_switches, memory_order_relaxed);
+  s->tlb_flushes = atomic_load_explicit(&G->tlb_flushes, memory_order_relaxed);
+  s->flush_invpcid = G->flush_stub == gk_flush_stub_invpcid;
   pthread_mutex_unlock(&G->lock);
 }
 

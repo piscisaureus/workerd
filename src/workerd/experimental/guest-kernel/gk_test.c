@@ -678,7 +678,8 @@ static long __attribute__((noinline)) wall_skip_check(const char *who) {
   gk_get_stats(&b);
   long sk1 = WALL_DELTA(wall_skipped), fl1 = WALL_DELTA(wall_flushed);
   uintptr_t host1 = w->host_frame;
-  int ok1 = r1 == GK_EFAULT && f1 == host1 && w->host_intact && sk1 == 1 && fl1 == 0;
+  int ok1 = r1 == GK_EFAULT && f1 == host1 && w->host_intact && sk1 == 1 && fl1 == 0 &&
+            WALL_DELTA(tlb_flushes) == 0;
   // 1b. Again after that fault, at the wall's first page: still skipping,
   //     still faulting.
   gk_get_stats(&a);
@@ -692,8 +693,10 @@ static long __attribute__((noinline)) wall_skip_check(const char *who) {
 
   // 2. A deeper turn: its window starts lower, taking in pages that were the
   //    previous turn's writable working stack (its frames and deep recursion
-  //    sat right below the previous entry), so the raise must flush, and its
-  //    store at the wall's first page -- one of those pages -- faults.
+  //    sat right below the previous entry), so the raise must flush (one full
+  //    flush, through whichever stub is in use), and its store at the wall's
+  //    first page -- one of those pages, whose writable translation the flush
+  //    had to drop -- faults.
   gk_get_stats(&a);
   w->which = 0;
   long r2 = wall_descend(WALL_DEPTH + 16, w);
@@ -701,7 +704,8 @@ static long __attribute__((noinline)) wall_skip_check(const char *who) {
   gk_get_stats(&b);
   uintptr_t bound2 = w->boundary;
   int ok2 = r2 == GK_EFAULT && f2 == bound2 && bound2 < bound1 && WALL_DELTA(wall_skipped) == 0 &&
-            WALL_DELTA(wall_flushed) == 1;
+            WALL_DELTA(wall_flushed) == 1 && WALL_DELTA(tlb_flushes) == 1;
+  const char *stub = b.flush_invpcid ? "invpcid" : "cr4.pge toggle";
 
   // 3. Back at the shallower depth the window lies within the deeper one, so
   //    the raise skips again, and the store into the host frame faults.
@@ -712,7 +716,7 @@ static long __attribute__((noinline)) wall_skip_check(const char *who) {
   unsigned long f3 = gk_fault_addr();
   gk_get_stats(&b);
   int ok3 = r3 == GK_EFAULT && f3 == host1 && w->host_intact && WALL_DELTA(wall_skipped) == 1 &&
-            WALL_DELTA(wall_flushed) == 0;
+            WALL_DELTA(wall_flushed) == 0 && WALL_DELTA(tlb_flushes) == 0;
 
   // 4. A ring-0 turn on the same chain runs the vCPU between two ring-3 turns
   //    and, having no wall, writes the very host frame the next wall covers
@@ -730,23 +734,25 @@ static long __attribute__((noinline)) wall_skip_check(const char *who) {
   unsigned long f4 = gk_fault_addr();
   gk_get_stats(&b);
   int ok4 = r4a == 0x4b1d && clobbered && r4 == GK_EFAULT && f4 == host1 && w->host_intact &&
-            WALL_DELTA(wall_skipped) == 0 && WALL_DELTA(wall_flushed) == 1;
+            WALL_DELTA(wall_skipped) == 0 && WALL_DELTA(wall_flushed) == 1 &&
+            WALL_DELTA(tlb_flushes) == 1;
 
   // 5. Skipping resumes: the next clean turn at the same depth skips.
   gk_get_stats(&a);
   w->which = 3;
   long r5 = wall_descend(WALL_DEPTH, w);
   gk_get_stats(&b);
-  int ok5 = r5 == 0x600d && WALL_DELTA(wall_skipped) == 1 && WALL_DELTA(wall_flushed) == 0;
+  int ok5 = r5 == 0x600d && WALL_DELTA(wall_skipped) == 1 && WALL_DELTA(wall_flushed) == 0 &&
+            WALL_DELTA(tlb_flushes) == 0;
 #undef WALL_DELTA
 
   int ok = okp && ok1 && ok1b && ok2 && ok3 && ok4 && ok5;
-  printf("wall flush skip (%s): warm-up %s; skipped raise: host-frame store -> %s (fault %#lx, "
-         "local %s, skipped %ld flushed %ld), wall-page store -> %s (fault %#lx) [%s]; deeper "
-         "turn (wall from %#lx < %#lx) flushed, store -> %s (fault %#lx) [%s]; shallower again "
-         "skipped, store -> %s [%s]; ring-0 turn between (wrote %#lx) -> next raise flushed, "
-         "store -> %s (local %s) [%s]; skipping resumed [%s] [%s]\n",
-         who, okp ? "ok" : "BROKEN", r1 == GK_EFAULT ? "FAULT" : "WROTE", f1,
+  printf("wall flush skip (%s, flush stub %s): warm-up %s; skipped raise: host-frame store -> %s "
+         "(fault %#lx, local %s, skipped %ld flushed %ld), wall-page store -> %s (fault %#lx) "
+         "[%s]; deeper turn (wall from %#lx < %#lx) flushed, store -> %s (fault %#lx) [%s]; "
+         "shallower again skipped, store -> %s [%s]; ring-0 turn between (wrote %#lx) -> next "
+         "raise flushed, store -> %s (local %s) [%s]; skipping resumed [%s] [%s]\n",
+         who, stub, okp ? "ok" : "BROKEN", r1 == GK_EFAULT ? "FAULT" : "WROTE", f1,
          w->host_intact ? "intact" : "CLOBBERED", sk1, fl1, r1b == GK_EFAULT ? "FAULT" : "WROTE",
          f1b, ok1 && ok1b ? "OK" : "FAIL", (unsigned long)bound2, (unsigned long)bound1,
          r2 == GK_EFAULT ? "FAULT" : "WROTE", f2, ok2 ? "OK" : "FAIL",
@@ -1128,7 +1134,10 @@ static long global_check(void) {
   long after = gk_run(flush_then_read, &d);
   gk_get_stats(&s1);
   long flush_faults = s1.demand_faults - s0.demand_faults;
-  int flush_ok = warm == 0x77 && warm_faults == 0 && after == 0x77 && flush_faults == 1;
+  // The reflected mprotect is one full flush (counted as such), and that flush
+  // has to drop the shared page's global entry: one fault.
+  int flush_ok = warm == 0x77 && warm_faults == 0 && after == 0x77 && flush_faults == 1 &&
+                 s1.tlb_flushes - s0.tlb_flushes == 1;
 
   gk_arena_enter(NULL);
   gk_get_stats(&s1);

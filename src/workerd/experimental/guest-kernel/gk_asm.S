@@ -154,12 +154,36 @@ gk_pkru_stub:
     outb %al, $0xFB
     hlt
 
-// TLB flush the host runs on a vCPU between guest instructions: clearing and
-// restoring CR4.PGE drops every one of the vCPU's TLB entries, global ones
+// TLB flush the host runs on a vCPU between guest instructions. Two stubs do
+// the same thing, dropping every one of the vCPU's TLB entries, global ones
 // included, and its paging-structure caches (a CR3 reload would keep the
 // global entries, which the shared runtime's pages have; see the global-pages
-// section in gk.c). No host-side ioctl flushes while the guest's control
-// registers stay the same. Reports on port 0xFA.
+// section in gk.c); gk_init picks one for the CPU (see flush_stub_select in
+// gk.c). No host-side ioctl flushes while the guest's control registers stay
+// the same. Both report on port 0xFA.
+//
+// gk_flush_stub_invpcid: INVPCID type 2 (all contexts, global translations
+// included). The instruction is legal with CR4.PCIDE clear and, for a guest
+// whose CPUID carries INVPCID, not intercepted under nested paging, so the
+// stub costs the one VM exit of its report. The type-2 descriptor's fields are
+// ignored, but the 16-byte operand must be readable: it is the zeroed constant
+// below, on this same supervisor page (which map_handler_text in gk.c maps by
+// symbol, gk_invpcid_desc among them).
+    .globl gk_flush_stub_invpcid
+    .type gk_flush_stub_invpcid, @function
+gk_flush_stub_invpcid:
+    movl $2, %eax
+    invpcid gk_invpcid_desc(%rip), %rax
+    outb %al, $0xFA
+    hlt
+    .balign 16
+    .globl gk_invpcid_desc
+    .hidden gk_invpcid_desc   /* RIP-relative above: must resolve within this object */
+gk_invpcid_desc:
+    .quad 0, 0
+
+// gk_flush_stub: clearing and restoring CR4.PGE, for a CPU without INVPCID.
+// Each CR4 write is intercepted, so this stub costs three VM exits.
     .globl gk_flush_stub
     .type gk_flush_stub, @function
 gk_flush_stub:
