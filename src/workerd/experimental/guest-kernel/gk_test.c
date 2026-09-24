@@ -83,6 +83,24 @@ static long decommit_read(void *arg) {
   return b[0];
 }
 
+// Runs in the guest: make a committed page read-only (mprotect R), then read
+// it. The read goes through the PTE the guest already has, rewritten in place.
+static long protect_read(void *arg) {
+  struct ap *p = arg;
+  if (mprotect(p->page, 4096, PROT_READ) != 0) return -errno;
+  volatile unsigned char *b = p->page;
+  return b[0];
+}
+
+// Runs in the guest: write a byte to the page, no mprotect. On a read-only
+// page this faults and gk_run returns GK_EFAULT.
+static long write_byte(void *arg) {
+  struct ap *p = arg;
+  volatile unsigned char *b = p->page;
+  b[0] = p->val;
+  return b[0];
+}
+
 
 // ---- arena churn -------------------------------------------------------------
 // A runtime creates and destroys arenas constantly (one per isolate). Each use
@@ -1344,8 +1362,45 @@ int main(void) {
     if ((uintptr_t)rv != 1) ok17 = 0;
   }
 
+  // ---- an mprotect reflected in place ----------------------------------------
+  // A forwarded mprotect that leaves a committed range readable rewrites the
+  // PTEs the guest already has for it rather than dropping them: the new
+  // protection takes effect (a page made read-only faults on write; made
+  // writable again, it takes the write) with no demand fault to re-derive
+  // what the syscall itself just set. The first run commits and touches the
+  // page; every run after it must add no demand fault, except the write to
+  // the read-only page, which is a genuine fault.
+  int ok18 = 0;
+  {
+    gk_arena *m = gk_arena_create(4096);
+    struct ap p = {gk_arena_base(m), 0x5a};
+    gk_stats s0, s1, s2, s3, s4;
+    gk_arena_enter(m);
+    long r0 = gk_run(commit_write, &p);   // RW commit, first touch: faults in
+    gk_get_stats(&s0);
+    long r1 = gk_run(commit_write, &p);   // RW -> RW: the PTE stays
+    gk_get_stats(&s1);
+    long r2 = gk_run(protect_read, &p);   // RW -> R: the read hits the rewritten PTE
+    gk_get_stats(&s2);
+    p.val = 0x3c;
+    long r3 = gk_run(write_byte, &p);     // the read-only page holds
+    unsigned long f3 = gk_fault_addr();
+    gk_get_stats(&s3);
+    long r4 = gk_run(commit_write, &p);   // R -> RW: the write hits in place
+    gk_get_stats(&s4);
+    gk_arena_enter(NULL);
+    gk_arena_destroy(m);
+    long d1 = s1.demand_faults - s0.demand_faults, d2 = s2.demand_faults - s1.demand_faults,
+         d4 = s4.demand_faults - s3.demand_faults;
+    ok18 = r0 == 0x5a && r1 == 0x5a && d1 == 0 && r2 == 0x5a && d2 == 0 &&
+           r3 == GK_EFAULT && f3 == (unsigned long)p.page && r4 == 0x3c && d4 == 0;
+    printf("mprotect in place: RW->RW %ld (%ld faults), RW->R read %ld (%ld faults), "
+           "write to R -> %ld at %#lx, R->RW write %ld (%ld faults) [%s]\n",
+           r1, d1, r2, d2, r3, f3, r4, d4, ok18 ? "OK" : "FAIL");
+  }
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
-            ok12 && ok13 && ok14 && ok15 && ok16 && ok17;
+            ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

@@ -562,18 +562,27 @@ static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
 
 // What a page-table walk over a range does to each leaf PTE it reaches.
 enum {
-  PTE_OP_UNMAP,       // clear the entry: reflect an mprotect, munmap or fixed mmap
+  PTE_OP_UNMAP,       // clear the entry: reflect a munmap, fixed mmap or PROT_NONE mprotect
   PTE_OP_WALL_RAISE,  // present and writable: withhold W, tag PTE_WALL (see wall_raise)
   PTE_OP_WALL_LOWER,  // present and PTE_WALL: give W back, untag (see wall_lower)
+  PTE_OP_REPROTECT,   // present: rewrite W and NX from a new host protection (see reprotect_range_all)
 };
+
+// The arguments of PTE_OP_REPROTECT: the protection a successful mprotect
+// just established over the range (bit0=r, bit1=w, bit2=x, the mprotect's own
+// prot argument) and the calling vCPU's host-frame wall window, inside which
+// W is withheld and tagged PTE_WALL exactly as demand_map would map the page.
+typedef struct { int prot; uintptr_t wall_lo, wall_hi; } gk_reprot;
 
 // Apply `op` to the leaf PTEs of [s, e) (page-aligned) in a root. Walks the
 // hierarchy and skips a whole 512GiB, 1GiB or 2MiB range at once where no
 // table exists beneath it, so a walk over a large, sparsely committed
 // reservation costs in proportion to what is mapped, not to the range. Leaves
-// intermediate tables in place and never allocates. Caller holds G->lock.
+// intermediate tables in place and never allocates. `rp` is PTE_OP_REPROTECT's
+// argument and NULL for the other ops. Caller holds G->lock.
 #define GK_NEXT_BOUNDARY(v, bits) ((((v) >> (bits)) + 1) << (bits))
-static void pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op) {
+static void pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
+                           const gk_reprot *rp) {
   for (uintptr_t v = s; v < e;) {
     uint64_t pml4e = root[(v >> 39) & 0x1ff];
     if (!(pml4e & PTE_P)) { v = GK_NEXT_BOUNDARY(v, 39); continue; }
@@ -595,6 +604,17 @@ static void pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op) {
       case PTE_OP_WALL_LOWER:
         if ((*pte & (PTE_P | PTE_WALL)) == (PTE_P | PTE_WALL)) *pte = (*pte & ~PTE_WALL) | PTE_W;
         break;
+      case PTE_OP_REPROTECT:
+        // Only W, NX and the wall tag change; the frame, P, U (the
+        // supervisor/refuse class), the protection key and the accessed/dirty
+        // bits are the page's own and stay.
+        if (*pte & PTE_P) {
+          uint64_t n = *pte & ~(PTE_W | PTE_NX | PTE_WALL);
+          if (!(rp->prot & 4)) n |= PTE_NX;
+          if (rp->prot & 2) n |= (v >= rp->wall_lo && v < rp->wall_hi) ? PTE_WALL : PTE_W;
+          *pte = n;
+        }
+        break;
     }
     v += 0x1000;
   }
@@ -604,12 +624,12 @@ static void pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op) {
 // root (whose subtrees every arena root shares for addresses outside arenas)
 // and each arena whose reservation the range overlaps (their private subtrees
 // are reachable from no other root). Caller holds G->lock.
-static void pte_range_all(uintptr_t s, uintptr_t e, int op) {
-  pte_range_root(G->pml4, s, e, op);
+static void pte_range_all(uintptr_t s, uintptr_t e, int op, const gk_reprot *rp) {
+  pte_range_root(G->pml4, s, e, op, rp);
   for (int i = 0; i < G->arena_n; i++) {
     gk_arena *a = G->arenas[i];
     uintptr_t lo = s > a->base ? s : a->base, hi = e < a->end ? e : a->end;
-    if (lo < hi) pte_range_root(a->pml4, lo, hi, op);
+    if (lo < hi) pte_range_root(a->pml4, lo, hi, op, rp);
   }
 }
 
@@ -620,13 +640,28 @@ static void pte_range_all(uintptr_t s, uintptr_t e, int op) {
 // unrecoverable KVM_RUN EFAULT rather than a demand fault. Caller holds
 // G->lock.
 static void unmap_range_all(uintptr_t s, uintptr_t e) {
-  pte_range_all(s, e, PTE_OP_UNMAP);
+  pte_range_all(s, e, PTE_OP_UNMAP, NULL);
+}
+
+// Reflect a successful plain mprotect over [s, e) that leaves the range
+// readable by rewriting, in place, every PTE any root holds for it (see
+// pte_range_all) to `prot`, the syscall's own argument: with the host call
+// just made under G->lock, that is exactly the host protection of every page
+// in the range, so nothing is cached and nothing needs re-deriving. Pages the
+// guest has no PTE for yet are untouched and fault in later against the host
+// as always. Dropping the PTEs instead (unmap_range_all) would have each one
+// re-fault, and every demand fault reads /proc/self/maps, which is long in
+// this process. `t` is the calling vCPU, whose host-frame wall the rewrite
+// honors (see gk_reprot). Caller holds G->lock.
+static void reprotect_range_all(gk_thread *t, uintptr_t s, uintptr_t e, int prot) {
+  gk_reprot rp = {prot, t->ro_lo, t->ro_hi};
+  pte_range_all(s, e, PTE_OP_REPROTECT, &rp);
 }
 
 // The same for one root only: an arena root being built or torn down, whose
 // private subtree no other root reaches. Caller holds G->lock.
 static void unmap_range_root(uint64_t *root, uintptr_t s, uintptr_t e) {
-  pte_range_root(root, s, e, PTE_OP_UNMAP);
+  pte_range_root(root, s, e, PTE_OP_UNMAP, NULL);
 }
 
 // ---- the MMU layer: interval-tree memslot manager --------------------------
@@ -1958,12 +1993,16 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
   // PKRU gets the new key's initial access rights, as the kernel would give the
   // calling thread.
   //
-  // Protection/mapping changes are reflected by clearing the guest PTEs for the
+  // Protection/mapping changes are reflected into the guest PTEs for the
   // affected range, in the base root and in every arena root the range
-  // overlaps (see unmap_range_all), so the next access re-faults and
-  // demand-maps with the new host permissions (this is what makes W^X, JIT code
-  // and V8's commit/decommit of sandbox pages work), then flushing this vCPU's
-  // TLB. The host call and the PTE clearing happen under G->lock so a demand
+  // overlaps, then this vCPU's TLB is flushed. A plain mprotect that leaves
+  // the range readable rewrites the PTEs the guest already has, in place, to
+  // the protection it just set (see reprotect_range_all); everything else --
+  // munmap, a fixed mmap, an mprotect to PROT_NONE, a pkey_mprotect (whose key
+  // the PTEs must pick up too) -- clears them (see unmap_range_all), so the
+  // next access re-faults and demand-maps with the new host state. Together
+  // this is what makes W^X, JIT code and V8's commit/decommit of sandbox pages
+  // work. The host call and the PTE update happen under G->lock so a demand
   // fault on another vCPU cannot install a PTE with the old protection in
   // between. The memslot backing is left in place: guest-physical equals
   // host-virtual, so a memslot validly covers its range whether or not the host
@@ -2001,7 +2040,12 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
       if ((nr == SYS_munmap || nr == SYS_mmap) && pkey_set_range(rs, re, 0) < 0 && G->dbg)
         fprintf(stderr, "[gk] pkey table full; [%#lx,%#lx) keeps a stale key\n",
                 (unsigned long)rs, (unsigned long)re);
-      unmap_range_all(rs, re);
+      // In place only for a prot made of PROT_READ|PROT_WRITE|PROT_EXEC with
+      // PROT_READ set; a PROT_GROWSDOWN/GROWSUP prot covers more than [rs, re).
+      if (nr == SYS_mprotect && (a3 & ~7L) == 0 && (a3 & PROT_READ))
+        reprotect_range_all(t, rs, re, (int)a3);
+      else
+        unmap_range_all(rs, re);
     }
     pthread_mutex_unlock(&G->lock);
     flush_tlb(t, r);
@@ -2311,7 +2355,7 @@ static int wall_raise(gk_thread *t, uintptr_t lo, uintptr_t hi) {
   pthread_mutex_lock(&G->lock);
   t->ro_lo = lo;
   t->ro_hi = hi;
-  pte_range_all(lo, hi, PTE_OP_WALL_RAISE);
+  pte_range_all(lo, hi, PTE_OP_WALL_RAISE, NULL);
   pthread_mutex_unlock(&G->lock);
   return run_stub(t, gk_flush_stub, 0, 0, PORT_FLUSH, "flush");
 }
@@ -2328,7 +2372,7 @@ static int wall_raise(gk_thread *t, uintptr_t lo, uintptr_t hi) {
 static void wall_lower(gk_thread *t) {
   if (t->ro_lo >= t->ro_hi) return;
   pthread_mutex_lock(&G->lock);
-  pte_range_all(t->ro_lo, t->ro_hi, PTE_OP_WALL_LOWER);
+  pte_range_all(t->ro_lo, t->ro_hi, PTE_OP_WALL_LOWER, NULL);
   t->ro_lo = t->ro_hi = 0;
   pthread_mutex_unlock(&G->lock);
 }
@@ -2777,5 +2821,6 @@ void gk_get_stats(gk_stats *s) {
   s->pt_pages_free = G->pt_free_n;
   s->pt_pages_total = (long)((G->pt_next - (uint8_t *)G->pt_base) >> 12);
   s->prot_ranges = G->prot_n;
+  s->demand_faults = G->demand_ok;
   pthread_mutex_unlock(&G->lock);
 }

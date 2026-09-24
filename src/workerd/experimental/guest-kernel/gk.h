@@ -191,6 +191,7 @@ typedef struct {
   long pt_pages_free;   // page-table pages on the free list
   long pt_pages_total;  // page-table pages ever taken from the fixed PT area
   int prot_ranges;      // ranges in the supervisor/refuse registry
+  long demand_faults;   // guest page faults resolved by mapping the page from the host
 } gk_stats;
 void gk_get_stats(gk_stats *s);
 

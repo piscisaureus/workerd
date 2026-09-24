@@ -128,11 +128,14 @@ hardware:
 - **W^X.** Pages are mapped with their host protection: executable pages are not
   writable and writable pages are not executable (NX is enabled in the guest,
   and `CR0.WP` is set so the ring-0 guest cannot write a read-only page either).
-  `mprotect` and `munmap` are reflected by dropping the affected guest PTEs and
-  flushing the TLB (a guest `CR3` reload, since re-setting identical control
-  registers through KVM does not flush), so the next access re-maps with the new
-  protection. This is what lets code that flips pages between writable and
-  executable work.
+  `mprotect` and `munmap` are reflected into the affected guest PTEs and the
+  TLB is flushed (a guest `CR3` reload, since re-setting identical control
+  registers through KVM does not flush). A plain `mprotect` that leaves the
+  range readable rewrites the PTEs the guest already has, in place, to the
+  protection the syscall itself just set; `munmap`, a fixed `mmap`, an
+  `mprotect` to `PROT_NONE` and `pkey_mprotect` drop them, so the next access
+  re-maps from the host. This is what lets code that flips pages between
+  writable and executable work.
 - **Protection keys (PKU).** V8's sandbox assigns protection keys with
   `pkey_mprotect` and flips its PKRU to write its code and pointer tables only in
   controlled windows. gk virtualizes this rather than stripping it: each range's
