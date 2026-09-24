@@ -1279,7 +1279,7 @@ static long global_check(void) {
 
 // ---- demand-fault neighborhoods ----------------------------------------------
 // A demand fault maps the pages around its page from the same /proc/self/maps
-// read, within an aligned 64 KiB window clipped to the host mapping (see
+// read, within an aligned 256 KiB window clipped to the host mapping (see
 // demand_map_neighbors in gk.c). Checks, with gk_stats' demand_faults and
 // neighbor_pages, that pages in the window are then usable with no fault of
 // their own while pages past the window still fault; that a protection
@@ -1289,10 +1289,13 @@ static long global_check(void) {
 // root; and that a REFUSE or SUPER page inside the window is left to its own
 // fault (refused, or mapped supervisor-only). Every region is fresh, its PTEs
 // dropped and the vCPU's TLB flushed before counting, so that an earlier
-// test's leftovers at a reused address cannot perturb the counts.
+// test's leftovers at a reused address cannot perturb the counts; each sits
+// between PROT_NONE guard pages, so the kernel cannot merge it with a
+// neighbor and its bounds are exactly known.
 #define NB_PAGE 4096UL
-#define NB_WIN (64UL << 10)
-enum { NB_PAGES = 16 };
+#define NB_WIN (256UL << 10)
+#define NB_LEN (8 * NB_WIN + 2 * NB_PAGE)  // nb_region's mapping, guards included
+enum { NB_PAGES = 64 };
 
 // Drops the PTEs of [p, p+len) in every root, then flushes this vCPU's TLB.
 static void nb_fresh(void *p, size_t len, void *dummy) {
@@ -1301,12 +1304,28 @@ static void nb_fresh(void *p, size_t len, void *dummy) {
   gk_run(flush_then_read, &d);
 }
 
-// A 64 KiB-aligned window inside a fresh mapping, with a page to spare on
-// either side. Returns the mapping (512 KiB) and sets *win.
-static unsigned char *nb_region(unsigned char **win) {
-  unsigned char *m = mmap(NULL, 8 * NB_WIN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+// A fresh read-write mapping of `usable` bytes between two PROT_NONE guard
+// pages. Returns the mapping, usable + 2 pages long, whose usable part starts
+// a page in; NULL on failure.
+static unsigned char *nb_guarded(size_t usable) {
+  size_t len = usable + 2 * NB_PAGE;
+  unsigned char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (m == MAP_FAILED) return NULL;
-  *win = (unsigned char *)(((uintptr_t)m + 2 * NB_WIN - 1) & ~(NB_WIN - 1));
+  if (mprotect(m, NB_PAGE, PROT_NONE) != 0 ||
+      mprotect(m + NB_PAGE + usable, NB_PAGE, PROT_NONE) != 0) {
+    munmap(m, len);
+    return NULL;
+  }
+  return m;
+}
+
+// A 256 KiB-aligned window inside a fresh guarded 2 MiB mapping (NB_LEN long
+// with its guards), with at least a page to spare on either side. Returns the
+// mapping and sets *win.
+static unsigned char *nb_region(unsigned char **win) {
+  unsigned char *m = nb_guarded(8 * NB_WIN);
+  if (!m) return NULL;
+  *win = (unsigned char *)(((uintptr_t)m + NB_PAGE + 2 * NB_WIN - 1) & ~(NB_WIN - 1));
   return m;
 }
 
@@ -1316,49 +1335,50 @@ static long neighborhood_check(void) {
 #define NB_DELTA(field) ((b).field - (a).field)
 #define P(i) (w + (i) * NB_PAGE)
 
-  // 1. The window: one fault maps its 16 pages; the pages just outside it on
+  // 1. The window: one fault maps its 64 pages; the pages just outside it on
   //    either side still fault, each mapping its own window.
   unsigned char *w, *m1 = nb_region(&w);
   int ok1 = 0;
   long f1 = -1, n1 = -1, f1b = -1, f1c = -1, f1d = -1, n1c = -1;
   if (m1) {
-    nb_fresh(m1, 8 * NB_WIN, dummy);
+    nb_fresh(m1, NB_LEN, dummy);
     gk_get_stats(&a);
     long r = gk_run(read_byte, P(5));
     gk_get_stats(&b);
     f1 = NB_DELTA(demand_faults); n1 = NB_DELTA(neighbor_pages);
     gk_get_stats(&a);
-    long r0 = gk_run(read_byte, P(0)), r6 = gk_run(read_byte, P(6)), r15 = gk_run(read_byte, P(15));
+    long r0 = gk_run(read_byte, P(0)), r6 = gk_run(read_byte, P(6)), r63 = gk_run(read_byte, P(63));
     struct ap wr = {P(7), 0x5e};
     long rw = gk_run(write_byte, &wr);
     gk_get_stats(&b);
     f1b = NB_DELTA(demand_faults);
     gk_get_stats(&a);
-    long r16 = gk_run(read_byte, P(16));
+    long r64 = gk_run(read_byte, P(64));
     gk_get_stats(&b);
     f1c = NB_DELTA(demand_faults); n1c = NB_DELTA(neighbor_pages);
     gk_get_stats(&a);
     long rm1 = gk_run(read_byte, P(-1));
     gk_get_stats(&b);
     f1d = NB_DELTA(demand_faults);
-    ok1 = r == 0 && f1 == 1 && n1 == NB_PAGES - 1 && r0 == 0 && r6 == 0 && r15 == 0 &&
-          rw == 0x5e && P(7)[0] == 0x5e && f1b == 0 && r16 == 0 && f1c == 1 &&
+    ok1 = r == 0 && f1 == 1 && n1 == NB_PAGES - 1 && r0 == 0 && r6 == 0 && r63 == 0 &&
+          rw == 0x5e && P(7)[0] == 0x5e && f1b == 0 && r64 == 0 && f1c == 1 &&
           n1c == NB_PAGES - 1 && rm1 == 0 && f1d == 1;
   }
-  printf("neighborhood: fault at page 5 -> %ld fault, %ld neighbors; pages 0, 6, 15 read and 7 "
-         "written with %ld faults; page 16 -> %ld fault (%ld neighbors), page -1 -> %ld fault "
+  printf("neighborhood: fault at page 5 -> %ld fault, %ld neighbors; pages 0, 6, 63 read and 7 "
+         "written with %ld faults; page 64 -> %ld fault (%ld neighbors), page -1 -> %ld fault "
          "[%s]\n", f1, n1, f1b, f1c, n1c, f1d, ok1 ? "OK" : "FAIL");
 
   // 2. A protection boundary inside the window: pages 8..15 are read-only on
   //    the host, a mapping of their own. A fault at page 1 maps pages 0..7
-  //    only; page 8 faults on its own and maps 9..15 read-only, so a write to
-  //    page 12 faults and page 16 (writable again) faults on its own.
+  //    only (the window starts at page 0, being aligned); page 8 faults on
+  //    its own and maps 9..15 read-only, so a write to page 12 faults and
+  //    page 16 (writable again) faults on its own.
   unsigned char *m2 = nb_region(&w);
   int ok2 = 0;
   long f2 = -1, n2 = -1, f2b = -1, f2c = -1, n2c = -1, f2d = -1, wf = -1, f2e = -1;
   unsigned long wfa = 0;
   if (m2 && mprotect(P(8), 8 * NB_PAGE, PROT_READ) == 0) {
-    nb_fresh(m2, 8 * NB_WIN, dummy);
+    nb_fresh(m2, NB_LEN, dummy);
     gk_get_stats(&a);
     long r1 = gk_run(read_byte, P(1));
     gk_get_stats(&b);
@@ -1391,9 +1411,9 @@ static long neighborhood_check(void) {
          "-> %s (fault %#lx); page 16 -> %ld fault [%s]\n", f2, n2, f2b, f2c, n2c, f2d,
          wf == GK_EFAULT ? "FAULT" : "WROTE", wfa, f2e, ok2 ? "OK" : "FAIL");
 
-  // 3. In an arena: pages 0..23 committed, so a fault at page 17 maps 16..23
-  //    and page 24 is refused as before; the pre-mapped pages are reachable
-  //    from the arena's root only.
+  // 3. In an arena: pages 0..23 committed, so a fault at page 17 maps the
+  //    other 23 (the window covers them all) and page 24 is refused as
+  //    before; the pre-mapped pages are reachable from the arena's root only.
   gk_arena *A = gk_arena_create(4 * NB_WIN), *B = gk_arena_create(4096);
   int ok3 = 0;
   long f3 = -1, n3 = -1, f3b = -1, x24 = 0, x0 = 0, xb = 0, f3c = -1, va = -1;
@@ -1423,7 +1443,7 @@ static long neighborhood_check(void) {
     gk_get_stats(&b);
     f3c = NB_DELTA(demand_faults);
     gk_arena_enter(NULL);
-    ok3 = r17 == 0 && f3 == 1 && n3 == 7 && r16 == 0 && r23 == 0 && f3b == 0 &&
+    ok3 = r17 == 0 && f3 == 1 && n3 == 23 && r16 == 0 && r23 == 0 && f3b == 0 &&
           x24 == GK_EFAULT && fx24 == (uintptr_t)P(24) && x0 == GK_EFAULT &&
           fx0 == (uintptr_t)P(20) && xb == GK_EFAULT && fxb == (uintptr_t)P(20) && va == 0 &&
           f3c == 0;
@@ -1438,7 +1458,7 @@ static long neighborhood_check(void) {
          f3c, ok3 ? "OK" : "FAIL");
 
   // 4. A REFUSE page (8) and a SUPER page (9) inside the window: a ring-3
-  //    fault at page 1 maps the other 13; page 8 is still refused, page 9
+  //    fault at page 1 maps the other 61; page 8 is still refused, page 9
   //    faults on its own and comes up supervisor-only, page 10 is usable from
   //    ring 3 with no fault.
   unsigned char *m4 = nb_region(&w);
@@ -1448,7 +1468,7 @@ static long neighborhood_check(void) {
   if (m4) {
     gk_debug_protect_range((unsigned long)P(8), NB_PAGE, GK_DEBUG_PROT_REFUSE);
     gk_debug_protect_range((unsigned long)P(9), NB_PAGE, GK_DEBUG_PROT_SUPER);
-    nb_fresh(m4, 8 * NB_WIN, dummy);
+    nb_fresh(m4, NB_LEN, dummy);
     gk_get_stats(&a);
     long r1 = gk_run_user(read_byte, P(1));
     gk_get_stats(&b);
@@ -1478,9 +1498,9 @@ static long neighborhood_check(void) {
 
 #undef P
 #undef NB_DELTA
-  if (m1) munmap(m1, 8 * NB_WIN);
-  if (m2) munmap(m2, 8 * NB_WIN);
-  if (m4) munmap(m4, 8 * NB_WIN);
+  if (m1) munmap(m1, NB_LEN);
+  if (m2) munmap(m2, NB_LEN);
+  if (m4) munmap(m4, NB_LEN);
   if (dummy != MAP_FAILED) munmap(dummy, 4096);
   return ok1 && ok2 && ok3 && ok4;
 }

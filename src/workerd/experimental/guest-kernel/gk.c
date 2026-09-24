@@ -208,6 +208,9 @@ struct gk_arena {
   // arena's page tables, slots and struct while any remain, since their
   // vCPUs would otherwise run under tables that now belong to someone else.
   int active_threads;
+  // G->pml4_gen as of the last arena_sync_root of this root (see sync_cr3).
+  // Written under G->lock, read without it.
+  unsigned synced_gen;
   gk_arena *next_free;        // free-list link while the struct is unused
 };
 
@@ -230,7 +233,7 @@ _Static_assert(GK_MAX_PROT_RANGES >= 2 * GK_MAX_VCPUS + 512,
 // A memslot-backed window (see the MMU layer below).
 #define GK_BACK_WIN (2UL << 20)   // memslot backing granularity (2MB, aligned)
 // The neighborhood a demand fault maps around its page (see demand_map_neighbors).
-#define GK_NEIGHBOR_WIN (64UL << 10)  // 16 pages, aligned; within one GK_BACK_WIN
+#define GK_NEIGHBOR_WIN (256UL << 10)  // 64 pages, aligned; within one GK_BACK_WIN
 #define GK_MAX_REGIONS 65536
 typedef struct gk_region {
   uintptr_t start, end;   // [start, end), GK_BACK_WIN-aligned
@@ -287,6 +290,13 @@ struct gk_ctl {
   // tables that have since been freed and reused, so it flushes at its next
   // entry when it sees a new generation (see sync_cr3).
   unsigned root_gen;
+  // Bumped whenever the base root gains a top-level (PML4) entry (next_table),
+  // the one change to the base root an arena root has to pick up: its other
+  // shared entries are the base root's own tables, and a leaf change inside
+  // them is seen by every root at once. An arena root whose synced_gen equals
+  // this needs no arena_sync_root at entry (see sync_cr3). Base PML4 entries
+  // are never removed, so the generation only ever moves forward.
+  unsigned pml4_gen;
 
   // The vCPU pool. Guarded by G->lock.
   gk_parked_vcpu parked[GK_MAX_VCPUS];
@@ -482,6 +492,9 @@ static uint64_t *next_table(uint64_t *tbl, int idx) {
     uint64_t *n = alloc_table();
     if (!n) return NULL;
     tbl[idx] = ((uint64_t)(uintptr_t)n) | PTE_P | PTE_W | PTE_U;
+    // A new base-root top-level entry: every arena root re-syncs at its next
+    // entry (see G->pml4_gen). Published after the entry is in place.
+    if (tbl == G->pml4) __atomic_fetch_add(&G->pml4_gen, 1, __ATOMIC_RELEASE);
   }
   return (uint64_t *)(uintptr_t)(tbl[idx] & ~0xfffULL);
 }
@@ -1286,9 +1299,13 @@ void *__wrap_realloc(void *p, size_t n) { gk_guard_alloc("realloc"); return __re
 // clipped to the host mapping: it is aligned, so it never leaves the 2MB
 // backing window of `page` or crosses a 512GiB slot, and everything in it that
 // gets a PTE is host-backed at exactly `perms` under the same G->lock hold
-// that read them. Nothing here is cached beyond the read: a later host change
-// is reflected or recovered for these PTEs exactly as for a page the guest
-// faulted itself (unmap_range_all, reprotect_range_all, host_backing_retry).
+// that read them. The window is 256KB, the chunk V8 grows its regular heap
+// by (adjacent chunks merge into one host mapping, so the mapping's own size
+// says nothing about the growth step): a chunk then costs one read as its
+// pages are first touched, not one per 64KB. Nothing here is cached beyond
+// the read: a later host change is reflected or recovered for these PTEs
+// exactly as for a page the guest faulted itself (unmap_range_all,
+// reprotect_range_all, host_backing_retry).
 //
 // This is an optimization, never a widening: a page is mapped only when it
 // would have been mapped the same way by its own fault under demand_map's
@@ -1837,6 +1854,7 @@ int gk_init(void) {
   // move the whole multi-megabyte block from .bss into the file.
   pthread_mutex_init(&G->lock, NULL);
   G->root_gen = 1;
+  G->pml4_gen = 1;
   G->rand_state = 0x9e3779b9u;
   prot_add(GK_CTL_START, GK_CTL_END, GK_PROT_SUPER);
   G->dbg = getenv("GK_DEBUG") != NULL;
@@ -2443,15 +2461,59 @@ static int guest_pkru_update(gk_thread *t, uint32_t keep, uint32_t set, uint32_t
 // entries back in its own slots. Entry by entry, with 8-byte stores, never
 // touching the arena's slots: another vCPU may be running under this root at
 // the same time (two threads in one arena), and its page walker must never
-// see a torn entry or a transiently absent slot. Caller holds G->lock.
-static void arena_sync_root(gk_arena *a) {
+// see a torn entry or a transiently absent slot. An entry that differs only
+// in its accessed bit (bit 5, which the page walker sets in whichever root it
+// walked) is the same entry and is left alone. Returns the number of entries
+// that changed. Caller holds G->lock.
+#define PML4E_DIFFERS(have, want) (((have) ^ (want)) & ~(1ULL << 5))
+static int arena_sync_root(gk_arena *a) {
+  int changed = 0;
   for (int i = 0; i < 512; i++) {
     if (i >= a->slot0 && i < a->slot0 + a->nslots) continue;
-    if (a->pml4[i] != G->pml4[i]) __atomic_store_n(&a->pml4[i], G->pml4[i], __ATOMIC_RELAXED);
+    if (PML4E_DIFFERS(a->pml4[i], G->pml4[i])) {
+      __atomic_store_n(&a->pml4[i], G->pml4[i], __ATOMIC_RELAXED);
+      changed++;
+    }
   }
   for (int i = 0; i < a->nslots; i++)
-    if (a->pml4[a->slot0 + i] != a->slot_entry[i])
+    if (PML4E_DIFFERS(a->pml4[a->slot0 + i], a->slot_entry[i])) {
       __atomic_store_n(&a->pml4[a->slot0 + i], a->slot_entry[i], __ATOMIC_RELAXED);
+      changed++;
+    }
+  return changed;
+}
+
+// Bring an arena root up to date with the base root if anything can have
+// changed since it last was: a base-root top-level entry added since
+// (G->pml4_gen moved past the root's synced_gen). The generation is read
+// before the scan, so an entry added during the scan, whether the scan saw it
+// or not, leaves the root marked as of a generation the next entry finds
+// stale and scans again. Skipping the scan on an unchanged generation is
+// what makes a warm turn's entry cheap; under GK_DEBUG the scan always runs
+// and a change it finds at an unchanged generation is reported, since that
+// would mean a base-root change the generation does not cover.
+static void arena_sync_if_stale(gk_arena *a) {
+  unsigned gen = __atomic_load_n(&G->pml4_gen, __ATOMIC_ACQUIRE);
+  unsigned have = __atomic_load_n(&a->synced_gen, __ATOMIC_RELAXED);
+  if (have == gen && !G->dbg) return;
+  pthread_mutex_lock(&G->lock);
+  int first = -1;
+  uint64_t was = 0, now = 0;
+  if (G->dbg && have == gen) {  // for the report below: the first entry that differs
+    for (int i = 0; i < 512 && first < 0; i++) {
+      int own = i >= a->slot0 && i < a->slot0 + a->nslots;
+      uint64_t want = own ? a->slot_entry[i - a->slot0] : G->pml4[i];
+      if (PML4E_DIFFERS(a->pml4[i], want)) { first = i; was = a->pml4[i]; now = want; }
+    }
+  }
+  int changed = arena_sync_root(a);
+  if (changed && have == gen)
+    fprintf(stderr, "[gk] BUG: arena root [%#lx,%#lx) changed %d entr%s at an unchanged "
+            "top-level generation %u (first: index %d, %#lx -> %#lx)\n", (unsigned long)a->base,
+            (unsigned long)a->end, changed, changed == 1 ? "y" : "ies", gen, first,
+            (unsigned long)was, (unsigned long)now);
+  __atomic_store_n(&a->synced_gen, gen, __ATOMIC_RELAXED);
+  pthread_mutex_unlock(&G->lock);
 }
 
 // Ready this vCPU's root for an entry: bring an active arena's root up to date
@@ -2475,11 +2537,7 @@ static void arena_sync_root(gk_arena *a) {
 // never global, so on a changed CR3 the load alone covers the generation
 // change too.
 static int sync_cr3(gk_thread *t, uint64_t *load) {
-  if (t->active_arena) {
-    pthread_mutex_lock(&G->lock);
-    arena_sync_root(t->active_arena);
-    pthread_mutex_unlock(&G->lock);
-  }
+  if (t->active_arena) arena_sync_if_stale(t->active_arena);
   unsigned gen = __atomic_load_n(&G->root_gen, __ATOMIC_ACQUIRE);
   uint64_t want_cr3 = (uint64_t)(uintptr_t)t->active_pml4;
   struct kvm_sregs s;
@@ -3210,6 +3268,7 @@ gk_arena *gk_arena_create(size_t size) {
   // the reservation from outside the arena.
   unmap_range_root(G->pml4, a->base, a->end);
   arena_sync_root(a);  // share the base root's other entries, own these slots
+  a->synced_gen = G->pml4_gen;  // under G->lock: no entry can be added in between
   for (int i = 0; i < nslots; i++) G->slot_used[idx + i] = 1;
   G->arenas[G->arena_n++] = a;
   pthread_mutex_unlock(&G->lock);
