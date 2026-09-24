@@ -100,6 +100,16 @@
 // too, when the vCPU had them, so stacks are recycled rather than leaked.
 // Guarded by G->lock.
 #define GK_MAX_VCPUS 4096
+// The kvm_run register sets gk exchanges with KVM_CAP_SYNC_REGS (see regs_get).
+// The constants are KVM ABI; spelled out for headers that predate them.
+#ifndef KVM_CAP_SYNC_REGS
+#define KVM_CAP_SYNC_REGS 74
+#endif
+#ifndef KVM_SYNC_X86_REGS
+#define KVM_SYNC_X86_REGS (1UL << 0)
+#define KVM_SYNC_X86_SREGS (1UL << 1)
+#endif
+#define GK_SYNC_REGS (KVM_SYNC_X86_REGS | KVM_SYNC_X86_SREGS)
 #define GK_IST_BYTES (64UL << 10)   // per-vCPU exception stack, TSS in its last page
 #define GK_SIDE_STACK (512UL << 10) // host-side stack for gk_run_here's gk loop
 typedef struct {
@@ -243,6 +253,7 @@ struct gk_ctl {
   uint64_t gdt_va, idt_va;
   int next_slot;                     // KVM memslot ids handed out, ever (see the region pool)
   int run_size;
+  int sync_regs;                     // registers go through kvm_run, not ioctls (see regs_get)
   // Host CPUID, applied to every vCPU: a struct kvm_cpuid2 (a flexible-array
   // struct, hence the raw buffer) with room for GK_CPUID_ENTRIES entries.
   _Alignas(struct kvm_cpuid2) unsigned char cpuid_buf[sizeof(struct kvm_cpuid2) +
@@ -1500,6 +1511,15 @@ static int vcpu_init(gk_thread *t, int flags) {
   s.gdt.base = G->gdt_va; s.gdt.limit = 6 * 8 - 1;  // through the ring-3 descriptors (0x28)
   s.idt.base = G->idt_va; s.idt.limit = 256 * 16 - 1;
   if (ioctl(fd, KVM_SET_SREGS, &s) < 0) { G->err = "KVM_SET_SREGS"; return -1; }
+  if (G->sync_regs) {
+    // From here the vCPU's registers go through kvm_run (see regs_get). Its
+    // sregs copy is made current now, as sync_cr3 may read it before this vCPU
+    // first runs; and a dirty flag left by a previous thread's write that never
+    // ran must not load that thread's registers over what was just set.
+    ioctl(fd, KVM_GET_SREGS, &run->s.regs.sregs);
+    run->kvm_valid_regs = GK_SYNC_REGS;
+    run->kvm_dirty_regs = 0;
+  }
 
   if (reused) {
     // Fresh x87/SSE control state, as a new thread would start with; the
@@ -1676,6 +1696,13 @@ int gk_init(void) {
   GK_CPUID->nent = GK_CPUID_ENTRIES;
   if (ioctl(G->kvm, KVM_GET_SUPPORTED_CPUID, GK_CPUID) < 0) { G->err = "GET_SUPPORTED_CPUID"; return -1; }
   G->run_size = ioctl(G->kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
+  // Register exchange through kvm_run (see regs_get) when KVM offers it for
+  // both register sets; GK_NO_SYNC_REGS in the environment forces the ioctls.
+  if (!getenv("GK_NO_SYNC_REGS")) {
+    long caps = ioctl(G->kvm, KVM_CHECK_EXTENSION, KVM_CAP_SYNC_REGS);
+    G->sync_regs = caps > 0 && (caps & GK_SYNC_REGS) == GK_SYNC_REGS;
+  }
+  if (G->dbg) fprintf(stderr, "[gk] registers via %s\n", G->sync_regs ? "kvm_run" : "ioctl");
   if (pthread_key_create(&G->thread_key, thread_key_dtor) != 0) { G->err = "pthread_key_create"; return -1; }
 
   // Bring up the calling thread's record and vCPU.
@@ -1724,6 +1751,57 @@ unsigned long gk_debug_ctl_addr(int which) {
 #define GK_ENOMEM 12
 #define GK_EINVAL 22
 
+// ---- vCPU registers ---------------------------------------------------------
+// With KVM_CAP_SYNC_REGS (G->sync_regs) a vCPU's general and special registers
+// are exchanged through its mmap'd kvm_run instead of by ioctl: KVM stores both
+// sets into run->s.regs at every KVM_RUN return, including a failed one
+// (kvm_valid_regs, set once by vcpu_init), and at the next KVM_RUN loads the
+// sets flagged in kvm_dirty_regs from there, before it completes a pending
+// port write or runs the guest: exactly where an ioctl issued in between would
+// have taken effect. A write is thus deferred to the next KVM_RUN on this
+// vCPU, which every writer follows it with; sregs_set_now is for writes that
+// must take effect back to back (host_backing_retry). kvm_run is refused to the
+// guest, so it can no more forge a register here than an ioctl argument.
+// Without the capability (or with GK_NO_SYNC_REGS set), the ioctls.
+static void regs_get(gk_thread *t, struct kvm_regs *r) {
+  if (G->sync_regs) *r = t->run->s.regs.regs;
+  else ioctl(t->fd, KVM_GET_REGS, r);
+}
+
+static void regs_set(gk_thread *t, const struct kvm_regs *r) {
+  if (G->sync_regs) {
+    t->run->s.regs.regs = *r;
+    t->run->kvm_dirty_regs |= KVM_SYNC_X86_REGS;
+  } else {
+    ioctl(t->fd, KVM_SET_REGS, r);
+  }
+}
+
+static void sregs_get(gk_thread *t, struct kvm_sregs *s) {
+  if (G->sync_regs) *s = t->run->s.regs.sregs;
+  else ioctl(t->fd, KVM_GET_SREGS, s);
+}
+
+static int sregs_set(gk_thread *t, const struct kvm_sregs *s) {
+  if (G->sync_regs) {
+    t->run->s.regs.sregs = *s;
+    t->run->kvm_dirty_regs |= KVM_SYNC_X86_SREGS;
+    return 0;
+  }
+  return ioctl(t->fd, KVM_SET_SREGS, s) < 0 ? -1 : 0;
+}
+
+// Loads the sregs into the vCPU right away, by ioctl, keeping the kvm_run copy
+// current so the next sregs_get reads what was set.
+static int sregs_set_now(gk_thread *t, const struct kvm_sregs *s) {
+  if (ioctl(t->fd, KVM_SET_SREGS, s) < 0) return -1;
+  if (G->sync_regs) {
+    t->run->s.regs.sregs = *s;
+    t->run->kvm_dirty_regs &= ~(uint64_t)KVM_SYNC_X86_SREGS;
+  }
+  return 0;
+}
+
 // Run one of the gk_asm.S stubs on this vCPU until it reports on `port`.
 // Clobbers the vCPU's general registers: the caller reprograms them afterwards
 // (gk_run and child_entry set the entry registers; a syscall exit sets the
@@ -1736,7 +1814,7 @@ static int run_stub(gk_thread *t, void (*stub)(void), uint64_t rdi, uint64_t rsi
   regs.rdi = rdi;
   regs.rsi = rsi;
   regs.rflags = 0x2;
-  ioctl(t->fd, KVM_SET_REGS, &regs);
+  regs_set(t, &regs);
   for (;;) {
     t->tlb_touched = 1;  // the vCPU runs: its TLB is no longer known (see wall_raise)
     if (ioctl(t->fd, KVM_RUN, 0) < 0) {
@@ -1868,7 +1946,7 @@ static long child_entry(void *arg) {
     regs.rip = (uintptr_t)&gk_user_child_launch;
     regs.rcx = t->start.regs.rip;
   }
-  ioctl(t->fd, KVM_SET_REGS, &regs);
+  regs_set(t, &regs);
   if (G->dbg)
     fprintf(stderr, "[gk] vcpu %d: guest thread tid %ld (from vcpu %d) rip=%#llx rsp=%#llx pkru=%#x ring %d\n",
             t->id, t->tid, t->start.parent_id, (unsigned long long)t->start.regs.rip,
@@ -2134,7 +2212,7 @@ static uint32_t host_pkru(void) {
 static int guest_pkru_update(gk_thread *t, uint32_t keep, uint32_t set, uint32_t *out) {
   if (run_stub(t, gk_pkru_stub, set, keep, PORT_PKRU, "pkru") < 0) return -1;
   struct kvm_regs regs;
-  ioctl(t->fd, KVM_GET_REGS, &regs);
+  regs_get(t, &regs);
   if (out) *out = (uint32_t)regs.rax;
   return 0;
 }
@@ -2172,10 +2250,10 @@ static int sync_cr3(gk_thread *t) {
   uint64_t want_cr3 = (uint64_t)(uintptr_t)t->active_pml4;
   if (want_cr3 != t->loaded_cr3) {
     struct kvm_sregs s;
-    ioctl(t->fd, KVM_GET_SREGS, &s);
+    sregs_get(t, &s);
     s.cr3 = want_cr3;
     t->tlb_touched = 1;  // the TLB changes under the host's hand (see wall_raise)
-    if (ioctl(t->fd, KVM_SET_SREGS, &s) < 0) return -1;
+    if (sregs_set(t, &s) < 0) return -1;
     t->loaded_cr3 = want_cr3;
   } else if (t->root_gen != gen) {
     if (run_stub(t, gk_flush_stub, 0, 0, PORT_FLUSH, "flush") < 0) return -1;
@@ -2231,7 +2309,7 @@ static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t st
   } else {
     regs.rip = (uintptr_t)fn;
   }
-  ioctl(t->fd, KVM_SET_REGS, &regs);
+  regs_set(t, &regs);
   t->user_mode = user;
   return run_vcpu(t);
 }
@@ -2545,14 +2623,15 @@ static int host_backing_retry(gk_thread *t) {
   pthread_mutex_unlock(&G->lock);
   // Only a CR3 change makes KVM flush the guest TLB (see flush_tlb), and the
   // stopped vCPU may be at ring 3, where it cannot run the flush stub: swing
-  // CR3 through the base root and back to the arena's.
+  // CR3 through the base root and back to the arena's, two loads that must
+  // both take effect (so not through kvm_run, which would keep only the last).
   struct kvm_sregs s;
-  ioctl(t->fd, KVM_GET_SREGS, &s);
+  sregs_get(t, &s);
   s.cr3 = (uint64_t)(uintptr_t)G->pml4;
-  if (ioctl(t->fd, KVM_SET_SREGS, &s) < 0) return 0;
+  if (sregs_set_now(t, &s) < 0) return 0;
   t->loaded_cr3 = s.cr3;  // so sync_cr3 restores the arena root if the next call fails
   s.cr3 = (uint64_t)(uintptr_t)a->pml4;
-  if (ioctl(t->fd, KVM_SET_SREGS, &s) < 0) return 0;
+  if (sregs_set_now(t, &s) < 0) return 0;
   t->loaded_cr3 = s.cr3;
   if (G->dbg) {  // fault path: raw output only
     gk_dbuf d = {.n = 0};
@@ -2580,8 +2659,8 @@ static int host_backing_retry(gk_thread *t) {
 // entry.
 static long host_backing_fail(gk_thread *t, int err) {
   struct kvm_regs r; struct kvm_sregs s;
-  ioctl(t->fd, KVM_GET_REGS, &r);
-  ioctl(t->fd, KVM_GET_SREGS, &s);
+  regs_get(t, &r);
+  sregs_get(t, &s);
   uint64_t addr = r.rip;
   int exact = 0;
 #ifdef KVM_EXIT_MEMORY_FAULT
@@ -2603,7 +2682,7 @@ static long host_backing_fail(gk_thread *t, int err) {
     db_flush(&d);
   }
   sregs_ring0(&s);
-  ioctl(t->fd, KVM_SET_SREGS, &s);
+  sregs_set_now(t, &s);
   struct kvm_vcpu_events ev = {0};
   ioctl(t->fd, KVM_SET_VCPU_EVENTS, &ev);
   if (err != EFAULT) return -1;
@@ -2628,7 +2707,7 @@ static long run_vcpu(gk_thread *t) {
         uint16_t port = t->run->io.port;
         if (port == PORT_SYSCALL) {
           struct kvm_regs r;
-          ioctl(t->fd, KVM_GET_REGS, &r);
+          regs_get(t, &r);
           // A ring-3 guest leaves through the sentinel exit syscall (ring 3
           // cannot use PORT_EXIT's OUT): its result is in RDI.
           if (r.rax == GK_EXIT_SYSCALL) return (long)r.rdi;
@@ -2639,20 +2718,20 @@ static long run_vcpu(gk_thread *t) {
           // have already pointed RIP at a resume label; override it to the
           // ring-3 one. Ring-0 guests keep RIP at the OUT so KVM completes it.
           if (t->user_mode) r.rip = (uintptr_t)&gk_user_syscall_resume;
-          ioctl(t->fd, KVM_SET_REGS, &r);
+          regs_set(t, &r);
         } else if (port == PORT_EXIT) {
           struct kvm_regs r;
-          ioctl(t->fd, KVM_GET_REGS, &r);
+          regs_get(t, &r);
           return (long)r.rax;
         } else if (port == PORT_UDRIP) {
           struct kvm_regs r;
-          ioctl(t->fd, KVM_GET_REGS, &r);
+          regs_get(t, &r);
           G->fault_addr = r.rax;
           if (G->dbg) fprintf(stderr, "[gk] #UD at rip=%#llx\n", (unsigned long long)r.rax);
           return GK_EFAULT;
         } else if (port == PORT_DEMAND) {
           struct kvm_sregs s;
-          ioctl(t->fd, KVM_GET_SREGS, &s);
+          sregs_get(t, &s);
           uint64_t cr2 = s.cr2;
           int repeat = (cr2 == t->last_fault);
           if (repeat) {
@@ -2664,7 +2743,7 @@ static long run_vcpu(gk_thread *t) {
           // changed it without a shootdown). The fault invalidated that entry,
           // so one retry against the current PTE tells the two apart.
           struct kvm_regs pr;
-          ioctl(t->fd, KVM_GET_REGS, &pr);
+          regs_get(t, &pr);
           uint64_t pf_err = *(uint64_t *)(uintptr_t)pr.rsp;  // top of the #PF frame
           int pk = (pf_err & PF_ERR_PK) != 0;
           if (pk && repeat) {
@@ -2699,7 +2778,7 @@ static long run_vcpu(gk_thread *t) {
           if (dm < 0) {
             if (G->dbg) {  // still the fault path: raw output only
               struct kvm_regs rr;
-              ioctl(t->fd, KVM_GET_REGS, &rr);
+              regs_get(t, &rr);
               // The #PF frame on the guest stack: [err, rip, cs, rflags, rsp].
               uint64_t *frame = (uint64_t *)(uintptr_t)rr.rsp;
               gk_dbuf d = {.n = 0};
@@ -2729,8 +2808,8 @@ static long run_vcpu(gk_thread *t) {
           // TLB entry it was taken through, so no explicit flush is needed.
         } else if (port == PORT_FAULT) {
           struct kvm_regs rr; struct kvm_sregs sr;
-          ioctl(t->fd, KVM_GET_REGS, &rr);
-          ioctl(t->fd, KVM_GET_SREGS, &sr);
+          regs_get(t, &rr);
+          sregs_get(t, &sr);
           if (G->dbg) {
             gk_dbuf d = {.n = 0};
             db_str(&d, "[gk] fatal exception, handler_rax="); db_hex(&d, rr.rax);
