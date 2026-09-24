@@ -445,7 +445,8 @@ struct wall {
   long tls_ok;           // out: a TLS variable was written and read back
   long deep;             // out: the deep recursion's result (the working stack is writable)
   int which;             // in: 0 store at the wall's first page, 1 store in the host caller frame,
-                         //     2 store in the entry slack (below the wall)
+                         //     2 store in the entry slack (below the wall), 3 no store (returns 0x600d)
+  int ring0;             // in: run the turn at ring 0 (gk_run_here) rather than ring 3
 };
 static __thread long wall_tls;
 static long user_cpl(void *arg);  // defined with the ring-3 privilege tests below
@@ -478,7 +479,7 @@ static long __attribute__((noinline)) wall_descend(int depth, struct wall *w) {
   if (depth <= 0) {
     volatile long host_local = 0x1111;  // a host caller frame just above the switch point
     w->host_frame = (uintptr_t)&host_local;
-    r = gk_run_here_user(wall_fn, w);
+    r = w->ring0 ? gk_run_here(wall_fn, w) : gk_run_here_user(wall_fn, w);
     w->host_intact = host_local == 0x1111;
   } else {
     r = wall_descend(depth - 1, w);
@@ -502,6 +503,7 @@ static long __attribute__((noinline)) wall_fn(void *arg) {
   switch (w->which) {
     case 0: w->target = w->boundary; break;      // the wall's first page
     case 1: w->target = w->host_frame; break;    // a host caller frame the wall covers
+    case 3: w->target = 0; return 0x600d;        // a clean turn: no store above the entry
     default: w->target = entry + 64; break;      // entry slack: below the wall, used by neither
   }
   *(volatile unsigned long *)w->target = 0x4b1d;
@@ -561,6 +563,123 @@ static long __attribute__((noinline)) wall_check(const char *who) {
 static void *wall_thread(void *arg) {
   (void)arg;
   return (void *)(uintptr_t)wall_check("pthread");
+}
+
+// The wall's TLB flush is skipped when it is provably unnecessary (see
+// wall_raise in gk.c): a ring-3 turn whose window lies within the previous
+// turn's, with the vCPU not having run in between. Every turn here descends
+// the same host chain, so consecutive turns meet that condition, and the
+// counters in gk_stats say which path each raise took. Checks that the skip
+// is taken and that the wall still holds on a turn that skipped, that each
+// condition whose failure makes a flush necessary again does force one and
+// the wall holds there too, and that skipping resumes afterwards. Runs on one
+// thread; returns 1 if every check held.
+static long __attribute__((noinline)) wall_skip_check(const char *who) {
+  struct wall *w = calloc(1, sizeof *w);
+  if (!w) return 0;
+  gk_stats a, b;
+#define WALL_DELTA(field) ((b).field - (a).field)
+
+  // Two clean turns at WALL_DEPTH make that window this vCPU's previous one,
+  // whatever ran on the thread before (the first raise after a flush-forcing
+  // event flushes; the second is a steady-state turn).
+  w->which = 3;
+  long p0 = wall_descend(WALL_DEPTH, w);
+  long p1 = wall_descend(WALL_DEPTH, w);
+  int okp = p0 == 0x600d && p1 == 0x600d;
+
+  // 1. Same depth, nothing ran in between: the raise skips its flush, and a
+  //    store into a host caller frame the wall covers still faults there.
+  gk_get_stats(&a);
+  w->which = 1;
+  w->target = 0;
+  long r1 = wall_descend(WALL_DEPTH, w);
+  unsigned long f1 = gk_fault_addr();
+  gk_get_stats(&b);
+  long sk1 = WALL_DELTA(wall_skipped), fl1 = WALL_DELTA(wall_flushed);
+  uintptr_t host1 = w->host_frame;
+  int ok1 = r1 == GK_EFAULT && f1 == host1 && w->host_intact && sk1 == 1 && fl1 == 0;
+  // 1b. Again after that fault, at the wall's first page: still skipping,
+  //     still faulting.
+  gk_get_stats(&a);
+  w->which = 0;
+  long r1b = wall_descend(WALL_DEPTH, w);
+  unsigned long f1b = gk_fault_addr();
+  gk_get_stats(&b);
+  uintptr_t bound1 = w->boundary;
+  int ok1b = r1b == GK_EFAULT && f1b == bound1 && WALL_DELTA(wall_skipped) == 1 &&
+             WALL_DELTA(wall_flushed) == 0;
+
+  // 2. A deeper turn: its window starts lower, taking in pages that were the
+  //    previous turn's writable working stack (its frames and deep recursion
+  //    sat right below the previous entry), so the raise must flush, and its
+  //    store at the wall's first page -- one of those pages -- faults.
+  gk_get_stats(&a);
+  w->which = 0;
+  long r2 = wall_descend(WALL_DEPTH + 16, w);
+  unsigned long f2 = gk_fault_addr();
+  gk_get_stats(&b);
+  uintptr_t bound2 = w->boundary;
+  int ok2 = r2 == GK_EFAULT && f2 == bound2 && bound2 < bound1 && WALL_DELTA(wall_skipped) == 0 &&
+            WALL_DELTA(wall_flushed) == 1;
+
+  // 3. Back at the shallower depth the window lies within the deeper one, so
+  //    the raise skips again, and the store into the host frame faults.
+  gk_get_stats(&a);
+  w->which = 1;
+  w->target = 0;
+  long r3 = wall_descend(WALL_DEPTH, w);
+  unsigned long f3 = gk_fault_addr();
+  gk_get_stats(&b);
+  int ok3 = r3 == GK_EFAULT && f3 == host1 && w->host_intact && WALL_DELTA(wall_skipped) == 1 &&
+            WALL_DELTA(wall_flushed) == 0;
+
+  // 4. A ring-0 turn on the same chain runs the vCPU between two ring-3 turns
+  //    and, having no wall, writes the very host frame the next wall covers
+  //    (so a writable translation of that page is now in the TLB). The next
+  //    raise must flush, and the ring-3 store into that frame faults.
+  w->ring0 = 1;
+  w->which = 1;
+  long r4a = wall_descend(WALL_DEPTH, w);
+  int clobbered = !w->host_intact;  // ring 0 may write there: the local was overwritten
+  w->ring0 = 0;
+  gk_get_stats(&a);
+  w->which = 1;
+  w->target = 0;
+  long r4 = wall_descend(WALL_DEPTH, w);
+  unsigned long f4 = gk_fault_addr();
+  gk_get_stats(&b);
+  int ok4 = r4a == 0x4b1d && clobbered && r4 == GK_EFAULT && f4 == host1 && w->host_intact &&
+            WALL_DELTA(wall_skipped) == 0 && WALL_DELTA(wall_flushed) == 1;
+
+  // 5. Skipping resumes: the next clean turn at the same depth skips.
+  gk_get_stats(&a);
+  w->which = 3;
+  long r5 = wall_descend(WALL_DEPTH, w);
+  gk_get_stats(&b);
+  int ok5 = r5 == 0x600d && WALL_DELTA(wall_skipped) == 1 && WALL_DELTA(wall_flushed) == 0;
+#undef WALL_DELTA
+
+  int ok = okp && ok1 && ok1b && ok2 && ok3 && ok4 && ok5;
+  printf("wall flush skip (%s): warm-up %s; skipped raise: host-frame store -> %s (fault %#lx, "
+         "local %s, skipped %ld flushed %ld), wall-page store -> %s (fault %#lx) [%s]; deeper "
+         "turn (wall from %#lx < %#lx) flushed, store -> %s (fault %#lx) [%s]; shallower again "
+         "skipped, store -> %s [%s]; ring-0 turn between (wrote %#lx) -> next raise flushed, "
+         "store -> %s (local %s) [%s]; skipping resumed [%s] [%s]\n",
+         who, okp ? "ok" : "BROKEN", r1 == GK_EFAULT ? "FAULT" : "WROTE", f1,
+         w->host_intact ? "intact" : "CLOBBERED", sk1, fl1, r1b == GK_EFAULT ? "FAULT" : "WROTE",
+         f1b, ok1 && ok1b ? "OK" : "FAIL", (unsigned long)bound2, (unsigned long)bound1,
+         r2 == GK_EFAULT ? "FAULT" : "WROTE", f2, ok2 ? "OK" : "FAIL",
+         r3 == GK_EFAULT ? "FAULT" : "WROTE", ok3 ? "OK" : "FAIL", (unsigned long)r4a,
+         r4 == GK_EFAULT ? "FAULT" : "WROTE", w->host_intact ? "intact" : "CLOBBERED",
+         ok4 ? "OK" : "FAIL", ok5 ? "OK" : "FAIL", ok ? "OK" : "FAIL");
+  free(w);
+  return ok;
+}
+
+static void *wall_skip_thread(void *arg) {
+  (void)arg;
+  return (void *)(uintptr_t)wall_skip_check("pthread");
 }
 
 // ---- a host-side decommit under an installed PTE ----------------------------
@@ -1350,6 +1469,19 @@ int main(void) {
     if ((uintptr_t)rv != 1) ok16 = 0;
   }
 
+  // ---- the wall's flush, skipped when provably unnecessary ------------------
+  // Consecutive same-depth ring-3 turns raise the wall without a TLB flush,
+  // and it holds regardless; a deeper turn or a guest run in between makes the
+  // next raise flush again (see wall_skip_check). On the main thread and on a
+  // pthread, whose vCPU is fresh or reused and must flush first.
+  int ok19 = wall_skip_check("main thread") == 1;
+  {
+    pthread_t t; void *rv = NULL;
+    pthread_create(&t, NULL, wall_skip_thread, NULL);
+    pthread_join(t, &rv);
+    if ((uintptr_t)rv != 1) ok19 = 0;
+  }
+
   // ---- a host-side decommit under an installed PTE ---------------------------
   // A page whose backing the host pulls without the guest seeing it faults at
   // the page and leaves the vCPU usable for the next turn (see
@@ -1400,7 +1532,7 @@ int main(void) {
   }
 
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
-            ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18;
+            ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

@@ -135,6 +135,15 @@ typedef struct gk_thread {
   // entry, which this vCPU maps read-only and whose write faults are genuine.
   // Empty (0, 0) outside such a turn. Written only by the owning thread.
   uintptr_t ro_lo, ro_hi;
+  // wall_raise's flush bookkeeping (see there). tlb_touched: this vCPU's TLB
+  // may have changed since wall_lower last ran. Set before every KVM_RUN (the
+  // guest loads translations as it runs) and by a host-side CR3 write, cleared
+  // only by wall_lower; while clear, the TLB holds exactly what it held when
+  // the previous wall came down. prev_ro_lo/prev_ro_hi: the window of the
+  // previous raised wall, (0, 0) when there is none to reason from (a fresh or
+  // reused vCPU, a turn with no wall, a failed flush). Owning thread only.
+  int tlb_touched;
+  uintptr_t prev_ro_lo, prev_ro_hi;
   // stack_wall_bounds' cache: the host mapping [wall_map_lo, wall_map_hi)
   // that held the previous turn's switch point, and the wall's end within it.
   uintptr_t wall_map_lo, wall_map_hi, wall_end;
@@ -250,6 +259,7 @@ struct gk_ctl {
   void (*tls_static_info)(size_t *, size_t *);
   pthread_mutex_t lock;
   long demand_ok;
+  long wall_flushed, wall_skipped;  // wall_raise: TLB flushes done / provably unneeded (see there)
   // Bumped whenever page-table pages are returned to the allocator (an arena
   // was destroyed). A vCPU whose root is unchanged since it last entered the
   // guest may still hold TLB and paging-structure-cache entries derived from
@@ -564,7 +574,8 @@ static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
 enum {
   PTE_OP_UNMAP,       // clear the entry: reflect a munmap, fixed mmap or PROT_NONE mprotect
   PTE_OP_WALL_RAISE,  // present and writable: withhold W, tag PTE_WALL (see wall_raise)
-  PTE_OP_WALL_LOWER,  // present and PTE_WALL: give W back, untag (see wall_lower)
+  PTE_OP_WALL_LOWER,  // present and PTE_WALL: give W back, untag; counts the present and
+                      // writable entries that carry no tag (see wall_lower)
   PTE_OP_REPROTECT,   // present: rewrite W and NX from a new host protection (see reprotect_range_all)
 };
 
@@ -579,10 +590,12 @@ typedef struct { int prot; uintptr_t wall_lo, wall_hi; } gk_reprot;
 // table exists beneath it, so a walk over a large, sparsely committed
 // reservation costs in proportion to what is mapped, not to the range. Leaves
 // intermediate tables in place and never allocates. `rp` is PTE_OP_REPROTECT's
-// argument and NULL for the other ops. Caller holds G->lock.
+// argument and NULL for the other ops. Returns PTE_OP_WALL_LOWER's count of
+// untagged writable entries, 0 for the other ops. Caller holds G->lock.
 #define GK_NEXT_BOUNDARY(v, bits) ((((v) >> (bits)) + 1) << (bits))
-static void pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
+static long pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
                            const gk_reprot *rp) {
+  long n = 0;
   for (uintptr_t v = s; v < e;) {
     uint64_t pml4e = root[(v >> 39) & 0x1ff];
     if (!(pml4e & PTE_P)) { v = GK_NEXT_BOUNDARY(v, 39); continue; }
@@ -603,6 +616,7 @@ static void pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
         break;
       case PTE_OP_WALL_LOWER:
         if ((*pte & (PTE_P | PTE_WALL)) == (PTE_P | PTE_WALL)) *pte = (*pte & ~PTE_WALL) | PTE_W;
+        else if ((*pte & (PTE_P | PTE_W)) == (PTE_P | PTE_W)) n++;
         break;
       case PTE_OP_REPROTECT:
         // Only W, NX and the wall tag change; the frame, P, U (the
@@ -618,19 +632,22 @@ static void pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
     }
     v += 0x1000;
   }
+  return n;
 }
 
 // Apply `op` over [s, e) in every root that may hold PTEs for it: the base
 // root (whose subtrees every arena root shares for addresses outside arenas)
 // and each arena whose reservation the range overlaps (their private subtrees
-// are reachable from no other root). Caller holds G->lock.
-static void pte_range_all(uintptr_t s, uintptr_t e, int op, const gk_reprot *rp) {
-  pte_range_root(G->pml4, s, e, op, rp);
+// are reachable from no other root). Returns the sum of the walks' counts
+// (see pte_range_root). Caller holds G->lock.
+static long pte_range_all(uintptr_t s, uintptr_t e, int op, const gk_reprot *rp) {
+  long n = pte_range_root(G->pml4, s, e, op, rp);
   for (int i = 0; i < G->arena_n; i++) {
     gk_arena *a = G->arenas[i];
     uintptr_t lo = s > a->base ? s : a->base, hi = e < a->end ? e : a->end;
-    if (lo < hi) pte_range_root(a->pml4, lo, hi, op, rp);
+    if (lo < hi) n += pte_range_root(a->pml4, lo, hi, op, rp);
   }
+  return n;
 }
 
 // Reflect a host protection or mapping change over [s, e) by dropping every
@@ -1542,6 +1559,8 @@ ready:
   t->backing_retries = 0;
   t->pkru_ready = 0;  // a fresh or reused vCPU gets its PKRU at first entry
   t->user_mode = 0;   // ring 0 until enter_guest or child_entry selects ring 3
+  t->tlb_touched = 1; // no known TLB state and no previous wall: the first
+  t->prev_ro_lo = t->prev_ro_hi = 0;  // wall_raise on this vCPU flushes
   if (!t->active_pml4) t->active_pml4 = G->pml4;
   t->inited = 1;
   if (G->dbg)
@@ -1719,6 +1738,7 @@ static int run_stub(gk_thread *t, void (*stub)(void), uint64_t rdi, uint64_t rsi
   regs.rflags = 0x2;
   ioctl(t->fd, KVM_SET_REGS, &regs);
   for (;;) {
+    t->tlb_touched = 1;  // the vCPU runs: its TLB is no longer known (see wall_raise)
     if (ioctl(t->fd, KVM_RUN, 0) < 0) {
       if (errno == EINTR) continue;
       if (G->dbg) fprintf(stderr, "[gk] vcpu %d: %s stub KVM_RUN: %s\n", t->id, what, strerror(errno));
@@ -2154,6 +2174,7 @@ static int sync_cr3(gk_thread *t) {
     struct kvm_sregs s;
     ioctl(t->fd, KVM_GET_SREGS, &s);
     s.cr3 = want_cr3;
+    t->tlb_touched = 1;  // the TLB changes under the host's hand (see wall_raise)
     if (ioctl(t->fd, KVM_SET_SREGS, &s) < 0) return -1;
     t->loaded_cr3 = want_cr3;
   } else if (t->root_gen != gen) {
@@ -2348,16 +2369,65 @@ static int stack_wall_bounds(gk_thread *t, uintptr_t caller_sp, uintptr_t top,
 // every demand fault reads /proc/self/maps, which is long in this process.
 // Pages in the window that are not mapped yet fault in without W through
 // demand_map. This vCPU's TLB may still hold writable translations of the
-// window from an earlier turn, so it is flushed too; no other vCPU's
-// translations are touched, as the wall is this vCPU's alone (see above).
+// window from an earlier turn, so it is flushed too, unless that is provably
+// unnecessary (below); no other vCPU's translations are touched, as the wall
+// is this vCPU's alone (see above).
+//
+// The flush (a KVM_RUN of gk_flush_stub, and the cold-TLB page walks the next
+// turn then starts with) is a large share of a turn's fixed cost, and on the
+// steady-state path it flushes nothing that matters: the turns of an event
+// loop enter at the same call depth, one after another, with nothing else
+// running the guest in between. Only a writable translation of a page in the
+// new window needs flushing, and the TLB can hold one only if the vCPU ran
+// while the page's PTE carried W. So the flush is skipped when both hold:
+//
+//  1. the vCPU has not run since the previous wall came down (tlb_touched is
+//     clear: no KVM_RUN and no host-side CR3 write since wall_lower). The
+//     window's PTEs have carried W again since then, but nothing could have
+//     loaded a translation through them: the TLB holds exactly what the
+//     previous turn left, and that turn ran under its own wall, under which
+//     every page of [prev_ro_lo, prev_ro_hi) was read-only or absent in the
+//     TLB (its raise flushed, or was itself skipped on the same argument);
+//  2. the new window lies within the previous one: prev_ro_hi == hi (the same
+//     stack end) and lo >= prev_ro_lo. Every page of [lo, hi) was then a
+//     read-only-or-absent page of the previous turn, and a translation the
+//     next run loads for it comes from the PTE, which withholds W again.
+//
+// Either condition failing means a writable translation of a window page may
+// exist, and the flush is done as before: the vCPU ran (a ring-0 turn on this
+// stack, a syscall retry, anything that entered the guest) and could have
+// written through the lowered PTEs; or the new window starts lower than the
+// previous one and takes in pages that were the previous turn's writable
+// working stack. A vCPU with no previous wall to reason from (fresh or
+// reused, see vcpu_init; a turn that had no wall; a failed flush) flushes.
+// The counts are in gk_stats (wall_flushed, wall_skipped).
 static int wall_raise(gk_thread *t, uintptr_t lo, uintptr_t hi) {
-  if (lo >= hi) return 0;
+  if (lo >= hi) {
+    // No wall this turn: the guest may write through the whole caller stack,
+    // so the next wall cannot treat this turn's window as its predecessor.
+    t->prev_ro_lo = t->prev_ro_hi = 0;
+    return 0;
+  }
+  int skip = !t->tlb_touched && t->prev_ro_hi != 0 && hi == t->prev_ro_hi && lo >= t->prev_ro_lo;
   pthread_mutex_lock(&G->lock);
   t->ro_lo = lo;
   t->ro_hi = hi;
   pte_range_all(lo, hi, PTE_OP_WALL_RAISE, NULL);
+  if (skip) G->wall_skipped++; else G->wall_flushed++;
   pthread_mutex_unlock(&G->lock);
-  return run_stub(t, gk_flush_stub, 0, 0, PORT_FLUSH, "flush");
+  if (G->dbg)
+    fprintf(stderr, "[gk] vcpu %d: wall [%#lx,%#lx) raised; previous [%#lx,%#lx), TLB %s since "
+            "lowered -> %s\n", t->id, (unsigned long)lo, (unsigned long)hi,
+            (unsigned long)t->prev_ro_lo, (unsigned long)t->prev_ro_hi,
+            t->tlb_touched ? "touched" : "untouched", skip ? "flush skipped" : "flush");
+  t->prev_ro_lo = lo;
+  t->prev_ro_hi = hi;
+  if (skip) return 0;
+  if (run_stub(t, gk_flush_stub, 0, 0, PORT_FLUSH, "flush") < 0) {
+    t->prev_ro_lo = t->prev_ro_hi = 0;  // TLB state unknown: the next wall flushes
+    return -1;
+  }
+  return 0;
 }
 
 // Lower the wall after the turn: give write permission back to every PTE the
@@ -2366,15 +2436,28 @@ static int wall_raise(gk_thread *t, uintptr_t lo, uintptr_t hi) {
 // was never tagged and stays as it is, so the window's PTEs again mirror the
 // host protection. This vCPU's TLB is not flushed: its read-only translations
 // of the window are what the next ring-3 turn wants anyway (wall_raise
-// flushes before the window can differ), and a ring-0 run in between that
-// writes through one takes a spurious #PF, which the fault path resolves by
-// re-mapping against the now-writable PTE.
+// flushes before the window can differ, or proves that it cannot), and a
+// ring-0 run in between that writes through one takes a spurious #PF, which
+// the fault path resolves by re-mapping against the now-writable PTE. From
+// here until the vCPU next runs, its TLB is known (tlb_touched clear), unless
+// the walk finds a window page writable without the wall's tag: the wall
+// withheld W from every writable page when it went up, so such a page was
+// mapped or reprotected writable during the turn by another vCPU (the
+// cross-thread residual, see run_here) and this vCPU may hold a writable
+// translation of it. The TLB then counts as touched, so the next wall_raise
+// flushes rather than reasons from this turn.
 static void wall_lower(gk_thread *t) {
   if (t->ro_lo >= t->ro_hi) return;
   pthread_mutex_lock(&G->lock);
-  pte_range_all(t->ro_lo, t->ro_hi, PTE_OP_WALL_LOWER, NULL);
+  long foreign = pte_range_all(t->ro_lo, t->ro_hi, PTE_OP_WALL_LOWER, NULL);
   t->ro_lo = t->ro_hi = 0;
   pthread_mutex_unlock(&G->lock);
+  if (foreign == 0) {
+    t->tlb_touched = 0;
+  } else if (G->dbg) {
+    fprintf(stderr, "[gk] vcpu %d: wall lowered over %ld page(s) another vCPU mapped writable; "
+            "the next wall flushes\n", t->id, foreign);
+  }
 }
 
 static long run_here(void *ctx, unsigned long caller_sp) {
@@ -2532,6 +2615,7 @@ static long host_backing_fail(gk_thread *t, int err) {
 // (via gk_exit_tramp) or faults.
 static long run_vcpu(gk_thread *t) {
   for (;;) {
+    t->tlb_touched = 1;  // the vCPU runs: its TLB is no longer known (see wall_raise)
     if (ioctl(t->fd, KVM_RUN, 0) < 0) {
       int err = errno;
       if (err == EINTR) continue;
@@ -2822,5 +2906,7 @@ void gk_get_stats(gk_stats *s) {
   s->pt_pages_total = (long)((G->pt_next - (uint8_t *)G->pt_base) >> 12);
   s->prot_ranges = G->prot_n;
   s->demand_faults = G->demand_ok;
+  s->wall_flushed = G->wall_flushed;
+  s->wall_skipped = G->wall_skipped;
   pthread_mutex_unlock(&G->lock);
 }

@@ -192,6 +192,8 @@ typedef struct {
   long pt_pages_total;  // page-table pages ever taken from the fixed PT area
   int prot_ranges;      // ranges in the supervisor/refuse registry
   long demand_faults;   // guest page faults resolved by mapping the page from the host
+  long wall_flushed;    // host-frame walls raised with a TLB flush
+  long wall_skipped;    // host-frame walls raised without one, the flush being provably unneeded
 } gk_stats;
 void gk_get_stats(gk_stats *s);
 
