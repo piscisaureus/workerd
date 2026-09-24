@@ -2982,8 +2982,21 @@ static long run_vcpu(gk_thread *t) {
               db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
               db_str(&d, ": write into the host-frame wall at "); db_hex(&d, cr2);
               db_str(&d, " (wall ["); db_hex(&d, t->ro_lo); db_str(&d, ", ");
-              db_hex(&d, t->ro_hi); db_str(&d, "), err="); db_hex(&d, pf_err); db_str(&d, ")");
+              db_hex(&d, t->ro_hi); db_str(&d, "), err="); db_hex(&d, pf_err);
+              db_str(&d, ", rip="); db_hex(&d, pf_frame[1]);
+              db_str(&d, ", rsp="); db_hex(&d, pf_sp); db_str(&d, ")");
               db_flush(&d);
+              // Best-effort frame-pointer walk of the faulting code's stack.
+              uint64_t bp = pr.rbp, lo = pf_sp, hi = pf_sp + (8UL << 20);
+              for (int i = 0; i < 24 && bp >= lo && bp + 16 <= hi; i++) {
+                uint64_t *f = (uint64_t *)(uintptr_t)bp;
+                db_str(&d, "[gk]   frame "); db_dec(&d, i);
+                db_str(&d, ": bp="); db_hex(&d, bp);
+                db_str(&d, " ret="); db_hex(&d, f[1]);
+                db_flush(&d);
+                if (f[0] <= bp) break;
+                bp = f[0];
+              }
             }
             G->fault_addr = cr2;
             return GK_EFAULT;
