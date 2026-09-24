@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include <errno.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -904,6 +905,174 @@ static long spawn_one_in_guest(void *arg) {
   return 1;
 }
 
+// ---- global pages across a root switch --------------------------------------
+// A turn for another isolate loads that isolate's root from inside the guest,
+// which keeps the TLB's global entries: the shared runtime's pages. Nothing an
+// arena holds may be global, or a translation of one isolate's page would
+// survive into the next isolate's turn. The alternation below (one thread,
+// arenas A and B in turn; ring 0, ring 3 and ring 3 on the caller's stack)
+// checks that after every switch the previous arena's page faults while the
+// current one's and a shared runtime page read fine.
+//
+// gk_debug_drop_pte then tells cached translations from fresh page walks: with
+// a page's PTE gone, an access that takes no demand fault used a TLB entry.
+// That shows an arena page's translation is cached at all (same root: no
+// fault), that it does not survive a switch away and back (its entry is not
+// global: one fault), that a shared page's does survive the switch (global
+// pages at work: no fault), and that gk's own flush -- a reflected mprotect --
+// drops the shared page's entry too (the flush includes global entries: one
+// fault). A survival check gets a few attempts, as the CPU may evict the entry
+// or KVM flush the vCPU on its own; the thread is pinned to one CPU meanwhile
+// so that KVM does not flush it on every move between CPUs.
+struct dp { void *dummy; void *target; };
+
+// Runs in the guest: an mprotect on a page of its own (a reflected syscall,
+// which flushes this vCPU's TLB), then a read of the target page.
+static long flush_then_read(void *arg) {
+  struct dp *d = arg;
+  if (mprotect(d->dummy, 4096, PROT_READ | PROT_WRITE) != 0) return -errno;
+  volatile unsigned char *p = d->target;
+  return (long)*p;
+}
+
+static unsigned char global_shared[2 * 4096] __attribute__((aligned(4096)));
+
+static long global_check(void) {
+  cpu_set_t old, one;
+  int pinned = sched_getaffinity(0, sizeof old, &old) == 0;
+  CPU_ZERO(&one);
+  CPU_SET(sched_getcpu(), &one);
+  if (pinned) sched_setaffinity(0, sizeof one, &one);
+  unsigned char *sp = global_shared;  // a page of the runtime's .bss: shared by every root
+  sp[0] = 0x77;
+  gk_arena *A = gk_arena_create(4096), *B = gk_arena_create(4096);
+  void *dummy = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (!A || !B || dummy == MAP_FAILED || mprotect(gk_arena_base(A), 4096, PROT_READ | PROT_WRITE) != 0 ||
+      mprotect(gk_arena_base(B), 4096, PROT_READ | PROT_WRITE) != 0) {
+    printf("global pages: setup failed [FAIL]\n");
+    return 0;
+  }
+  unsigned char *pa = gk_arena_base(A), *pb = gk_arena_base(B);
+  pa[0] = 0xAA;
+  pb[0] = 0xBB;
+  gk_stats s0, s1, sfirst;
+  gk_get_stats(&sfirst);
+
+  // 1. Alternation. Start on the base root, so every round's first entry is a
+  //    root switch.
+  gk_arena_enter(NULL);
+  gk_run(test_compute, (void *)10);
+  gk_get_stats(&s0);
+  enum { ROUNDS = 8 };
+  int alt_ok = 1, rounds_ok = 0;
+  for (int r = 0; r < ROUNDS && alt_ok; r++) {
+    gk_arena *own = (r & 1) ? B : A;
+    unsigned char *po = (r & 1) ? pb : pa, *px = (r & 1) ? pa : pb;
+    long want = (r & 1) ? 0xBB : 0xAA;
+    gk_arena_enter(own);
+    long r0 = gk_run(read_byte, po), r3 = gk_run_user(read_byte, po),
+         rh = gk_run_here_user(read_byte, po);
+    long rs0 = gk_run(read_byte, sp), rsh = gk_run_here_user(read_byte, sp);
+    long x0 = gk_run(read_byte, px);
+    unsigned long f0 = gk_fault_addr();
+    long x3 = gk_run_user(read_byte, px);
+    unsigned long f3 = gk_fault_addr();
+    long xh = gk_run_here_user(read_byte, px);
+    unsigned long fh = gk_fault_addr();
+    alt_ok = r0 == want && r3 == want && rh == want && rs0 == 0x77 && rsh == 0x77 &&
+             x0 == GK_EFAULT && f0 == (uintptr_t)px && x3 == GK_EFAULT && f3 == (uintptr_t)px &&
+             xh == GK_EFAULT && fh == (uintptr_t)px;
+    if (alt_ok) rounds_ok++;
+    else
+      printf("  round %d under %s: own %#lx/%#lx/%#lx, shared %#lx/%#lx, other -> %s %#lx / %s "
+             "%#lx / %s %#lx (want fault at %p)\n", r, (r & 1) ? "B" : "A", r0, r3, rh, rs0, rsh,
+             x0 == GK_EFAULT ? "FAULT" : "READ", f0, x3 == GK_EFAULT ? "FAULT" : "READ", f3,
+             xh == GK_EFAULT ? "FAULT" : "READ", fh, (void *)px);
+  }
+  gk_get_stats(&s1);
+  long switches = s1.root_switches - s0.root_switches;
+  int sw_ok = switches == ROUNDS;
+
+  // 2a. Same root: an arena page's translation is cached (methodology check).
+  int cached = 0;
+  for (int attempt = 0; attempt < 3 && !cached; attempt++) {
+    gk_arena_enter(A);
+    gk_run(read_byte, pa);
+    gk_debug_drop_pte((unsigned long)pa);
+    gk_get_stats(&s0);
+    long v = gk_run(read_byte, pa);
+    gk_get_stats(&s1);
+    cached = v == 0xAA && s1.demand_faults == s0.demand_faults;
+  }
+  // 2b. An arena page's translation does not survive a switch away and back,
+  //     and the page is unreachable from the other arena in between.
+  gk_arena_enter(A);
+  gk_run(read_byte, pa);
+  gk_debug_drop_pte((unsigned long)pa);
+  gk_get_stats(&s0);
+  gk_arena_enter(B);
+  long xb = gk_run(read_byte, pa);
+  unsigned long fxb = gk_fault_addr();
+  gk_arena_enter(A);
+  long va = gk_run(read_byte, pa);
+  gk_get_stats(&s1);
+  long arena_faults = s1.demand_faults - s0.demand_faults;
+  int arena_ok = xb == GK_EFAULT && fxb == (uintptr_t)pa && va == 0xAA && arena_faults == 1 &&
+                 s1.root_switches - s0.root_switches == 2;
+  // 2c. A shared page's translation survives the switch to another arena.
+  int survived = 0, shared_attempts = 0;
+  long shared_faults = -1;
+  for (int attempt = 0; attempt < 3 && !survived; attempt++) {
+    shared_attempts++;
+    gk_arena_enter(A);
+    gk_run(read_byte, sp);
+    gk_debug_drop_pte((unsigned long)sp);
+    gk_get_stats(&s0);
+    gk_arena_enter(B);
+    long v = gk_run(read_byte, sp);
+    gk_get_stats(&s1);
+    shared_faults = s1.demand_faults - s0.demand_faults;
+    survived = v == 0x77 && shared_faults == 0 && s1.root_switches - s0.root_switches == 1;
+  }
+  // 2d. gk's flush drops it: first a warm-up so that every page the guest
+  //     function touches is mapped, then the same with the PTE dropped.
+  struct dp d = {dummy, sp};
+  gk_arena_enter(A);
+  gk_run(read_byte, sp);
+  gk_run(flush_then_read, &d);
+  gk_get_stats(&s0);
+  long warm = gk_run(flush_then_read, &d);
+  gk_get_stats(&s1);
+  long warm_faults = s1.demand_faults - s0.demand_faults;
+  gk_debug_drop_pte((unsigned long)sp);
+  gk_get_stats(&s0);
+  long after = gk_run(flush_then_read, &d);
+  gk_get_stats(&s1);
+  long flush_faults = s1.demand_faults - s0.demand_faults;
+  int flush_ok = warm == 0x77 && warm_faults == 0 && after == 0x77 && flush_faults == 1;
+
+  gk_arena_enter(NULL);
+  gk_get_stats(&s1);
+  long globals = s1.global_pages - sfirst.global_pages;
+  gk_arena_destroy(A);
+  gk_arena_destroy(B);
+  munmap(dummy, 4096);
+  if (pinned) sched_setaffinity(0, sizeof old, &old);
+
+  int ok = alt_ok && sw_ok && cached && arena_ok && survived && flush_ok && globals > 0;
+  printf("global pages: %d/%d alternating turns isolated (%ld root switches); arena page cached "
+         "on the same root %s, after a switch away and back %s (%ld fault, unreachable in "
+         "between %s); shared page after a switch %s (%ld faults, %d attempt%s); after gk's "
+         "flush %s (%ld fault, warm-up %ld); %ld global PTEs installed [%s]\n",
+         rounds_ok, ROUNDS, switches, cached ? "ok" : "NOT CACHED",
+         arena_ok ? "re-walked" : "STALE", arena_faults,
+         xb == GK_EFAULT && fxb == (uintptr_t)pa ? "faults" : "READABLE",
+         survived ? "survived" : "DROPPED", shared_faults, shared_attempts,
+         shared_attempts == 1 ? "" : "s", flush_ok ? "dropped" : "SURVIVED", flush_faults,
+         warm_faults, globals, ok ? "OK" : "FAIL");
+  return ok;
+}
+
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (gk_init() != 0) {
@@ -1531,8 +1700,14 @@ int main(void) {
            r1, d1, r2, d2, r3, f3, r4, d4, ok18 ? "OK" : "FAIL");
   }
 
+  // ---- global pages across a root switch -------------------------------------
+  // Alternating turns for two arenas on one thread stay isolated, a shared
+  // runtime page's translation survives the switch while an arena page's does
+  // not, and gk's own flush drops global entries too (see global_check).
+  int ok20 = global_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
-            ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19;
+            ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

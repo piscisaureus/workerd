@@ -22,17 +22,20 @@
 #define PTE_P (1UL << 0)
 #define PTE_W (1UL << 1)
 #define PTE_U (1UL << 2)
+#define PTE_G (1UL << 8)         // global: the translation survives a CR3 load (see the global-pages section)
 #define PTE_WALL (1UL << 9)      // CPU-ignored software bit: W withheld by the host-frame wall
 #define PTE_NX (1UL << 63)
 #define PTE_PKEY_SHIFT 59        // bits 62:59 hold the page's protection key
 #define PTE_PKEY_MASK (0xfUL << PTE_PKEY_SHIFT)
 #define GK_MAP_WALLED 8          // map4k_root flag: host-writable page, W withheld (PTE_WALL)
+#define GK_MAP_GLOBAL 16         // map4k_root flag: the page may be global (see the global-pages section)
 #define PF_ERR_WR (1UL << 1)     // #PF error code: the access was a write
 #define PF_ERR_PK (1UL << 5)     // #PF error code: protection-key violation
 #define CR0_PE (1UL << 0)
 #define CR0_WP (1UL << 16)
 #define CR0_PG (1UL << 31)
 #define CR4_PAE (1UL << 5)
+#define CR4_PGE (1UL << 7)
 #define CR4_OSFXSR (1UL << 9)
 #define CR4_OSXMMEXCPT (1UL << 10)
 #define CR4_OSXSAVE (1UL << 18)
@@ -133,7 +136,6 @@ typedef struct gk_thread {
   uint64_t stack_top;
   uint64_t ist;            // exception stack + TSS region of this vCPU
   void *side_stack;        // host stack for gk_run_here's gk loop (see there)
-  uint64_t loaded_cr3;
   unsigned root_gen;       // G->root_gen as of this vCPU's last TLB flush (0: never)
   uint64_t last_fault;
   int fault_repeat;
@@ -271,6 +273,8 @@ struct gk_ctl {
   pthread_mutex_t lock;
   long demand_ok;
   long wall_flushed, wall_skipped;  // wall_raise: TLB flushes done / provably unneeded (see there)
+  long global_pages;                // PTEs installed with PTE_G (see the global-pages section)
+  atomic_long root_switches;        // guest entries that loaded another root (enter_guest)
   // Bumped whenever page-table pages are returned to the allocator (an arena
   // was destroyed). A vCPU whose root is unchanged since it last entered the
   // guest may still hold TLB and paging-structure-cache entries derived from
@@ -302,6 +306,9 @@ struct gk_ctl {
   // Which PML4 slots live arenas own. A destroyed arena's slots are reused by
   // later arenas, so slot churn does not run through the user address space.
   unsigned char slot_used[GK_USER_SLOTS];
+  // Which PML4 slots have ever held a global PTE. No arena is ever placed over
+  // one (see the global-pages section).
+  unsigned char slot_pinned[GK_USER_SLOTS];
 
   // The supervisor/refuse registry: disjoint ranges sorted by start. Guarded
   // by G->lock.
@@ -349,6 +356,8 @@ extern void gk_syscall_tramp(void);
 extern void gk_syscall_tramp_resume(void);
 extern void gk_user_syscall_resume(void);
 extern void gk_user_launch(void);
+extern void gk_launch_cr3(void);
+extern void gk_user_launch_cr3(void);
 extern void gk_user_child_launch(void);
 extern void gk_exit_tramp(void);
 extern void gk_user_exit_tramp(void);
@@ -547,6 +556,54 @@ static void prot_remove(uintptr_t s, uintptr_t e) {
   }
 }
 
+// ---- global pages ----------------------------------------------------------
+// The guest runs with CR4.PGE, so a PTE carrying the G bit yields a TLB entry
+// that a CR3 load keeps. A turn on a thread whose previous turn ran another
+// isolate loads that isolate's root at entry (see enter_guest); without global
+// pages that load drops every translation the vCPU had, and the turn starts
+// cold on the shared runtime's text, data and heap. With them, only the
+// previous arena's translations go.
+//
+// A global entry is correct only if the translation it caches is the same
+// under every root the vCPU can ever load, and stays so until a flush that
+// includes global entries. Both hold, by construction, for the pages that get
+// PTE_G, and map4k_root sets it for no others:
+//
+//  * The PTE lives in a table every root shares. PTE_G goes only into the base
+//    root, for a page outside every arena's reservation. Such a PTE sits under
+//    a base-root PML4 entry, which every arena root copies (arena_sync_root)
+//    and which is never replaced once set (the shared subtree is never freed),
+//    so every root reaches the identical PTE or, until its next sync, none. An
+//    arena's private subtree is never global: it differs per root by design,
+//    and a surviving entry would let one isolate's turn reach another's memory
+//    after the switch.
+//  * The page's address can never later become arena memory. A slot that has
+//    ever held a global PTE is pinned (slot_pinned) and gk_arena_create never
+//    places an arena over it; otherwise a stale global translation of a runtime
+//    mapping that was later unmapped could outlive the slot's reuse as an
+//    arena, and a turn for another arena could read that arena's memory through
+//    it. Pinning changes nothing in practice: an arena needs its whole 512GiB
+//    span free, and the slots holding the runtime's mappings never are.
+//  * The page is an ordinary user page (KEEP) -- supervisor pages stay
+//    non-global as a matter of caution, not need -- and not part of a thread
+//    stack: not in the calling vCPU's host-frame wall window, not in the stack
+//    mapping its ring-3 turns run on, and not in the mapping holding the
+//    interrupted code's stack pointer (see demand_map; the eager-mapped guest
+//    and child stacks never get the flag either). The wall withholds W on a
+//    window page per turn; with the stack non-global, a root switch between
+//    turns drops the vCPU's stack translations regardless, so wall_raise's
+//    flush-skip argument only ever has to carry turns with no switch between.
+//
+// Every TLB flush gk does itself includes global entries: gk_flush_stub
+// toggles CR4.PGE, which the CPU defines to drop every entry, global or not.
+// So a reflected mprotect/munmap, a wall raise and the root_gen flush all drop
+// them, and a changed shared PTE never leaves a stale global entry on the vCPU
+// that changed it; other vCPUs are not shot down, with or without global pages
+// (see the README's limitations). The per-turn root load is the guest's own
+// MOV CR3 (gk_launch_cr3, gk_user_launch_cr3), which keeps global entries; a
+// root load through KVM (cr3_load_host, host_backing_retry) makes KVM flush the
+// whole guest TLB, global entries included, which is harmless.
+
 // Four-level map of one page; guest-virtual == guest-physical == host-virtual.
 // `pkey` (0..15) is the page's protection key, placed in PTE bits 62:59; the
 // guest CPU checks it against the guest PKRU on every data access (with
@@ -555,10 +612,16 @@ static void prot_remove(uintptr_t s, uintptr_t e) {
 //
 // The leaf's U bit follows the supervisor/refuse registry: a SUPER page is
 // mapped with U cleared (ring 3 cannot reach it), a REFUSE page is never mapped
-// at all, and everything else is user-accessible. Caller holds G->lock.
+// at all, and everything else is user-accessible. GK_MAP_GLOBAL asks for the G
+// bit; it is granted only under the conditions of the global-pages section,
+// which are checked here again rather than trusted from the caller. Caller
+// holds G->lock.
 static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
   int cls = prot_class(va & ~0xfffULL);
   if (cls == GK_PROT_REFUSE) return -1;  // a control page: never reachable
+  int slot = (int)((va >> 39) & 0x1ff);
+  int global = (flags & GK_MAP_GLOBAL) && root == G->pml4 && cls == GK_PROT_KEEP &&
+               !(flags & GK_MAP_WALLED) && slot < GK_USER_SLOTS && !arena_containing(va);
   uint64_t *pdpt = next_table(root, (va >> 39) & 0x1ff);
   if (!pdpt) return -1;
   uint64_t *pd = next_table(pdpt, (va >> 30) & 0x1ff);
@@ -577,6 +640,11 @@ static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
   if (flags & GK_MAP_WALLED) pte |= PTE_WALL;
   if (!(flags & 4)) pte |= PTE_NX;
   pte |= ((uint64_t)pkey << PTE_PKEY_SHIFT) & PTE_PKEY_MASK;
+  if (global) {
+    pte |= PTE_G;
+    G->slot_pinned[slot] = 1;  // no arena may ever take this slot (see the global-pages section)
+    G->global_pages++;
+  }
   pt[(va >> 12) & 0x1ff] = pte;
   return 0;
 }
@@ -1125,12 +1193,17 @@ static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms)
 // an existing memslot. Refused pages within the range are left unmapped, as a
 // demand fault would leave them: a host mapping that abuts one of gk's refused
 // allocations (the kernel merges neighboring anonymous mappings) can be
-// eager-mapped without the refused part failing the whole call. Caller holds
-// G->lock.
+// eager-mapped without the refused part failing the whole call. So are pages
+// inside an arena's reservation (a guest-created thread whose clone named a
+// stack there, say): they belong to the arena's private subtree and are left
+// to demand paging under the arena's root. Installed here they would land in
+// the base root's subtree for the arena's slot, which every other root shares,
+// and be reachable from every other arena. Nothing mapped here is global: the
+// ranges are gk's control pages and guest stacks. Caller holds G->lock.
 static int mmu_map_range(uintptr_t s, uintptr_t e, int perms) {
   if (region_ensure(s, e) < 0) return -1;
   for (uintptr_t v = s & ~0xfffUL; v < e; v += 0x1000) {
-    if (prot_class(v) == GK_PROT_REFUSE) continue;
+    if (prot_class(v) == GK_PROT_REFUSE || arena_containing(v)) continue;
     if (map4k_root(G->pml4, v, (uint64_t)perms, pkey_lookup(v)) < 0) return -1;
   }
   return 0;
@@ -1186,8 +1259,10 @@ void *__wrap_realloc(void *p, size_t n) { gk_guard_alloc("realloc"); return __re
 // and refused). Inside any other arena the fault is refused outright: that is
 // a cross-arena access, and it must stay unaddressable even though the host
 // could back it. Outside every arena the PTE goes into the base root, whose
-// subtrees all arena roots share.
-static int demand_map(gk_thread *t, uintptr_t addr) {
+// subtrees all arena roots share, and is global unless the page is part of a
+// stack (see the global-pages section); `sp` is the interrupted code's stack
+// pointer, which names the mapping its stack lies in.
+static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
   uintptr_t page = addr & ~0xfffUL;
   uintptr_t rs, re; int perms;
   pthread_mutex_lock(&G->lock);
@@ -1247,6 +1322,14 @@ static int demand_map(gk_thread *t, uintptr_t addr) {
   // give W back in place instead of the page re-faulting after the turn.
   uint64_t flags = (uint64_t)perms;
   if (page >= t->ro_lo && page < t->ro_hi && (perms & 2)) flags = (flags & ~2ULL) | GK_MAP_WALLED;
+  // A base-root page may be global unless it is part of a stack: in this
+  // vCPU's wall window, in the stack mapping its ring-3 turns run on (cached
+  // by stack_wall_bounds; the mapping may have grown since, hence the overlap
+  // test), or in the mapping the interrupted code's stack pointer lies in.
+  // map4k_root checks the rest of the global-pages conditions itself.
+  int stack = (page >= t->ro_lo && page < t->ro_hi) ||
+              (rs < t->wall_map_hi && re > t->wall_map_lo) || (sp >= rs && sp < re);
+  if (!in && !stack) flags |= GK_MAP_GLOBAL;
   int r = map4k_root(root, page, flags, pkey);  // honor R/W/X for W^X
   if (r >= 0) {
     G->demand_ok++;
@@ -1490,7 +1573,8 @@ static int vcpu_init(gk_thread *t, int flags) {
   struct kvm_sregs s;
   ioctl(fd, KVM_GET_SREGS, &s);
   s.cr3 = (uint64_t)(uintptr_t)G->pml4;
-  s.cr4 = CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_OSXSAVE | CR4_PKE;
+  // PGE makes the G bit of a PTE take effect (see the global-pages section).
+  s.cr4 = CR4_PAE | CR4_PGE | CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_OSXSAVE | CR4_PKE;
   // The guest runs in ring 0, where the CPU ignores a PTE's write-protect bit
   // and a protection key's write-disable bit unless CR0.WP is set. It is, so
   // read-only pages and write-disabled keys hold for the guest as they would
@@ -1572,7 +1656,6 @@ ready:
   t->stack_top = stack_top;
   t->ist = ist;
   t->side_stack = side_stack;
-  t->loaded_cr3 = (uint64_t)(uintptr_t)G->pml4;
   t->root_gen = 0;    // a fresh or reused vCPU flushes its TLB at first entry
   t->last_fault = 0;
   t->fault_repeat = 0;
@@ -1599,6 +1682,7 @@ static int map_handler_text(void) {
       (uintptr_t)&gk_exc_gp, (uintptr_t)&gk_exc_pf, (uintptr_t)&gk_syscall_tramp,
       (uintptr_t)&gk_exit_tramp, (uintptr_t)&gk_pkru_stub, (uintptr_t)&gk_flush_stub,
       (uintptr_t)&gk_user_syscall_resume, (uintptr_t)&gk_user_launch,
+      (uintptr_t)&gk_launch_cr3, (uintptr_t)&gk_user_launch_cr3,
       (uintptr_t)&gk_user_child_launch};
   // gk_user_exit_tramp is deliberately absent: it runs in ring 3, so it must
   // stay a user page (its own page-aligned section, demand-paged as user r-x).
@@ -1867,7 +1951,8 @@ struct gk_clone_args {  // struct clone_args from <linux/sched.h>
       tls, set_tid, set_tid_size, cgroup;
 };
 static long run_vcpu(gk_thread *t);
-static int sync_cr3(gk_thread *t);
+static int sync_cr3(gk_thread *t, uint64_t *load);
+static int cr3_load_host(gk_thread *t, uint64_t cr3);
 static void host_pkru_allow_all(void);
 static uint32_t host_pkru(void);
 static int guest_pkru_update(gk_thread *t, uint32_t keep, uint32_t set, uint32_t *out);
@@ -1932,7 +2017,12 @@ static long child_entry(void *arg) {
             (unsigned long long)t->start.regs.rsp);
     host_syscall(SYS_exit_group, 70, 0, 0, 0, 0, 0);
   }
-  if (sync_cr3(t) < 0) host_syscall(SYS_exit_group, 70, 0, 0, 0, 0, 0);
+  // The child's vCPU comes up on the base root; a parent in an arena needs
+  // its root loaded, which is done from the host here (a full flush of a
+  // fresh or reused vCPU's TLB, which costs nothing worth keeping).
+  uint64_t cr3;
+  if (sync_cr3(t, &cr3) < 0 || (cr3 && cr3_load_host(t, cr3) < 0))
+    host_syscall(SYS_exit_group, 70, 0, 0, 0, 0, 0);
   host_pkru_allow_all();
   // A clone's child starts with its parent's PKRU.
   if (guest_pkru_update(t, 0, t->start.pkru, NULL) < 0)
@@ -2233,14 +2323,27 @@ static void arena_sync_root(gk_arena *a) {
       __atomic_store_n(&a->pml4[a->slot0 + i], a->slot_entry[i], __ATOMIC_RELAXED);
 }
 
-// Point this vCPU's CR3 at the thread's active root, after bringing an active
-// arena's root up to date with the base root (see arena_sync_root). A changed
-// CR3 makes KVM flush the guest TLB; an unchanged one does not, so when
-// page-table pages were freed since this vCPU last flushed (G->root_gen moved),
-// the guest reloads CR3 itself (gk_flush_stub): the same root page may by now
-// be a different arena's, or its subtrees may have been rebuilt from recycled
-// tables, and the vCPU's cached translations would be stale.
-static int sync_cr3(gk_thread *t) {
+// Ready this vCPU's root for an entry: bring an active arena's root up to date
+// with the base root (see arena_sync_root) and find out whether the vCPU's CR3
+// already names the thread's active root. If not, *load is set to the root
+// the entry must load and 0 otherwise. The load itself is the guest's own MOV
+// CR3 at the start of the turn (see enter_guest and the global-pages
+// section), or cr3_load_host for an entry that does not go through
+// enter_guest. The vCPU's CR3 is read back from KVM rather than remembered:
+// a load from inside the guest, one from the host (host_backing_retry) and one
+// that failed all leave it wherever the vCPU actually is, and an entry that
+// assumed a root it does not have would run one isolate's turn under
+// another's tables.
+//
+// A CR3 load drops every non-global translation. An unchanged CR3 drops
+// nothing, so when page-table pages were freed since this vCPU last flushed
+// (G->root_gen moved), the guest flushes explicitly (gk_flush_stub): the same
+// root page may by now be a different arena's, or its subtrees may have been
+// rebuilt from recycled tables, and the vCPU's cached translations would be
+// stale. The freed tables were an arena's private ones, whose translations are
+// never global, so on a changed CR3 the load alone covers the generation
+// change too.
+static int sync_cr3(gk_thread *t, uint64_t *load) {
   if (t->active_arena) {
     pthread_mutex_lock(&G->lock);
     arena_sync_root(t->active_arena);
@@ -2248,13 +2351,11 @@ static int sync_cr3(gk_thread *t) {
   }
   unsigned gen = __atomic_load_n(&G->root_gen, __ATOMIC_ACQUIRE);
   uint64_t want_cr3 = (uint64_t)(uintptr_t)t->active_pml4;
-  if (want_cr3 != t->loaded_cr3) {
-    struct kvm_sregs s;
-    sregs_get(t, &s);
-    s.cr3 = want_cr3;
-    t->tlb_touched = 1;  // the TLB changes under the host's hand (see wall_raise)
-    if (sregs_set(t, &s) < 0) return -1;
-    t->loaded_cr3 = want_cr3;
+  struct kvm_sregs s;
+  sregs_get(t, &s);
+  *load = 0;
+  if (s.cr3 != want_cr3) {
+    *load = want_cr3;
   } else if (t->root_gen != gen) {
     if (run_stub(t, gk_flush_stub, 0, 0, PORT_FLUSH, "flush") < 0) return -1;
   }
@@ -2262,10 +2363,23 @@ static int sync_cr3(gk_thread *t) {
   return 0;
 }
 
-// Ready this thread's vCPU for a guest invocation: its root, its PKRU on first
-// entry, and the per-invocation fault-repeat tracking.
-static int prepare_entry(gk_thread *t) {
-  if (sync_cr3(t) < 0) return -1;
+// Load `cr3` into this vCPU from the host, for an entry that does not go
+// through enter_guest (a guest-created thread's first, see child_entry). KVM
+// then flushes the whole guest TLB, global entries included, at the next
+// KVM_RUN.
+static int cr3_load_host(gk_thread *t, uint64_t cr3) {
+  struct kvm_sregs s;
+  sregs_get(t, &s);
+  s.cr3 = cr3;
+  t->tlb_touched = 1;  // the TLB changes under the host's hand (see wall_raise)
+  return sregs_set(t, &s);
+}
+
+// Ready this thread's vCPU for a guest invocation: its root (*load, see
+// sync_cr3), its PKRU on first entry, and the per-invocation fault-repeat
+// tracking.
+static int prepare_entry(gk_thread *t, uint64_t *load) {
+  if (sync_cr3(t, load) < 0) return -1;
   uint32_t hp = host_pkru();
   host_pkru_allow_all();
   if (!t->pkru_ready) {
@@ -2292,23 +2406,35 @@ static int prepare_entry(gk_thread *t) {
 //    this way: it cannot execute privileged instructions, reload CR3 or reach
 //    the supervisor/refused pages, so the arena walls hold against it.
 //
-// Either way the return value comes back through run_vcpu.
+// `cr3`, when nonzero, is the root the turn must run under (see sync_cr3):
+// RIP then goes to the variant of the entry stub that loads it into CR3 first
+// (RSI = the root; gk_launch_cr3 also takes RAX = fn), inside the turn's own
+// KVM_RUN. The guest's MOV CR3 is not intercepted under nested paging and
+// keeps the TLB's global entries, the shared runtime's translations, whereas a
+// CR3 set through KVM makes KVM flush the whole guest TLB (see the
+// global-pages section). Either way the return value comes back through
+// run_vcpu.
 static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t stack_top,
-                        int user) {
+                        int user, uint64_t cr3) {
   uint64_t sp = stack_top - 8;
   *(uint64_t *)sp = user ? (uintptr_t)&gk_user_exit_tramp : (uintptr_t)&gk_exit_tramp;
 
   struct kvm_regs regs = {0};
   regs.rsp = sp;
   regs.rdi = (uintptr_t)arg;
+  regs.rsi = cr3;
   regs.rflags = 0x2;
   if (user) {
-    regs.rip = (uintptr_t)&gk_user_launch;
+    regs.rip = cr3 ? (uintptr_t)&gk_user_launch_cr3 : (uintptr_t)&gk_user_launch;
     regs.rcx = (uintptr_t)fn;   // SYSRET target RIP
     regs.r11 = 0x2;             // SYSRET target RFLAGS
+  } else if (cr3) {
+    regs.rip = (uintptr_t)&gk_launch_cr3;
+    regs.rax = (uintptr_t)fn;
   } else {
     regs.rip = (uintptr_t)fn;
   }
+  if (cr3) atomic_fetch_add_explicit(&G->root_switches, 1, memory_order_relaxed);
   regs_set(t, &regs);
   t->user_mode = user;
   return run_vcpu(t);
@@ -2316,18 +2442,20 @@ static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t st
 
 long gk_run(long (*fn)(void *), void *arg) {
   gk_thread *t = thread_get();
+  uint64_t cr3;
   if (!t || vcpu_init(t, GK_VCPU_STACK) < 0) return -1;
-  if (prepare_entry(t) < 0) return -1;
-  return enter_guest(t, fn, arg, t->stack_top, 0);
+  if (prepare_entry(t, &cr3) < 0) return -1;
+  return enter_guest(t, fn, arg, t->stack_top, 0, cr3);
 }
 
 // Like gk_run, but fn runs at guest ring 3 (see enter_guest). Same private
 // guest stack, same fault/return reporting.
 long gk_run_user(long (*fn)(void *), void *arg) {
   gk_thread *t = thread_get();
+  uint64_t cr3;
   if (!t || vcpu_init(t, GK_VCPU_STACK) < 0) return -1;
-  if (prepare_entry(t) < 0) return -1;
-  return enter_guest(t, fn, arg, t->stack_top, 1);
+  if (prepare_entry(t, &cr3) < 0) return -1;
+  return enter_guest(t, fn, arg, t->stack_top, 1, cr3);
 }
 
 // ---- gk_run_here: the guest on the caller's stack ---------------------------
@@ -2346,7 +2474,7 @@ long gk_run_user(long (*fn)(void *), void *arg) {
 // a whole page, so that the host frames above caller_sp and the guest's own
 // stack never share a page: the host-frame wall below is page-granular.
 #define GK_HERE_SLACK (4096 + 128)
-typedef struct { gk_thread *t; long (*fn)(void *); void *arg; int user; } gk_here_ctx;
+typedef struct { gk_thread *t; long (*fn)(void *); void *arg; int user; uint64_t cr3; } gk_here_ctx;
 
 // ---- the host-frame wall --------------------------------------------------
 // A ring-3 fn on the caller's stack sits directly below the host frames it
@@ -2541,7 +2669,7 @@ static void wall_lower(gk_thread *t) {
 static long run_here(void *ctx, unsigned long caller_sp) {
   gk_here_ctx *c = ctx;
   uint64_t top = (caller_sp - GK_HERE_SLACK) & ~0xfULL;
-  if (!c->user) return enter_guest(c->t, c->fn, c->arg, top, 0);
+  if (!c->user) return enter_guest(c->t, c->fn, c->arg, top, 0, c->cr3);
   uintptr_t lo, hi;
   if (stack_wall_bounds(c->t, caller_sp, top, &lo, &hi) < 0) {
     G->err = "gk_run_here_user: caller stack not in /proc/self/maps";
@@ -2551,7 +2679,7 @@ static long run_here(void *ctx, unsigned long caller_sp) {
     wall_lower(c->t);
     return -1;
   }
-  long r = enter_guest(c->t, c->fn, c->arg, top, 1);
+  long r = enter_guest(c->t, c->fn, c->arg, top, 1, c->cr3);
   wall_lower(c->t);
   return r;
 }
@@ -2575,8 +2703,9 @@ static long run_here_common(long (*fn)(void *), void *arg, int user) {
     }
     t->side_stack = ss;
   }
-  if (prepare_entry(t) < 0) return -1;
-  gk_here_ctx c = {t, fn, arg, user};  // lives above caller_sp, out of the guest's way
+  uint64_t cr3;
+  if (prepare_entry(t, &cr3) < 0) return -1;
+  gk_here_ctx c = {t, fn, arg, user, cr3};  // lives above caller_sp, out of the guest's way
   return gk_host_call_on_stack((char *)t->side_stack + GK_SIDE_STACK, run_here, &c);
 }
 
@@ -2621,18 +2750,18 @@ static int host_backing_retry(gk_thread *t) {
   pthread_mutex_lock(&G->lock);
   unmap_range_root(a->pml4, a->base, a->end);
   pthread_mutex_unlock(&G->lock);
-  // Only a CR3 change makes KVM flush the guest TLB (see flush_tlb), and the
-  // stopped vCPU may be at ring 3, where it cannot run the flush stub: swing
-  // CR3 through the base root and back to the arena's, two loads that must
-  // both take effect (so not through kvm_run, which would keep only the last).
+  // A CR3 change through KVM makes it flush the whole guest TLB (see the
+  // global-pages section), and the stopped vCPU may be at ring 3, where it
+  // cannot run the flush stub: swing CR3 through the base root and back to the
+  // arena's, two loads that must both take effect (so not through kvm_run,
+  // which would keep only the last). Should the second fail, the vCPU is left
+  // on the base root, which the next entry's sync_cr3 reads back and corrects.
   struct kvm_sregs s;
   sregs_get(t, &s);
   s.cr3 = (uint64_t)(uintptr_t)G->pml4;
   if (sregs_set_now(t, &s) < 0) return 0;
-  t->loaded_cr3 = s.cr3;  // so sync_cr3 restores the arena root if the next call fails
   s.cr3 = (uint64_t)(uintptr_t)a->pml4;
   if (sregs_set_now(t, &s) < 0) return 0;
-  t->loaded_cr3 = s.cr3;
   if (G->dbg) {  // fault path: raw output only
     gk_dbuf d = {.n = 0};
     db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
@@ -2744,7 +2873,9 @@ static long run_vcpu(gk_thread *t) {
           // so one retry against the current PTE tells the two apart.
           struct kvm_regs pr;
           regs_get(t, &pr);
-          uint64_t pf_err = *(uint64_t *)(uintptr_t)pr.rsp;  // top of the #PF frame
+          // The #PF frame on the IST stack: [err, rip, cs, rflags, rsp].
+          const uint64_t *pf_frame = (const uint64_t *)(uintptr_t)pr.rsp;
+          uint64_t pf_err = pf_frame[0], pf_sp = pf_frame[4];
           int pk = (pf_err & PF_ERR_PK) != 0;
           if (pk && repeat) {
             if (G->dbg) {
@@ -2773,7 +2904,7 @@ static long run_vcpu(gk_thread *t) {
             return GK_EFAULT;
           }
           GK_HANDLER_ENTER();
-          int dm = demand_map(t, (uintptr_t)cr2);
+          int dm = demand_map(t, (uintptr_t)cr2, (uintptr_t)pf_sp);
           GK_HANDLER_LEAVE();
           if (dm < 0) {
             if (G->dbg) {  // still the fault path: raw output only
@@ -2843,7 +2974,8 @@ static long run_vcpu(gk_thread *t) {
 // MAP_NORESERVE: it costs address space only, and its pages stay unmapped in
 // every root until the owner commits them and the guest touches them.
 //
-// Slots are taken from the lowest run of nslots that no live arena owns, so a
+// Slots are taken from the lowest run of nslots that no live arena owns and
+// that has never held a global PTE (see the global-pages section), so a
 // destroyed arena's slots serve later arenas: under isolate churn the slot
 // index would otherwise run off the end of the user address space.
 gk_arena *gk_arena_create(size_t size) {
@@ -2866,7 +2998,7 @@ gk_arena *gk_arena_create(size_t size) {
   for (idx = GK_FIRST_CAGE_SLOT; idx + nslots <= GK_USER_SLOTS; idx++) {
     int free = 1;
     for (int i = 0; i < nslots; i++)
-      if (G->slot_used[idx + i]) { free = 0; break; }
+      if (G->slot_used[idx + i] || G->slot_pinned[idx + i]) { free = 0; break; }
     if (!free) continue;
     uintptr_t va = (uintptr_t)idx << GK_SLOT_BITS;
     mem = mmap((void *)va, span, PROT_NONE,
@@ -2987,5 +3119,18 @@ void gk_get_stats(gk_stats *s) {
   s->demand_faults = G->demand_ok;
   s->wall_flushed = G->wall_flushed;
   s->wall_skipped = G->wall_skipped;
+  s->global_pages = G->global_pages;
+  s->root_switches = atomic_load_explicit(&G->root_switches, memory_order_relaxed);
+  pthread_mutex_unlock(&G->lock);
+}
+
+// Test/diagnostic hook (see gk.h): drop the PTE of the page holding `addr`
+// from every root, without a flush. Equivalent to the reflection of a munmap of
+// that page minus the calling vCPU's flush, so any translation a vCPU holds
+// keeps working until something flushes it.
+void gk_debug_drop_pte(unsigned long addr) {
+  uintptr_t page = (uintptr_t)addr & ~0xfffUL;
+  pthread_mutex_lock(&G->lock);
+  unmap_range_all(page, page + 0x1000);
   pthread_mutex_unlock(&G->lock);
 }

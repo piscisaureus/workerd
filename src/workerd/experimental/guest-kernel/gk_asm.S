@@ -36,6 +36,31 @@ gk_user_syscall_resume:
 gk_user_launch:
     sysretq
 
+// The same two entries with a page-table root switch first: the host sets
+// RSI = the root the turn runs under, and RAX = the function (ring 0) or
+// RCX/R11 as for gk_user_launch (ring 3). The root is loaded here, by the
+// guest, rather than through KVM: under nested paging a guest MOV CR3 is not
+// intercepted, and it keeps the TLB's global entries (the shared runtime's
+// translations, see the global-pages section in gk.c), whereas a CR3 set
+// through KVM_SET_SREGS or kvm_run makes KVM flush the whole guest TLB. The
+// load drops every non-global entry, so the previous root's arena translations
+// are gone before the first instruction of the turn. This page and the stack
+// are in tables every root shares, so the fetch after the load walks fine. RSI
+// is cleared so the root's address does not reach the turn's code.
+    .globl gk_launch_cr3
+    .type gk_launch_cr3, @function
+gk_launch_cr3:
+    movq %rsi, %cr3
+    xorl %esi, %esi
+    jmpq *%rax
+
+    .globl gk_user_launch_cr3
+    .type gk_user_launch_cr3, @function
+gk_user_launch_cr3:
+    movq %rsi, %cr3
+    xorl %esi, %esi
+    sysretq
+
 // Drop into ring 3 to start a guest-created thread whose creator ran at ring 3
 // (see child_entry in gk.c). The host programs the vCPU with the child's start
 // registers -- its parent's at the clone syscall, with RAX = 0 and RSP = the
@@ -129,14 +154,20 @@ gk_pkru_stub:
     outb %al, $0xFB
     hlt
 
-// TLB flush the host runs on a vCPU between guest instructions: reloading CR3
-// drops the vCPU's (non-global) TLB entries, which no host-side ioctl does
-// while the guest's control registers stay the same. Reports on port 0xFA.
+// TLB flush the host runs on a vCPU between guest instructions: clearing and
+// restoring CR4.PGE drops every one of the vCPU's TLB entries, global ones
+// included, and its paging-structure caches (a CR3 reload would keep the
+// global entries, which the shared runtime's pages have; see the global-pages
+// section in gk.c). No host-side ioctl flushes while the guest's control
+// registers stay the same. Reports on port 0xFA.
     .globl gk_flush_stub
     .type gk_flush_stub, @function
 gk_flush_stub:
-    movq %cr3, %rax
-    movq %rax, %cr3
+    movq %cr4, %rax
+    movq %rax, %rcx
+    andq $~0x80, %rcx      /* CR4.PGE */
+    movq %rcx, %cr4
+    movq %rax, %cr4
     outb %al, $0xFA
     hlt
 

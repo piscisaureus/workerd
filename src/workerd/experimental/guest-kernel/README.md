@@ -125,12 +125,29 @@ hardware:
   windows, so every mapped page has a backing memslot. Memory is backed one
   aligned 2 MiB window at a time; memslots are created once and never deleted.
   Faults into another arena's region are refused, preserving isolation.
+- **Global pages across the per-turn root switch.** The guest runs with
+  `CR4.PGE`, and the pages of the shared runtime (the binary's text and data,
+  glibc, the C++ heap: everything demand-paged into the base root outside every
+  arena) are mapped global, so their TLB entries survive the root switch a turn
+  makes when the previous turn on the thread ran another isolate. The switch is
+  the guest's own `mov %cr3` at the start of the turn (a guest CR3 load is not
+  intercepted under nested paging and keeps global entries; a CR3 set through
+  `KVM_SET_SREGS` or `kvm_run` makes KVM flush the whole guest TLB, global
+  entries included). Nothing inside an arena is ever global: an arena's private
+  tables differ per root, and a surviving translation would hand one isolate's
+  page to the next isolate's turn. Nor is any page of a thread stack, and a
+  slot that has ever held a global PTE is never given to an arena. The test
+  alternates two arenas on one thread and, by dropping PTEs without a flush,
+  shows that an arena page's translation is re-walked after a switch away and
+  back while a shared page's survives it, and that gk's own flush drops global
+  entries too.
 - **W^X.** Pages are mapped with their host protection: executable pages are not
   writable and writable pages are not executable (NX is enabled in the guest,
   and `CR0.WP` is set so the ring-0 guest cannot write a read-only page either).
   `mprotect` and `munmap` are reflected into the affected guest PTEs and the
-  TLB is flushed (a guest `CR3` reload, since re-setting identical control
-  registers through KVM does not flush). A plain `mprotect` that leaves the
+  TLB is flushed (the guest toggles `CR4.PGE`, which drops global entries too;
+  re-setting identical control registers through KVM does not flush, and a
+  `CR3` reload would keep the global entries). A plain `mprotect` that leaves the
   range readable rewrites the PTEs the guest already has, in place, to the
   protection the syscall itself just set; `munmap`, a fixed `mmap`, an
   `mprotect` to `PROT_NONE` and `pkey_mprotect` drop them, so the next access
@@ -201,7 +218,9 @@ decides the overall cost.
   only lazily: the reflection runs under the global lock and flushes the faulting
   vCPU's TLB when a fault repeats at the same address, rather than sending an
   IPI-driven flush to every vCPU. So a stale entry on another vCPU can briefly
-  retain the old permission until its next repeated fault.
+  retain the old permission until its next repeated fault; for a shared
+  runtime page, whose entries are global, that vCPU's own root switches do not
+  drop it either, only its next flush does.
 - **No signal delivery** into the library's API yet; only faults are caught,
   via the in-guest IDT handlers. (Injecting a host signal as a guest interrupt
   is demonstrated separately and would be wired in here.)

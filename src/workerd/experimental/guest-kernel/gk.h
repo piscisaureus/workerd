@@ -194,8 +194,19 @@ typedef struct {
   long demand_faults;   // guest page faults resolved by mapping the page from the host
   long wall_flushed;    // host-frame walls raised with a TLB flush
   long wall_skipped;    // host-frame walls raised without one, the flush being provably unneeded
+  long global_pages;    // PTEs installed as global (shared runtime pages whose TLB entries survive a root switch)
+  long root_switches;   // guest entries that loaded a different page-table root (an arena switch)
 } gk_stats;
 void gk_get_stats(gk_stats *s);
+
+// Test/diagnostic: drop the guest PTE for the page holding `addr` from every
+// root, flushing no TLB. A vCPU that holds a translation of the page in its TLB
+// keeps using it, with no demand fault, until that entry is flushed: by gk's
+// own flushes, or, for a translation that is not global, by the root switch at
+// an entry for another arena. A vCPU without one takes a demand fault, which
+// re-installs the PTE. With gk_stats.demand_faults a test can thus tell which
+// translations survive what. Not for production use.
+void gk_debug_drop_pte(unsigned long addr);
 
 // Syscall policy. By default gk forwards every syscall to the host (blind
 // re-issue), which is fine for a spike but not for production. Install a filter
