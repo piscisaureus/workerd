@@ -1294,7 +1294,7 @@ static long global_check(void) {
 // neighbor and its bounds are exactly known.
 #define NB_PAGE 4096UL
 #define NB_WIN (256UL << 10)
-#define NB_LEN (8 * NB_WIN + 2 * NB_PAGE)  // nb_region's mapping, guards included
+#define NB_LEN (4 * NB_WIN + 2 * NB_PAGE)  // nb_region's mapping, guards included
 enum { NB_PAGES = 64 };
 
 // Drops the PTEs of [p, p+len) in every root, then flushes this vCPU's TLB.
@@ -1306,7 +1306,9 @@ static void nb_fresh(void *p, size_t len, void *dummy) {
 
 // A fresh read-write mapping of `usable` bytes between two PROT_NONE guard
 // pages. Returns the mapping, usable + 2 pages long, whose usable part starts
-// a page in; NULL on failure.
+// a page in; NULL on failure. The guards keep the kernel from merging it with
+// a neighboring mapping: merged into a large enough one, a window could be
+// covered by a 2MiB entry (see huge_check) instead of being mapped per page.
 static unsigned char *nb_guarded(size_t usable) {
   size_t len = usable + 2 * NB_PAGE;
   unsigned char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1319,11 +1321,12 @@ static unsigned char *nb_guarded(size_t usable) {
   return m;
 }
 
-// A 256 KiB-aligned window inside a fresh guarded 2 MiB mapping (NB_LEN long
+// A 256 KiB-aligned window inside a fresh guarded 1 MiB mapping (NB_LEN long
 // with its guards), with at least a page to spare on either side. Returns the
-// mapping and sets *win.
+// mapping and sets *win. Under 2 MiB, the mapping can never hold an aligned
+// 2 MiB range, so its pages are always mapped per page.
 static unsigned char *nb_region(unsigned char **win) {
-  unsigned char *m = nb_guarded(8 * NB_WIN);
+  unsigned char *m = nb_guarded(4 * NB_WIN);
   if (!m) return NULL;
   *win = (unsigned char *)(((uintptr_t)m + NB_PAGE + 2 * NB_WIN - 1) & ~(NB_WIN - 1));
   return m;
@@ -1503,6 +1506,355 @@ static long neighborhood_check(void) {
   if (m4) munmap(m4, NB_LEN);
   if (dummy != MAP_FAILED) munmap(dummy, 4096);
   return ok1 && ok2 && ok3 && ok4;
+}
+
+// ---- 2MiB pages ---------------------------------------------------------------
+// A 2MiB-aligned range that is one host mapping at one protection, one key, one
+// arena (or none) and no thread's stack is mapped by a single 2MiB entry on its
+// first fault (see the huge-pages section in gk.c), and a change to part of it
+// -- a reflected mprotect or decommit, a supervisor/refuse registration, a
+// host-frame wall, a protection key -- splits it back into 4KiB entries and
+// takes effect on exactly the pages it names, while the rest of the range stays
+// mapped with no further fault. A range that fails a condition is mapped per
+// page. Counted with gk_stats' huge_pages, huge_splits, demand_faults and
+// neighbor_pages.
+#define HP_WIN (2UL << 20)
+
+// A fresh RW mapping of `sz` bytes at an address no earlier test has used: a
+// page table left behind by an earlier mapping at a reused address would keep
+// a window per page (a table is never freed and a range never promoted).
+static unsigned char *hp_fresh(size_t sz) {
+  static uintptr_t next = 0x5f0000000000;  // PML4 slot 190: far from every mapping and arena
+  unsigned char *p = mmap((void *)next, sz, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+  if (p == MAP_FAILED) return NULL;
+  next += sz + HP_WIN;
+  return p;
+}
+
+// A fresh mapping holding `n` whole aligned 2MiB windows, with a PROT_NONE
+// page on either side so the kernel merges it with no neighbor. Returns the
+// first window and sets *m and *len to the mapping.
+static unsigned char *hp_region(int n, unsigned char **m, size_t *len) {
+  size_t sz = (size_t)(n + 1) * HP_WIN;
+  unsigned char *p = hp_fresh(sz);
+  if (!p) return NULL;
+  unsigned char *w = (unsigned char *)(((uintptr_t)p + 4096 + HP_WIN - 1) & ~(HP_WIN - 1));
+  mprotect(w - 4096, 4096, PROT_NONE);
+  mprotect(w + (size_t)n * HP_WIN, 4096, PROT_NONE);
+  *m = p; *len = sz;
+  return w;
+}
+
+// The wall over a stack another thread mapped with a 2MiB entry (see 6. in
+// huge_check): the thread runs on a stack of the test's own, whose top is
+// 2MiB-aligned so that the wall's pages lie in a whole window.
+struct hw {
+  pthread_barrier_t b;
+  long r; unsigned long fault; uintptr_t host; long intact, deep_ok;  // the ring-3 turn
+  long r0;                                                            // a ring-0 turn after it
+};
+static void *hw_thread(void *arg) {
+  struct hw *h = arg;
+  pthread_barrier_wait(&h->b);  // main maps our stack now
+  pthread_barrier_wait(&h->b);
+  struct wall *w = calloc(1, sizeof *w);
+  long want_deep = deep(DEEP_DEPTH, 1);
+  w->which = 1;
+  h->r = wall_descend(WALL_DEPTH, w);
+  h->fault = gk_fault_addr();
+  h->host = w->host_frame;
+  h->intact = w->host_intact;
+  h->deep_ok = w->deep == want_deep;
+  volatile long local = 0x2222;
+  w->host_frame = (uintptr_t)&local;
+  w->which = 2;
+  w->ring0 = 1;
+  h->r0 = gk_run_here(wall_fn, w);
+  free(w);
+  return NULL;
+}
+
+// Runs in the guest: assigns a fresh key to one page, disables access to the
+// key, and reads the page next to it (still key 0).
+struct hpk { unsigned char *page; int key; };
+static long hpk_setup(void *arg) {
+  struct hpk *k = arg;
+  k->key = pkey_alloc(0, 0);
+  if (k->key <= 0) return -1;
+  if (pkey_mprotect(k->page, 4096, PROT_READ | PROT_WRITE, k->key) != 0) return -2;
+  pkey_set(k->key, PKEY_DISABLE_ACCESS);
+  return k->page[4096];
+}
+static long hpk_read(void *arg) { return ((struct hpk *)arg)->page[0]; }
+static long hpk_teardown(void *arg) {
+  struct hpk *k = arg;
+  pkey_set(k->key, 0);
+  pkey_mprotect(k->page, 4096, PROT_READ | PROT_WRITE, 0);
+  return pkey_free(k->key);
+}
+
+static long huge_check(void) {
+  gk_stats a, b;
+#define HP_DELTA(field) ((b).field - (a).field)
+#define PG(base, i) ((base) + (i) * 4096UL)
+  long want_compute = 0;
+  for (long i = 0; i < 100; i++) want_compute += i * i;
+
+  // 1. Installation. The first fault in a whole, uniform window installs one
+  //    2MiB entry and no per-page neighbors; every other page of the window
+  //    is then usable with no fault. A window holding a page of another
+  //    protection is mapped per page, with the usual neighborhood.
+  unsigned char *m1; size_t l1;
+  unsigned char *w = hp_region(3, &m1, &l1);
+  int ok1 = 0;
+  long f1 = -1, h1 = -1, n1 = -1, f1b = -1, f1c = -1, h1c = -1, n1c = -1;
+  if (w) {
+    mprotect(PG(w + 2 * HP_WIN, 16), 4096, PROT_READ);  // the third window: two mappings
+    gk_get_stats(&a);
+    long r = gk_run(read_byte, w + 12345);
+    gk_get_stats(&b);
+    f1 = HP_DELTA(demand_faults); h1 = HP_DELTA(huge_pages); n1 = HP_DELTA(neighbor_pages);
+    gk_get_stats(&a);
+    long r0 = gk_run(read_byte, w), rl = gk_run(read_byte, w + HP_WIN - 1);
+    struct ap wr = {PG(w, 100), 0x5e};
+    long rw = gk_run(write_byte, &wr);
+    gk_get_stats(&b);
+    f1b = HP_DELTA(demand_faults);
+    gk_get_stats(&a);
+    long r3 = gk_run(read_byte, PG(w + 2 * HP_WIN, 1));
+    gk_get_stats(&b);
+    f1c = HP_DELTA(demand_faults); h1c = HP_DELTA(huge_pages); n1c = HP_DELTA(neighbor_pages);
+    ok1 = r == 0 && f1 == 1 && h1 == 1 && n1 == 0 && r0 == 0 && rl == 0 && rw == 0x5e &&
+          PG(w, 100)[0] == 0x5e && f1b == 0 && r3 == 0 && f1c == 1 && h1c == 0 && n1c == 15;
+  }
+  printf("2MiB pages: first fault -> %ld fault, %ld 2MiB entries, %ld neighbors; the window's "
+         "other pages %ld faults; a mixed window -> %ld fault, %ld 2MiB entries, %ld neighbors "
+         "[%s]\n", f1, h1, n1, f1b, f1c, h1c, n1c, ok1 ? "OK" : "FAIL");
+
+  // 2. A reflected mprotect of one page (the second window, RW -> R on page
+  //    7) splits the entry; the write to page 7 faults at page 7, its
+  //    neighbors take writes with no fault, and R -> RW takes in place.
+  int ok2 = 0;
+  long s2 = -1, f2 = -1;
+  if (w) {
+    unsigned char *w2 = w + HP_WIN;
+    struct ap p7 = {PG(w2, 7), 0x11}, p6 = {PG(w2, 6), 0x22}, p8 = {PG(w2, 8), 0x33};
+    gk_get_stats(&a);
+    long first = gk_run(write_byte, &p7);
+    gk_get_stats(&b);
+    long h2 = HP_DELTA(huge_pages);
+    gk_get_stats(&a);
+    long pr = gk_run(protect_read, &p7);
+    long w6 = gk_run(write_byte, &p6), w8 = gk_run(write_byte, &p8);
+    gk_get_stats(&b);
+    s2 = HP_DELTA(huge_splits); f2 = HP_DELTA(demand_faults);
+    p7.val = 0x44;
+    long pw = gk_run(write_byte, &p7);
+    unsigned long pwf = gk_fault_addr();
+    long back = gk_run(commit_write, &p7);
+    ok2 = first == 0x11 && h2 == 1 && pr == 0x11 && w6 == 0x22 && w8 == 0x33 && s2 == 1 &&
+          f2 == 0 && pw == GK_EFAULT && pwf == (uintptr_t)p7.page && back == 0x44 &&
+          PG(w2, 7)[0] == 0x44 && PG(w2, 6)[0] == 0x22;
+    printf("2MiB pages, mprotect inside: RW->R on page 7 -> %ld split, neighbors written with %ld "
+           "faults, write to page 7 -> %s (fault %#lx), R->RW write -> %#lx [%s]\n", s2, f2,
+           pw == GK_EFAULT ? "FAULT" : "WROTE", pwf, back, ok2 ? "OK" : "FAIL");
+  }
+
+  // 3. A reflected decommit of one page (the first window, still one entry:
+  //    PROT_NONE on page 300) splits it; page 300 faults, its neighbors do
+  //    not; recommitted, it is mapped per page again.
+  int ok3 = 0;
+  if (w) {
+    struct ap d = {PG(w, 300), 0};
+    gk_get_stats(&a);
+    long dr = gk_run(decommit_read, &d);
+    unsigned long drf = gk_fault_addr();
+    long d299 = gk_run(read_byte, PG(w, 299)), d301 = gk_run(read_byte, PG(w, 301));
+    gk_get_stats(&b);
+    long s3 = HP_DELTA(huge_splits), f3 = HP_DELTA(demand_faults);
+    d.val = 0x66;
+    gk_get_stats(&a);
+    long rec = gk_run(commit_write, &d);
+    gk_get_stats(&b);
+    long f3b = HP_DELTA(demand_faults), h3b = HP_DELTA(huge_pages);
+    ok3 = dr == GK_EFAULT && drf == (uintptr_t)d.page && d299 == 0 && d301 == 0 && s3 == 1 &&
+          f3 == 0 && rec == 0x66 && f3b == 1 && h3b == 0;
+    printf("2MiB pages, decommit inside: PROT_NONE on page 300 -> %ld split, read -> %s (fault "
+           "%#lx), neighbors %ld faults; recommit+write -> %#lx (%ld fault, %ld 2MiB entries) "
+           "[%s]\n", s3, dr == GK_EFAULT ? "FAULT" : "READ", drf, f3, rec, f3b, h3b,
+           ok3 ? "OK" : "FAIL");
+  }
+
+  // 4. In an arena: two whole committed windows get 2MiB entries in the
+  //    arena's root only (unreachable from the base root and another arena,
+  //    which cannot reach a page just past its own reservation either); a
+  //    host-side decommit of one page under an entry faults at that page and
+  //    leaves the rest of the window and the vCPU usable.
+  gk_arena *A = gk_arena_create(4 * HP_WIN), *B = gk_arena_create(HP_WIN);
+  int ok4 = 0;
+  if (A && B && mprotect(gk_arena_base(A), 2 * HP_WIN, PROT_READ | PROT_WRITE) == 0 &&
+      mprotect(gk_arena_base(B), HP_WIN, PROT_READ | PROT_WRITE) == 0) {
+    unsigned char *ab = gk_arena_base(A), *bb = gk_arena_base(B);
+    struct ap wa = {PG(ab, 1), 0xA5}, wb = {bb, 0xB5};
+    gk_arena_enter(A);
+    gk_get_stats(&a);
+    long ra = gk_run(write_byte, &wa), ra2 = gk_run(read_byte, PG(ab + HP_WIN, 9));
+    gk_get_stats(&b);
+    long ha = HP_DELTA(huge_pages), fa = HP_DELTA(demand_faults);
+    long xb = gk_run(read_byte, bb);  // B's committed page: another arena
+    unsigned long fxb = gk_fault_addr();
+    gk_arena_enter(NULL);
+    long x0 = gk_run(read_byte, PG(ab, 1));  // the base root
+    unsigned long fx0 = gk_fault_addr();
+    gk_arena_enter(B);
+    long rb = gk_run(write_byte, &wb);
+    long xa = gk_run(read_byte, PG(ab, 1));  // A's 2MiB-mapped page from B
+    unsigned long fxa = gk_fault_addr();
+    unsigned char *past = bb + gk_arena_size(B);  // just past B's usable size: uncommitted
+    long xp = gk_run(read_byte, past);
+    unsigned long fxp = gk_fault_addr();
+    gk_arena_enter(A);
+    host_decommit(PG(ab, 40));
+    long hd = gk_run(read_byte, PG(ab, 40));
+    unsigned long hdf = gk_fault_addr();
+    long hn = gk_run(read_byte, PG(ab, 41)), hc = gk_run(test_compute, (void *)100);
+    gk_arena_enter(NULL);
+    ok4 = ra == 0xA5 && ra2 == 0 && ha == 2 && fa == 2 && xb == GK_EFAULT && fxb == (uintptr_t)bb &&
+          x0 == GK_EFAULT && fx0 == (uintptr_t)PG(ab, 1) && rb == 0xB5 && xa == GK_EFAULT &&
+          fxa == (uintptr_t)PG(ab, 1) && xp == GK_EFAULT && fxp == (uintptr_t)past &&
+          hd == GK_EFAULT && hdf == (uintptr_t)PG(ab, 40) && hn == 0 && hc == want_compute &&
+          ab[4096] == 0xA5 && bb[0] == 0xB5;
+    printf("2MiB pages, arena: two windows -> %ld 2MiB entries (%ld faults); from the base root "
+           "-> %s (fault %#lx), from another arena -> %s (fault %#lx), that arena past its size "
+           "-> %s (fault %#lx), its own page %#lx; host-side decommit of page 40 -> %s (fault "
+           "%#lx), page 41 -> %ld, next turn %ld [%s]\n", ha, fa, x0 == GK_EFAULT ? "FAULT" : "READ",
+           fx0, xa == GK_EFAULT ? "FAULT" : "READ", fxa, xp == GK_EFAULT ? "FAULT" : "READ", fxp,
+           rb, hd == GK_EFAULT ? "FAULT" : "READ", hdf, hn, hc, ok4 ? "OK" : "FAIL");
+  } else {
+    printf("2MiB pages, arena: setup failed [FAIL]\n");
+  }
+
+  // 5. Class boundaries. A window with a SUPER page registered before its
+  //    first fault is mapped per page (a 256 KiB neighborhood: its other 62
+  //    pages, the SUPER page left to its own fault: readable from ring 0, not
+  //    from ring 3). A REFUSE page registered inside an existing 2MiB entry
+  //    splits it: that page faults, its neighbor reads with no fault.
+  int ok5 = 0;
+  if (A && mprotect(gk_arena_base(A) + 2 * HP_WIN, 2 * HP_WIN, PROT_READ | PROT_WRITE) == 0) {
+    unsigned char *w3 = gk_arena_base(A) + 2 * HP_WIN, *w4 = w3 + HP_WIN;
+    gk_debug_protect_range((unsigned long)PG(w3, 3), 4096, GK_DEBUG_PROT_SUPER);
+    gk_arena_enter(A);
+    gk_get_stats(&a);
+    long r10 = gk_run_user(read_byte, PG(w3, 10));
+    gk_get_stats(&b);
+    long h5 = HP_DELTA(huge_pages), n5 = HP_DELTA(neighbor_pages);
+    long s0 = gk_run(read_byte, PG(w3, 3)), s3 = gk_run_user(read_byte, PG(w3, 3));
+    unsigned long fs3 = gk_fault_addr();
+    gk_get_stats(&a);
+    long r4 = gk_run(read_byte, PG(w4, 100));
+    gk_get_stats(&b);
+    long h5b = HP_DELTA(huge_pages);
+    gk_get_stats(&a);
+    gk_debug_protect_range((unsigned long)PG(w4, 200), 4096, GK_DEBUG_PROT_REFUSE);  // splits
+    long x200 = gk_run(read_byte, PG(w4, 200));
+    unsigned long fx200 = gk_fault_addr();
+    long r201 = gk_run(read_byte, PG(w4, 201));
+    gk_get_stats(&b);
+    long s5 = HP_DELTA(huge_splits), f5 = HP_DELTA(demand_faults);
+    gk_arena_enter(NULL);
+    gk_debug_protect_range((unsigned long)PG(w3, 3), 4096, GK_DEBUG_PROT_KEEP);
+    gk_debug_protect_range((unsigned long)PG(w4, 200), 4096, GK_DEBUG_PROT_KEEP);
+    ok5 = r10 == 0 && h5 == 0 && n5 == 62 && s0 == 0 && s3 == GK_EFAULT && fs3 == (uintptr_t)PG(w3, 3) &&
+          r4 == 0 && h5b == 1 && x200 == GK_EFAULT && fx200 == (uintptr_t)PG(w4, 200) && r201 == 0 &&
+          s5 == 1 && f5 == 0;
+    printf("2MiB pages, class boundary: window with a SUPER page -> %ld 2MiB entries, %ld neighbors, "
+           "SUPER page from ring 0 -> %ld, from ring 3 -> %s (fault %#lx); REFUSE page registered "
+           "inside a 2MiB entry (%ld) -> %ld split, read -> %s (fault %#lx), neighbor -> %ld (%ld "
+           "faults) [%s]\n", h5, n5, s0, s3 == GK_EFAULT ? "FAULT" : "READ", fs3, h5b, s5,
+           x200 == GK_EFAULT ? "FAULT" : "READ", fx200, r201, f5, ok5 ? "OK" : "FAIL");
+  } else {
+    printf("2MiB pages, class boundary: setup failed [FAIL]\n");
+  }
+  if (A) gk_arena_destroy(A);
+  if (B) gk_arena_destroy(B);
+
+  // 6. The host-frame wall inside a 2MiB entry. A thread's stack that another
+  //    thread touched first (before the owner ran any ring-3 turn, so nothing
+  //    marked it a stack) gets a 2MiB entry; the owner's ring-3 turn then
+  //    splits it, and the wall holds: a store into a host caller frame faults
+  //    while the turn's own frames below work; a ring-0 turn after it writes
+  //    above its entry again.
+  int ok6 = 0;
+  {
+    struct hw h;
+    memset(&h, 0, sizeof h);
+    pthread_barrier_init(&h.b, NULL, 2);
+    // A 2MiB-aligned stack of 8MiB, with a PROT_NONE guard below, whose top
+    // is 2MiB-aligned so the wall's pages sit in a whole window.
+    size_t ssz = 8 * HP_WIN, smsz = ssz + 2 * HP_WIN;
+    unsigned char *sm = hp_fresh(smsz);
+    unsigned char *stk = sm ? (unsigned char *)(((uintptr_t)sm + 4096 + HP_WIN - 1) & ~(HP_WIN - 1)) : NULL;
+    pthread_attr_t attr;
+    pthread_t th;
+    long hs = -1, sp6 = -1;
+    if (stk && mprotect(stk - 4096, 4096, PROT_NONE) == 0 && mprotect(stk + ssz, 4096, PROT_NONE) == 0 &&
+        pthread_attr_init(&attr) == 0 && pthread_attr_setstack(&attr, stk, ssz) == 0 &&
+        pthread_create(&th, &attr, hw_thread, &h) == 0) {
+      pthread_barrier_wait(&h.b);
+      gk_get_stats(&a);
+      long rs = gk_run(read_byte, stk + ssz - HP_WIN + 4096);  // the top window, from main
+      gk_get_stats(&b);
+      hs = HP_DELTA(huge_pages);
+      gk_get_stats(&a);
+      pthread_barrier_wait(&h.b);
+      pthread_join(th, NULL);
+      gk_get_stats(&b);
+      sp6 = HP_DELTA(huge_splits);
+      pthread_attr_destroy(&attr);
+      ok6 = rs >= 0 && hs == 1 && h.r == GK_EFAULT && h.fault == h.host && h.intact && h.deep_ok &&
+            sp6 == 1 && h.r0 == 0x4b1d;
+    }
+    if (sm) munmap(sm, smsz);
+    pthread_barrier_destroy(&h.b);
+    printf("2MiB pages, wall: a thread's stack mapped by another thread -> %ld 2MiB entries; its "
+           "ring-3 turn -> %ld split, store into a host caller frame -> %s (fault %#lx, frame %#lx, "
+           "local %s, recursion %s); ring-0 store above the entry after it -> %#lx [%s]\n", hs, sp6,
+           h.r == GK_EFAULT ? "FAULT" : "WROTE", h.fault, (unsigned long)h.host,
+           h.intact ? "intact" : "CLOBBERED", h.deep_ok ? "ok" : "BROKEN", h.r0, ok6 ? "OK" : "FAIL");
+  }
+
+  // 7. A protection key on one page of a 2MiB entry: the pkey_mprotect splits
+  //    it, and with access to the key disabled the page faults while its
+  //    neighbor (key 0) reads.
+  int ok7 = 0;
+  {
+    unsigned char *m7; size_t l7;
+    unsigned char *w7 = hp_region(1, &m7, &l7);
+    long s7 = -1;
+    if (w7) {
+      struct hpk k = {PG(w7, 20), 0};
+      gk_run(read_byte, PG(w7, 5));
+      gk_get_stats(&a);
+      long r21 = gk_run(hpk_setup, &k);
+      gk_get_stats(&b);
+      s7 = HP_DELTA(huge_splits);
+      long x20 = gk_run(hpk_read, &k);
+      unsigned long fx20 = gk_fault_addr();
+      long td = gk_run(hpk_teardown, &k);
+      ok7 = r21 == 0 && s7 == 1 && x20 == GK_EFAULT && fx20 == (uintptr_t)PG(w7, 20) && td == 0;
+      printf("2MiB pages, protection key on page 20: %ld split, neighbor read -> %ld, page 20 with "
+             "access disabled -> %s (fault %#lx), teardown %ld [%s]\n", s7, r21,
+             x20 == GK_EFAULT ? "FAULT" : "READ", fx20, td, ok7 ? "OK" : "FAIL");
+      munmap(m7, l7);
+    } else {
+      printf("2MiB pages, protection key: setup failed [FAIL]\n");
+    }
+  }
+  if (w) munmap(m1, l1);
+#undef PG
+#undef HP_DELTA
+  return ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7;
 }
 
 int main(void) {
@@ -2154,9 +2506,15 @@ int main(void) {
   // recommit (see thp_check).
   int ok23 = thp_check() == 1;
 
+  // ---- 2MiB pages -------------------------------------------------------------
+  // A whole, uniform 2MiB range gets one entry; a change to part of it splits
+  // the entry and affects only the pages named; class, arena, stack and key
+  // boundaries hold (see huge_check).
+  int ok24 = huge_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
-            ok22 && ok23;
+            ok22 && ok23 && ok24;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

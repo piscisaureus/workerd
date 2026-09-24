@@ -198,6 +198,8 @@ typedef struct {
   long wall_skipped;    // host-frame walls raised without one, the flush being provably unneeded
   long global_pages;    // PTEs installed as global (shared runtime pages whose TLB entries survive a root switch)
   long neighbor_pages;  // PTEs installed ahead of a fault, for pages adjacent to a demand-faulted one
+  long huge_pages;      // 2MiB entries installed, each mapping a whole uniform 2MiB range instead of 512 PTEs
+  long huge_splits;     // 2MiB entries split back into 4KiB PTEs so that part of the range could change
   long root_switches;   // guest entries that loaded a different page-table root (an arena switch)
   long tlb_flushes;     // full TLB flushes run on a vCPU, on every path: a wall raise that could not
                         // skip, a reflected mprotect/munmap, freed page tables (wall_flushed is the

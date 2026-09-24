@@ -22,6 +22,7 @@
 #define PTE_P (1UL << 0)
 #define PTE_W (1UL << 1)
 #define PTE_U (1UL << 2)
+#define PTE_PS (1UL << 7)        // in a PD entry: maps a 2MiB page, no table beneath (see the huge-pages section)
 #define PTE_G (1UL << 8)         // global: the translation survives a CR3 load (see the global-pages section)
 #define PTE_WALL (1UL << 9)      // CPU-ignored software bit: W withheld by the host-frame wall
 #define PTE_NX (1UL << 63)
@@ -232,6 +233,12 @@ _Static_assert(GK_MAX_PROT_RANGES >= 2 * GK_MAX_VCPUS + 512,
 
 // A memslot-backed window (see the MMU layer below).
 #define GK_BACK_WIN (2UL << 20)   // memslot backing granularity (2MB, aligned)
+// A 2MiB page (see the huge-pages section). Its frame is bits 51:21 of the PD
+// entry; the entry's other bits are a 4KiB PTE's, except PS.
+#define GK_HUGE (2UL << 20)
+#define GK_HUGE_FRAME_MASK 0x000FFFFFFFE00000ULL
+#define GK_MADV_COLLAPSE 25       // madvise advice (Linux 6.1+); spelled out for older headers
+_Static_assert(GK_BACK_WIN % GK_HUGE == 0, "a 2MiB page must lie within one memslot window");
 // The neighborhood a demand fault maps around its page (see demand_map_neighbors).
 #define GK_NEIGHBOR_WIN (256UL << 10)  // 64 pages, aligned; within one GK_BACK_WIN
 #define GK_MAX_REGIONS 65536
@@ -281,6 +288,9 @@ struct gk_ctl {
   long wall_flushed, wall_skipped;  // wall_raise: TLB flushes done / provably unneeded (see there)
   long global_pages;                // PTEs installed with PTE_G (see the global-pages section)
   long neighbor_pages;              // PTEs installed ahead of a fault (see demand_map_neighbors)
+  long huge_pages, huge_splits;     // 2MiB entries installed / split into 4KiB tables (see the huge-pages section)
+  int no_huge;                      // GK_NO_HUGE_PAGES in the environment: map per page only
+  int huge_collapse;                // GK_HUGE_COLLAPSE in the environment: ask the host for a 2MiB page too
   atomic_long root_switches;        // guest entries that loaded another root (enter_guest)
   atomic_long tlb_flushes;          // full flushes run on a vCPU, on any path (see flush_run)
   void (*flush_stub)(void);         // the flush stub for this CPU (see flush_stub_select)
@@ -478,12 +488,14 @@ static void free_table(uint64_t *p) {
 
 // Free a table and every table beneath it. `level` is the table's paging
 // level: 3 for a PDPT, 2 for a PD, 1 for a PT (whose entries are pages, not
-// tables). gk maps only 4KiB pages, so every present entry above level 1
-// points at a table. Caller holds G->lock.
+// tables). A present entry above level 1 points at a table unless it carries
+// PS, in which case it maps a 2MiB page (level 2; see the huge-pages section)
+// with nothing beneath it. Caller holds G->lock.
 static void free_subtree(uint64_t *tbl, int level) {
   if (level > 1)
     for (int i = 0; i < 512; i++)
-      if (tbl[i] & PTE_P) free_subtree((uint64_t *)(uintptr_t)(tbl[i] & ~0xfffULL), level - 1);
+      if ((tbl[i] & (PTE_P | PTE_PS)) == PTE_P)
+        free_subtree((uint64_t *)(uintptr_t)(tbl[i] & ~0xfffULL), level - 1);
   free_table(tbl);
 }
 
@@ -624,6 +636,34 @@ static void prot_remove(uintptr_t s, uintptr_t e) {
 // root load through KVM (cr3_load_host, host_backing_retry) makes KVM flush the
 // whole guest TLB, global entries included, which is harmless.
 
+// The bits of a leaf entry (a 4KiB PTE, or a 2MiB PD entry less PS) for a page
+// of class `cls`: `flags` is a protection bitmask, 1=read, 2=write, 4=execute,
+// honored so that W^X holds (code is mapped executable but not writable, data
+// writable but not executable; KVM also enforces the host VMA's real
+// protection). GK_MAP_WALLED marks a page the host allows writes to whose W
+// this vCPU's host-frame wall withholds: it is mapped without W and tagged
+// PTE_WALL so wall_lower can give W back in place. The frame and G are the
+// caller's.
+static uint64_t leaf_bits(int cls, uint64_t flags, int pkey) {
+  uint64_t pte = PTE_P;
+  if (cls != GK_PROT_SUPER) pte |= PTE_U;  // user pages only; supervisor clears U
+  if (flags & 2) pte |= PTE_W;
+  if (flags & GK_MAP_WALLED) pte |= PTE_WALL;
+  if (!(flags & 4)) pte |= PTE_NX;
+  pte |= ((uint64_t)pkey << PTE_PKEY_SHIFT) & PTE_PKEY_MASK;
+  return pte;
+}
+
+// Whether a leaf for `va` in `root` may carry PTE_G: the conditions of the
+// global-pages section, checked here rather than trusted from the caller.
+static int global_ok(const uint64_t *root, uint64_t va, uint64_t flags, int cls) {
+  int slot = (int)((va >> 39) & 0x1ff);
+  return (flags & GK_MAP_GLOBAL) && root == G->pml4 && cls == GK_PROT_KEEP &&
+         !(flags & GK_MAP_WALLED) && slot < GK_USER_SLOTS && !arena_containing(va);
+}
+
+static int huge_split(uint64_t *pde);
+
 // Four-level map of one page; guest-virtual == guest-physical == host-virtual.
 // `pkey` (0..15) is the page's protection key, placed in PTE bits 62:59; the
 // guest CPU checks it against the guest PKRU on every data access (with
@@ -640,26 +680,19 @@ static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
   int cls = prot_class(va & ~0xfffULL);
   if (cls == GK_PROT_REFUSE) return -1;  // a control page: never reachable
   int slot = (int)((va >> 39) & 0x1ff);
-  int global = (flags & GK_MAP_GLOBAL) && root == G->pml4 && cls == GK_PROT_KEEP &&
-               !(flags & GK_MAP_WALLED) && slot < GK_USER_SLOTS && !arena_containing(va);
+  int global = global_ok(root, va, flags, cls);
   uint64_t *pdpt = next_table(root, (va >> 39) & 0x1ff);
   if (!pdpt) return -1;
   uint64_t *pd = next_table(pdpt, (va >> 30) & 0x1ff);
   if (!pd) return -1;
+  // The page may be part of a 2MiB page (see the huge-pages section); split
+  // that first so this page alone gets the new entry. A PD entry with PS has no
+  // table beneath it, so next_table must never see one.
+  uint64_t *pde = &pd[(va >> 21) & 0x1ff];
+  if ((*pde & (PTE_P | PTE_PS)) == (PTE_P | PTE_PS) && huge_split(pde) < 0) return -1;
   uint64_t *pt = next_table(pd, (va >> 21) & 0x1ff);
   if (!pt) return -1;
-  // `flags` is a protection bitmask: 1=read, 2=write, 4=execute. Honor it so
-  // W^X holds: code is mapped executable but not writable, data writable but
-  // not executable. KVM also enforces the host VMA's real protection.
-  // GK_MAP_WALLED marks a page the host allows writes to whose W this vCPU's
-  // host-frame wall withholds: it is mapped without W and tagged PTE_WALL so
-  // wall_lower can give W back in place.
-  uint64_t pte = (va & ~0xfffULL) | PTE_P;
-  if (cls != GK_PROT_SUPER) pte |= PTE_U;  // user pages only; supervisor clears U
-  if (flags & 2) pte |= PTE_W;
-  if (flags & GK_MAP_WALLED) pte |= PTE_WALL;
-  if (!(flags & 4)) pte |= PTE_NX;
-  pte |= ((uint64_t)pkey << PTE_PKEY_SHIFT) & PTE_PKEY_MASK;
+  uint64_t pte = (va & ~0xfffULL) | leaf_bits(cls, flags, pkey);
   if (global) {
     pte |= PTE_G;
     G->slot_pinned[slot] = 1;  // no arena may ever take this slot (see the global-pages section)
@@ -667,6 +700,164 @@ static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
   }
   pt[(va >> 12) & 0x1ff] = pte;
   return 0;
+}
+
+// ---- huge pages ---------------------------------------------------------------
+// A 2MiB-aligned range that is uniform in every respect a leaf entry encodes
+// can be mapped by one PD entry with PS set instead of a page table of 512
+// PTEs: the guest's page walk is one level shorter and one TLB entry covers the
+// range, which matters because every miss is a two-dimensional walk under
+// nested paging. demand_map installs such an entry, eagerly, on the first fault
+// in a range that qualifies at that moment; the memslot backing is 2MiB windows
+// already (GK_BACK_WIN), so the range is always backed as a whole. The
+// conditions, each checked under the G->lock hold that installs the entry
+// (huge_range_ok and demand_map):
+//
+//  * One host mapping at one protection covers the whole range: a single
+//    /proc/self/maps line spans it (the kernel merges adjacent mappings only
+//    when their flags agree, so one line means one protection throughout).
+//    Guest-virtual is host-virtual, so the frame is the range itself, aligned.
+//  * Every page is class KEEP: no supervisor or refused range overlaps it. A
+//    supervisor page needs U cleared and a refused page must stay unmapped,
+//    neither of which a single entry could do for one page of the range.
+//  * One protection key throughout.
+//  * One arena, or none, throughout, and the entry goes into that root. Arenas
+//    own whole 512GiB slots, so an aligned 2MiB range cannot straddle one, but
+//    the walls rest on it, so it is checked rather than assumed.
+//  * No thread's stack: not the mapping holding the interrupted code's stack
+//    pointer, not a mapping the kernel tags [stack], not any vCPU's host-frame
+//    wall window nor the stack mapping its ring-3 turns run on. The wall
+//    withholds W from single pages of the caller stack every turn; those stay
+//    per page rather than splitting a 2MiB entry each turn.
+//  * No table exists for the range yet. A page table there holds per-page
+//    state (wall tags, pages deliberately absent, a page another vCPU faulted
+//    with a different protection since) that one entry would erase, and the
+//    table could not be freed anyway: another vCPU may be walking through it
+//    (see below). Such a range stays per page; there is no promotion.
+//
+// Anything that changes part of a 2MiB page must first split it: huge_split
+// replaces the entry with a table of 512 PTEs mapping the same frames with the
+// same bits, and the change then applies to the pages it names. That is what
+// pte_range_root does for a reflected mprotect, munmap or decommit, a wall
+// raise or lower, a supervisor/refuse registration and a dropped PTE, and what
+// map4k_root does for a demand fault that lands inside a 2MiB page (a write to
+// a read-only one, say). An operation that covers the whole range and is the
+// same for every page of it -- an unmap, a wall over all of it, a reprotect
+// with the wall window either covering or missing all of it -- applies to the
+// entry itself. Once split, a range stays split: the table is never freed and
+// the range never re-promoted, so a range whose protection keeps changing (a
+// JIT that flips W^X per page) costs one split and is per page from then on,
+// never churning.
+//
+// The regions this covers in practice are the runtime binary's text, rodata
+// and data, the C++ heap's committed windows, and an arena's whole committed
+// windows, V8's code range among them; stacks, windows holding gk's own pages
+// (control block, page tables, kvm_run, exception stacks) and partially
+// committed or mixed-protection windows stay per page. GK_NO_HUGE_PAGES in the
+// environment turns the whole thing off (every range is then mapped per page),
+// for comparison.
+//
+// What a 2MiB guest entry buys depends on the host. Under nested paging a TLB
+// entry covers the smaller of the guest page and the host page behind it, so
+// with the host backing the range in 4KiB pages (no transparent huge page) the
+// guest entry shortens each walk by a level but every translation is still a
+// 4KiB one. With GK_HUGE_COLLAPSE in the environment, demand_map also asks the
+// host to back the range with one 2MiB page (madvise MADV_COLLAPSE, which
+// migrates the range's pages into a huge page synchronously; KVM then maps it
+// as one nested 2MiB page as well) so that the translation is 2MiB end to end.
+// The collapse populates every page of the range on the host, so a sparsely
+// touched window costs its whole 2MiB of memory; it is opt-in for that reason.
+
+// Split the 2MiB page a PD entry maps into a table of 512 4KiB entries with the
+// same frames and bits, so that an operation on part of the range can apply to
+// those pages alone. The table comes from the page-table pool (never malloc:
+// this runs on the fault path), is filled completely before the entry is
+// switched over with one 8-byte store, and translates every address exactly as
+// the 2MiB entry did, so a vCPU walking through the entry meanwhile sees one or
+// the other and nothing changes for it. No TLB is flushed here: the split
+// alters no translation, and the operation that needed it flushes the calling
+// vCPU afterwards as it always did. Other vCPUs are not shot down (see
+// forward_syscall): one may keep using a 2MiB translation while the calling
+// vCPU installs 4KiB ones with other bits, which is the same stale entry a 4KiB
+// one would be, and the CPU tolerates translations of two sizes for one
+// address when they agree; a kernel's split of its own large pages relies on
+// the same. If the pool is exhausted the entry is cleared instead and -1
+// returned: the whole 2MiB then re-faults page by page, which is always safe,
+// only slower. Caller holds G->lock.
+static int huge_split(uint64_t *pde) {
+  uint64_t *pt = alloc_table();
+  if (!pt) {
+    __atomic_store_n(pde, 0, __ATOMIC_RELAXED);
+    return -1;
+  }
+  uint64_t h = *pde;
+  uint64_t frame = h & GK_HUGE_FRAME_MASK;
+  uint64_t bits = h & ~(GK_HUGE_FRAME_MASK | PTE_PS);
+  for (int i = 0; i < 512; i++) pt[i] = bits | (frame + ((uint64_t)i << 12));
+  __atomic_store_n(pde, ((uint64_t)(uintptr_t)pt) | PTE_P | PTE_W | PTE_U, __ATOMIC_RELEASE);
+  G->huge_splits++;
+  return 0;
+}
+
+// Map [va, va+2MiB), 2MiB-aligned, with one PD entry in a root, with the bits
+// map4k_root would give each of its pages: the caller has established (see
+// huge_range_ok) that those are the same for every page. Fails, leaving the
+// tables as they were, if the range's PD entry is already present (see the
+// section note), and for a page that is not class KEEP. Caller holds G->lock.
+static int map2m_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
+  int cls = prot_class(va);
+  if (cls != GK_PROT_KEEP || (flags & GK_MAP_WALLED)) return -1;
+  int slot = (int)((va >> 39) & 0x1ff);
+  int global = global_ok(root, va, flags, cls);
+  uint64_t *pdpt = next_table(root, (va >> 39) & 0x1ff);
+  if (!pdpt) return -1;
+  uint64_t *pd = next_table(pdpt, (va >> 30) & 0x1ff);
+  if (!pd) return -1;
+  uint64_t *pde = &pd[(va >> 21) & 0x1ff];
+  if (*pde & PTE_P) return -1;
+  uint64_t pte = va | PTE_PS | leaf_bits(cls, flags, pkey);
+  if (global) {
+    pte |= PTE_G;
+    G->slot_pinned[slot] = 1;  // no arena may ever take this slot (see the global-pages section)
+    G->global_pages++;
+  }
+  __atomic_store_n(pde, pte, __ATOMIC_RELEASE);
+  G->huge_pages++;
+  return 0;
+}
+
+// Whether no supervisor or refused range overlaps [s, e). Caller holds G->lock.
+static int prot_range_clear(uintptr_t s, uintptr_t e) {
+  int lo = 0, hi = G->prot_n;
+  while (lo < hi) {  // the first range ending beyond s
+    int mid = lo + (hi - lo) / 2;
+    if (G->prot[mid].end <= s) lo = mid + 1;
+    else hi = mid;
+  }
+  return !(lo < G->prot_n && G->prot[lo].start < e);
+}
+
+static int pkey_uniform(uintptr_t s, uintptr_t e);
+static gk_region *region_find(uintptr_t addr);
+
+// Whether [lo, hi), a 2MiB-aligned range that one host mapping covers, may be
+// mapped with one entry into the root of arena `in` (NULL: the base root),
+// beyond what demand_map has already checked of the faulting page (its class,
+// and that the mapping is not the faulting thread's stack): see the huge-pages
+// section for each condition. Caller holds G->lock.
+static int huge_range_ok(uintptr_t lo, uintptr_t hi, const gk_arena *in) {
+  if (arena_containing(lo) != in || arena_containing(hi - 1) != in) return 0;
+  if (in && (lo < in->base || hi > in->end)) return 0;
+  if (!prot_range_clear(lo, hi)) return 0;
+  if (!pkey_uniform(lo, hi)) return 0;
+  const gk_region *rg = region_find(lo);  // windows are aligned: the one holding lo backs it all
+  if (!rg || rg->start > lo || rg->end < hi) return 0;
+  for (int i = 0; i < G->thread_n; i++) {
+    const gk_thread *o = &G->threads[i];
+    if (lo < o->ro_hi && hi > o->ro_lo) return 0;
+    if (lo < o->wall_map_hi && hi > o->wall_map_lo) return 0;
+  }
+  return 1;
 }
 
 // What a page-table walk over a range does to each leaf PTE it reaches.
@@ -684,13 +875,55 @@ enum {
 // W is withheld and tagged PTE_WALL exactly as demand_map would map the page.
 typedef struct { int prot; uintptr_t wall_lo, wall_hi; } gk_reprot;
 
-// Apply `op` to the leaf PTEs of [s, e) (page-aligned) in a root. Walks the
+// Apply `op` to one leaf entry: a PTE mapping the page `va`, or a PD entry
+// mapping the 2MiB page at `va` when the op is the same for every page of it
+// (see op_uniform). Returns 1 for an untagged writable entry under
+// PTE_OP_WALL_LOWER, 0 otherwise.
+static long pte_apply(uint64_t *pte, uintptr_t va, int op, const gk_reprot *rp) {
+  switch (op) {
+    case PTE_OP_UNMAP:
+      *pte = 0;
+      break;
+    case PTE_OP_WALL_RAISE:
+      if ((*pte & (PTE_P | PTE_W)) == (PTE_P | PTE_W)) *pte = (*pte & ~PTE_W) | PTE_WALL;
+      break;
+    case PTE_OP_WALL_LOWER:
+      if ((*pte & (PTE_P | PTE_WALL)) == (PTE_P | PTE_WALL)) *pte = (*pte & ~PTE_WALL) | PTE_W;
+      else if ((*pte & (PTE_P | PTE_W)) == (PTE_P | PTE_W)) return 1;
+      break;
+    case PTE_OP_REPROTECT:
+      // Only W, NX and the wall tag change; the frame, P, U (the
+      // supervisor/refuse class), the protection key, the page size and the
+      // accessed/dirty bits are the page's own and stay.
+      if (*pte & PTE_P) {
+        uint64_t n = *pte & ~(PTE_W | PTE_NX | PTE_WALL);
+        if (!(rp->prot & 4)) n |= PTE_NX;
+        if (rp->prot & 2) n |= (va >= rp->wall_lo && va < rp->wall_hi) ? PTE_WALL : PTE_W;
+        *pte = n;
+      }
+      break;
+  }
+  return 0;
+}
+
+// Whether `op` does the same to every page of [lo, hi): always, except for a
+// reprotect whose wall window covers part of the range.
+static int op_uniform(int op, const gk_reprot *rp, uintptr_t lo, uintptr_t hi) {
+  if (op != PTE_OP_REPROTECT) return 1;
+  return (rp->wall_lo <= lo && rp->wall_hi >= hi) || rp->wall_hi <= lo || rp->wall_lo >= hi;
+}
+
+// Apply `op` to the leaf entries of [s, e) (page-aligned) in a root. Walks the
 // hierarchy and skips a whole 512GiB, 1GiB or 2MiB range at once where no
 // table exists beneath it, so a walk over a large, sparsely committed
-// reservation costs in proportion to what is mapped, not to the range. Leaves
-// intermediate tables in place and never allocates. `rp` is PTE_OP_REPROTECT's
-// argument and NULL for the other ops. Returns PTE_OP_WALL_LOWER's count of
-// untagged writable entries, 0 for the other ops. Caller holds G->lock.
+// reservation costs in proportion to what is mapped, not to the range. A 2MiB
+// page (see the huge-pages section) that the range covers whole takes an op
+// that is uniform over it as one entry; otherwise it is split into a page
+// table first and the op applies to its pages in the range. Leaves
+// intermediate tables in place and allocates only for a split, from the
+// page-table pool. `rp` is PTE_OP_REPROTECT's argument and NULL for the other
+// ops. Returns PTE_OP_WALL_LOWER's count of untagged writable entries, 0 for
+// the other ops. Caller holds G->lock.
 #define GK_NEXT_BOUNDARY(v, bits) ((((v) >> (bits)) + 1) << (bits))
 static long pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
                            const gk_reprot *rp) {
@@ -702,40 +935,30 @@ static long pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
     uint64_t pdpte = pdpt[(v >> 30) & 0x1ff];
     if (!(pdpte & PTE_P)) { v = GK_NEXT_BOUNDARY(v, 30); continue; }
     uint64_t *pd = (uint64_t *)(uintptr_t)(pdpte & ~0xfffULL);
-    uint64_t pde = pd[(v >> 21) & 0x1ff];
-    if (!(pde & PTE_P)) { v = GK_NEXT_BOUNDARY(v, 21); continue; }
-    uint64_t *pt = (uint64_t *)(uintptr_t)(pde & ~0xfffULL);
-    uint64_t *pte = &pt[(v >> 12) & 0x1ff];
-    switch (op) {
-      case PTE_OP_UNMAP:
-        *pte = 0;
-        break;
-      case PTE_OP_WALL_RAISE:
-        if ((*pte & (PTE_P | PTE_W)) == (PTE_P | PTE_W)) *pte = (*pte & ~PTE_W) | PTE_WALL;
-        break;
-      case PTE_OP_WALL_LOWER:
-        if ((*pte & (PTE_P | PTE_WALL)) == (PTE_P | PTE_WALL)) *pte = (*pte & ~PTE_WALL) | PTE_W;
-        else if ((*pte & (PTE_P | PTE_W)) == (PTE_P | PTE_W)) n++;
-        break;
-      case PTE_OP_REPROTECT:
-        // Only W, NX and the wall tag change; the frame, P, U (the
-        // supervisor/refuse class), the protection key and the accessed/dirty
-        // bits are the page's own and stay.
-        if (*pte & PTE_P) {
-          uint64_t n = *pte & ~(PTE_W | PTE_NX | PTE_WALL);
-          if (!(rp->prot & 4)) n |= PTE_NX;
-          if (rp->prot & 2) n |= (v >= rp->wall_lo && v < rp->wall_hi) ? PTE_WALL : PTE_W;
-          *pte = n;
-        }
-        break;
+    uint64_t *pde = &pd[(v >> 21) & 0x1ff];
+    if (!(*pde & PTE_P)) { v = GK_NEXT_BOUNDARY(v, 21); continue; }
+    if (*pde & PTE_PS) {
+      uintptr_t lo = v & ~(GK_HUGE - 1), hi = lo + GK_HUGE;
+      if (s <= lo && e >= hi && op_uniform(op, rp, lo, hi)) {
+        n += pte_apply(pde, lo, op, rp);
+        v = hi;
+        continue;
+      }
+      if (huge_split(pde) < 0) {  // pool exhausted: the whole page was dropped instead
+        v = hi;
+        continue;
+      }
     }
+    uint64_t *pt = (uint64_t *)(uintptr_t)(*pde & ~0xfffULL);
+    n += pte_apply(&pt[(v >> 12) & 0x1ff], v, op, rp);
     v += 0x1000;
   }
   return n;
 }
 
-// The leaf PTE a root holds for the page of `va`, or 0 if no table on the way
-// down exists. Never allocates. Caller holds G->lock.
+// The leaf entry a root holds for the page of `va`: its PTE, or the PD entry
+// of the 2MiB page holding it, or 0 if no table on the way down exists. Never
+// allocates. Caller holds G->lock.
 static uint64_t pte_lookup(const uint64_t *root, uintptr_t va) {
   uint64_t pml4e = root[(va >> 39) & 0x1ff];
   if (!(pml4e & PTE_P)) return 0;
@@ -745,6 +968,7 @@ static uint64_t pte_lookup(const uint64_t *root, uintptr_t va) {
   const uint64_t *pd = (const uint64_t *)(uintptr_t)(pdpte & ~0xfffULL);
   uint64_t pde = pd[(va >> 21) & 0x1ff];
   if (!(pde & PTE_P)) return 0;
+  if (pde & PTE_PS) return pde;
   const uint64_t *pt = (const uint64_t *)(uintptr_t)(pde & ~0xfffULL);
   return pt[(va >> 12) & 0x1ff];
 }
@@ -1112,6 +1336,16 @@ static int pkey_lower_bound(uintptr_t addr) {
   return lo;
 }
 
+// Whether every page of [s, e) holds the same key: no range holding a nonzero
+// key overlaps [s, e) without covering it. Caller holds G->lock.
+static int pkey_uniform(uintptr_t s, uintptr_t e) {
+  if (!GK_VIRTUALIZE_PKEYS) return 1;
+  int i = pkey_lower_bound(s);
+  if (i < G->pkey_n && G->pkeys[i].start < e)
+    return G->pkeys[i].start <= s && G->pkeys[i].end >= e;
+  return 1;
+}
+
 // Set the key of [s, e) (page-aligned) to `pkey`, replacing whatever keys the
 // range held. Existing ranges overlapping [s, e) are trimmed, split or removed;
 // a nonzero key is then inserted and merged with equal-key neighbors. Fails
@@ -1191,16 +1425,25 @@ static int parse_maps_line(const char *l, const char *end, uintptr_t *s,
   return 1;
 }
 
+// Whether the line [l, end) contains `needle`.
+static int line_has(const char *l, const char *end, const char *needle) {
+  size_t n = strlen(needle);
+  for (; l + n <= end; l++)
+    if (memcmp(l, needle, n) == 0) return 1;
+  return 0;
+}
+
 // Look up the host mapping containing `page` in /proc/self/maps. V8 reserves
 // huge PROT_NONE regions and commits sub-ranges; only committed pages may be
 // mapped. On success sets [*rs, *re) to the mapping's bounds and *perms to its
 // protection (bit0=r, bit1=w, bit2=x) and returns 1; returns 0 if `page` is
-// not mapped.
+// not mapped. `stack`, if given, is set to whether the kernel tags the mapping
+// as a stack (the main thread's, which it grows on demand).
 //
 // This runs on the fault path, so it uses raw syscalls and a stack buffer only:
 // stdio would call malloc, and the faulting guest thread may be inside malloc
 // holding its arena lock, which the same host thread could then never take.
-static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms) {
+static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms, int *stack) {
   long fd = host_syscall(SYS_open, (long)"/proc/self/maps", O_RDONLY | O_CLOEXEC,
                          0, 0, 0, 0);
   if (fd < 0) return 0;
@@ -1223,6 +1466,7 @@ static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms)
       uintptr_t s, e; int m;
       if (parse_maps_line(buf + pos, nl, &s, &e, &m) && page >= s && page < e) {
         *rs = s; *re = e; *perms = m;
+        if (stack) *stack = line_has(buf + pos, nl, "[stack");
         found = 1;
         break;
       }
@@ -1408,7 +1652,8 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
     pthread_mutex_unlock(&G->lock);
     return -1;
   }
-  int mapped = host_region(page, &rs, &re, &perms);
+  int stack_vma = 0;
+  int mapped = host_region(page, &rs, &re, &perms, &stack_vma);
   if (!mapped) {
     // The page may lie just below a stack the kernel grows on demand (the main
     // thread's, which gk_run_here runs the guest on). Natively the thread's own
@@ -1419,7 +1664,7 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
     // native write would (and return EFAULT, not a signal, if it cannot).
     // Ordinary unmapped addresses just fail the probe.
     host_syscall(SYS_rt_sigprocmask, SIG_BLOCK, 0, (long)page, 8, 0, 0);
-    mapped = host_region(page, &rs, &re, &perms);
+    mapped = host_region(page, &rs, &re, &perms, &stack_vma);
   }
   if (!mapped || !(perms & 1)) {
     pthread_mutex_unlock(&G->lock);
@@ -1446,13 +1691,19 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
   int stack = (page >= t->ro_lo && page < t->ro_hi) ||
               (rs < t->wall_map_hi && re > t->wall_map_lo) || (sp >= rs && sp < re);
   if (!in && !stack) flags |= GK_MAP_GLOBAL;
-  int r = map4k_root(root, page, flags, pkey);  // honor R/W/X for W^X
+  // The whole 2MiB range around the page gets one entry when the mapping just
+  // read covers it and everything else about it is uniform (see the huge-pages
+  // section); the flags are then the same the page itself would get.
+  uintptr_t hlo = page & ~(GK_HUGE - 1), hhi = hlo + GK_HUGE;
+  int huge = !G->no_huge && cls == GK_PROT_KEEP && !stack && !stack_vma && rs <= hlo &&
+             re >= hhi && huge_range_ok(hlo, hhi, in) && map2m_root(root, hlo, flags, pkey) == 0;
+  int r = huge ? 0 : map4k_root(root, page, flags, pkey);  // honor R/W/X for W^X
   if (r >= 0) {
     G->demand_ok++;
     // Settle the page's neighborhood from the same read (an aligned window,
     // so it shares the page's top-level entry, which the carry-over below
-    // covers).
-    if (cls == GK_PROT_KEEP) demand_map_neighbors(t, page, root, in, rs, re, perms, sp);
+    // covers). A 2MiB entry has settled it already.
+    if (cls == GK_PROT_KEEP && !huge) demand_map_neighbors(t, page, root, in, rs, re, perms, sp);
     // A base-root mapping that populated a fresh top-level entry is not yet in
     // the active arena's root (which copied the base root's entries at entry,
     // see sync_cr3); carry it over now so the retry does not fault again. The
@@ -1465,14 +1716,21 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
     }
   }
   pthread_mutex_unlock(&G->lock);
-  if (G->dbg && (cls == GK_PROT_SUPER || pkey != 0)) {
+  // Outside the lock: the host may take a while to migrate the range's pages,
+  // and other vCPUs' faults need not wait for it (see the huge-pages section).
+  long collapsed = 0;
+  if (huge && G->huge_collapse)
+    collapsed = host_syscall(SYS_madvise, (long)hlo, (long)GK_HUGE, GK_MADV_COLLAPSE, 0, 0, 0);
+  if (G->dbg && (cls == GK_PROT_SUPER || pkey != 0 || huge)) {
     gk_dbuf d = {.n = 0};
     db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
-    db_str(&d, cls == GK_PROT_SUPER ? ": SUPER demand-map " : ": demand-map ");
-    db_hex(&d, page);
+    db_str(&d, cls == GK_PROT_SUPER ? ": SUPER demand-map " : huge ? ": 2MiB demand-map " : ": demand-map ");
+    db_hex(&d, huge ? hlo : page);
     db_str(&d, " perms="); db_dec(&d, perms);
     if (cls == GK_PROT_SUPER) db_str(&d, " (U cleared)");
     if (pkey != 0) { db_str(&d, " pkey="); db_dec(&d, pkey); db_str(&d, " (PTE bits 62:59)"); }
+    if (huge) db_str(&d, in ? " (arena root)" : " (base root)");
+    if (huge && G->huge_collapse) { db_str(&d, " host collapse -> "); db_dec(&d, collapsed); }
     db_flush(&d);
   }
   return r;
@@ -1859,6 +2117,8 @@ int gk_init(void) {
   prot_add(GK_CTL_START, GK_CTL_END, GK_PROT_SUPER);
   G->dbg = getenv("GK_DEBUG") != NULL;
   G->thp = getenv("GK_NO_THP") == NULL;
+  G->no_huge = getenv("GK_NO_HUGE_PAGES") != NULL;  // see the huge-pages section
+  G->huge_collapse = getenv("GK_HUGE_COLLAPSE") != NULL;
   *(void **)&G->tls_static_info = dlsym(RTLD_DEFAULT, "_dl_get_tls_static_info");
   if (!G->tls_static_info)
     fprintf(stderr, "[gk] _dl_get_tls_static_info not found: gk_run_here_user builds no "
@@ -2159,7 +2419,7 @@ static long child_entry(void *arg) {
   // before the first fault or that push double-faults.
   uintptr_t rs, re; int perms;
   pthread_mutex_lock(&G->lock);
-  int ok = host_region(t->start.regs.rsp - 1, &rs, &re, &perms) && (perms & 2) &&
+  int ok = host_region(t->start.regs.rsp - 1, &rs, &re, &perms, NULL) && (perms & 2) &&
            mmu_map_range(rs, re, perms) == 0;
   pthread_mutex_unlock(&G->lock);
   if (!ok) {
@@ -2732,7 +2992,7 @@ static int stack_wall_bounds(gk_thread *t, uintptr_t caller_sp, uintptr_t top,
   *lo = *hi = 0;
   if (caller_sp < t->wall_map_lo || caller_sp >= t->wall_map_hi) {
     uintptr_t rs, re; int perms;
-    if (!host_region(caller_sp & ~0xfffUL, &rs, &re, &perms)) return -1;
+    if (!host_region(caller_sp & ~0xfffUL, &rs, &re, &perms, NULL)) return -1;
     uintptr_t end = re;
     uintptr_t tp = thread_pointer();
     if (tp > caller_sp && tp < re) {
@@ -3364,6 +3624,8 @@ void gk_get_stats(gk_stats *s) {
   s->wall_skipped = G->wall_skipped;
   s->global_pages = G->global_pages;
   s->neighbor_pages = G->neighbor_pages;
+  s->huge_pages = G->huge_pages;
+  s->huge_splits = G->huge_splits;
   s->root_switches = atomic_load_explicit(&G->root_switches, memory_order_relaxed);
   s->tlb_flushes = atomic_load_explicit(&G->tlb_flushes, memory_order_relaxed);
   s->flush_invpcid = G->flush_stub == gk_flush_stub_invpcid;

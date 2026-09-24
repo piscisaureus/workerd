@@ -156,6 +156,46 @@ hardware:
   shows that an arena page's translation is re-walked after a switch away and
   back while a shared page's survives it, and that gk's own flush drops global
   entries too.
+- **2 MiB pages.** A 2 MiB-aligned range that is uniform in everything a page
+  entry encodes is mapped by one PD entry with the PS bit instead of a table of
+  512 PTEs, so the guest's walk is a level shorter and one TLB entry covers the
+  range (every miss is a two-dimensional walk under nested paging). The entry
+  is installed on the first fault in a range that qualifies at that moment:
+  one host mapping at one protection covers all of it (one `/proc/self/maps`
+  line), every page is class KEEP (no supervisor or refused page inside), one
+  protection key, one arena or none (the entry goes into that root), no
+  thread's stack (not the faulting code's stack mapping, nothing the kernel
+  tags `[stack]`, no vCPU's host-frame wall window or ring-3 stack mapping),
+  and no table for the range yet. In practice that is the binary's text,
+  rodata and data, the C++ heap's windows and an arena's whole committed
+  windows, V8's code range included; stacks and windows holding gk's own pages
+  stay per page. Anything that changes part of a 2 MiB page -- a reflected
+  `mprotect`, `munmap` or decommit, a wall raise, a supervisor/refuse
+  registration, a key -- first splits it into a table of 512 PTEs with the same
+  frames and bits (from the page-table pool: the fault path stays malloc-free)
+  and then applies to the pages named; an operation covering the whole range
+  applies to the entry itself. A split range stays split: tables are never
+  freed under running vCPUs and ranges are never promoted, so a range whose
+  protection keeps changing costs one split, never churn. The test installs an
+  entry over a fresh window and checks that a 4 KiB `mprotect`, decommit,
+  host-side decommit, refuse registration, protection key and host-frame wall
+  inside it split it and affect only their pages, that a window with a
+  supervisor page or two protections is mapped per page, and that an arena's
+  2 MiB entries are unreachable from the base root and from another arena.
+  `GK_NO_HUGE_PAGES` in the environment maps everything per page, for
+  comparison.
+
+  What the guest entry buys depends on the host: under nested paging a TLB
+  entry covers the smaller of the guest page and the host page behind it, so
+  with the host backing memory in 4 KiB pages (no transparent huge page) the
+  entry shortens each walk by a level but every translation is still 4 KiB.
+  With `GK_HUGE_COLLAPSE` in the environment gk also asks the host to back
+  each such range with one 2 MiB page (`madvise(MADV_COLLAPSE)`, synchronous;
+  KVM then maps it as a 2 MiB nested page too), which makes the translation
+  2 MiB end to end for anonymous memory (the kernel refuses it for the
+  binary's file-backed text unless built with read-only THP for filesystems).
+  The collapse populates the whole 2 MiB on the host, so a sparsely touched
+  window costs its full 2 MiB of memory; it is opt-in for that reason.
 - **W^X.** Pages are mapped with their host protection: executable pages are not
   writable and writable pages are not executable (NX is enabled in the guest,
   and `CR0.WP` is set so the ring-0 guest cannot write a read-only page either).
@@ -249,6 +289,15 @@ decides the overall cost.
 - **Syscall policy is a single filter hook.** `gk_set_syscall_filter` bounds
   forwarded syscalls, but there is no default allowlist or host-side seccomp on
   the forwarding thread itself yet.
+- **2 MiB pages are never promoted or re-promoted.** A range whose table
+  already exists when it becomes uniform (an arena window committed in pieces
+  and touched before it was whole, a window split once by a partial change)
+  stays per page. Promoting it would free or replace a table that another vCPU
+  may be walking through, which needs the cross-vCPU shootdown above, or a
+  quarantine for retired tables. Where windows are committed whole before
+  first use (the binary, the C++ heap's windows, V8's code range) this costs
+  nothing; a heap committed 256 KiB at a time gets 2 MiB entries only for the
+  windows it happens to complete before touching.
 - **The MMU backs whole 2 MiB windows, not exact VMAs.** It reparses
   `/proc/self/maps` per fault (each read also settles the fault's aligned
   256 KiB neighborhood, see `demand_map_neighbors` in `gk.c`, so a growing
