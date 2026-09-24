@@ -202,6 +202,9 @@ typedef struct {
   long tlb_flushes;     // full TLB flushes run on a vCPU, on every path: a wall raise that could not
                         // skip, a reflected mprotect/munmap, freed page tables (wall_flushed is the
                         // wall's share)
+  long reflect_flush_skipped;  // reflected mprotect/munmap/mmap-fixed syscalls that changed no PTE
+                               // (nothing mapped, or the protection the range already had) and, no
+                               // PTE having changed elsewhere since the vCPU's last flush, ran none
   int flush_invpcid;    // the flush stub in use: 1 = INVPCID (one VM exit), 0 = CR4.PGE toggle (three)
 } gk_stats;
 void gk_get_stats(gk_stats *s);

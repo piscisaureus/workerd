@@ -102,6 +102,13 @@ static long write_byte(void *arg) {
   return b[0];
 }
 
+// Runs in the guest: commit one page (mprotect RW) and touch nothing, so the
+// reflected syscall finds no PTE of the page in any root.
+static long commit_only(void *arg) {
+  struct ap *p = arg;
+  return mprotect(p->page, 4096, PROT_READ | PROT_WRITE) != 0 ? -errno : 0;
+}
+
 
 // ---- arena churn -------------------------------------------------------------
 // A runtime creates and destroys arenas constantly (one per isolate). Each use
@@ -1996,6 +2003,85 @@ int main(void) {
            r1, d1, r2, d2, r3, f3, r4, d4, ok18 ? "OK" : "FAIL");
   }
 
+  // ---- a reflection that changes no PTE skips its flush ----------------------
+  // A reflected syscall flushes this vCPU's TLB only when it changed a PTE, or
+  // when a PTE changed elsewhere since the vCPU's last full flush (see
+  // forward_syscall). A commit of pages the guest has not touched, a commit of
+  // a mapped page to the protection it already has (V8's re-commit of a
+  // discarded page) and a decommit of an unmapped range change none and skip;
+  // RW->R, R->RW and a decommit of a mapped page change a PTE, flush, and take
+  // effect as before. A PTE dropped behind the vCPU's back makes its next
+  // reflection flush once, after which skipping resumes and the dropped page
+  // faults back in intact.
+  int ok23 = 0;
+  {
+    gk_arena *m = gk_arena_create(2 * 4096);
+    unsigned char *base = gk_arena_base(m);
+    struct ap p0 = {base, 0x5a}, p1 = {base + 4096, 0x6b};
+    gk_stats s[13];
+    gk_arena_enter(m);
+    gk_run(test_compute, (void *)10);       // warm-up: a first-entry flush, if any, is done
+    gk_get_stats(&s[0]);
+    long r1 = gk_run(commit_only, &p0);     // RW commit, nothing mapped: no PTE to change
+    gk_get_stats(&s[1]);
+    long r2 = gk_run(commit_write, &p0);    // RW->RW still unmapped; the write then maps it
+    gk_get_stats(&s[2]);
+    long r3 = gk_run(commit_write, &p0);    // RW->RW on the mapped page: the PTE is unchanged
+    gk_get_stats(&s[3]);
+    long r4 = gk_run(protect_read, &p0);    // RW->R: the PTE changes
+    gk_get_stats(&s[4]);
+    p0.val = 0x3c;
+    long r5 = gk_run(write_byte, &p0);      // the read-only page holds
+    unsigned long f5 = gk_fault_addr();
+    long r6 = gk_run(commit_write, &p0);    // R->RW: the PTE changes
+    gk_get_stats(&s[6]);
+    long r7 = gk_run(decommit_read, &p0);   // RW->NONE drops the PTE; the read faults
+    unsigned long f7 = gk_fault_addr();
+    gk_get_stats(&s[7]);
+    long r8 = gk_run(decommit_read, &p0);   // NONE->NONE with no PTE: nothing to change
+    unsigned long f8 = gk_fault_addr();
+    gk_get_stats(&s[8]);
+    p0.val = 0x77;
+    long r9 = gk_run(commit_write, &p0);    // commit again (no PTE), the write maps it
+    gk_get_stats(&s[9]);
+    gk_debug_drop_pte((unsigned long)base); // a foreign change: the PTE goes behind the vCPU's back
+    long r10 = gk_run(commit_only, &p1);    // nothing to change here, but the generation moved
+    gk_get_stats(&s[10]);
+    long r11 = gk_run(commit_only, &p1);    // skipping resumes
+    gk_get_stats(&s[11]);
+    long r12 = gk_run(read_byte, base);     // the dropped page faults back in, intact
+    gk_get_stats(&s[12]);
+    gk_arena_enter(NULL);
+    gk_arena_destroy(m);
+#define STEP(i, fl, sk, df) \
+    (s[i].tlb_flushes - s[(i) - 1].tlb_flushes == (fl) && \
+     s[i].reflect_flush_skipped - s[(i) - 1].reflect_flush_skipped == (sk) && \
+     s[i].demand_faults - s[(i) - 1].demand_faults == (df))
+    int st1 = r1 == 0 && STEP(1, 0, 1, 0);
+    int st2 = r2 == 0x5a && STEP(2, 0, 1, 1);
+    int st3 = r3 == 0x5a && STEP(3, 0, 1, 0);
+    int st4 = r4 == 0x5a && STEP(4, 1, 0, 0);
+    int st5 = r5 == GK_EFAULT && f5 == (unsigned long)base;
+    int st6 = r6 == 0x3c && s[6].tlb_flushes - s[4].tlb_flushes == 1 &&
+              s[6].reflect_flush_skipped - s[4].reflect_flush_skipped == 0;
+    int st7 = r7 == GK_EFAULT && f7 == (unsigned long)base && STEP(7, 1, 0, 0);
+    int st8 = r8 == GK_EFAULT && f8 == (unsigned long)base && STEP(8, 0, 1, 0);
+    int st9 = r9 == 0x77 && STEP(9, 0, 1, 1);
+    int st10 = r10 == 0 && STEP(10, 1, 0, 0);
+    int st11 = r11 == 0 && STEP(11, 0, 1, 0);
+    int st12 = r12 == 0x77 && STEP(12, 0, 0, 1);
+#undef STEP
+    ok23 = st1 && st2 && st3 && st4 && st5 && st6 && st7 && st8 && st9 && st10 && st11 && st12;
+    printf("reflection flush skip: untouched commit %s, RW->RW unmapped %s, RW->RW mapped %s, "
+           "RW->R flushed %s, write to R -> %ld at %#lx %s, R->RW flushed %s, decommit flushed "
+           "%s, decommit again skipped %s, re-commit skipped %s, foreign drop -> flushed once %s, "
+           "skipping resumed %s, dropped page back %ld %s [%s]\n",
+           st1 ? "skipped" : "FLUSHED", st2 ? "skipped" : "FLUSHED", st3 ? "skipped" : "FLUSHED",
+           st4 ? "ok" : "BAD", r5, f5, st5 ? "ok" : "BAD", st6 ? "ok" : "BAD", st7 ? "ok" : "BAD",
+           st8 ? "ok" : "BAD", st9 ? "ok" : "BAD", st10 ? "ok" : "BAD", st11 ? "ok" : "BAD", r12,
+           st12 ? "ok" : "BAD", ok23 ? "OK" : "FAIL");
+  }
+
   // ---- global pages across a root switch -------------------------------------
   // Alternating turns for two arenas on one thread stay isolated, a shared
   // runtime page's translation survives the switch while an arena page's does
@@ -2014,7 +2100,7 @@ int main(void) {
 
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
-            ok22;
+            ok22 && ok23;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

@@ -114,6 +114,7 @@
 #endif
 #define GK_SYNC_REGS (KVM_SYNC_X86_REGS | KVM_SYNC_X86_SREGS)
 #define GK_IST_BYTES (64UL << 10)   // per-vCPU exception stack, TSS in its last page
+#define GK_PTE_GEN_UNKNOWN (~0UL)   // a vCPU's pte_gen when it has no full flush on record
 #define GK_SIDE_STACK (512UL << 10) // host-side stack for gk_run_here's gk loop
 typedef struct {
   int fd, id;
@@ -137,6 +138,8 @@ typedef struct gk_thread {
   uint64_t ist;            // exception stack + TSS region of this vCPU
   void *side_stack;        // host stack for gk_run_here's gk loop (see there)
   unsigned root_gen;       // G->root_gen as of this vCPU's last TLB flush (0: never)
+  unsigned long pte_gen;   // G->pte_gen as of this vCPU's last full TLB flush (see flush_run);
+                           // GK_PTE_GEN_UNKNOWN when no flush is on record
   uint64_t last_fault;
   int fault_repeat;
   int backing_retries;     // host-backing faults recovered this invocation (see run_vcpu)
@@ -279,7 +282,16 @@ struct gk_ctl {
   long neighbor_pages;              // PTEs installed ahead of a fault (see demand_map_neighbors)
   atomic_long root_switches;        // guest entries that loaded another root (enter_guest)
   atomic_long tlb_flushes;          // full flushes run on a vCPU, on any path (see flush_run)
+  long reflect_flush_skipped;       // reflected syscalls that changed no PTE and skipped their flush
   void (*flush_stub)(void);         // the flush stub for this CPU (see flush_stub_select)
+  // Bumped by every unmap or reprotect walk that changed a leaf PTE
+  // (pte_range_root), under G->lock. A vCPU whose TLB was fully flushed at
+  // generation g holds no translation that any such change since could have
+  // made stale, so a reflected syscall on it that changes no PTE itself has
+  // nothing to flush while the generation is still g (see forward_syscall).
+  // The wall's own ops are not counted: a wall narrows only its vCPU's window,
+  // and that vCPU's raise flushes or proves it need not (see wall_raise).
+  unsigned long pte_gen;
   // Bumped whenever page-table pages are returned to the allocator (an arena
   // was destroyed). A vCPU whose root is unchanged since it last entered the
   // guest may still hold TLB and paging-structure-cache entries derived from
@@ -522,7 +534,7 @@ static int prot_class(uintptr_t addr) {
   return GK_PROT_KEEP;
 }
 
-static void unmap_range_all(uintptr_t s, uintptr_t e);
+static long unmap_range_all(uintptr_t s, uintptr_t e);
 
 // Register [s, e) (page-aligned) as SUPER or REFUSE, keeping the array sorted by
 // start. Ranges never overlap: they are gk's own allocations. Any PTE a root
@@ -675,7 +687,10 @@ typedef struct { int prot; uintptr_t wall_lo, wall_hi; } gk_reprot;
 // reservation costs in proportion to what is mapped, not to the range. Leaves
 // intermediate tables in place and never allocates. `rp` is PTE_OP_REPROTECT's
 // argument and NULL for the other ops. Returns PTE_OP_WALL_LOWER's count of
-// untagged writable entries, 0 for the other ops. Caller holds G->lock.
+// untagged writable entries; PTE_OP_UNMAP's count of present entries cleared;
+// PTE_OP_REPROTECT's count of entries whose value changed; 0 for
+// PTE_OP_WALL_RAISE. An unmap or reprotect that changed an entry also moves
+// G->pte_gen (see there). Caller holds G->lock.
 #define GK_NEXT_BOUNDARY(v, bits) ((((v) >> (bits)) + 1) << (bits))
 static long pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
                            const gk_reprot *rp) {
@@ -693,6 +708,7 @@ static long pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
     uint64_t *pte = &pt[(v >> 12) & 0x1ff];
     switch (op) {
       case PTE_OP_UNMAP:
+        if (*pte & PTE_P) n++;
         *pte = 0;
         break;
       case PTE_OP_WALL_RAISE:
@@ -707,15 +723,17 @@ static long pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
         // supervisor/refuse class), the protection key and the accessed/dirty
         // bits are the page's own and stay.
         if (*pte & PTE_P) {
-          uint64_t n = *pte & ~(PTE_W | PTE_NX | PTE_WALL);
-          if (!(rp->prot & 4)) n |= PTE_NX;
-          if (rp->prot & 2) n |= (v >= rp->wall_lo && v < rp->wall_hi) ? PTE_WALL : PTE_W;
-          *pte = n;
+          uint64_t nv = *pte & ~(PTE_W | PTE_NX | PTE_WALL);
+          if (!(rp->prot & 4)) nv |= PTE_NX;
+          if (rp->prot & 2) nv |= (v >= rp->wall_lo && v < rp->wall_hi) ? PTE_WALL : PTE_W;
+          if (nv != *pte) { *pte = nv; n++; }
         }
         break;
     }
     v += 0x1000;
   }
+  if ((op == PTE_OP_UNMAP || op == PTE_OP_REPROTECT) && n > 0)
+    __atomic_fetch_add(&G->pte_gen, 1, __ATOMIC_RELEASE);
   return n;
 }
 
@@ -753,10 +771,10 @@ static long pte_range_all(uintptr_t s, uintptr_t e, int op, const gk_reprot *rp)
 // PTE any root holds for it (see pte_range_all), so the guest's next access
 // demand-faults and re-derives the mapping from the host. A stale PTE over a
 // page the host has decommitted would otherwise make that access an
-// unrecoverable KVM_RUN EFAULT rather than a demand fault. Caller holds
-// G->lock.
-static void unmap_range_all(uintptr_t s, uintptr_t e) {
-  pte_range_all(s, e, PTE_OP_UNMAP, NULL);
+// unrecoverable KVM_RUN EFAULT rather than a demand fault. Returns the number
+// of present PTEs dropped. Caller holds G->lock.
+static long unmap_range_all(uintptr_t s, uintptr_t e) {
+  return pte_range_all(s, e, PTE_OP_UNMAP, NULL);
 }
 
 // Reflect a successful plain mprotect over [s, e) that leaves the range
@@ -768,10 +786,12 @@ static void unmap_range_all(uintptr_t s, uintptr_t e) {
 // as always. Dropping the PTEs instead (unmap_range_all) would have each one
 // re-fault, and every demand fault reads /proc/self/maps, which is long in
 // this process. `t` is the calling vCPU, whose host-frame wall the rewrite
-// honors (see gk_reprot). Caller holds G->lock.
-static void reprotect_range_all(gk_thread *t, uintptr_t s, uintptr_t e, int prot) {
+// honors (see gk_reprot). Returns the number of PTEs whose value changed: an
+// mprotect to the protection a range already has, which V8 issues on every
+// re-commit of a discarded page, changes none. Caller holds G->lock.
+static long reprotect_range_all(gk_thread *t, uintptr_t s, uintptr_t e, int prot) {
   gk_reprot rp = {prot, t->ro_lo, t->ro_hi};
-  pte_range_all(s, e, PTE_OP_REPROTECT, &rp);
+  return pte_range_all(s, e, PTE_OP_REPROTECT, &rp);
 }
 
 // The same for one root only: an arena root being built or torn down, whose
@@ -1758,6 +1778,7 @@ ready:
   t->ist = ist;
   t->side_stack = side_stack;
   t->root_gen = 0;    // a fresh or reused vCPU flushes its TLB at first entry
+  t->pte_gen = GK_PTE_GEN_UNKNOWN;
   t->last_fault = 0;
   t->fault_repeat = 0;
   t->backing_retries = 0;
@@ -2044,9 +2065,15 @@ static int run_stub(gk_thread *t, void (*stub)(void), uint64_t rdi, uint64_t rsi
 // goes through here, so gk_stats.tlb_flushes counts them all. No ioctl does
 // this from the host: KVM flushes the guest TLB only when KVM_SET_SREGS
 // changes a control register, and re-setting the same values is a no-op.
+// Records G->pte_gen as of before the flush as the vCPU's flushed generation
+// (see G->pte_gen): a PTE change that lands during the flush then reads as
+// newer than it, and the next reflection flushes again.
 static int flush_run(gk_thread *t) {
+  unsigned long gen = __atomic_load_n(&G->pte_gen, __ATOMIC_ACQUIRE);
   atomic_fetch_add_explicit(&G->tlb_flushes, 1, memory_order_relaxed);
-  return run_stub(t, G->flush_stub, 0, 0, PORT_FLUSH, "flush");
+  int rc = run_stub(t, G->flush_stub, 0, 0, PORT_FLUSH, "flush");
+  t->pte_gen = rc == 0 ? gen : GK_PTE_GEN_UNKNOWN;
+  return rc;
 }
 
 // Flush this vCPU's TLB from a syscall exit, whose register snapshot is `r`:
@@ -2332,10 +2359,20 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
   // Other vCPUs' TLBs are not shot down: a stale entry there carries the old
   // protection or key until it is evicted or faults (a page fault invalidates
   // the entry, so the retry re-walks and sees the new PTE).
+  //
+  // The flush is skipped when the reflection changed no PTE in any root and
+  // no unmap or reprotect anywhere has changed one since this vCPU's last
+  // full flush (G->pte_gen reads as it did then): every translation the TLB
+  // holds is then still backed by a PTE with the same protection, so there is
+  // nothing to drop. That is the common shape of a commit of pages the guest
+  // has not touched yet (no PTE exists to change) and of V8's mprotect of a
+  // discarded page back to the protection it kept. A flush is a stub round
+  // trip through KVM_RUN and a cold TLB for the guest afterwards.
   long ret;
   int reflect = (nr == SYS_mprotect || nr == SYS_munmap ||
                  nr == SYS_pkey_mprotect ||
                  (nr == SYS_mmap && (a4 & MAP_FIXED))) && a2 > 0;
+  int flush = 0;
   uintptr_t rs = (uintptr_t)a1 & ~0xfffUL;
   uintptr_t re = ((uintptr_t)a1 + (uintptr_t)a2 + 0xfff) & ~0xfffUL;
   if (reflect) pthread_mutex_lock(&G->lock);
@@ -2363,8 +2400,11 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
       else
         unmap_range_all(rs, re);
     }
+    // A change of this vCPU's own moved pte_gen past its flushed generation.
+    flush = t->pte_gen != __atomic_load_n(&G->pte_gen, __ATOMIC_ACQUIRE);
+    if (!flush) G->reflect_flush_skipped++;
     pthread_mutex_unlock(&G->lock);
-    flush_tlb(t, r);
+    if (flush) flush_tlb(t, r);
   } else if (nr == SYS_mmap && a2 > 0 && (unsigned long)ret < (unsigned long)-4096) {
     // A fresh mapping, placed by the kernel: whatever key was last recorded
     // for those addresses belonged to a mapping that is gone.
@@ -2387,9 +2427,11 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
               t->id, ret, (unsigned long)a2, pkru);
   }
   if (G->dbg) {
-    fprintf(stderr, "[gk] vcpu %d syscall %ld(%#lx, %#lx, %#lx, %#lx) -> %ld\n",
+    fprintf(stderr, "[gk] vcpu %d syscall %ld(%#lx, %#lx, %#lx, %#lx) -> %ld%s\n",
             t->id, nr, (unsigned long)a1, (unsigned long)a2, (unsigned long)a3,
-            (unsigned long)a4, ret);
+            (unsigned long)a4, ret,
+            !reflect ? "" : flush ? " (reflected, flushed)"
+                                  : " (reflected, no PTE changed: flush skipped)");
     if (nr == SYS_pkey_mprotect && ret == 0)
       fprintf(stderr, "[gk] vcpu %d pkey_mprotect [%#lx,%#lx) key %ld: host mprotect only, "
               "guest PTEs will carry key %d\n", t->id, (unsigned long)rs, (unsigned long)re,
@@ -3266,6 +3308,7 @@ void gk_get_stats(gk_stats *s) {
   s->neighbor_pages = G->neighbor_pages;
   s->root_switches = atomic_load_explicit(&G->root_switches, memory_order_relaxed);
   s->tlb_flushes = atomic_load_explicit(&G->tlb_flushes, memory_order_relaxed);
+  s->reflect_flush_skipped = G->reflect_flush_skipped;
   s->flush_invpcid = G->flush_stub == gk_flush_stub_invpcid;
   pthread_mutex_unlock(&G->lock);
 }
