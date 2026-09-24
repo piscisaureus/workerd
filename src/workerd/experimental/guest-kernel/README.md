@@ -125,6 +125,21 @@ hardware:
   windows, so every mapped page has a backing memslot. Memory is backed one
   aligned 2 MiB window at a time; memslots are created once and never deleted.
   Faults into another arena's region are refused, preserving isolation.
+- **Huge host pages behind large commits.** A range of 2 MiB or more that an
+  arena's owner commits in one piece (an ArrayBuffer backing store, a large
+  object page, a semispace) is advised `MADV_HUGEPAGE` as the commit is
+  reflected. The host then backs it with 2 MiB pages on its first touch from
+  the guest, which KVM maps with one nested-page-table entry per 2 MiB: one
+  nested page fault (a VM exit) per 2 MiB instead of one per 4 KiB. The
+  guest's own PTEs stay 4 KiB and the arena walls are unchanged. Smaller
+  commits, V8's 256 KiB regular heap chunks in particular, are deliberately
+  left with 4 KiB pages: they could not take a huge page at their first touch
+  anyway, and advising them would only let khugepaged collapse sparsely used
+  ranges later and inflate RSS across many isolates. The advice is applied
+  per commit rather than to the reservation, since a fixed `mmap` (V8's
+  decommit, sometimes issued by a host thread gk never sees) replaces the VMA
+  and loses it. `GK_NO_THP=1` disables the advice; a kernel whose
+  `transparent_hugepage/enabled` is `never` ignores it.
 - **Global pages across the per-turn root switch.** The guest runs with
   `CR4.PGE`, and the pages of the shared runtime (the binary's text and data,
   glibc, the C++ heap: everything demand-paged into the base root outside every

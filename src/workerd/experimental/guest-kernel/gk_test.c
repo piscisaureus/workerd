@@ -846,6 +846,122 @@ static void *host_decommit_thread(void *arg) {
   return (void *)(uintptr_t)host_decommit_check("pthread");
 }
 
+// ---- transparent huge pages behind an arena ---------------------------------
+// A range of 2MB or more that the owner commits in one piece is advised
+// MADV_HUGEPAGE as the commit is reflected (see arena_thp_advise), so it is
+// backed by 2MB host pages when the guest first touches it, and KVM maps it
+// with one nested entry per 2MB. The backing is read from /proc/self/smaps
+// (AnonHugePages over the range, and whether its VMAs carry the advice, the
+// "hg" VmFlag). A range decommitted V8-style, with a fixed PROT_NONE mmap,
+// and recommitted has to come back huge too: the fixed mmap replaced the VMA,
+// and the advice with it, so the recommit must have re-advised it. A small
+// commit (a V8 heap chunk) must get neither the advice nor a huge page, so
+// khugepaged has nothing to collapse there.
+struct thp_range { unsigned char *base; size_t len; };
+
+// Runs in the guest at ring 3: commit the range RW and write one byte per 4KB
+// page, first to last. Returns the number of pages touched.
+static long thp_commit_touch(void *arg) {
+  struct thp_range *r = arg;
+  if (mprotect(r->base, r->len, PROT_READ | PROT_WRITE) != 0) return -errno;
+  long n = 0;
+  for (size_t off = 0; off < r->len; off += 4096, n++) ((volatile unsigned char *)r->base)[off] = 1;
+  return n;
+}
+
+// Runs in the guest: decommit the range the way V8 does, by mapping fresh
+// PROT_NONE memory over it.
+static long thp_decommit(void *arg) {
+  struct thp_range *r = arg;
+  void *p = mmap(r->base, r->len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  return p == r->base ? 0 : -errno;
+}
+
+// AnonHugePages (kB) summed over the VMAs inside [s, e), from /proc/self/smaps.
+// Through `advised`, if given, whether any of those VMAs carries MADV_HUGEPAGE
+// (the "hg" VmFlag).
+static long anon_huge_kb(uintptr_t s, uintptr_t e, int *advised) {
+  FILE *f = fopen("/proc/self/smaps", "r");
+  if (!f) return -1;
+  char line[512];
+  long kb = 0;
+  int inside = 0, hg = 0;
+  while (fgets(line, sizeof line, f)) {
+    unsigned long vs, ve;
+    if (sscanf(line, "%lx-%lx ", &vs, &ve) == 2) { inside = vs >= s && ve <= e; continue; }
+    if (!inside) continue;
+    long v;
+    if (sscanf(line, "AnonHugePages: %ld kB", &v) == 1) kb += v;
+    if (strncmp(line, "VmFlags:", 8) == 0 && strstr(line, " hg")) hg = 1;
+  }
+  fclose(f);
+  if (advised) *advised = hg;
+  return kb;
+}
+
+// The kernel's THP mode: 1 if the advice can take effect ("always" or
+// "madvise"), 0 for "never" or a kernel without THP.
+static int thp_available(void) {
+  FILE *f = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
+  if (!f) return 0;
+  char line[128] = "";
+  if (!fgets(line, sizeof line, f)) line[0] = 0;
+  fclose(f);
+  return strstr(line, "[never]") == NULL;
+}
+
+static long thp_check(void) {
+  if (!thp_available()) {
+    printf("arena huge pages: THP disabled on this kernel; skipped [OK]\n");
+    return 1;
+  }
+  gk_arena *a = gk_arena_create(16UL << 20);
+  if (!a) { printf("arena huge pages: no arena [FAIL]\n"); return 0; }
+  unsigned char *base = gk_arena_base(a);
+  // Each range is measured as the VMAs inside it, so the ranges are kept
+  // apart by uncommitted memory, which never merges with them.
+  struct thp_range whole = {base + (2UL << 20), 4UL << 20};   // aligned 4MB, in one piece
+  struct thp_range first = {base + (2UL << 20), 2UL << 20};   // its first half
+  struct thp_range apart = {base + (8UL << 20), 2UL << 20};   // an aligned 2MB on its own
+  struct thp_range small = {base + (12UL << 20), 256UL << 10}; // a V8 heap chunk's worth
+  int hg1, hg7;
+  gk_arena_enter(a);
+  long n1 = gk_run_user(thp_commit_touch, &whole);
+  long kb1 = anon_huge_kb((uintptr_t)whole.base, (uintptr_t)whole.base + whole.len, &hg1);
+  // Decommitted from the guest: the fixed mmap is forwarded, the recommit
+  // re-advises.
+  long d = gk_run_user(thp_decommit, &first);
+  long kb2 = anon_huge_kb((uintptr_t)first.base, (uintptr_t)first.base + first.len, NULL);
+  long n3 = gk_run_user(thp_commit_touch, &first);
+  long kb3 = anon_huge_kb((uintptr_t)first.base, (uintptr_t)first.base + first.len, NULL);
+  // Decommitted from the host, by a thread outside the guest (V8's background
+  // sweeper): gk sees nothing of it, so the guest's recommit must re-advise.
+  long n4 = gk_run_user(thp_commit_touch, &apart);
+  long kb4 = anon_huge_kb((uintptr_t)apart.base, (uintptr_t)apart.base + apart.len, NULL);
+  long dh = thp_decommit(&apart);
+  long kb5 = anon_huge_kb((uintptr_t)apart.base, (uintptr_t)apart.base + apart.len, NULL);
+  long n6 = gk_run_user(thp_commit_touch, &apart);
+  long kb6 = anon_huge_kb((uintptr_t)apart.base, (uintptr_t)apart.base + apart.len, NULL);
+  // A small commit: below GK_THP_MIN, so neither advised nor huge.
+  long n7 = gk_run_user(thp_commit_touch, &small);
+  long kb7 = anon_huge_kb((uintptr_t)small.base, (uintptr_t)small.base + small.len, &hg7);
+  gk_arena_enter(NULL);
+  gk_arena_destroy(a);
+  // The kernel may fail to find a free 2MB page (fragmentation), so one huge
+  // page in the 4MB is enough to prove the backing is eligible.
+  int ok = n1 == 1024 && kb1 >= 2048 && hg1 && d == 0 && kb2 == 0 && n3 == 512 &&
+           kb3 == 2048 && n4 == 512 && kb4 == 2048 && dh == 0 && kb5 == 0 && n6 == 512 &&
+           kb6 == 2048 && n7 == 64 && kb7 == 0 && !hg7;
+  printf("arena huge pages: 4MB committed and touched from ring 3 -> %ld pages, AnonHugePages "
+         "%ld kB, advised %s; its first 2MB decommitted by a guest fixed mmap -> %ld, %ld kB, "
+         "recommitted and touched -> %ld pages, %ld kB; a 2MB apart touched -> %ld pages, "
+         "%ld kB, decommitted by a host fixed mmap -> %ld, %ld kB, recommitted and touched -> "
+         "%ld pages, %ld kB; a 256KB commit touched -> %ld pages, %ld kB, advised %s [%s]\n",
+         n1, kb1, hg1 ? "yes" : "no", d, kb2, n3, kb3, n4, kb4, dh, kb5, n6, kb6, n7, kb7,
+         hg7 ? "yes" : "no", ok ? "OK" : "FAIL");
+  return ok;
+}
+
 // ---- guest ring-3 privilege split -------------------------------------------
 // gk_run_user runs fn at guest ring 3. Untrusted code runs there so that even
 // arbitrary code execution cannot breach the arena walls: ring-3 code cannot
@@ -2012,9 +2128,15 @@ int main(void) {
   // like one allocated in the guest (see host_key_check).
   int ok22 = host_key_check() == 1;
 
+  // ---- transparent huge pages behind an arena --------------------------------
+  // A range committed in one piece is host-backed by 2MB pages on its first
+  // touch from the guest, and stays eligible across a V8-style decommit and
+  // recommit (see thp_check).
+  int ok23 = thp_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
-            ok22;
+            ok22 && ok23;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }
