@@ -14,6 +14,7 @@
 #include <workerd/util/batch-queue.h>
 #include <workerd/util/strong-bool.h>
 
+#include <v8-platform.h>
 #include <v8-profiler.h>
 
 #include <kj/map.h>
@@ -95,11 +96,163 @@ class V8System {
       JitCodeEventTracking);
 };
 
+// Whether experimental guest-kernel isolation (experimental/guest-kernel/gk.h) is enabled for
+// this process: the build links gk (WORKERD_HAS_GUEST_KERNEL) and the environment variable
+// WORKERD_EXPERIMENTAL_GUEST_KERNEL is set. Whoever enables it is responsible for calling
+// gk_init() before any isolate is created. Always false where gk is not built in.
+bool isGuestKernelEnabled();
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+// A v8::PageAllocator that hands out pages from a fixed address range that is already reserved
+// as inaccessible (PROT_NONE) anonymous memory and stays reserved for the allocator's lifetime:
+// the unused tail of a guest-kernel arena (see GuestArena). V8 uses one per isolate group for
+// the memory it keeps outside of the sandbox -- the trusted range, the code range, the
+// isolate's pointer tables and the cppgc heap (v8::IsolateGroup::CreateParams::page_allocator
+// and v8::CppHeapCreateParams::page_allocator) -- so that those live in the isolate's arena
+// too.
+//
+// Allocation is a first-fit search of a sorted free list of address ranges; V8's placement
+// hints are ignored, the requested alignment is honored. Pages are made accessible or
+// inaccessible in place with mprotect(), discarded with madvise(MADV_DONTNEED), and returned
+// to the reservation state by mapping fresh anonymous PROT_NONE memory over them (as V8's own
+// DecommitPages() does), which also undoes a file-backed remap V8 may have placed in the range
+// (it remaps the embedded builtins into the code range). Every method is safe to call from
+// any thread: V8 allocates and changes permissions from its background threads too.
+class ArenaPageAllocator final: public v8::PageAllocator {
+ public:
+  // Manages [begin, end), which must be page-aligned and reserved as described above.
+  ArenaPageAllocator(uintptr_t begin, uintptr_t end);
+  // v8::PageAllocator's destructor is noexcept, which the KJ members' destructors are not.
+  ~ArenaPageAllocator() noexcept override {}
+  KJ_DISALLOW_COPY_AND_MOVE(ArenaPageAllocator);
+
+  uintptr_t begin() const {
+    return rangeBegin;
+  }
+  uintptr_t end() const {
+    return rangeEnd;
+  }
+  bool contains(const void* p) const {
+    auto addr = reinterpret_cast<uintptr_t>(p);
+    return addr >= rangeBegin && addr < rangeEnd;
+  }
+
+  // v8::PageAllocator implementation.
+  size_t AllocatePageSize() override;
+  size_t CommitPageSize() override;
+  void SetRandomMmapSeed(int64_t seed) override;
+  void* GetRandomMmapAddr() override;
+  void* AllocatePages(void* hint, size_t length, size_t alignment, Permission permissions) override;
+  bool FreePages(void* address, size_t length) override;
+  bool ReleasePages(void* address, size_t length, size_t newLength) override;
+  bool SetPermissions(void* address, size_t length, Permission permissions) override;
+  bool RecommitPages(void* address, size_t length, Permission permissions) override;
+  bool DiscardSystemPages(void* address, size_t length) override;
+  bool DecommitPages(void* address, size_t length) override;
+
+ private:
+  struct Range {
+    uintptr_t begin;
+    uintptr_t end;
+  };
+
+  const uintptr_t rangeBegin;
+  const uintptr_t rangeEnd;
+  // The free ranges, sorted by address, pairwise disjoint and never adjacent (adjacent ranges
+  // are merged when one is freed).
+  kj::MutexGuarded<kj::Vector<Range>> freeList;
+
+  // Removes an aligned sub-range of `length` bytes from the free list and returns its start,
+  // or 0 if no free range can hold it.
+  uintptr_t take(size_t length, size_t alignment);
+  // Returns [begin, end) to the free list, merging it with adjacent free ranges. The range must
+  // have been taken and not yet returned.
+  void give(uintptr_t begin, uintptr_t end);
+  // Maps fresh inaccessible anonymous memory over [address, address + length), which must lie
+  // in the allocator's range.
+  bool decommit(void* address, size_t length);
+  void checkRange(const void* address, size_t length) const;
+};
+#endif  // WORKERD_HAS_GUEST_KERNEL
+
+// A private guest-kernel memory arena holding one isolate group's V8 sandbox. The arena is a
+// PROT_NONE reservation with its own guest page-table root: while it is a thread's active arena
+// (see GuestArenaScope, entered by jsg::Lock), guest execution on that thread can address the
+// sandbox placed in it, and while any other arena (or none) is active, that sandbox is unmapped
+// and unaddressable, enforced by the hardware.
+//
+// gk reserves arenas in whole 512 GiB page-table slots, so the reservation extends past the
+// requested size to the end of the last slot. That tail is arena memory like the rest, only
+// not part of the sandbox; it is handed to V8 through an ArenaPageAllocator for the group's
+// out-of-sandbox memory (trusted range, code range, pointer tables, cppgc heap), which thereby
+// gets the same hardware isolation as the sandbox.
+//
+// The arena must outlive the isolate group placed in it: V8 adopts the reservation for the
+// group's sandbox and, on teardown, decommits inside it but never unmaps it; destroying the
+// arena releases the reservation. The page allocator lives as long as the arena, as
+// v8::IsolateGroup::CreateParams::page_allocator requires.
+class GuestArena final {
+ public:
+  // Takes ownership of `arena`, which must have been created by gk_arena_create().
+  explicit GuestArena(gk_arena* arena);
+  ~GuestArena() noexcept(false);
+  KJ_DISALLOW_COPY_AND_MOVE(GuestArena);
+
+  gk_arena* get() const {
+    return arena;
+  }
+  // The sandbox part of the arena's reservation, [base(), base() + size()).
+  void* base() const;
+  size_t size() const;
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  // The allocator over the arena's tail, [base() + size(), end of the reservation).
+  ArenaPageAllocator& getPageAllocator() {
+    return *pageAllocator;
+  }
+#endif
+
+ private:
+  gk_arena* arena;
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  kj::Own<ArenaPageAllocator> pageAllocator;
+#endif
+};
+
+// Where a new isolate lives: its v8::IsolateGroup and, when guest-kernel isolation is enabled,
+// the arena holding that group's sandbox (see newIsolateGroup()). Converts implicitly from a
+// bare v8::IsolateGroup for callers that place an isolate in an existing group without an arena.
+struct IsolatePlacement {
+  v8::IsolateGroup group;
+  kj::Maybe<kj::Own<GuestArena>> arena;
+
+  IsolatePlacement(v8::IsolateGroup group): group(kj::mv(group)) {}
+  IsolatePlacement(v8::IsolateGroup group, kj::Own<GuestArena> arena)
+      : group(kj::mv(group)),
+        arena(kj::mv(arena)) {}
+};
+
+// Creates the isolate group for a new isolate. With guest-kernel isolation enabled this is a
+// fresh group whose sandbox is placed in a new private arena and whose out-of-sandbox memory
+// (trusted range, code range) is allocated from that arena's tail, so that the isolate's memory
+// is unaddressable from any other isolate's guest execution. Otherwise it is the default group,
+// shared by all isolates, exactly as when gk is not built in.
+IsolatePlacement newIsolateGroup();
+
 // Base class of Isolate<T> containing parts that don't need to be templated, to avoid code
 // bloat.
 class IsolateBase {
  public:
   static IsolateBase& from(v8::Isolate* isolate);
+
+  // The guest-kernel arena holding this isolate's sandbox and out-of-sandbox memory, if
+  // guest-kernel isolation is enabled.
+  kj::Maybe<GuestArena&> getGuestArena() {
+    KJ_IF_SOME(a, guestArena) {
+      return *a;
+    }
+    return kj::none;
+  }
 
   // Unwraps a JavaScript exception as a kj::Exception.
   virtual kj::Exception unwrapException(
@@ -431,6 +584,10 @@ class IsolateBase {
   using Item = kj::OneOf<GlobalToDelete, RefToDelete, kj::Own<void>>;
 
   V8System& v8System;
+  // Declared before the CppHeap and the isolate so that it is destroyed after the isolate (and
+  // with it the CppHeap and the isolate group, whose memory the arena holds) has been disposed;
+  // see GuestArena.
+  kj::Maybe<kj::Own<GuestArena>> guestArena;
   // TODO(cleanup): After v8 13.4 is fully released we can inline this into `newIsolate`
   //                and remove this member.
   std::unique_ptr<class v8::CppHeap> cppHeap;
@@ -585,7 +742,7 @@ class IsolateBase {
       v8::Isolate::CreateParams&& createParams,
       kj::Own<IsolateObserver> observer,
       kj::Own<ExternalStringAllocator> externalStringAllocator,
-      v8::IsolateGroup group);
+      IsolatePlacement placement);
   ~IsolateBase() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(IsolateBase);
 
@@ -701,17 +858,18 @@ class Isolate: public IsolateBase {
   // and should be instantiated with `instantiateTypeWrapper` before `newContext` is called on
   // a jsg::Lock of this Isolate.
   //
-  // If using v8 sandboxing, the group argument controls which isolates share a
+  // If using v8 sandboxing, the placement's group controls which isolates share a
   // sandbox, and which are isolated (as much as possible) in the event of a
   // heap corruption attack. Note: The isolates in a group are limited to at
   // most 4Gbytes of V8 heap in all.  Groups can be created with
   // v8::IsolateGroup::Create().  (If using V8 pointer compression, this
   // requires the enable_pointer_compression_multiple_cages build flag for V8.)
-  // Pass v8::IsolateGroup::Default() as the group to put all isolates in the
-  // same group.
+  // Pass v8::IsolateGroup::Default() as the placement to put all isolates in the
+  // same group, or jsg::newIsolateGroup() to place the isolate as the process's
+  // isolation settings dictate.
   template <typename MetaConfiguration>
   explicit Isolate(V8System& system,
-      v8::IsolateGroup group,
+      IsolatePlacement placement,
       MetaConfiguration&& configuration,
       kj::Own<IsolateObserver> observer,
       kj::Own<ExternalStringAllocator> externalStringAllocator = defaultExternalStringAllocator(),
@@ -721,7 +879,7 @@ class Isolate: public IsolateBase {
             kj::mv(createParams),
             kj::mv(observer),
             kj::mv(externalStringAllocator),
-            group) {
+            kj::mv(placement)) {
     wrappers.resize(1);
     registerTypeHandlers();
     if (instantiateTypeWrapper) {

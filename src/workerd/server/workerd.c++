@@ -5,6 +5,9 @@
 #include "server.h"
 
 #include <workerd/api/unsafe.h>
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <workerd/experimental/guest-kernel/gk.h>
+#endif
 #include <workerd/io/compatibility-date.capnp.h>
 #include <workerd/io/compatibility-date.h>
 #include <workerd/io/release-version.embed.h>
@@ -23,6 +26,9 @@
 #ifdef __linux__
 #include <sys/mman.h>
 #include <sys/stat.h>
+#endif
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <sys/syscall.h>
 #endif
 
 #include <capnp/dynamic.h>
@@ -90,6 +96,100 @@ void initSignalHandlers() {
 
 namespace workerd::server {
 namespace {
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+// Syscall allowlist for JS turns that run inside the guest kernel. gk forwards
+// every syscall the guest makes to the host; this filter bounds that to what
+// V8 and the runtime need during a turn, and everything else fails with EPERM
+// in the guest (an escaped ring-3 isolate then cannot open files, exec, ptrace,
+// and so on). Runs on gk's syscall-forward path, so it must not allocate.
+//
+// Adapted from Deno Deploy's V8 seccomp allowlist (x86_64 set).
+// TODO: see if this can be tightened further.
+int guestKernelSyscallFilter(long nr, long, long, long, long, long, long) {
+#ifndef SYS_clone3
+  constexpr long SYS_clone3 = 435;
+#endif
+#ifndef SYS_rseq
+  constexpr long SYS_rseq = 334;
+#endif
+  switch (nr) {
+    case SYS_accept4:
+    case SYS_access:
+    case SYS_bind:
+    case SYS_brk:
+    case SYS_clock_gettime:
+    case SYS_clock_nanosleep:
+    case SYS_clone:
+    case SYS_clone3:
+    case SYS_close:
+    case SYS_connect:
+    case SYS_epoll_create1:
+    case SYS_epoll_ctl:
+    case SYS_epoll_wait:
+    case SYS_eventfd:
+    case SYS_eventfd2:
+    case SYS_exit_group:
+    case SYS_exit:
+    case SYS_fcntl:
+    case SYS_fstat:
+    case SYS_futex:
+    case SYS_getpeername:
+    case SYS_getpid:
+    case SYS_getrandom:
+    case SYS_getrusage:
+    case SYS_getsockname:
+    case SYS_getsockopt:
+    case SYS_gettid:
+    case SYS_ioctl:
+    case SYS_lseek:
+    case SYS_madvise:
+    case SYS_mmap:
+    case SYS_mprotect:
+    case SYS_mremap:
+    case SYS_munmap:
+    case SYS_newfstatat:
+    case SYS_openat:
+    case SYS_pkey_mprotect:
+    case SYS_poll:
+    case SYS_prctl:
+    case SYS_prlimit64:
+    case SYS_pwrite64:
+    case SYS_read:
+    case SYS_recvfrom:
+    case SYS_recvmsg:
+    case SYS_rename:
+    case SYS_rseq:
+    case SYS_rt_sigaction:
+    case SYS_rt_sigprocmask:
+    case SYS_rt_sigreturn:
+    case SYS_sched_getaffinity:
+    case SYS_sched_yield:
+    case SYS_sched_getparam:
+    case SYS_sched_getscheduler:
+    case SYS_sendmmsg:
+    case SYS_sendmsg:
+    case SYS_sendto:
+    case SYS_set_robust_list:
+    case SYS_setsockopt:
+    case SYS_shutdown:
+    case SYS_sigaltstack:
+    case SYS_socket:
+    case SYS_stat:
+    case SYS_statx:
+    case SYS_restart_syscall:
+    case SYS_tgkill:
+    case SYS_uname:
+    case SYS_write:
+    case SYS_writev:
+    case SYS_getcwd:
+    case SYS_readlink:
+      return 1;
+    default:
+      return 0;
+  }
+}
+#endif
 
 static kj::StringPtr getVersionString() {
   static const kj::String result = kj::str("workerd ", RELEASE_VERSION);
@@ -1218,6 +1318,18 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
                               : config.getStructuredLogging()) {
         context.enableStructuredLogging();
       }
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+      // Experimental: run isolate code inside a KVM guest (guest ring 0). Must
+      // happen before the V8 platform starts its worker threads and before
+      // V8::Initialize reserves the sandbox/cage. Off unless the env var is set.
+      if (getenv("WORKERD_EXPERIMENTAL_GUEST_KERNEL") != nullptr) {
+        KJ_REQUIRE(gk_init() >= 0, "guest-kernel: gk_init() failed",
+            kj::StringPtr(gk_last_error() != nullptr ? gk_last_error() : "unknown"));
+        gk_set_syscall_filter(&guestKernelSyscallFilter);
+        KJ_LOG(WARNING, "guest-kernel isolation enabled (experimental)");
+      }
+#endif
 
       auto platform = jsg::defaultPlatform(0);
       WorkerdPlatform v8Platform(*platform);

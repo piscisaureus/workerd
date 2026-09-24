@@ -1,0 +1,49 @@
+load("@bazel_skylib//lib:selects.bzl", "selects")
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+# gk: run a process inside a KVM guest as guest ring 0 (see README.md). The
+# library is x86-64 Linux only (it needs /dev/kvm and hand-written long-mode
+# entry code), so it is gated with target_compatible_with. Embedders add it to
+# their deps through the :is_linux_x86_64 select below, which drops it (and the
+# WORKERD_HAS_GUEST_KERNEL define) on every other platform.
+#
+# The standalone Makefile still builds gk + gk_test directly (see README.md);
+# this cc_library is for linking gk into the workerd binary.
+
+# True only on the platform gk supports; used by embedders to select the dep.
+selects.config_setting_group(
+    name = "is_linux_x86_64",
+    match_all = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "guest-kernel",
+    srcs = [
+        "gk.c",
+        "gk_asm.S",
+    ],
+    hdrs = ["gk.h"],
+    # The guest-entry code and anything that runs inside the guest must not carry
+    # a stack canary (it reads a TLS slot the guest has not set up) or CET endbr
+    # markers, and must build without them for the whole library since gk_run's
+    # callee runs in the guest.
+    copts = [
+        "-fno-stack-protector",
+        "-fcf-protection=none",
+    ],
+    # Let a dependent gate the gk_init() call site: the define is present only
+    # when this library is actually linked in (via the :is_linux_x86_64 select).
+    defines = ["WORKERD_HAS_GUEST_KERNEL=1"],
+    # Expose the header as <workerd/experimental/guest-kernel/gk.h>, matching the
+    # rest of the tree.
+    strip_include_prefix = "/src",
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    visibility = ["//visibility:public"],
+)

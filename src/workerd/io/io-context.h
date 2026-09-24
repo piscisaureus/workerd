@@ -1432,20 +1432,45 @@ kj::PromiseForResult<Func, Worker::Lock&> IoContext::runSingle(
 
     using Result = decltype(func(kj::instance<Worker::Lock&>()));
 
+    // Under the guest-kernel host-frame wall (see IoContext::runJsTurn / gk.h), run() executes at
+    // guest ring 3 and the RunnableImpl, on the caller's stack above the guest boundary, is
+    // read-only for the turn. The callable writes to its own closure as it runs -- awaitIo's
+    // continuation is a mutable lambda that moves its captures (the resolver, the I/O result)
+    // out -- and a non-void result has to be stored somewhere, so neither may live in this frame.
+    // Hold both on the C++ heap (a KEEP/RW mapping, outside the wall) and read the result back
+    // host-side after the turn returns.
     if constexpr (kj::isSameType<Result, void>()) {
       struct RunnableImpl: public Runnable {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+        kj::Own<kj::Decay<Func>> func;
+
+        RunnableImpl(Func&& func): func(kj::heap<kj::Decay<Func>>(kj::fwd<Func>(func))) {}
+        void run(Worker::Lock& lock) override {
+          (*func)(lock);
+        }
+#else
         Func func;
 
         RunnableImpl(Func&& func): func(kj::fwd<Func>(func)) {}
         void run(Worker::Lock& lock) override {
           func(lock);
         }
+#endif
       };
 
       RunnableImpl runnable(kj::fwd<Func>(func));
       runImpl(runnable, lock, kj::mv(inputLock), Runnable::Exceptional(false));
     } else {
       struct RunnableImpl: public Runnable {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+        kj::Own<kj::Decay<Func>> func;
+        kj::Own<kj::Maybe<Result>> result = kj::heap<kj::Maybe<Result>>();
+
+        RunnableImpl(Func&& func): func(kj::heap<kj::Decay<Func>>(kj::fwd<Func>(func))) {}
+        void run(Worker::Lock& lock) override {
+          *result = (*func)(lock);
+        }
+#else
         Func func;
         kj::Maybe<Result> result;
 
@@ -1453,11 +1478,16 @@ kj::PromiseForResult<Func, Worker::Lock&> IoContext::runSingle(
         void run(Worker::Lock& lock) override {
           result = func(lock);
         }
+#endif
       };
 
       RunnableImpl runnable{kj::fwd<Func>(func)};
       runImpl(runnable, lock, kj::mv(inputLock), Runnable::Exceptional(false));
+#ifdef WORKERD_HAS_GUEST_KERNEL
+      KJ_IF_SOME(r, *runnable.result) {
+#else
       KJ_IF_SOME(r, runnable.result) {
+#endif
         return kj::mv(r);
       } else {
         KJ_UNREACHABLE;

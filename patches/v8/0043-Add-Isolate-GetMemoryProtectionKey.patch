@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Tue, 22 Sep 2026 12:00:00 +0000
+Subject: Add Isolate::GetMemoryProtectionKey
+
+Expose the memory protection key used for in-sandbox memory so that an
+embedder can grant a thread access to sandbox memory (for example an
+ArrayBuffer backing store) while it is not running inside V8. Returns
+-1 when sandbox hardware support is unavailable.
+
+diff --git a/include/v8-isolate.h b/include/v8-isolate.h
+--- a/include/v8-isolate.h
++++ b/include/v8-isolate.h
+@@ -727,6 +727,15 @@
+   IsolateGroup GetGroup() const;
+ 
+   /**
++   * Returns the memory protection key (pkey) that V8 uses for memory inside
++   * the sandbox, or -1 if sandbox hardware support is not compiled in or not
++   * active. Embedders that need to access sandbox memory (such as ArrayBuffer
++   * backing stores) from a thread that is not currently running inside V8 can
++   * use this key with pkey_set() to obtain access.
++   */
++  int GetMemoryProtectionKey() const;
++
++  /**
+    * Initialize an Isolate previously allocated by Isolate::Allocate().
+    */
+   static void Initialize(Isolate* isolate, const CreateParams& params);
+diff --git a/src/api/api.cc b/src/api/api.cc
+--- a/src/api/api.cc
++++ b/src/api/api.cc
+@@ -142,6 +142,7 @@
+ #include "src/roots/static-roots.h"
+ #include "src/runtime/runtime.h"
+ #include "src/sandbox/external-pointer.h"
++#include "src/sandbox/hardware-support.h"
+ #include "src/sandbox/isolate.h"
+ #include "src/sandbox/sandbox.h"
+ #include "src/snapshot/code-serializer.h"
+@@ -10207,6 +10208,14 @@
+   return IsolateGroup(i_isolate->isolate_group()->Acquire());
+ }
+ 
++int Isolate::GetMemoryProtectionKey() const {
++#ifdef V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
++  return i::SandboxHardwareSupport::SandboxPkey();
++#else
++  return -1;
++#endif
++}
++
+ Isolate::CreateParams::CreateParams() = default;
+ 
+ Isolate::CreateParams::~CreateParams() = default;

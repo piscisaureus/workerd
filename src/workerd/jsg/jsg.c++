@@ -12,6 +12,10 @@
 #include <workerd/jsg/util.h>
 #include <workerd/util/thread-scopes.h>
 
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <workerd/experimental/guest-kernel/gk.h>
+#endif
+
 #ifdef V8_ENABLE_SANDBOX
 #include <sys/mman.h>
 #endif
@@ -138,10 +142,28 @@ void Data::moveFromTraced(Data& other, v8::TracedReference<v8::Data>& otherTrace
   other.tracedHandle = kj::none;
 }
 
+GuestArenaScope::GuestArenaScope(v8::Isolate* isolate) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  KJ_IF_SOME(arena, IsolateBase::from(isolate).getGuestArena()) {
+    previous = gk_arena_enter(arena.get());
+    entered = true;
+  }
+#endif
+}
+
+GuestArenaScope::~GuestArenaScope() noexcept(false) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (entered) {
+    gk_arena_enter(previous);
+  }
+#endif
+}
+
 Lock::Lock(v8::Isolate* v8Isolate)
     : v8Isolate(v8Isolate),
       locker(v8Isolate),
       isolateScope(v8Isolate),
+      guestArenaScope(v8Isolate),
       previousData(v8Isolate->GetData(SET_DATA_LOCK)),
       warningsLogged(IsolateBase::from(v8Isolate).areWarningsLogged()) {
   if (previousData != nullptr) {
@@ -667,20 +689,20 @@ void ContextGlobal::setSchemaLoader(const capnp::SchemaLoader& schemaLoader) {
 }
 
 #ifdef V8_ENABLE_SANDBOX
-// These are disabled by default in workerd. We do not build workerd with
-// the V8_ENABLED_SANDBOX flag. If we do decide to enable it, we will need
-// additional setup to ensure that these are handled correctly on all platforms.
-// For now, keeping it simple. This bit will only be used in the internal
-// project.
+// V8 reports -1 as the key when sandbox hardware support (memory protection keys) is not
+// compiled in or not active; in that case there is nothing to switch and the scope is a no-op.
 static constexpr int kPkeyNoRestrictions = 0;
+static constexpr int kNoPkey = -1;
 MemoryProtectionKeyScope::MemoryProtectionKeyScope(Lock& js)
     : pkey(js.v8Isolate->GetMemoryProtectionKey()) {}
 
-MemoryProtectionKeyScope::PkeyScope::PkeyScope(int pkey): key(pkey), saved(pkey_get(key)) {
-  pkey_set(pkey, kPkeyNoRestrictions);
+MemoryProtectionKeyScope::PkeyScope::PkeyScope(int pkey)
+    : key(pkey),
+      saved(key == kNoPkey ? kPkeyNoRestrictions : pkey_get(key)) {
+  if (key != kNoPkey) pkey_set(key, kPkeyNoRestrictions);
 }
 MemoryProtectionKeyScope::PkeyScope::~PkeyScope() {
-  pkey_set(key, saved);
+  if (key != kNoPkey) pkey_set(key, saved);
 }
 #endif
 

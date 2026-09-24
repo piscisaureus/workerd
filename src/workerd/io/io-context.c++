@@ -8,6 +8,7 @@
 #include <workerd/io/io-gate.h>
 #include <workerd/io/tracer.h>
 #include <workerd/io/worker.h>
+#include <workerd/jsg/guest-run.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/setup.h>
 #include <workerd/util/autogate.h>
@@ -485,9 +486,11 @@ void IoContext::logUncaughtException(
 
 void IoContext::logUncaughtExceptionAsync(
     UncaughtExceptionSource source, kj::Exception&& exception) {
-  if (getWorkerTracer() == kj::none && !worker->getIsolate().isInspectorEnabled()) {
-    // We don't need to take the isolate lock as neither inspecting nor tracing is enabled. We
-    // do still want to syslog if relevant, but we can do that without a lock.
+  if ((getWorkerTracer() == kj::none && !worker->getIsolate().isInspectorEnabled()) ||
+      worker->getIsolate().isCondemned()) {
+    // We don't need to take the isolate lock as neither inspecting nor tracing is enabled (or the
+    // isolate is condemned and must not be entered again, not even to report to them). We do
+    // still want to syslog if relevant, but we can do that without a lock.
     if (!jsg::isTunneledException(exception.getDescription()) &&
         !jsg::isDoNotLogException(exception.getDescription()) &&
         // TODO(soon): Figure out why client disconnects are getting logged here if we don't
@@ -502,6 +505,22 @@ void IoContext::logUncaughtExceptionAsync(
 
   struct RunnableImpl: public Runnable {
     UncaughtExceptionSource source;
+#ifdef WORKERD_HAS_GUEST_KERNEL
+    // Under the guest-kernel host-frame wall (see runJsTurn / gk.h), run() executes at guest
+    // ring 3 and this RunnableImpl, on the caller's stack above the guest boundary, is read-only
+    // for the turn. logUncaughtException() moves the exception out, which writes to the
+    // moved-from object; keep it on the C++ heap (a KEEP/RW mapping, outside the wall) so that
+    // write does not land on the walled stack.
+    kj::Own<kj::Exception> exception;
+
+    RunnableImpl(UncaughtExceptionSource source, kj::Exception&& exception)
+        : source(source),
+          exception(kj::heap<kj::Exception>(kj::mv(exception))) {}
+    void run(Worker::Lock& lock) override {
+      // TODO(soon): Add logUncaughtException to jsg::Lock.
+      lock.logUncaughtException(source, kj::mv(*exception));
+    }
+#else
     kj::Exception exception;
 
     RunnableImpl(UncaughtExceptionSource source, kj::Exception&& exception)
@@ -511,6 +530,7 @@ void IoContext::logUncaughtExceptionAsync(
       // TODO(soon): Add logUncaughtException to jsg::Lock.
       lock.logUncaughtException(source, kj::mv(exception));
     }
+#endif
   };
 
   // Make sure this is logged even if another exception occurs trying to log it to the devtools inspector,
@@ -1422,6 +1442,25 @@ void IoContext::runInContextScope(Worker::LockType lockType,
   });
 }
 
+namespace {
+
+// Run one JS turn for `context` on its locked worker, inside the guest kernel when it is enabled
+// and directly otherwise (see jsg::runInGuest).
+template <typename Func>
+void runJsTurn(IoContext& context, Worker::Lock& workerLock, Func&& body) {
+  jsg::runInGuest(workerLock, body, [&](const kj::Exception& e) {
+    // The turn faulted inside the guest. Condemn the isolate so no further JS turn is run on it
+    // -- while this thread still holds the isolate lock (`workerLock`), so a thread waiting for
+    // the lock finds the isolate condemned as soon as it acquires it -- and abort this request's
+    // IoContext so its pending work is cancelled instead of re-entering the isolate. The
+    // exception then fails the current request.
+    workerLock.getWorker().getIsolate().condemn(e.clone());
+    context.abort(e.clone());
+  });
+}
+
+}  // namespace
+
 void IoContext::runImpl(Runnable& runnable,
     Worker::LockType lockType,
     kj::Maybe<InputGate::Lock> inputLock,
@@ -1430,9 +1469,19 @@ void IoContext::runImpl(Runnable& runnable,
     KJ_REQUIRE(l.isFor(KJ_ASSERT_NONNULL(actor).getInputGate()));
   }
 
+  // A condemned isolate (see Worker::Isolate::condemn()) must not run JS again, so refuse the
+  // turn before runInContextScope() even tries to lock it. This is only a fast-fail: the isolate
+  // may still be condemned by the thread holding the lock while this one waits for it, which is
+  // caught by the authoritative check the lock itself performs once it is held. Exceptional
+  // turns, which only exist to report an exception to the inspector or tracer, are refused the
+  // same way; logUncaughtExceptionAsync() skips them for a condemned isolate before getting here.
+  worker->getIsolate().requireNotCondemned();
+
   getIoChannelFactory().getTimer().syncTime();
 
-  runInContextScope(lockType, kj::mv(inputLock), [&](Worker::Lock& workerLock) {
+  // One JS turn: the runnable plus the microtask / message-loop draining that must follow it,
+  // all under the isolate lock and inside the context scope.
+  auto turn = [&](Worker::Lock& workerLock) {
     kj::Own<void> event;
     if (!exceptional) {
       workerLock.requireNoPermanentException();
@@ -1579,7 +1628,10 @@ void IoContext::runImpl(Runnable& runnable,
         }
       }
     }
-  });
+  };
+
+  runInContextScope(lockType, kj::mv(inputLock),
+      [&](Worker::Lock& workerLock) { runJsTurn(*this, workerLock, [&]() { turn(workerLock); }); });
 }
 
 static constexpr auto kAsyncIoErrorMessage =

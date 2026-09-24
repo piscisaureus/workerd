@@ -30,6 +30,7 @@
 #include <workerd/io/tracer.h>
 #include <workerd/jsg/async-context.h>
 #include <workerd/jsg/ser.h>
+#include <workerd/jsg/setup.h>
 #include <workerd/jsg/util.h>
 #include <workerd/util/sentry.h>
 #include <workerd/util/stream-utils.h>
@@ -304,6 +305,26 @@ kj::Promise<void> ServiceWorkerGlobalScope::connectUdp(kj::String host,
   JSG_FAIL_REQUIRE(Error, "Handler does not export a connect() function.");
 }
 
+namespace {
+
+// Test-only hook for the experimental guest kernel's fault path. With the guest kernel enabled
+// and WORKERD_GK_TEST_FAULT set, a request whose path is /__gk_fault dereferences a null pointer
+// from inside the JS turn. At guest ring 3 that is a page fault the guest cannot service, so
+// gk_run_here_user() returns GK_EFAULT to IoContext::runImpl (see runJsTurn there), which must
+// fail the request, condemn the isolate and keep the process serving. Both gates are required: a
+// production process (no WORKERD_GK_TEST_FAULT) never takes this branch, and neither does one
+// running without the guest kernel, where the dereference would be a host-side SIGSEGV.
+void maybeForceGuestFaultForTest(kj::StringPtr url) {
+  static const bool enabled =
+      jsg::isGuestKernelEnabled() && getenv("WORKERD_GK_TEST_FAULT") != nullptr;
+  if (enabled && url.endsWith("/__gk_fault")) {
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_FAULT: forcing a guest fault for this request", url);
+    *static_cast<volatile int*>(nullptr) = 0;
+  }
+}
+
+}  // namespace
+
 kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(kj::HttpMethod method,
     kj::StringPtr url,
     const kj::HttpHeaders& headers,
@@ -314,6 +335,7 @@ kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(kj::HttpMetho
     kj::Maybe<ExportedHandler&> exportedHandler,
     kj::Maybe<jsg::Ref<AbortSignal>> abortSignal) {
   TRACE_EVENT("workerd", "ServiceWorkerGlobalScope::request()");
+  maybeForceGuestFaultForTest(url);
   // To construct a ReadableStream object, we're supposed to pass in an Own<AsyncInputStream>, so
   // that it can drop the reference whenever it gets GC'ed. But in this case the stream's lifetime
   // is not under our control -- it's attached to the request. So, we wrap it in a

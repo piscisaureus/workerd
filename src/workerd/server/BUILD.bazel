@@ -84,7 +84,14 @@ wd_cc_binary(
         "@capnp-cpp//src/capnp:capnpc",
         "@capnp-cpp//src/kj:kj-async-core",
         "@capnp-cpp//src/kj:kj-async-io",
-    ],
+    ] + select({
+        # Experimental guest-kernel isolation is x86-64 Linux only; the dep and
+        # its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 # The link-time complement of build/rust_io_graph_check.sh: that query forbids dependency EDGES to
