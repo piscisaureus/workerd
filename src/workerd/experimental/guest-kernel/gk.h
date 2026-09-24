@@ -37,7 +37,9 @@ const char *gk_last_error(void);
 // the guest page tables, and the guest's own rdpkru/wrpkru (glibc's pkey_get/
 // pkey_set) act on the calling thread's vCPU PKRU, which the CPU enforces. A
 // thread enters the guest with the PKRU it has on the host; a thread created
-// inside the guest inherits its creator's.
+// inside the guest inherits its creator's. A pkey_mprotect from the guest may
+// use any key, including one pkey_alloc'ed on the host outside the guest; a
+// key gk cannot reflect fails with ENOMEM, never EINVAL.
 long gk_run(long (*fn)(void *), void *arg);
 
 // Like gk_run, but fn runs on the calling thread's own stack rather than on a

@@ -162,12 +162,16 @@ hardware:
   is left keyless (the `pkey_mprotect` reaches the host as a plain `mprotect`) so
   KVM's page backing never pkey-faults. A single switch (`GK_VIRTUALIZE_PKEYS`)
   turns the whole scheme off, since gk already isolates by page-table root and
-  does not depend on the keys for security. One exception: in workerd the
-  pointer tables live in the arena tail (V8 patch 0048) and are keyed by a
-  `pkey_mprotect` that V8 issues directly on the host during isolate
-  initialization, outside any guest entry, so gk never sees that call, does not
-  learn the key, and does not reflect it into the guest PTEs for those pages.
-  The tables are still isolated by the arena's page-table root; only the key is
+  does not depend on the keys for security. The keys themselves come from the
+  host: V8 allocates its sandbox, JIT and pointer-table keys at initialization,
+  outside any guest entry, so gk never sees those `pkey_alloc` calls and accepts
+  any key in a forwarded `pkey_mprotect` rather than only the ones it saw handed
+  out. A key it cannot reflect fails with `ENOMEM`, the one errno V8 tolerates
+  from `pkey_mprotect` (it aborts on any other). One gap remains: pages keyed by
+  a `pkey_mprotect` that V8 issues directly on the host, outside any guest entry
+  (in workerd, the pointer tables in the arena tail at isolate initialization,
+  V8 patch 0048), carry no key in the guest PTEs until the guest re-keys them.
+  Those pages are still isolated by the arena's page-table root; only the key is
   not virtualized for them.
 - **Guest on the caller's stack.** `gk_run(fn)` runs the guest on a private
   per-vCPU stack. `gk_run_here(fn)` instead runs it on the calling thread's own
@@ -268,9 +272,9 @@ The JIT works too, with V8's default configuration (no special flags): a
 JIT-optimized hot loop runs to the correct result across repeated runs. W^X plus
 mprotect reflection handles the code pages that flip between writable and
 executable, and the protection keys V8's sandbox assigns from inside the guest
-are virtualized into it (see the PKU point above, including the exception for
-the pointer tables, which are keyed from the host and so are isolated by the
-arena's root only), so the isolate runs with the sandbox enabled and its keys
+are virtualized into it (see the PKU point above, including the gap for pages
+keyed only from the host, which are isolated by the arena's root alone), so the
+isolate runs with the sandbox enabled and its keys
 honored, not stripped.
 
 V8 also runs **multi-threaded** now, with its default platform: the background

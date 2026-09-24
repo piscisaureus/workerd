@@ -337,13 +337,15 @@ static long pk_inherit(void *arg) {
   pthread_join(t, NULL);
   return (p->child_pkru >> (2 * p->key)) & 3;
 }
-// Unallocated keys are rejected as the kernel rejects them; the freed key's
-// page, reassigned the default key, is plainly accessible again.
+// A key nobody allocated is not refused with EINVAL: gk cannot tell it from
+// one the host allocated behind its back (see host_key_check), and a caller
+// like V8 aborts on any errno but ENOMEM. The freed key's page, reassigned the
+// default key, is plainly accessible again.
 static long pk_teardown(void *arg) {
   struct pk *p = arg;
   int bad = 15;
   while (bad > 0 && bad == p->key) bad--;
-  if (pkey_mprotect((void *)p->page, 4096, PROT_READ | PROT_WRITE, bad) == 0 || errno != EINVAL)
+  if (pkey_mprotect((void *)p->page, 4096, PROT_READ | PROT_WRITE, bad) != 0 && errno == EINVAL)
     return -1;
   if (pkey_mprotect((void *)p->page, 4096, PROT_READ | PROT_WRITE, 0) != 0) return -2;
   if (pkey_free(p->key) != 0) return -3;
@@ -351,6 +353,83 @@ static long pk_teardown(void *arg) {
   long v = p->page[0];
   munmap((void *)p->page, 4096);
   return v;
+}
+
+// ---- host-allocated keys ------------------------------------------------------
+// A key allocated on the host, outside any guest entry, is one gk never saw
+// handed out; workerd's V8 allocates its sandbox, JIT and pointer-table keys at
+// initialization this way and keys pages with them from inside a turn. Such a
+// pkey_mprotect must be virtualized like one whose pkey_alloc gk forwarded:
+// the call succeeds, the page carries the key in the guest PTEs, and the guest
+// PKRU decides the access. A key gk cannot reflect at all fails with ENOMEM,
+// the one errno a caller like V8 tolerates. Runs on a fresh thread, so that
+// the key exists before the thread's guest PKRU is first taken from its host
+// PKRU, as it does for workerd's request threads.
+struct hk {
+  int key;
+  volatile unsigned char *page;
+  long setup, read, denied, again, bad;
+  unsigned long fault;
+};
+
+static long hk_setup(void *arg) {
+  struct hk *h = arg;
+  h->page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (h->page == MAP_FAILED) return -1;
+  h->page[0] = 0x42;
+  if (pkey_mprotect((void *)h->page, 4096, PROT_READ | PROT_WRITE, h->key) != 0)
+    return -(100 + errno);
+  return 0;
+}
+static long hk_read(void *arg) { return ((struct hk *)arg)->page[0]; }
+static long hk_deny_read(void *arg) {
+  struct hk *h = arg;
+  pkey_set(h->key, PKEY_DISABLE_ACCESS);
+  return h->page[0];
+}
+static long hk_allow_read(void *arg) {
+  struct hk *h = arg;
+  pkey_set(h->key, 0);
+  return h->page[0];
+}
+// Keys outside the PTE field: ENOMEM, never EINVAL. Then the page gets the
+// default key back and goes away.
+static long hk_bad_keys(void *arg) {
+  struct hk *h = arg;
+  long r = 0;
+  if (pkey_mprotect((void *)h->page, 4096, PROT_READ | PROT_WRITE, 16) == 0 || errno != ENOMEM)
+    r |= 1;
+  if (pkey_mprotect((void *)h->page, 4096, PROT_READ | PROT_WRITE, -2) == 0 || errno != ENOMEM)
+    r |= 2;
+  if (pkey_mprotect((void *)h->page, 4096, PROT_READ | PROT_WRITE, 0) != 0) r |= 4;
+  munmap((void *)h->page, 4096);
+  return r;
+}
+static void *hk_thread(void *arg) {
+  struct hk *h = arg;
+  h->key = pkey_alloc(0, 0);  // on the host: no guest entry sees this
+  if (h->key <= 0) { h->setup = -99; return NULL; }
+  h->setup = gk_run(hk_setup, h);
+  h->read = gk_run(hk_read, h);
+  h->denied = gk_run(hk_deny_read, h);
+  h->fault = gk_fault_addr();
+  h->again = gk_run(hk_allow_read, h);
+  h->bad = gk_run(hk_bad_keys, h);
+  pkey_free(h->key);
+  return NULL;
+}
+static int host_key_check(void) {
+  struct hk h = {0};
+  pthread_t t;
+  if (pthread_create(&t, NULL, hk_thread, &h) != 0) return 0;
+  pthread_join(t, NULL);
+  int ok = h.setup == 0 && h.read == 0x42 && h.denied == GK_EFAULT &&
+           h.fault == (uintptr_t)h.page && h.again == 0x42 && h.bad == 0;
+  printf("host-allocated key: key %d, pkey_mprotect from the guest -> %ld, read=%#lx, "
+         "read with access disabled->%s, re-enabled=%#lx, keys outside 0..15 -> ENOMEM %s "
+         "[%s]\n", h.key, h.setup, h.read, h.denied == GK_EFAULT ? "FAULT" : "allowed",
+         h.again, h.bad == 0 ? "yes" : "no", ok ? "OK" : "FAIL");
+  return ok;
 }
 
 // ---- gk_run_here: the guest on the caller's stack ---------------------------
@@ -1919,8 +1998,14 @@ int main(void) {
   // arena and class boundaries hold (see neighborhood_check).
   int ok21 = neighborhood_check() == 1;
 
+  // ---- host-allocated protection keys ----------------------------------------
+  // A key pkey_alloc'ed on the host, unseen by gk, is virtualized and enforced
+  // like one allocated in the guest (see host_key_check).
+  int ok22 = host_key_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
-            ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21;
+            ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
+            ok22;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

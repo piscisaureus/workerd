@@ -330,9 +330,6 @@ struct gk_ctl {
   // Protection-key ranges (see the protection-keys section). Guarded by G->lock.
   gk_pkey_range pkeys[GK_MAX_PKEY_RANGES];
   int pkey_n;
-  // Keys the guest holds from pkey_alloc, as a bitmask; key 0 is always held.
-  // pkey_mprotect validates against this the way the kernel would (EINVAL).
-  unsigned pkeys_held;
 
   // A word for tests to read and write through the guest (gk_debug_ctl_addr).
   unsigned long debug_scratch;
@@ -1047,6 +1044,20 @@ static int region_ensure(uintptr_t s, uintptr_t e) {
 // (a fresh mapping has key 0), and pkey_free leaves it in the PTEs. Lookups
 // run on the fault path (demand_map), so the table is static and the lookup a
 // binary search: no allocation there. Guarded by G->lock.
+//
+// Which keys a pkey_mprotect may use is not checked against the set of keys
+// the process has allocated: that set is the kernel's, and gk sees only the
+// pkey_alloc calls forwarded from inside the guest, not the ones the host side
+// makes outside any guest entry (V8 allocates its sandbox, JIT and pointer-
+// table keys at initialization, and keys pages with them from within a turn
+// whenever it commits or decommits sandbox, code or table pages). A key the
+// kernel would reject as unallocated is thus virtualized like any other; it
+// costs nothing in isolation, which comes from the page-table root, and the
+// guest can only ever key pages it could mprotect anyway. What gk cannot do
+// -- reflect a key outside the PTE field, or record one more range -- fails
+// with ENOMEM, the one errno a pkey_mprotect caller has to be prepared for
+// (V8 aborts on any other).
+//
 // Master switch for protection-key virtualization. gk isolates isolates by
 // page-table root, so V8's host-side keys are not needed for security in this
 // model; set this to 0 and the guest PTEs carry no key, so nothing is enforced
@@ -1798,7 +1809,6 @@ int gk_init(void) {
   pthread_mutex_init(&G->lock, NULL);
   G->root_gen = 1;
   G->rand_state = 0x9e3779b9u;
-  G->pkeys_held = 1;
   prot_add(GK_CTL_START, GK_CTL_END, GK_PROT_SUPER);
   G->dbg = getenv("GK_DEBUG") != NULL;
   *(void **)&G->tls_static_info = dlsym(RTLD_DEFAULT, "_dl_get_tls_static_info");
@@ -2264,7 +2274,8 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
   // the range re-fault and pick the key up. pkey_alloc and pkey_free are
   // forwarded so the host hands out the key numbers, and the calling vCPU's
   // PKRU gets the new key's initial access rights, as the kernel would give the
-  // calling thread.
+  // calling thread. Any key that fits the PTE field is accepted, host-allocated
+  // ones included (see the protection-keys section).
   //
   // Protection/mapping changes are reflected into the guest PTEs for the
   // affected range, in the base root and in every arena root the range
@@ -2296,10 +2307,8 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
   if (reflect) pthread_mutex_lock(&G->lock);
   if (nr == SYS_pkey_mprotect) {
     long pkey = a4;
-    if (pkey != -1 && (pkey < 0 || pkey > 15 || !(G->pkeys_held & (1u << pkey))))
-      ret = -GK_EINVAL;
-    else if (pkey != -1 && !pkey_room())
-      ret = -GK_ENOMEM;
+    if (pkey != -1 && (pkey < 0 || pkey > 15 || !pkey_room()))
+      ret = -GK_ENOMEM;  // never EINVAL: see the protection-keys section
     else {
       ret = host_syscall(SYS_mprotect, a1, a2, a3, 0, 0, 0);
       if (ret == 0 && pkey != -1 && a2 > 0) pkey_set_range(rs, re, (int)pkey);  // room checked
@@ -2336,7 +2345,6 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
     // The kernel gave the calling *host* thread the key's initial rights; the
     // guest thread is this vCPU, so give them to its PKRU (2 bits per key:
     // bit 0 = access disable, bit 1 = write disable).
-    G->pkeys_held |= 1u << ret;
     uint32_t shift = 2u * (uint32_t)ret, pkru = 0;
     if (guest_pkru_update(t, ~(3u << shift), ((uint32_t)a2 & 3u) << shift, &pkru) == 0)
       r->rip = (uintptr_t)&gk_syscall_tramp_resume;  // the stub consumed the outb
@@ -2344,8 +2352,6 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
       fprintf(stderr, "[gk] vcpu %d pkey_alloc -> key %ld, rights %#lx; guest PKRU now %#x\n",
               t->id, ret, (unsigned long)a2, pkru);
   }
-  if (nr == SYS_pkey_free && ret == 0 && a1 >= 1 && a1 <= 15)
-    G->pkeys_held &= ~(1u << a1);
   if (G->dbg) {
     fprintf(stderr, "[gk] vcpu %d syscall %ld(%#lx, %#lx, %#lx, %#lx) -> %ld\n",
             t->id, nr, (unsigned long)a1, (unsigned long)a2, (unsigned long)a3,
