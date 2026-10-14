@@ -22,6 +22,7 @@
 #include <workerd/experimental/guest-kernel/gk.h>
 
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <cerrno>
 #include <cstdlib>
@@ -455,9 +456,6 @@ static v8::Isolate* newIsolate(
 // GuestArena).
 constexpr size_t GUEST_ARENA_SLOT_SIZE = size_t(1) << 39;
 
-// The page size gk maps guest memory at, and the host's (gk_init refuses any other).
-constexpr size_t GUEST_ARENA_PAGE_SIZE = 4096;
-
 int protectionFor(v8::PageAllocator::Permission permission) {
   switch (permission) {
     case v8::PageAllocator::kNoAccess:
@@ -508,18 +506,19 @@ static_assert(GUEST_ARENA_TAIL_SIZE >= 8ull * 1024 * 1024 * 1024 &&
 
 ArenaPageAllocator::ArenaPageAllocator(uintptr_t begin, uintptr_t end)
     : rangeBegin(begin),
-      rangeEnd(end) {
-  KJ_REQUIRE(begin % GUEST_ARENA_PAGE_SIZE == 0 && end % GUEST_ARENA_PAGE_SIZE == 0 && begin < end,
+      rangeEnd(end),
+      pageSize(sysconf(_SC_PAGESIZE)) {
+  KJ_REQUIRE(begin % pageSize == 0 && end % pageSize == 0 && begin < end,
       "invalid page allocator range", begin, end);
   freeList.getWithoutLock().add(Range{begin, end});
 }
 
 size_t ArenaPageAllocator::AllocatePageSize() {
-  return GUEST_ARENA_PAGE_SIZE;
+  return pageSize;
 }
 
 size_t ArenaPageAllocator::CommitPageSize() {
-  return GUEST_ARENA_PAGE_SIZE;
+  return pageSize;
 }
 
 void ArenaPageAllocator::SetRandomMmapSeed(int64_t seed) {
@@ -533,7 +532,7 @@ void* ArenaPageAllocator::GetRandomMmapAddr() {
 
 void ArenaPageAllocator::checkRange(const void* address, size_t length) const {
   auto addr = reinterpret_cast<uintptr_t>(address);
-  KJ_REQUIRE(addr % GUEST_ARENA_PAGE_SIZE == 0 && length % GUEST_ARENA_PAGE_SIZE == 0 &&
+  KJ_REQUIRE(addr % pageSize == 0 && length % pageSize == 0 &&
           addr >= rangeBegin && length <= rangeEnd - addr,
       "address range is not in the arena tail", addr, length, rangeBegin, rangeEnd);
 }
@@ -610,9 +609,9 @@ bool ArenaPageAllocator::decommit(void* address, size_t length) {
 
 void* ArenaPageAllocator::AllocatePages(
     void* hint, size_t length, size_t alignment, Permission permissions) {
-  KJ_REQUIRE(length % GUEST_ARENA_PAGE_SIZE == 0, length);
+  KJ_REQUIRE(length % pageSize == 0, length);
   KJ_REQUIRE(alignment != 0 && (alignment & (alignment - 1)) == 0, alignment);
-  alignment = kj::max(alignment, GUEST_ARENA_PAGE_SIZE);
+  alignment = kj::max(alignment, pageSize);
   uintptr_t start = take(length, alignment);
   if (start == 0) return nullptr;
   void* address = reinterpret_cast<void*>(start);
@@ -635,7 +634,7 @@ bool ArenaPageAllocator::FreePages(void* address, size_t length) {
 
 bool ArenaPageAllocator::ReleasePages(void* address, size_t length, size_t newLength) {
   checkRange(address, length);
-  KJ_REQUIRE(newLength % GUEST_ARENA_PAGE_SIZE == 0 && newLength <= length, newLength, length);
+  KJ_REQUIRE(newLength % pageSize == 0 && newLength <= length, newLength, length);
   if (newLength == length) return true;
   return FreePages(reinterpret_cast<kj::byte*>(address) + newLength, length - newLength);
 }
