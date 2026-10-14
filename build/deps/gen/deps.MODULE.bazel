@@ -102,6 +102,9 @@ archive_override(
     url = "https://github.com/google/highway/tarball/2607d3b5b0113992fe84d3848859eae13b3b52c1",
 )
 
+# jemalloc
+bazel_dep(name = "jemalloc", version = "5.3.0-bcr.4")
+
 # nbytes
 http.archive(
     name = "nbytes",

@@ -118,6 +118,7 @@ build:v8-codegen-opt --per_file_copt=v8/src@-O3
 build:v8-codegen-opt --per_file_copt=external/abseil-cpp@-O3
 # zlib and tcmalloc (for Linux) are also CPU-intensive, optimize them too.
 build:v8-codegen-opt --per_file_copt=external/tcmalloc@-O3
+build:v8-codegen-opt --per_file_copt=external/jemalloc@-O3
 build:v8-codegen-opt --per_file_copt=external/zlib@-O3
 # BoringSSL is CPU-intensive for crypto tests, optimize it too.
 build:v8-codegen-opt --per_file_copt=external/boringssl@-O3
