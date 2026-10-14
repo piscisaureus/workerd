@@ -29,8 +29,9 @@ not match the tables below; the off-vs-on ratio is what carries over.
 ## Requirements
 
 x86-64 Linux with read/write access to `/dev/kvm`, a `workerd` built with
-guest-kernel support (`WORKERD_HAS_GUEST_KERNEL`), and `oha` as the load
-generator. `profile.sh` additionally needs `perf` and either root or
+guest-kernel support (`WORKERD_HAS_GUEST_KERNEL`), and `oha` 1.5 or newer as
+the load generator (the drivers ask it for JSON with `--output-format json`).
+`profile.sh` additionally needs `perf` and either root or
 `kernel.perf_event_paranoid` at 1 or less.
 
 ## Running

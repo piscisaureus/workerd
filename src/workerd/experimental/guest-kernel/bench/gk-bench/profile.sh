@@ -39,7 +39,7 @@ for w in "${workloads[@]}"; do
     else ev=cycles:u,cycles:k,instructions:u,instructions:k; fi
     start_server "$mode" "$cfg"
     warm
-    taskset -c "$CLIENT_CPUS" oha -z "${WINDOW}s" -c "$CONC" --no-tui -j \
+    taskset -c "$CLIENT_CPUS" oha -z "${WINDOW}s" -c "$CONC" --no-tui --output-format json \
       "http://127.0.0.1:$PORT/" > "$OUT/$w-$mode-load.json" 2>/dev/null &
     load=$!
     perf stat -e "$ev" -p "$SRV_PID" -x, -o "$OUT/$w-$mode-perf.csv" \

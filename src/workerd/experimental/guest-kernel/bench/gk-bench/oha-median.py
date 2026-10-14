@@ -11,7 +11,8 @@ cpus = sys.argv[5] if len(sys.argv) > 5 else None
 
 runs = []
 for _ in range(reps):
-    cmd = ["oha", "-z", dur, "-c", conc, "--no-tui", "-j", url]
+    cmd = ["oha", "-z", dur, "-c", conc, "--no-tui",
+           "--output-format", "json", url]
     if cpus:
         cmd = ["taskset", "-c", cpus] + cmd
     out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
