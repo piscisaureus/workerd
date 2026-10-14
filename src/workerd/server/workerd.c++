@@ -1320,8 +1320,9 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
       }
 
 #ifdef WORKERD_HAS_GUEST_KERNEL
-      // Experimental: run isolate code inside a KVM guest (guest ring 0). Must
-      // happen before the V8 platform starts its worker threads and before
+      // Experimental: make this process a KVM guest so that each isolate's JS
+      // turns can run at guest ring 3 in their own arena (see jsg::runInGuest).
+      // Must happen before the V8 platform starts its worker threads and before
       // V8::Initialize reserves the sandbox/cage. Off unless the env var is set.
       if (getenv("WORKERD_EXPERIMENTAL_GUEST_KERNEL") != nullptr) {
         KJ_REQUIRE(gk_init() >= 0, "guest-kernel: gk_init() failed",
