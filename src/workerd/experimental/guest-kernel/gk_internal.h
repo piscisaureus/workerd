@@ -640,7 +640,6 @@ struct gk_ctl {
   uint64_t gpa_next, gpa_limit;
   gk_gpa_extent gpa_free[GK_MAX_REGIONS];
   int gpa_free_n;
-  int gpa_keep;                      // region_remove leaks the space rather than reusing it
   size_t pthread_size;               // glibc's struct pthread (see stack_wall_bounds), 0 if unknown
   // The vDSO and the kernel's data pages behind it (see the vDSO section).
   uintptr_t vdso_lo, vdso_hi;
@@ -986,6 +985,7 @@ static void db_flush(gk_dbuf *d);
 
 #if GK_HVF
 // gk_hvf.c
+static int host_stack_grow(uintptr_t page);
 static uintptr_t thread_pointer(void);
 static uintptr_t thread_data_floor(uintptr_t tp);
 static void turn_prepare(void);
@@ -1024,6 +1024,8 @@ static void stack_refresh(void);
 
 #if !GK_HVF
 // gk_linux.c
+static int host_stack_grow(uintptr_t page);
+static void arena_thp_advise(uintptr_t s, uintptr_t e);
 static gk_thread *thread_ending(void *p);
 static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
                          long a6);
@@ -1063,8 +1065,8 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp, gk_dm_refusal 
 static struct gk_region *region_find(uintptr_t addr);
 static gk_region *region_succ(uintptr_t s);
 static int region_add(uintptr_t s, uintptr_t e);
-static int region_remove(gk_region *n);
-static int region_remove_range(uintptr_t s, uintptr_t e);
+static int region_remove(gk_region *n, int keep_gpa);
+static int region_remove_range(uintptr_t s, uintptr_t e, int keep_gpa);
 static int region_ensure(uintptr_t s, uintptr_t e);
 
 // gk_pkey.c
@@ -1185,8 +1187,5 @@ static long run_here(void *ctx, unsigned long caller_sp);
 
 // gk_arena.c
 static gk_arena *arena_containing(uintptr_t a);
-#if !GK_HVF
-static void arena_thp_advise(uintptr_t s, uintptr_t e);
-#endif
 
 #endif  // GK_INTERNAL_H

@@ -28,42 +28,7 @@ static gk_arena *arena_containing(uintptr_t a) {
 // pages wherever the kernel finds room), could otherwise land in a freed slot
 // and keep every later arena out of it. A run is taken over held slots as
 // they are and over the others with MAP_FIXED_NOREPLACE.
-//
-// Huge host pages. The host backs the arena's pages when KVM's nested-page-
-// fault handler first touches them (get_user_pages on the host VMA), and
-// every such fault is a VM exit. A range the owner commits in one piece of
-// GK_THP_MIN or more is advised MADV_HUGEPAGE by forward_syscall as the
-// commit is reflected: the host then backs each aligned 2MB of it at once,
-// and KVM installs one 2MB nested entry for it, so the range costs one exit
-// per 2MB rather than one per 4KB. Such commits are ArrayBuffer backing
-// stores, large object pages and semispaces. Smaller commits, in particular
-// the 256KB chunks V8 grows its regular heap by, are left alone on purpose:
-// a chunk-sized VMA could not take a huge page at its first touch anyway (it
-// is smaller than 2MB when it faults), and the advice would only put the
-// range on khugepaged's list, which collapses sparsely used 2MB ranges into
-// huge pages later and inflates RSS across many isolates. For the same
-// reason the reservation itself is not advised. The guest side is unchanged:
-// the arena's PTEs stay 4KB, and isolation is enforced by the arena's
-// private root, not by the host page size.
-//
-// The advice is the VMA's: it survives the mprotect splits later commits and
-// decommits make, and a fixed mmap (V8's decommit, whether forwarded from the
-// guest or issued by a host thread gk never sees, such as V8's background
-// sweeper freeing a backing store) replaces the VMA and drops it, which is
-// why every large commit is advised rather than the range once. A commit
-// after such a decommit is the allocating JS thread's, hence forwarded.
-// Re-advising a VMA that already carries the advice changes nothing.
-// GK_NO_THP=1 in the environment disables the advice. It is a hint: it
-// requires the kernel's transparent_hugepage/enabled to be "madvise" or
-// "always" and is ignored otherwise (EINVAL on a kernel without THP is
-// ignored too).
-#define GK_THP_MIN (2UL << 20)  // the smallest commit advised: one huge page
-#if !GK_HVF  // no such advice on macOS, and no forwarded Linux mprotect to hang it on
-static void arena_thp_advise(uintptr_t s, uintptr_t e) {
-  if (!G->thp || e <= s || e - s < GK_THP_MIN || !arena_containing(s)) return;
-  host_syscall(SYS_madvise, (long)s, (long)(e - s), MADV_HUGEPAGE, 0, 0, 0);
-}
-#endif
+
 
 // Reserve the run of nslots slots from idx, none of them used or pinned: a
 // held slot is gk's already, and any other must be free host address space,
@@ -321,13 +286,7 @@ void gk_arena_destroy(gk_arena *a) {
     __atomic_fetch_add(&G->root_gen, 1, __ATOMIC_RELEASE);
   }
   unmap_range_root(G->pml4, a->base, a->end);
-#if defined(__aarch64__)
-  G->gpa_keep = in_use > 0;
-#endif
-  int removed = region_remove_range(a->base, a->end);
-#if defined(__aarch64__)
-  G->gpa_keep = 0;
-#endif
+  int removed = region_remove_range(a->base, a->end, in_use > 0);
   uintptr_t base = a->base, end = a->end;
   int slot0 = a->slot0, nslots = a->nslots;
   if (in_use == 0) {

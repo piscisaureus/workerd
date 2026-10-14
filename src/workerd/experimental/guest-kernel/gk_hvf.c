@@ -583,6 +583,12 @@ static long run_vcpu(gk_thread *t) {
   }
 }
 
+// A macOS stack is a mapping of its full size: nothing grows on demand.
+static int host_stack_grow(uintptr_t page) {
+  (void)page;
+  return 0;
+}
+
 // ---- the host thread (see stack_wall_bounds) ---------------------------------
 // The thread pointer: the thread descriptor itself (pthread_self), which holds
 // the TLS and starts exactly at the top of a pthread's stack, in the stack's

@@ -133,6 +133,54 @@ static gk_thread *thread_ending(void *p) {
   return thread_cur();
 }
 
+// The page may lie just below a stack the kernel grows on demand (the main
+// thread's, which gk_run_here runs the guest on). Natively the thread's own
+// access would grow it; a guest access never reaches the host's fault
+// handler, so ask the kernel to fault the page here. rt_sigprocmask with a
+// NULL `set` changes nothing, but writing the old mask to `oldset` = page
+// makes the kernel's copy_to_user grow a VM_GROWSDOWN stack exactly as a
+// native write would (and return EFAULT, not a signal, if it cannot).
+// Ordinary unmapped addresses just fail the probe. Returns 1: look again.
+static int host_stack_grow(uintptr_t page) {
+  host_syscall(SYS_rt_sigprocmask, SIG_BLOCK, 0, (long)page, 8, 0, 0);
+  return 1;
+}
+
+// ---- huge host pages for arenas ----------------------------------------------
+// The host backs the arena's pages when KVM's nested-page-
+// fault handler first touches them (get_user_pages on the host VMA), and
+// every such fault is a VM exit. A range the owner commits in one piece of
+// GK_THP_MIN or more is advised MADV_HUGEPAGE by forward_syscall as the
+// commit is reflected: the host then backs each aligned 2MB of it at once,
+// and KVM installs one 2MB nested entry for it, so the range costs one exit
+// per 2MB rather than one per 4KB. Such commits are ArrayBuffer backing
+// stores, large object pages and semispaces. Smaller commits, in particular
+// the 256KB chunks V8 grows its regular heap by, are left alone on purpose:
+// a chunk-sized VMA could not take a huge page at its first touch anyway (it
+// is smaller than 2MB when it faults), and the advice would only put the
+// range on khugepaged's list, which collapses sparsely used 2MB ranges into
+// huge pages later and inflates RSS across many isolates. For the same
+// reason the reservation itself is not advised. The guest side is unchanged:
+// the arena's PTEs stay 4KB, and isolation is enforced by the arena's
+// private root, not by the host page size.
+//
+// The advice is the VMA's: it survives the mprotect splits later commits and
+// decommits make, and a fixed mmap (V8's decommit, whether forwarded from the
+// guest or issued by a host thread gk never sees, such as V8's background
+// sweeper freeing a backing store) replaces the VMA and drops it, which is
+// why every large commit is advised rather than the range once. A commit
+// after such a decommit is the allocating JS thread's, hence forwarded.
+// Re-advising a VMA that already carries the advice changes nothing.
+// GK_NO_THP=1 in the environment disables the advice. It is a hint: it
+// requires the kernel's transparent_hugepage/enabled to be "madvise" or
+// "always" and is ignored otherwise (EINVAL on a kernel without THP is
+// ignored too).
+#define GK_THP_MIN (2UL << 20)  // the smallest commit advised: one huge page
+static void arena_thp_advise(uintptr_t s, uintptr_t e) {
+  if (!G->thp || e <= s || e - s < GK_THP_MIN || !arena_containing(s)) return;
+  host_syscall(SYS_madvise, (long)s, (long)(e - s), MADV_HUGEPAGE, 0, 0, 0);
+}
+
 // ---- guest thread creation -------------------------------------------------
 // glibc's pthread_create issues clone3 (or clone) with CLONE_VM|CLONE_THREAD|
 // CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID: the kernel starts the

@@ -44,12 +44,8 @@ static void gpa_unassign(uintptr_t s, uintptr_t e, uint64_t gpa) {
   gpa_release(gpa - (s - wlo), whi - wlo);
 }
 
-// A deleted region's range goes back to the allocator, unless a vCPU still
-// running under a destroyed arena's root (see gk_arena_destroy) may hold
-// translations to it.
-static void gpa_retire(gk_region *n) {
-  if (!G->gpa_keep) gpa_unassign(n->start, n->end, n->gpa);
-}
+// A deleted region's range goes back to the allocator.
+static void gpa_retire(gk_region *n) { gpa_unassign(n->start, n->end, n->gpa); }
 
 static void region_set_gpa(gk_region *n, uint64_t gpa) { n->gpa = gpa; }
 static inline uint64_t region_gpa(const gk_region *n) { return n->gpa; }
