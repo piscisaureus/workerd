@@ -26,6 +26,49 @@ extern void gk_vectors(void);        // the guest's exception vectors (gk_asm.S)
 #include <unistd.h>
 #include <pthread.h>
 
+// What the tests can exercise on this host. macOS (Hypervisor.framework) has no
+// guest-created threads, and a stage-2 page there does not follow a host-side
+// remap (see the HVF section in gk.c), so the host-side decommit test does not
+// apply; it also has no pthread barriers, no CPU affinity and no /proc.
+#if defined(__APPLE__)
+#define GK_TEST_GUEST_THREADS 0
+#define GK_TEST_HOST_DECOMMIT 0
+#include <mach/mach.h>
+typedef struct { pthread_mutex_t m; pthread_cond_t c; unsigned n, waiting, round; } pthread_barrier_t;
+static int pthread_barrier_init(pthread_barrier_t *b, const void *attr, unsigned n) {
+  (void)attr;
+  pthread_mutex_init(&b->m, NULL);
+  pthread_cond_init(&b->c, NULL);
+  b->n = n; b->waiting = 0; b->round = 0;
+  return 0;
+}
+static int pthread_barrier_wait(pthread_barrier_t *b) {
+  pthread_mutex_lock(&b->m);
+  unsigned round = b->round;
+  if (++b->waiting == b->n) {
+    b->waiting = 0; b->round++;
+    pthread_cond_broadcast(&b->c);
+  } else {
+    while (round == b->round) pthread_cond_wait(&b->c, &b->m);
+  }
+  pthread_mutex_unlock(&b->m);
+  return 0;
+}
+static int pthread_barrier_destroy(pthread_barrier_t *b) {
+  pthread_cond_destroy(&b->c);
+  pthread_mutex_destroy(&b->m);
+  return 0;
+}
+#else
+#define GK_TEST_GUEST_THREADS 1
+#define GK_TEST_HOST_DECOMMIT 1
+#endif
+
+// The host's page size: the unit of the mprotects and mmaps the tests issue.
+// The guest's pages are 4 KiB whatever the host's are, so the per-page counts
+// below (demand faults, neighbors) stay in 4 KiB pages.
+static uintptr_t hpage;
+
 // The few instructions the tests need that differ between the architectures:
 // a raw syscall, a read only ring 0 can do (priv_probe), and the selector a
 // ring-3 probe reports (USER_CS).
@@ -33,6 +76,28 @@ extern void gk_vectors(void);        // the guest's exception vectors (gk_asm.S)
 // CR0, readable only at ring 0; PG (bit 31) is set in the guest.
 #define PRIV_PROBE_OK(v) ((v) & (1UL << 31))
 #define USER_CS 0x2b  // the ring-3 code selector
+#elif defined(__APPLE__)
+// macOS: the number in x16, failure in the carry flag with the errno in x0,
+// returned Linux-style as -errno.
+static long raw_syscall3(long nr, long a1, long a2, long a3) {
+  register long x16 __asm__("x16") = nr;
+  register long x0 __asm__("x0") = a1;
+  register long x1 __asm__("x1") = a2;
+  register long x2 __asm__("x2") = a3;
+  long cf;
+  __asm__ __volatile__("svc #0x80\n\tcset %1, cs"
+                       : "+r"(x0), "=r"(cf), "+r"(x1), "+r"(x2), "+r"(x16)
+                       :
+                       : "memory", "cc");
+  return cf ? -x0 : x0;
+}
+// gk's own ring probe is an svc #0 with the number in x8 on either OS (see gk.h).
+static long gk_probe_syscall(long nr) {
+  register long x8 __asm__("x8") = nr;
+  register long x0 __asm__("x0") = 0;
+  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+  return x0;
+}
 #else
 static long raw_syscall3(long nr, long a1, long a2, long a3) {
   register long x8 __asm__("x8") = nr;
@@ -42,8 +107,11 @@ static long raw_syscall3(long nr, long a1, long a2, long a3) {
   __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
   return x0;
 }
+static long gk_probe_syscall(long nr) { return raw_syscall3(nr, 0, 0, 0); }
+#endif
+#if defined(__aarch64__)
 // CurrentEL, readable only at EL1 and above: EL1 (1 << 2) at guest ring 0.
-static unsigned long priv_probe(void) {
+static unsigned long __attribute__((unused)) priv_probe(void) {
   unsigned long el;
   __asm__ __volatile__("mrs %0, CurrentEL" : "=r"(el));
   return el;
@@ -52,7 +120,7 @@ static unsigned long priv_probe(void) {
 // arm64 has no unprivileged read of the exception level: gk answers a
 // reserved syscall with the caller's ring (see gk.h), and the tests' "CS" is
 // that ring.
-static unsigned long user_ring(void) { return (unsigned long)raw_syscall3(GK_DEBUG_RING_SYSCALL, 0, 0, 0); }
+static unsigned long user_ring(void) { return (unsigned long)gk_probe_syscall(GK_DEBUG_RING_SYSCALL); }
 #define USER_CS 3
 #endif
 
@@ -160,7 +228,7 @@ static long write_byte(void *arg) {
 struct churn_arena { unsigned char *base; size_t stride; int npages; unsigned seed; };
 
 static unsigned char *churn_page(const struct churn_arena *c, int i) {
-  return c->base + (size_t)i * c->stride + 4096 * (size_t)i;
+  return c->base + (size_t)i * c->stride + hpage * (size_t)i;
 }
 
 static long churn_use(void *arg) {
@@ -261,6 +329,7 @@ static long guest_try_write(void *arg) {
 #endif
 }
 
+#if GK_TEST_GUEST_THREADS
 // ---- guest-created threads --------------------------------------------------
 // Threads created *from inside the guest* (pthread_create -> clone3/clone) must
 // enter the guest themselves. The thread body reads CR0 (CurrentEL on arm64),
@@ -333,6 +402,8 @@ static long churn_in_guest(void *arg) {
   }
   return 0;
 }
+
+#endif  // GK_TEST_GUEST_THREADS
 
 // Host-side churn: a host thread enters the guest via gk_run and then ends.
 static void *host_churn_thread(void *arg) {
@@ -534,6 +605,11 @@ static long here_fn(void *arg) {
 
 // The range of the calling thread's stack, as V8 would learn it.
 static int thread_stack(uintptr_t *lo, uintptr_t *hi) {
+#if defined(__APPLE__)
+  *hi = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
+  *lo = *hi - pthread_get_stacksize_np(pthread_self());
+  return 1;
+#else
   pthread_attr_t a;
   void *addr; size_t size;
   if (pthread_getattr_np(pthread_self(), &a) != 0) return 0;
@@ -541,6 +617,7 @@ static int thread_stack(uintptr_t *lo, uintptr_t *hi) {
   pthread_attr_destroy(&a);
   *lo = (uintptr_t)addr; *hi = (uintptr_t)addr + size;
   return ok;
+#endif
 }
 
 // Runs the caller's-stack check on one thread (the main thread's stack is
@@ -623,6 +700,7 @@ static volatile long wall_sink;
 // leaves the turn's return value exactly intact.
 static long __attribute__((noinline)) wall_descend(int depth, struct wall *w) {
   volatile char pad[512];
+  __asm__ __volatile__("" : : "r"(pad) : "memory");  // the whole pad exists in the frame
   pad[0] = (char)depth;
   pad[sizeof pad - 1] = (char)~depth;
   long r;
@@ -847,6 +925,7 @@ static void *wall_skip_thread(void *arg) {
   return (void *)(uintptr_t)wall_skip_check("pthread");
 }
 
+#if GK_TEST_HOST_DECOMMIT
 // ---- a host-side decommit under an installed PTE ----------------------------
 // The host can change a mapping without the change passing through the guest
 // (a decommit issued by another host thread, say): the guest's PTE for the page
@@ -858,7 +937,7 @@ static void *wall_skip_thread(void *arg) {
 // Pull the backing from under `page` on the host side: a fixed PROT_NONE
 // mapping replaces it, and gk sees no forwarded syscall.
 static void host_decommit(void *page) {
-  mmap(page, 4096, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  mmap(page, hpage, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
 }
 
 // One page: committed and written by a guest turn (installing its PTE),
@@ -894,7 +973,7 @@ static long host_decommit_check(const char *who) {
     printf("host-side decommit (%s): no arena [FAIL]\n", who);
     return 0;
   }
-  unsigned char *p3 = gk_arena_base(a), *p0 = p3 + 4096;
+  unsigned char *p3 = gk_arena_base(a), *p0 = p3 + hpage;
   struct backing u, k, h;
   gk_arena_enter(a);
   backing_probe(gk_run_here_user, p3, &u);
@@ -924,6 +1003,7 @@ static void *host_decommit_thread(void *arg) {
   (void)arg;
   return (void *)(uintptr_t)host_decommit_check("pthread");
 }
+#endif  // GK_TEST_HOST_DECOMMIT
 
 // ---- transparent huge pages behind an arena ---------------------------------
 // A range of 2MB or more that the owner commits in one piece is advised
@@ -990,6 +1070,10 @@ static int thp_available(void) {
 }
 
 static long thp_check(void) {
+#if defined(__APPLE__)
+  printf("arena huge pages: no huge-page advice on macOS; skipped [OK]\n");
+  return 1;
+#endif
   if (!thp_available()) {
     printf("arena huge pages: THP disabled on this kernel; skipped [OK]\n");
     return 1;
@@ -1099,6 +1183,7 @@ static long user_getpid(void *arg) {
 #endif
 }
 
+#if GK_TEST_GUEST_THREADS
 // ---- guest-created threads at ring 3 ----------------------------------------
 // A thread that ring-3 code creates must run at ring 3 as well: gaining ring 0
 // through pthread_create would void the privilege split. These bodies run in
@@ -1211,6 +1296,7 @@ static long spawn_one_in_guest(void *arg) {
   if (pthread_join(th, NULL) != 0) return -2;
   return 1;
 }
+#endif  // GK_TEST_GUEST_THREADS
 
 // ---- global pages across a root switch --------------------------------------
 // A turn for another isolate loads that isolate's root from inside the guest,
@@ -1245,11 +1331,13 @@ static long flush_then_read(void *arg) {
 static unsigned char global_shared[2 * 4096] __attribute__((aligned(4096)));
 
 static long global_check(void) {
+#if !defined(__APPLE__)  // no CPU affinity on macOS
   cpu_set_t old, one;
   int pinned = sched_getaffinity(0, sizeof old, &old) == 0;
   CPU_ZERO(&one);
   CPU_SET(sched_getcpu(), &one);
   if (pinned) sched_setaffinity(0, sizeof one, &one);
+#endif
   unsigned char *sp = global_shared;  // a page of the runtime's .bss: shared by every root
   sp[0] = 0x77;
   gk_arena *A = gk_arena_create(4096), *B = gk_arena_create(4096);
@@ -1375,7 +1463,9 @@ static long global_check(void) {
   gk_arena_destroy(A);
   gk_arena_destroy(B);
   munmap(dummy, 4096);
+#if !defined(__APPLE__)
   if (pinned) sched_setaffinity(0, sizeof old, &old);
+#endif
 
   int ok = alt_ok && sw_ok && (no_tlb || (cached && survived)) && arena_ok && flush_ok && globals > 0;
   printf("global pages: %d/%d alternating turns isolated (%ld root switches); arena page cached "
@@ -1409,9 +1499,9 @@ static long global_check(void) {
 // test's leftovers at a reused address cannot perturb the counts; each sits
 // between PROT_NONE guard pages, so the kernel cannot merge it with a
 // neighbor and its bounds are exactly known.
-#define NB_PAGE 4096UL
+#define NB_PAGE 4096UL                     // a guest page
 #define NB_WIN (256UL << 10)
-#define NB_LEN (8 * NB_WIN + 2 * NB_PAGE)  // nb_region's mapping, guards included
+#define NB_LEN (8 * NB_WIN + 2 * hpage)  // nb_region's mapping, guards included
 enum { NB_PAGES = 64 };
 
 // Drops the PTEs of [p, p+len) in every root, then flushes this vCPU's TLB.
@@ -1425,11 +1515,11 @@ static void nb_fresh(void *p, size_t len, void *dummy) {
 // pages. Returns the mapping, usable + 2 pages long, whose usable part starts
 // a page in; NULL on failure.
 static unsigned char *nb_guarded(size_t usable) {
-  size_t len = usable + 2 * NB_PAGE;
+  size_t len = usable + 2 * hpage;
   unsigned char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (m == MAP_FAILED) return NULL;
-  if (mprotect(m, NB_PAGE, PROT_NONE) != 0 ||
-      mprotect(m + NB_PAGE + usable, NB_PAGE, PROT_NONE) != 0) {
+  if (mprotect(m, hpage, PROT_NONE) != 0 ||
+      mprotect(m + hpage + usable, hpage, PROT_NONE) != 0) {
     munmap(m, len);
     return NULL;
   }
@@ -1442,7 +1532,7 @@ static unsigned char *nb_guarded(size_t usable) {
 static unsigned char *nb_region(unsigned char **win) {
   unsigned char *m = nb_guarded(8 * NB_WIN);
   if (!m) return NULL;
-  *win = (unsigned char *)(((uintptr_t)m + NB_PAGE + 2 * NB_WIN - 1) & ~(NB_WIN - 1));
+  *win = (unsigned char *)(((uintptr_t)m + hpage + 2 * NB_WIN - 1) & ~(NB_WIN - 1));
   return m;
 }
 
@@ -4172,6 +4262,7 @@ static int turn_dir_check(void) {
 
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
+  hpage = (uintptr_t)sysconf(_SC_PAGESIZE);
   if (gk_init() != 0) {
     fprintf(stderr, "gk_init failed: %s\n", gk_last_error());
     return 1;
@@ -4202,8 +4293,8 @@ int main(void) {
   int ok3 = 0;
   if (A && B) {
     unsigned char *ab = gk_arena_base(A), *bb = gk_arena_base(B);
-    unsigned char *a2 = ab + SLOT + 4096;      // a page in A's second slot
-    unsigned char *a3 = ab + 2 * SLOT + 8192;  // and one in its third
+    unsigned char *a2 = ab + SLOT + hpage;         // a page in A's second slot
+    unsigned char *a3 = ab + 2 * SLOT + 2 * hpage; // and one in its third
     int layout = gk_arena_size(A) >= 2 * SLOT + (64UL << 20) && ((uintptr_t)ab % SLOT) == 0 &&
                  ((uintptr_t)bb % SLOT) == 0 && (bb < ab || bb >= ab + 3 * SLOT);
     struct ap wa = {ab, 0xA1}, wa2 = {a2, 0xA2}, wa3 = {a3, 0xA4}, wb = {bb, 0xB1},
@@ -4286,8 +4377,9 @@ int main(void) {
     pthread_join(t1, NULL);
     pthread_barrier_destroy(&bar);
     ok5 = a0.own_ok && a0.peer_faulted && a1.own_ok && a1.peer_faulted;
-    printf("per-thread arenas: two threads, each isolated from the other [%s]\n",
-           ok5 ? "OK" : "FAIL");
+    printf("per-thread arenas: two threads, each isolated from the other (own %#lx/%#lx, peer "
+           "%ld/%ld, faults %#lx/%#lx) [%s]\n", a0.r_own, a1.r_own, a0.r_peer, a1.r_peer, a0.fa,
+           a1.fa, ok5 ? "OK" : "FAIL");
   }
 
   // Syscall policy: with a filter denying write, the guest's write returns
@@ -4299,6 +4391,7 @@ int main(void) {
   printf("syscall policy: denied write returned %ld (want -1/-EPERM) [%s]\n",
          denied, ok6 ? "OK" : "FAIL");
 
+#if GK_TEST_GUEST_THREADS
   // Threads created from inside the guest enter the guest as their own vCPUs.
   struct gt ts[3];
   for (int i = 0; i < 3; i++) { ts[i].id = i + 1; ts[i].n = 100000; ts[i].cr0 = 0; ts[i].sum = -1; }
@@ -4343,6 +4436,24 @@ int main(void) {
   printf("vCPU pooling: %d guest threads churned, vCPUs %d -> %d, registry ranges %d -> %d; "
          "20 host threads churned, vCPUs -> %d [%s]\n", ch.iters * ch.per_iter, before,
          after_guest, sp1.prot_ranges, sp2.prot_ranges, after_host, ok8 ? "OK" : "FAIL");
+#else
+  int ok7 = 1;
+  printf("guest-created threads (ring-0 creator): not supported on macOS; skipped [OK]\n");
+  // Host-side churn alone: 20 sequential host threads entering via gk_run may
+  // add at most 1 vCPU id, as the pool hands the ended thread's on.
+  int before = gk_vcpu_count(), ok8 = 1;
+  for (int i = 0; i < 20; i++) {
+    pthread_t t;
+    void *rv;
+    pthread_create(&t, NULL, host_churn_thread, (void *)1000);
+    pthread_join(t, &rv);
+    if ((long)(uintptr_t)rv != want) ok8 = 0;
+  }
+  int after_host = gk_vcpu_count();
+  if (after_host - before > 1) ok8 = 0;
+  printf("vCPU pooling: 20 host threads churned, vCPUs %d -> %d [%s]\n", before, after_host,
+         ok8 ? "OK" : "FAIL");
+#endif
 
   // Memory protection keys, enforced by the guest CPU against the guest PKRU.
 #if defined(__x86_64__)
@@ -4418,7 +4529,7 @@ int main(void) {
         if (base == first_base) reused++;
         // Pages of a big arena land in each of its three slots; of a small one,
         // in separate 2MiB backing windows.
-        struct churn_arena c = {base, big ? (2 * SLOT / 3) & ~(size_t)0xfff : (2UL << 20),
+        struct churn_arena c = {base, big ? (2 * SLOT / 3) & ~(hpage - 1) : (2UL << 20),
                                 PAGES, (unsigned)(it * 2 + k)};
         gk_arena_enter(a);
         long r = (it & 1) ? gk_run_here(churn_use, &c) : gk_run(churn_use, &c);
@@ -4575,6 +4686,9 @@ int main(void) {
   // case ends only the thread that faulted: its spawner's join returns and the
   // process survives to run the next check.
   int ok15 = 1;
+#if !GK_TEST_GUEST_THREADS
+  printf("guest-created threads (ring-3 creator): not supported on macOS; skipped [OK]\n");
+#else
   {
     // 1. Three threads spawned at once from ring 3 run at CPL 3 (CS 0x2b), as
     //    do the grandchildren they spawn; each forwards a getpid (3.) and
@@ -4671,6 +4785,7 @@ int main(void) {
            "afterwards ring 3 at CPL %ld, ring-0 threads %s [%s]\n", cpl_after,
            r0_after == 0 && c1.bad == 0 ? "ok" : "BROKEN", ok15 ? "OK" : "FAIL");
   }
+#endif
 
   // ---- gk's control data is supervisor memory --------------------------------
   // The structures that decide which root a thread runs under (the arena
@@ -4761,6 +4876,7 @@ int main(void) {
   // A page whose backing the host pulls without the guest seeing it faults at
   // the page and leaves the vCPU usable for the next turn (see
   // host_decommit_check). On the main thread and on a pthread.
+#if GK_TEST_HOST_DECOMMIT
   int ok17 = host_decommit_check("main thread") == 1;
   {
     pthread_t t; void *rv = NULL;
@@ -4768,6 +4884,11 @@ int main(void) {
     pthread_join(t, &rv);
     if ((uintptr_t)rv != 1) ok17 = 0;
   }
+#else
+  int ok17 = 1;
+  printf("host-side decommit: a stage-2 page does not follow a host-side remap on macOS; "
+         "skipped [OK]\n");
+#endif
 
   // ---- an mprotect reflected in place ----------------------------------------
   // A forwarded mprotect that leaves a committed range readable rewrites the
