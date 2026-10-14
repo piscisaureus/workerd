@@ -1,18 +1,19 @@
 # gk: a guest-kernel isolation library (prototype)
 
-`gk` runs the calling process inside a KVM virtual machine as its own guest
+`gk` runs the calling process inside a virtual machine as its own guest
 ring 0 (the Dune model), forwards its syscalls to the host, and gives each
 isolate a private memory arena backed by a separate guest page-table root. The
 goal is per-isolate, hardware-enforced memory isolation with no fixed cap on
-the number of isolates, using upstream KVM rather than a bespoke hypervisor.
+the number of isolates, using the host's hypervisor (KVM, or
+Hypervisor.framework on macOS) rather than a bespoke one.
 
 This is a research prototype. It runs on Linux on x86-64 or arm64 (see
-[arm64](#arm64)) and needs read/write access to `/dev/kvm` (no root, no kernel
-module). The library builds and runs standalone with the included Makefile
-(`make run`); on those platforms it is also
-built as a Bazel `cc_library` and wired into the workerd runtime behind the
-`WORKERD_EXPERIMENTAL_GUEST_KERNEL` environment variable, which runs each
-isolate's JS turn at guest ring 3.
+[arm64](#arm64)), where it needs read/write access to `/dev/kvm` (no root, no
+kernel module), and on macOS on Apple Silicon (see [macOS](#macos)). The
+library builds and runs standalone with the included Makefile (`make run`); on
+Linux it is also built as a Bazel `cc_library` and wired into the workerd
+runtime behind the `WORKERD_EXPERIMENTAL_GUEST_KERNEL` environment variable,
+which runs each isolate's JS turn at guest ring 3.
 
 ## Files
 
@@ -20,6 +21,7 @@ isolate's JS turn at guest ring 3.
 - `gk_asm.S` — the in-guest trampolines and exception handlers.
 - `gk_test.c` — the test/example.
 - `Makefile` — `make run` builds and runs the test.
+- `gk.entitlements` — the hypervisor entitlement the macOS binary is signed with.
 - `fault-test.sh` / `fault-test.capnp` — end-to-end check against a built
   workerd that a fault inside the guest during a JS turn fails only that
   request and condemns only that isolate, and the process keeps serving.
@@ -261,6 +263,65 @@ the setup is not representative for performance:
   itself.
 - A vCPU sometimes keeps no TLB entries across `KVM_RUN` at all, so `gk_test`
   reports the global-page survival checks as not observable rather than failed.
+
+## macOS
+
+On macOS the hypervisor is Hypervisor.framework (HVF), arm64 only. `make`
+links the framework and ad-hoc signs `gk_test` with `gk.entitlements`
+(`com.apple.security.hypervisor`), which HVF requires; no root and no system
+changes. The guest model is the arm64 one above, with the same vector table,
+dispatcher and page tables, and `gk_test` passes with the checks that do not
+apply skipped. The differences, all in the host side of `gk.c` under `GK_HVF`:
+
+- **Stage 2 is filled page by page and pins what it maps.** KVM backs a memslot
+  from the host page tables as the guest touches it and follows the host's
+  later changes; HVF's `hv_vm_map` takes a range the host has mapped and pins
+  its pages into stage 2 then and there, and refuses pages whose maximum
+  protection excludes writing (the binary's text and read-only data, the dyld
+  shared cache). So a region gets no stage-2 mapping when created; each host
+  page enters stage 2 when it gets its first guest PTE, right after gk has read
+  its host mapping (a Mach VM region query rather than `/proc/self/maps`). A
+  page HVF refuses is shadowed: a copy from a refused pool is mapped read-only
+  and executable in its place. The commpage (two read-only kernel pages libc
+  reads for the time) is shadowed too, and its copies are refreshed before
+  every turn. A guest-side `munmap`, fixed `mmap` or decommit drops the range
+  from stage 2 along with its PTEs, so the next access maps the host's current
+  page.
+- **A host-side remap is not seen.** A page the guest has touched stays the
+  physical page it was: a host `mprotect` or `madvise` keeps it, but a mapping
+  replaced from outside the guest (`munmap`/`vm_deallocate` and a new mapping at
+  the same address) leaves the guest reading the old page and writing where the
+  host never looks, where KVM would follow the host. Thread stacks, which come
+  and go at the same addresses, are dropped from stage 2 and from every root at
+  thread entry and exit (`stack_refresh`). Any other replacement is a known gap.
+- **Syscalls are macOS's.** A guest `svc #0x80` carries the number in `x16`
+  (negative for a Mach trap) and reports a BSD error through the carry flag,
+  which gk puts back into the frame's SPSR. `mmap`/`munmap`/`mprotect` and the
+  Mach traps `vm_allocate`/`vm_map`/`vm_deallocate`/`vm_protect` on the task
+  itself are reflected into the guest page tables as the Linux calls are. Thread
+  creation (`bsdthread_create`, the workqueue calls) is refused with `EPERM`: gk
+  does not intercept Mach thread creation as it does `clone`, so guest-created
+  threads are unsupported and the corresponding tests are skipped.
+- **A vCPU belongs to its thread.** HVF vCPUs cannot be run from another
+  thread, so one is created per host thread and destroyed when the thread ends;
+  the vCPU id, control block and guest stacks are pooled and reused as on
+  Linux. The thread pointer is `pthread_self()`, whose descriptor sits at the top
+  of a pthread's stack, which is where the host-frame wall stops.
+- **The vCPU resumes under a root that may be gone.** Between turns a vCPU
+  waits at the dispatcher with its last root in `TTBR0_EL1`, which a
+  destroyed arena may have freed; HVF keeps no TLB entry for the dispatcher
+  across `hv_vcpu_run`, so gk loads the next root from the host before a turn
+  that switches roots (the dispatcher then re-loads it and invalidates). Under
+  KVM the same switch runs with the stale root still in `TTBR0_EL1` and relies
+  on the dispatcher's translation being cached, which it normally is.
+- **No vDSO, no protection keys, no huge-page advice.** The guest reads the
+  counter directly (`CNTVCT_EL0` with a zero vtimer offset is
+  `mach_absolute_time`), arm64 has no `pkey_*`, and macOS has no
+  `MADV_HUGEPAGE`.
+
+Not done on macOS: the Bazel build and the workerd integration, guest-created
+threads, and any performance measurement. `hv_vcpu_exit_t`, which HVF
+allocates, is readable from the guest, and a shadow pool page is never reused.
 
 ## How it would map to workerd
 
