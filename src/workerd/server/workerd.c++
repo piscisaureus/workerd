@@ -119,7 +119,8 @@ namespace {
 // by path; the turn directory (gk_confine_paths in gk.h) decides where the
 // path ones may land.
 //
-// Adapted from Deno Deploy's V8 seccomp allowlist (x86_64 set).
+// Adapted from Deno Deploy's V8 seccomp allowlist (x86_64 set), with the arm64
+// equivalents of the legacy x86-64 calls.
 // TODO: see if this can be tightened further.
 int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
 #ifndef SYS_clone3
@@ -140,7 +141,6 @@ int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a
     case SYS_pkey_mprotect:
       return gk_mapping_syscall_ok(nr, a1, a2, a3, a4, a5, a6);
     case SYS_accept4:
-    case SYS_access:
     case SYS_bind:
     case SYS_brk:
     case SYS_clock_gettime:
@@ -151,8 +151,6 @@ int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a
     case SYS_connect:
     case SYS_epoll_create1:
     case SYS_epoll_ctl:
-    case SYS_epoll_wait:
-    case SYS_eventfd:
     case SYS_eventfd2:
     case SYS_exit_group:
     case SYS_exit:
@@ -176,7 +174,11 @@ int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a
     case SYS_lseek:
     case SYS_newfstatat:
     case SYS_openat:
+    case SYS_pkey_mprotect:
+#ifdef SYS_poll
+    // arm64 has no poll(2); the libc there uses ppoll instead.
     case SYS_poll:
+#endif
     case SYS_prctl:
     case SYS_prlimit64:
     case SYS_pread64:
@@ -184,7 +186,6 @@ int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a
     case SYS_read:
     case SYS_recvfrom:
     case SYS_recvmsg:
-    case SYS_rename:
     case SYS_rseq:
     case SYS_rt_sigaction:
     case SYS_rt_sigprocmask:
@@ -201,7 +202,6 @@ int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a
     case SYS_shutdown:
     case SYS_sigaltstack:
     case SYS_socket:
-    case SYS_stat:
     case SYS_statx:
     case SYS_restart_syscall:
     case SYS_tgkill:
@@ -210,7 +210,24 @@ int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a
     case SYS_write:
     case SYS_writev:
     case SYS_getcwd:
+#if defined(__x86_64__)
+    case SYS_access:
+    case SYS_epoll_wait:
+    case SYS_eventfd:
+    case SYS_poll:
     case SYS_readlink:
+    case SYS_rename:
+    case SYS_stat:
+#else
+    // arm64 has none of the legacy calls above; glibc issues these instead.
+    case SYS_epoll_pwait:
+    case SYS_faccessat:
+    case SYS_faccessat2:
+    case SYS_ppoll:
+    case SYS_readlinkat:
+    case SYS_renameat:
+    case SYS_renameat2:
+#endif
       return 1;
     default:
       return 0;

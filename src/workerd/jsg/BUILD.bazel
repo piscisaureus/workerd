@@ -156,9 +156,9 @@ wd_cc_library(
         "@capnp-cpp//src/kj",
         "@workerd-v8//:v8",
     ] + select({
-        # Experimental guest-kernel isolation is x86-64 Linux only; the dep and
-        # its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
-        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+        # Experimental guest-kernel isolation is Linux (x86-64 and arm64) only;
+        # the dep and its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_supported": [
             "//src/workerd/experimental/guest-kernel",
         ],
         "//conditions:default": [],
@@ -355,7 +355,8 @@ wd_cc_library(
 )]
 
 # Proves that per-isolate guest-kernel arenas make one isolate's sandbox unaddressable from
-# another's guest execution. The test body is compiled only where gk is (x86-64 Linux); there it
+# another's guest execution. The test body is compiled only where gk is (Linux on x86-64 or
+# arm64); there it
 # also skips itself when gk cannot initialize (no /dev/kvm). The environment configures the
 # process allocator as a workerd run with guest-kernel isolation has it (see
 # heapArenasAvailable() in heap-arena.h): the test binary links jemalloc as a shared library,
@@ -368,7 +369,7 @@ kj_test(
     },
     local_defines = ["JSG_IMPLEMENTATION"],
     deps = [":jsg"] + select({
-        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+        "//src/workerd/experimental/guest-kernel:is_supported": [
             "//src/workerd/experimental/guest-kernel",
         ],
         "//conditions:default": [],
