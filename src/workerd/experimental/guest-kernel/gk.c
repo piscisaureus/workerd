@@ -6406,6 +6406,38 @@ static int confined_path_syscall(gk_thread *t, long nr, long a1, long a2, long a
 #define GK_SPSR_C (1UL << 29)
 enum { GK_REFLECT_NONE, GK_REFLECT_PROTECT, GK_REFLECT_UNMAP, GK_REFLECT_MAP };
 
+// The Mach traps the guest may make. A Mach message can ask the kernel to
+// do anything the sending task's ports allow, including reading and writing
+// any memory of the process and starting host threads outside the VM, so
+// mach_msg and every trap not listed here is refused. What remains acts only
+// on the calling task's own port names, its own address space (the VM traps,
+// with the task's own port; gk reflects their effect), semaphores, and time.
+static int mach_trap_allowed(long nr, uint64_t target) {
+  switch (nr) {
+    case GK_TRAP_vm_allocate:
+    case GK_TRAP_vm_deallocate:
+    case GK_TRAP_vm_protect:
+    case GK_TRAP_vm_map:
+      return (mach_port_name_t)target == mach_task_self();
+    case -16: case -17: case -18: case -19: case -20:  // _kernelrpc_mach_port_*
+    case -21: case -22: case -23: case -24: case -25:
+    case -26:  // mach_reply_port
+    case -27:  // thread_self_trap
+    case -28:  // task_self_trap
+    case -29:  // host_self_trap
+    case -33: case -34: case -35: case -36:  // semaphore_signal/_all/_thread, wait
+    case -37: case -38: case -39:  // semaphore_wait_signal, timedwait, timedwait_signal
+    case -46:  // pid_for_task
+    case -50:  // thread_get_special_reply_port
+    case -59: case -60: case -61: case -62:  // swtch_pri, swtch, thread_switch, clock_sleep
+    case -89: case -90:  // mach_timebase_info, mach_wait_until
+    case -91: case -92: case -93: case -94:  // mk_timer_create/destroy/arm/cancel
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 static long forward_syscall(gk_thread *t, gk_regs *r) {
   long nr = (long)r->x[16];
   uint64_t a[8];
@@ -6420,8 +6452,14 @@ static long forward_syscall(gk_thread *t, gk_regs *r) {
              nr == GK_SYS_workq_kernreturn) {
     if (G->dbg) fprintf(stderr, "[gk] vcpu %d syscall %ld: thread creation is not supported on macOS\n", t->id, nr);
     deny = 1;
+  } else if (nr < 0 && !mach_trap_allowed(nr, a[0])) {
+    if (G->dbg) fprintf(stderr, "[gk] vcpu %d Mach trap %ld DENIED\n", t->id, nr);
+    deny = 1;
   }
   if (deny) {
+    // A Mach trap reports failure in its return value alone; a BSD call in
+    // the carry flag, with the errno.
+    if (nr < 0) return KERN_PROTECTION_FAILURE;
     r->spsr |= GK_SPSR_C;
     return GK_EPERM;
   }
