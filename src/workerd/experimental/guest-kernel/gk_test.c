@@ -404,6 +404,25 @@ static long clone3_bad_args(void *arg) {
 
 #endif  // GK_TEST_GUEST_THREADS
 
+#if defined(__APPLE__)
+#include <mach/mach_vm.h>
+// The guest's Mach traps are policed: the VM traps on its own task work (and
+// are reflected), Mach messaging is refused. Returns 1 if both held.
+static long mach_policy(void *arg) {
+  (void)arg;
+  mach_vm_address_t addr = 0;
+  if (mach_vm_allocate(mach_task_self(), &addr, hpage, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
+    return -1;
+  *(volatile char *)addr = 1;
+  if (mach_vm_deallocate(mach_task_self(), addr, hpage) != KERN_SUCCESS) return -2;
+  register long x16 __asm__("x16") = -31;  // mach_msg_trap, no send, no receive
+  register long x0 __asm__("x0") = 0;
+  __asm__ __volatile__("svc #0x80" : "+r"(x0), "+r"(x16) : : "x1", "x2", "x3", "x4", "x5",
+                       "x6", "memory", "cc");
+  return x0 == KERN_PROTECTION_FAILURE ? 1 : -3;
+}
+#endif
+
 // Host-side churn: a host thread enters the guest via gk_run and then ends.
 static void *host_churn_thread(void *arg) {
   return (void *)(uintptr_t)gk_run(test_compute, arg);
@@ -1841,6 +1860,12 @@ int main(void) {
   int ok6 = (denied == -1);  // -EPERM
   printf("syscall policy: denied write returned %ld (want -1/-EPERM) [%s]\n",
          denied, ok6 ? "OK" : "FAIL");
+#if defined(__APPLE__)
+  long mp = gk_run(mach_policy, NULL);
+  printf("syscall policy: Mach VM traps on the own task work, mach_msg is refused "
+         "(gk_run=%ld) [%s]\n", mp, mp == 1 ? "OK" : "FAIL");
+  if (mp != 1) ok6 = 0;
+#endif
 
 #if GK_TEST_GUEST_THREADS
   // Threads created from inside the guest enter the guest as their own vCPUs.

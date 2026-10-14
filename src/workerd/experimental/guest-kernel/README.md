@@ -298,7 +298,11 @@ apply skipped. The differences, all in the host side of `gk.c` under `GK_HVF`:
   (negative for a Mach trap) and reports a BSD error through the carry flag,
   which gk puts back into the frame's SPSR. `mmap`/`munmap`/`mprotect` and the
   Mach traps `vm_allocate`/`vm_map`/`vm_deallocate`/`vm_protect` on the task
-  itself are reflected into the guest page tables as the Linux calls are. Thread
+  itself are reflected into the guest page tables as the Linux calls are. Mach
+  traps are allowlisted (`mach_trap_allowed`): a Mach message can have the
+  kernel act on the process through its task port, so `mach_msg` and every
+  trap outside the VM traps on the task itself, port-name management,
+  semaphores and timing are refused with `KERN_PROTECTION_FAILURE`. Thread
   creation (`bsdthread_create`, the workqueue calls) is refused with `EPERM`: gk
   does not intercept Mach thread creation as it does `clone`, so guest-created
   threads are unsupported and the corresponding tests are skipped.
