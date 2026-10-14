@@ -45,15 +45,11 @@ const char *gk_last_error(void) { return G->err; }
 unsigned long gk_fault_addr(void) { return G->fault_addr; }
 void gk_set_syscall_filter(gk_syscall_filter f) { G->filter = f; }
 
-// Test/diagnostic hook: hand out one supervisor page (the GDT) and one refused
+// Test/diagnostic hook: hand out one supervisor page (super_page) and one refused
 // page (the page-table arena), so a test can verify that ring-3 code faults on
 // gk's own control memory while its own user pages work.
 void gk_debug_control_addrs(unsigned long *super, unsigned long *refuse) {
-#if defined(__x86_64__)
-  if (super) *super = (unsigned long)G->gdt_va;
-#else
-  if (super) *super = (unsigned long)G->vbar;  // the vector table
-#endif
+  if (super) *super = (unsigned long)super_page();
   if (refuse) *refuse = (unsigned long)G->pt_base;
 }
 
@@ -145,9 +141,7 @@ static void arena_sync_if_stale(gk_arena *a) {
 // tracking.
 static int prepare_entry(gk_thread *t, uint64_t *load) {
   if (sync_cr3(t, load) < 0) return -1;
-#if GK_HVF
-  commpage_refresh();
-#endif
+  turn_prepare();
   uint32_t hp = host_pkru();
   host_pkru_allow_all();
   if (!t->pkru_ready) {
@@ -237,30 +231,13 @@ typedef struct { gk_thread *t; long (*fn)(void *); void *arg; int user; uint64_t
 // writes to this thread's frames are not walled; that is the cross-thread
 // residual of the shared-runtime model, not this wall's job.
 
-// The thread pointer (the fs base): a pthread's TCB, which glibc places at the
-// top of the thread's stack mapping, with its static TLS block just below.
-// On arm64 Linux it is TPIDR_EL0, with glibc's struct pthread just below it
-// and the static TLS block just above. On macOS it is the thread descriptor
-// itself (pthread_self), which holds the TLS and starts exactly at the top of
-// a pthread's stack, in the stack's own mapping.
-static uintptr_t thread_pointer(void) {
-  uintptr_t tp;
-#if GK_HVF
-  tp = (uintptr_t)pthread_self();
-#elif defined(__x86_64__)
-  __asm__ __volatile__("mov %%fs:0, %0" : "=r"(tp));
-#else
-  __asm__ __volatile__("mrs %0, tpidr_el0" : "=r"(tp));
-#endif
-  return tp;
-}
-
 // Compute the wall for a turn entered at rsp `top` from a host switch point
 // at caller_sp: [*lo, *hi) is page-aligned and empty if nothing can be walled.
 // *hi is the end of the host mapping holding the stack, clamped below the
-// TCB and static TLS when they sit on that mapping (a pthread; the main
-// thread's live in ld.so's own mapping): the turn writes TLS and glibc writes
-// the TCB, so those must stay writable. Runs on the host before the turn.
+// thread's own data (thread_pointer, thread_data_floor) when it sits on that
+// mapping (a pthread; the main thread's lives in ld.so's own mapping on
+// Linux): the turn writes TLS and libc writes the thread descriptor, so those
+// must stay writable. Runs on the host before the turn.
 //
 // The mapping lookup reads /proc/self/maps, which is long in a process with
 // many mappings and lists the stack last, so its result is cached on the
@@ -276,29 +253,9 @@ static int stack_wall_bounds(gk_thread *t, uintptr_t caller_sp, uintptr_t top,
     uintptr_t end = re;
     uintptr_t tp = thread_pointer();
     if (tp > caller_sp && tp < re) {
-#if defined(__x86_64__)
-      if (!G->tls_static_info) {
-        end = 0;  // cannot place the TLS: no wall (warned at init)
-      } else {
-        size_t size = 0, align = 0;
-        G->tls_static_info(&size, &align);
-        uintptr_t tls_lo = GUEST_FLOOR(tp - size);
-        if (tls_lo < end) end = tls_lo;
-      }
-#elif GK_HVF
-      // The descriptor and its TLS start at tp and extend upward.
-      uintptr_t pd_lo = GUEST_FLOOR(tp);
-      if (pd_lo < end) end = pd_lo;
-#else
-      // The TCB and static TLS sit above tp; struct pthread (glibc's
-      // TLS_PRE_TCB_SIZE, plus slack for its alignment) below it.
-      if (!G->pthread_size) {
-        end = 0;  // cannot place the thread descriptor: no wall (warned at init)
-      } else {
-        uintptr_t pd_lo = GUEST_FLOOR(tp - G->pthread_size - 64);
-        if (pd_lo < end) end = pd_lo;
-      }
-#endif
+      uintptr_t floor = thread_data_floor(tp);
+      if (!floor) end = 0;  // the thread's data cannot be placed: no wall (warned at init)
+      else if (floor < end) end = floor;
     }
     t->wall_map_lo = rs;
     t->wall_map_hi = re;
@@ -483,11 +440,7 @@ void gk_get_stats(gk_stats *s) {
   s->neighbor_pages = G->neighbor_pages;
   s->root_switches = atomic_load_explicit(&G->root_switches, memory_order_relaxed);
   s->tlb_flushes = atomic_load_explicit(&G->tlb_flushes, memory_order_relaxed);
-#if defined(__x86_64__)
-  s->flush_invpcid = G->flush_stub == gk_flush_stub_invpcid;
-#else
-  s->flush_invpcid = 0;
-#endif
+  s->flush_invpcid = flush_uses_invpcid();
   pthread_mutex_unlock(&G->lock);
 }
 

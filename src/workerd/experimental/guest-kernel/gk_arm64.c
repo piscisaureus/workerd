@@ -680,4 +680,8 @@ static int vcb_exception(gk_thread *t, long *ret) {
   return 0;
 }
 
+// ---- diagnostics -------------------------------------------------------------
+static int flush_uses_invpcid(void) { return 0; }
+static uintptr_t super_page(void) { return G->vbar; }  // the vector table
+
 #endif  // defined(__aarch64__)

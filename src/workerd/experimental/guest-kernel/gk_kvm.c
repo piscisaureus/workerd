@@ -67,4 +67,7 @@ static void vcpu_park_hw(gk_thread *t, gk_parked_vcpu *p) {
 // section), so a thread's stack needs no refresh when it comes or goes.
 static void stack_refresh(void) {}
 
+// Nothing in the guest needs refreshing before a turn under KVM.
+static void turn_prepare(void) {}
+
 #endif  // !GK_HVF
