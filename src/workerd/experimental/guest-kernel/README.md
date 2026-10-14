@@ -230,9 +230,30 @@ decides the overall cost.
   memory: the C++/KJ heap, glibc, and every guest thread's stack (the JS turn
   runs on the calling thread's stack, above host frames) are user-mapped. Code
   execution inside an isolate can corrupt that shared state and, via a host
-  return address on the stack, potentially reach host execution. Confining it
-  needs the runtime's memory, or at least its stacks and control-flow data, kept
-  out of ring 3's reach.
+  return address on the stack, potentially reach host execution.
+
+  That memory is also *readable*, which matters even without code execution.
+  The per-isolate arena covers what V8 reserves page-granularly -- the
+  sandbox, trusted and code ranges, pointer tables and cppgc pages, all
+  routed through `jsg::ArenaPageAllocator` -- so another isolate's V8 heap is
+  unmapped and a stray read cannot reach it. It does not cover the C++
+  objects that come from the process allocator: `i::Isolate` and malloc'd V8
+  state, JSG `Wrappable`, `IoOwn`, `IoContext`, and the KJ allocations that
+  carry request and response bodies. Those share one heap across isolates, so
+  an escape with only a read primitive can still recover another isolate's
+  in-flight data from it.
+
+  Confining this needs the runtime's mutable memory out of ring 3's reach, so
+  that an arena maps only the isolate's own pages, the runtime's text and
+  read-only data, and a per-isolate channel for talking to a host-side
+  runtime. gk already has the enforcement primitive for it: `prot_add()`
+  classes a range `GK_PROT_SUPER` (mapped, `PTE_U` cleared, so ring 3 faults)
+  or `GK_PROT_REFUSE` (never mapped), which is how gk's own control state is
+  protected. What is missing is the interface: the C++ bindings reach runtime
+  state through direct pointers, so reclassifying that memory faults the turn
+  until those accesses become messages. Moving the malloc'd objects into the
+  arena needs a per-isolate allocator arena, which means an allocator with
+  extent hooks; workerd uses tcmalloc, which has none.
 - **No cross-vCPU TLB shootdown IPIs yet.** Adding mappings needs none (a
   not-present entry has nothing stale to flush), which is why dynamic `mmap`
   and per-thread stacks work across vCPUs. Removing or shrinking a mapping
