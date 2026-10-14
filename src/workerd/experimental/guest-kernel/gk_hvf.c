@@ -106,11 +106,7 @@ static int vm_create(void) {
     return -1;
   }
   os_release(cfg);
-  static const int ips_bits[] = {32, 36, 40, 42, 44, 48};
-  for (G->ips = 0; G->ips < 5 && ips_bits[G->ips + 1] <= (int)ipa; G->ips++) {}
-  ipa = (uint32_t)ips_bits[G->ips];
-  G->gpa_next = GK_BACK_WIN;  // guest-physical 0 stays unused
-  G->gpa_limit = 1ULL << ipa;
+  ipa = (uint32_t)gpa_space_init((int)ipa);
   void *pool = mmap(NULL, (size_t)GK_MAX_SHADOWS * GK_HOST_PAGE, PROT_NONE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (pool == MAP_FAILED) { G->err = "mmap shadow pool"; return -1; }

@@ -138,6 +138,19 @@ static uint64_t pte_reprotect(uint64_t e, const gk_reprot *rp, uintptr_t v) {
 // address is congruent to its host-virtual one modulo GK_BACK_WIN, so KVM can
 // still back an aligned 2MB with one stage-2 block (see arena_thp_advise).
 // Guarded by G->lock.
+
+// The guest-physical space for a VM of at most `ipa` bits: the largest size
+// TCR_EL1.IPS can name that fits (G->ips), which is returned. Guest-physical 0
+// stays unused.
+static int gpa_space_init(int ipa) {
+  static const int ips_bits[] = {32, 36, 40, 42, 44, 48};
+  for (G->ips = 0; G->ips < 5 && ips_bits[G->ips + 1] <= ipa; G->ips++) {}
+  ipa = ips_bits[G->ips];
+  G->gpa_next = GK_BACK_WIN;
+  G->gpa_limit = 1ULL << ipa;
+  return ipa;
+}
+
 static int gpa_alloc(uint64_t size, uint64_t *out) {
   for (int i = 0; i < G->gpa_free_n; i++) {
     gk_gpa_extent *x = &G->gpa_free[i];
