@@ -54,5 +54,6 @@
 #define GK_USER_SLOTS 256        // PML4 slots 0..255 are the 47-bit user address space
 
 typedef struct kvm_regs gk_regs;
+#define GK_REGS_SP(r) ((r).rsp)
 
 #endif  // GK_X86_64_H
