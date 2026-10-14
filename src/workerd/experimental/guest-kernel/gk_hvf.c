@@ -2,6 +2,9 @@
 // Mach traps, stage 2, the vCPU registers, syscall forwarding and the run loop.
 #include "gk_internal.h"
 #if GK_HVF
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
 
 // One macOS syscall or Mach trap, with the registers a caller has at svc #0x80:
 // x0..x7 from `a`, the number in x16 (negative for a Mach trap). Returns x0 and
@@ -440,6 +443,121 @@ static int mach_trap_allowed(long nr, uint64_t target) {
   }
 }
 
+// ---- the ring-3 syscall memory broker (macOS) -------------------------------
+// As on Linux (see the broker in gk_linux.c), a ring-3 turn's forwarded BSD
+// syscall may name only memory the turn could reach itself (guest_range_ok),
+// and a BSD syscall gk has no descriptor for is refused. The Mach traps are
+// policed separately (mach_trap_allowed) and the address-taking VM traps have
+// their range checked where the call is reflected below. Ring-0 turns are gk's
+// own trusted code and are not brokered.
+#ifndef UIO_MAXIOV
+#define UIO_MAXIOV 1024
+#endif
+
+static int g_str(gk_thread *t, uintptr_t s) {
+  if (s == 0) return 0;
+  for (uintptr_t off = 0; off <= 4096;) {
+    uintptr_t p = s + off;
+    uintptr_t page_end = (p & ~(GK_HOST_PAGE - 1)) + GK_HOST_PAGE;
+    if (!guest_range_ok(t, p, page_end - p, 0)) return 0;
+    char buf[256];
+    while (p < page_end && off <= 4096) {
+      size_t n = page_end - p;
+      if (n > sizeof buf) n = sizeof buf;
+      if (copy_in(buf, p, n) < 0) return 0;
+      for (size_t i = 0; i < n; i++)
+        if (buf[i] == 0) return 1;
+      p += n;
+      off += n;
+    }
+  }
+  return 1;
+}
+
+static int g_iov(gk_thread *t, uintptr_t iov, long cnt, int write) {
+  if (cnt < 0 || cnt > UIO_MAXIOV) return 0;
+  if (!guest_range_ok(t, iov, (uintptr_t)cnt * sizeof(struct iovec), 0)) return 0;
+  for (long i = 0; i < cnt; i++) {
+    struct iovec v;
+    if (copy_in(&v, iov + (uintptr_t)i * sizeof v, sizeof v) < 0) return 0;
+    if (!guest_range_ok(t, (uintptr_t)v.iov_base, v.iov_len, write)) return 0;
+  }
+  return 1;
+}
+
+static int g_msg(gk_thread *t, uintptr_t mp, int write) {
+  struct msghdr m;
+  if (!guest_range_ok(t, mp, sizeof m, 0) || copy_in(&m, mp, sizeof m) < 0) return 0;
+  if (m.msg_name && !guest_range_ok(t, (uintptr_t)m.msg_name, m.msg_namelen, write)) return 0;
+  if (m.msg_control &&
+      !guest_range_ok(t, (uintptr_t)m.msg_control, m.msg_controllen, write))
+    return 0;
+  return g_iov(t, (uintptr_t)m.msg_iov, (long)m.msg_iovlen, write);
+}
+
+// Whether ring-3 thread `t` may forward BSD syscall `nr` (>= 0) with arguments
+// a[0..5]. Fail-closed: a syscall not named here is refused.
+static int syscall_mem_ok(gk_thread *t, long nr, const uint64_t a[8]) {
+#define RD(p, n) \
+  do { if (!guest_range_ok(t, (uintptr_t)(p), (uintptr_t)(n), 0)) return 0; } while (0)
+#define WR(p, n) \
+  do { if (!guest_range_ok(t, (uintptr_t)(p), (uintptr_t)(n), 1)) return 0; } while (0)
+#define STR(p) \
+  do { if (!g_str(t, (uintptr_t)(p))) return 0; } while (0)
+#define OPT_WR(p, n) \
+  do { if ((p) && !guest_range_ok(t, (uintptr_t)(p), (uintptr_t)(n), 1)) return 0; } while (0)
+  switch (nr) {
+    // Scalar-only, plus the mapping calls whose range is checked where they are
+    // reflected below.
+    case SYS_getpid: case SYS_getppid: case SYS_gettid: case SYS_close: case SYS_fcntl:
+    case SYS_lseek: case SYS_socket: case SYS_shutdown: case SYS_listen: case SYS_fsync:
+    case SYS_mprotect: case SYS_munmap: case SYS_madvise: case SYS_mmap: case SYS_exit:
+    case SYS_dup: case SYS_dup2: case SYS_kill: case SYS_fdatasync:
+      return 1;
+    case SYS_read: case SYS_pread: WR(a[1], a[2]); return 1;
+    case SYS_write: case SYS_pwrite: RD(a[1], a[2]); return 1;
+    case SYS_readv: return g_iov(t, a[1], (long)a[2], 1);
+    case SYS_writev: return g_iov(t, a[1], (long)a[2], 0);
+    case SYS_getentropy: WR(a[0], a[1]); return 1;
+    case SYS_recvfrom:
+      WR(a[1], a[2]);
+      if (a[4] && a[5]) {
+        socklen_t sl = 0;
+        if (copy_in(&sl, (uintptr_t)a[5], sizeof sl) < 0) return 0;
+        WR(a[5], sizeof sl);
+        WR(a[4], sl);
+      }
+      return 1;
+    case SYS_sendto: RD(a[1], a[2]); if (a[4]) RD(a[4], a[5]); return 1;
+    case SYS_recvmsg: return g_msg(t, a[1], 1);
+    case SYS_sendmsg: return g_msg(t, a[1], 0);
+    case SYS_connect: case SYS_bind: RD(a[1], a[2]); return 1;
+    case SYS_setsockopt: RD(a[3], a[4]); return 1;
+    case SYS_getsockopt:
+      WR(a[4], sizeof(int));
+      if (a[3]) {
+        socklen_t sl = 0;
+        if (copy_in(&sl, (uintptr_t)a[4], sizeof sl) < 0) return 0;
+        WR(a[3], sl);
+      }
+      return 1;
+    case SYS_open: STR(a[0]); return 1;
+    case SYS_openat: STR(a[1]); return 1;
+    case SYS_fstat64: WR(a[1], sizeof(struct stat)); return 1;
+    case SYS_stat64: case SYS_lstat64: STR(a[0]); WR(a[1], sizeof(struct stat)); return 1;
+    case SYS_fstatat64: STR(a[1]); WR(a[2], sizeof(struct stat)); return 1;
+    default:
+      if (G->dbg)
+        fprintf(stderr, "[gk] vcpu %d ring-3 BSD syscall %ld has no memory descriptor: refused\n",
+                t->id, nr);
+      return 0;
+  }
+#undef RD
+#undef WR
+#undef STR
+#undef OPT_WR
+}
+
 static long forward_syscall(gk_thread *t, gk_regs *r) {
   long nr = (long)r->x[16];
   uint64_t a[8];
@@ -456,6 +574,9 @@ static long forward_syscall(gk_thread *t, gk_regs *r) {
     deny = 1;
   } else if (nr < 0 && !mach_trap_allowed(nr, a[0])) {
     if (G->dbg) fprintf(stderr, "[gk] vcpu %d Mach trap %ld DENIED\n", t->id, nr);
+    deny = 1;
+  } else if (t->user_mode && nr >= 0 && !syscall_mem_ok(t, nr, a)) {
+    // A ring-3 BSD syscall may name only memory the turn could reach itself.
     deny = 1;
   }
   if (deny) {
@@ -492,6 +613,15 @@ static long forward_syscall(gk_thread *t, gk_regs *r) {
       break;
   }
   if (len == 0) kind = GK_REFLECT_NONE;
+  // A ring-3 turn may only unmap or reprotect a range it could reach itself; a
+  // placed (anywhere) mapping gets fresh memory and is left to the output path.
+  if (t->user_mode && (kind == GK_REFLECT_UNMAP || kind == GK_REFLECT_PROTECT ||
+                       (kind == GK_REFLECT_MAP && nr == GK_SYS_mmap && (a[3] & MAP_FIXED))) &&
+      !guest_range_ok(t, rs, len, 1)) {
+    if (nr < 0) return KERN_PROTECTION_FAILURE;
+    r->spsr |= GK_SPSR_C;
+    return GK_EPERM;
+  }
   if (kind) {
     rs = HOST_FLOOR(rs);
     re = HOST_CEIL(rs + len);

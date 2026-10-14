@@ -1217,22 +1217,36 @@ static long gk_lsys(long nr, long a1, long a2, long a3) {
   return raw_syscall3(nr, a1, a2, a3);
 #endif
 }
+#endif  // GK_TEST_GUEST_THREADS
 
-// Probes the ring-3 memory broker from inside the guest. getrandom writes its
-// buffer, so forwarding it is allowed only when the buffer is memory this ring-3
-// turn could reach: `own` (its own arena page) works, while `other` (another
-// arena) and `ctl` (gk control memory) are refused with EPERM before the host
-// ever sees them. A host-state syscall (rt_sigaction) is refused too. Results
-// go back in the struct; returns 1 if the broker behaved.
+// Probes the ring-3 memory broker from inside the guest. getrandom (Linux) /
+// getentropy (macOS) writes its buffer, so forwarding it is allowed only when
+// the buffer is memory this ring-3 turn could reach: `own` (its own arena page)
+// works, while `other` (another arena) and `ctl` (gk control memory) are
+// refused with EPERM before the host ever sees them. A syscall with no memory
+// descriptor is refused too. Results go back in the struct; returns 1 if the
+// broker behaved.
 struct broker { void *own, *other, *ctl; long r_own, r_other, r_ctl, r_sig; };
 static long broker_probe(void *arg) {
   struct broker *b = arg;
+#if defined(__APPLE__)
+  b->r_own = raw_syscall3(SYS_getentropy, (long)b->own, 16, 0);
+  b->r_other = raw_syscall3(SYS_getentropy, (long)b->other, 16, 0);
+  b->r_ctl = raw_syscall3(SYS_getentropy, (long)b->ctl, 16, 0);
+  b->r_sig = raw_syscall3(SYS_sigaction, SIGUSR1, 0, 0);  // no descriptor: refused
+  return b->r_own == 0 && b->r_other == -EPERM && b->r_ctl == -EPERM && b->r_sig == -EPERM;
+#else
   b->r_own = gk_lsys(SYS_getrandom, (long)b->own, 16, 0);
   b->r_other = gk_lsys(SYS_getrandom, (long)b->other, 16, 0);
   b->r_ctl = gk_lsys(SYS_getrandom, (long)b->ctl, 16, 0);
   b->r_sig = gk_lsys(SYS_rt_sigaction, SIGUSR1, 0, 0);
   return b->r_own == 16 && b->r_other == -EPERM && b->r_ctl == -EPERM && b->r_sig == -EPERM;
+#endif
 }
+
+
+#if GK_TEST_GUEST_THREADS
+// A thread that ring-3 code creates must run at ring 3 as well: gaining ring 0
 
 
 // A thread that ring-3 code creates must run at ring 3 as well: gaining ring 0
@@ -2198,8 +2212,7 @@ int main(void) {
   // The ring-3 syscall memory broker: a forwarded syscall may name only memory
   // this ring-3 turn could reach itself. Under arena A, getrandom into A's own
   // page is forwarded, into arena B or gk control memory it is refused with
-  // EPERM before the host runs it, and a host-state syscall is refused too.
-#if GK_TEST_GUEST_THREADS
+  // EPERM before the host runs it, and a syscall with no descriptor is refused.
   int ok_broker = 1;
   {
     gk_arena *A = gk_arena_create(4096), *B = gk_arena_create(4096);
@@ -2210,6 +2223,12 @@ int main(void) {
       ok_broker = 0;
       printf("ring-3 syscall broker: setup failed [FAIL]\n");
     } else {
+      long own_want = -EPERM + 1;  // getrandom returns 16, getentropy returns 0
+#if defined(__APPLE__)
+      own_want = 0;
+#else
+      own_want = 16;
+#endif
       struct broker b = {gk_arena_base(A), gk_arena_base(B), (void *)refuse, 0, 0, 0, 0};
       gk_arena_enter(A);
       long ok = gk_run_user(broker_probe, &b);
@@ -2218,14 +2237,10 @@ int main(void) {
       gk_arena_destroy(B);
       ok_broker = ok == 1;
       printf("ring-3 syscall broker: own arena -> %ld, other arena -> %ld, gk control -> %ld, "
-             "rt_sigaction -> %ld (want 16/-EPERM/-EPERM/-EPERM) [%s]\n", b.r_own, b.r_other,
-             b.r_ctl, b.r_sig, ok_broker ? "OK" : "FAIL");
+             "undescribed -> %ld (want %ld/-EPERM/-EPERM/-EPERM) [%s]\n", b.r_own, b.r_other,
+             b.r_ctl, b.r_sig, own_want, ok_broker ? "OK" : "FAIL");
     }
   }
-#else
-  int ok_broker = 1;
-  printf("ring-3 syscall broker: Linux-only; skipped [OK]\n");
-#endif
 
   // ---- guest-created threads at ring 3 --------------------------------------
   // Threads spawned by a ring-3 context run at ring 3 themselves. Each faulting

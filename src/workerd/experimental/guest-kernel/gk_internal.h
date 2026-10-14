@@ -619,6 +619,7 @@ static void unmap_range_root(uint64_t *root, uintptr_t s, uintptr_t e);
 static int mmu_map_range(uintptr_t s, uintptr_t e, int perms);
 static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp);
 static int prot_class(uintptr_t addr);
+static int guest_range_ok(gk_thread *t, uintptr_t addr, uintptr_t len, int write);
 
 // gk_region.c
 static struct gk_region *region_find(uintptr_t addr);
