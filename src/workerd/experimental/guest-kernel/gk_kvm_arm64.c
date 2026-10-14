@@ -271,4 +271,56 @@ static uintptr_t thread_data_floor(uintptr_t tp) {
   return GUEST_FLOOR(tp - G->pthread_size - 64);
 }
 
+// ---- the Linux syscall ABI and guest threads (see gk_linux.c) ----------------
+// gk's own host calls, in the Linux shape: the result, or -errno.
+static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
+                         long a6) {
+  register long x8 __asm__("x8") = nr;
+  register long x0 __asm__("x0") = a1;
+  register long x1 __asm__("x1") = a2;
+  register long x2 __asm__("x2") = a3;
+  register long x3 __asm__("x3") = a4;
+  register long x4 __asm__("x4") = a5;
+  register long x5 __asm__("x5") = a6;
+  __asm__ __volatile__("svc #0"
+                       : "+r"(x0)
+                       : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                       : "memory");
+  return x0;
+}
+
+// A guest syscall's number and arguments from its register snapshot, as a[0]
+// and a[1..6].
+static void syscall_args(const gk_regs *r, long a[7]) {
+  a[0] = (long)r->x[8];
+  for (int i = 0; i < 6; i++) a[i + 1] = (long)r->x[i];
+}
+
+// The SVC exit resumes from the vcb whatever ran on the vCPU in between.
+static void syscall_stub_ran(gk_regs *r) {
+  (void)r;
+}
+
+// The start registers of a guest-created thread, from its parent's snapshot
+// `c` at the clone: the clone returns 0 on the stack it named. ELR and SPSR
+// stay the parent's: the child resumes after the SVC, at the parent's
+// exception level (see child_launch).
+static void child_regs_init(gk_regs *c, uint64_t sp) {
+  c->x[0] = 0;
+  c->sp = sp;
+}
+
+// Hand a guest-created thread's vCPU its start registers (see child_entry).
+static void child_launch(gk_thread *t) {
+  // The dispatcher resumes the parent's frame as the child's: after the SVC,
+  // at the parent's exception level (the frame's SPSR), so a ring-3 creator's
+  // child starts at ring 3 with no stub of its own.
+  VCB(t)->f = t->start.regs;
+  VCB(t)->action &= ~GK_ACT_LAUNCH;
+  if (G->dbg)
+    fprintf(stderr, "[gk] vcpu %d: guest thread tid %ld (from vcpu %d) pc=%#llx sp=%#llx ring %d\n",
+            t->id, t->tid, t->start.parent_id, (unsigned long long)t->start.regs.elr,
+            (unsigned long long)t->start.regs.sp, t->start.user ? 3 : 0);
+}
+
 #endif  // defined(__aarch64__) && !GK_HVF

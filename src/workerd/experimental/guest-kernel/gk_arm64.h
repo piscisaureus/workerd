@@ -89,6 +89,7 @@ _Static_assert(offsetof(struct gk_vcb, f.sp) == 248 && offsetof(struct gk_vcb, f
                "struct gk_vcb must match the VCB_* offsets in gk_asm_arm64.S");
 #define VCB(t) ((struct gk_vcb *)(uintptr_t)(t)->ist)
 typedef gk_frame gk_regs;
+#define GK_REGS_SP(r) ((r).sp)
 #if !GK_HVF
 // One register of a vCPU, by KVM_{GET,SET}_ONE_REG id: GK_CORE_REG names a
 // field of struct kvm_regs, ARM64_SYS_REG a system register.

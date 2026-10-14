@@ -29,7 +29,6 @@ static gk_arena *arena_containing(uintptr_t a) {
 // and keep every later arena out of it. A run is taken over held slots as
 // they are and over the others with MAP_FIXED_NOREPLACE.
 
-
 // Reserve the run of nslots slots from idx, none of them used or pinned: a
 // held slot is gk's already, and any other must be free host address space,
 // which MAP_FIXED_NOREPLACE takes only if nothing is mapped there. On success

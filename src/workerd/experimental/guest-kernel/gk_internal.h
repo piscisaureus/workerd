@@ -591,8 +591,6 @@ static void stack_refresh(void);
 static int host_stack_grow(uintptr_t page);
 static void arena_thp_advise(uintptr_t s, uintptr_t e);
 static gk_thread *thread_ending(void *p);
-static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
-                         long a6);
 static int copy_in(void *dst, uintptr_t src, size_t n);
 static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms);
 static long gettid_raw(void);
@@ -675,6 +673,12 @@ static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t st
 static int host_backing_retry(gk_thread *t);
 static long host_backing_fail(gk_thread *t, int err);
 static long run_vcpu(gk_thread *t);
+static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
+                         long a6);
+static void syscall_args(const gk_regs *r, long a[7]);
+static void syscall_stub_ran(gk_regs *r);
+static void child_regs_init(gk_regs *c, uint64_t sp);
+static void child_launch(gk_thread *t);
 #endif
 
 #if defined(__aarch64__)
@@ -726,6 +730,12 @@ static int cr3_load_host(gk_thread *t, uint64_t cr3);
 static int host_backing_retry(gk_thread *t);
 static long host_backing_fail(gk_thread *t, int err);
 static long run_vcpu(gk_thread *t);
+static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
+                         long a6);
+static void syscall_args(const gk_regs *r, long a[7]);
+static void syscall_stub_ran(gk_regs *r);
+static void child_regs_init(gk_regs *c, uint64_t sp);
+static void child_launch(gk_thread *t);
 #endif
 
 // gk_core.c

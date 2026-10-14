@@ -885,4 +885,62 @@ static uintptr_t thread_data_floor(uintptr_t tp) {
 static int flush_uses_invpcid(void) { return G->flush_stub == gk_flush_stub_invpcid; }
 static uintptr_t super_page(void) { return G->gdt_va; }
 
+// ---- the Linux syscall ABI and guest threads (see gk_linux.c) ----------------
+// gk's own host calls, in the Linux shape: the result, or -errno.
+static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
+                         long a6) {
+  long ret;
+  register long r10 __asm__("r10") = a4;
+  register long r8 __asm__("r8") = a5;
+  register long r9 __asm__("r9") = a6;
+  __asm__ __volatile__("syscall"
+                       : "=a"(ret)
+                       : "a"(nr), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8),
+                         "r"(r9)
+                       : "rcx", "r11", "memory");
+  return ret;
+}
+
+// A guest syscall's number and arguments from its register snapshot, as a[0]
+// and a[1..6].
+static void syscall_args(const gk_regs *r, long a[7]) {
+  a[0] = (long)r->rax; a[1] = (long)r->rdi; a[2] = (long)r->rsi; a[3] = (long)r->rdx;
+  a[4] = (long)r->r10; a[5] = (long)r->r8; a[6] = (long)r->r9;
+}
+
+// A stub ran on this vCPU during the syscall exit whose snapshot is `r` (see
+// run_stub): the guest resumes after the hypercall.
+static void syscall_stub_ran(gk_regs *r) {
+  r->rip = (uintptr_t)&gk_syscall_tramp_resume;
+}
+
+// The start registers of a guest-created thread, from its parent's snapshot
+// `c` at the clone: the clone returns 0 on the stack it named, straight at the
+// guest's return address.
+static void child_regs_init(gk_regs *c, uint64_t sp) {
+  c->rax = 0;
+  c->rsp = sp;
+  c->rip = c->rcx;  // the return address SYSCALL saved
+}
+
+// Hand a guest-created thread's vCPU its start registers (see child_entry). A
+// ring-0 creator's child starts at its RIP in ring 0; a ring-3 creator's is
+// launched through gk_user_child_launch, which SYSRETs down to that RIP in
+// ring 3.
+static void child_launch(gk_thread *t) {
+  struct kvm_regs regs = t->start.regs;
+  if (t->start.user) {
+    // Enter ring 3 through the SYSRET stub. The snapshot's RCX and R11 already
+    // hold the return RIP and RFLAGS SYSCALL saved in the parent; the stub's
+    // contract wants RCX = the start RIP, which is that same return address.
+    regs.rip = (uintptr_t)&gk_user_child_launch;
+    regs.rcx = t->start.regs.rip;
+  }
+  regs_set(t, &regs);
+  if (G->dbg)
+    fprintf(stderr, "[gk] vcpu %d: guest thread tid %ld (from vcpu %d) rip=%#llx rsp=%#llx pkru=%#x ring %d\n",
+            t->id, t->tid, t->start.parent_id, (unsigned long long)t->start.regs.rip,
+            (unsigned long long)t->start.regs.rsp, t->start.pkru, t->start.user ? 3 : 0);
+}
+
 #endif  // defined(__x86_64__)
