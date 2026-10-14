@@ -154,9 +154,10 @@ unsigned long gk_debug_ctl_addr(int which);
 // next gk_run runs normally.
 unsigned long gk_fault_addr(void);
 
-// The number of KVM vCPUs created so far. vCPUs of ended threads are pooled
-// and reused, so this is bounded by the peak number of concurrently running
-// guest threads, not by the number of threads ever created.
+// The number of vCPU ids handed out so far. The vCPUs (on macOS, the ids and
+// per-vCPU state) of ended threads are pooled and reused, so this is bounded by
+// the peak number of concurrently running guest threads, not by the number of
+// threads ever created.
 int gk_vcpu_count(void);
 
 // Per-isolate memory arena: a large PROT_NONE reservation with its own
@@ -187,9 +188,10 @@ size_t gk_arena_size(const gk_arena *a);
 // when called from within forwarded code, immediately.
 gk_arena *gk_arena_enter(gk_arena *a);
 
-// Tear an arena down: its reservation is unmapped, every mapping and KVM
-// memslot inside it is removed, and its page tables and address-space slots
-// are recycled for later arenas, so creating and destroying arenas
+// Tear an arena down: its reservation is replaced with an inaccessible
+// placeholder that keeps the address range from other host mappings, every
+// mapping and guest-physical region inside it is removed, and its page tables
+// and address-space slots are recycled for later arenas, so creating and destroying arenas
 // indefinitely is bounded in every resource. The calling thread leaves the
 // arena if it is active there. No other thread may still have it active (or
 // be a guest thread that inherited it): such an arena's tables are leaked
@@ -198,8 +200,8 @@ void gk_arena_destroy(gk_arena *a);
 
 // Resource counters, for tests and diagnostics.
 typedef struct {
-  int memslots;         // live KVM memslots
-  int memslot_ids;      // memslot ids ever handed out (bounded by peak live memslots)
+  int memslots;         // live guest-physical regions (KVM memslots; HVF stage-2 ranges)
+  int memslot_ids;      // region ids ever handed out (bounded by peak live regions)
   int arenas;           // live arenas
   long pt_pages_used;   // page-table pages in use, across all roots
   long pt_pages_free;   // page-table pages on the free list

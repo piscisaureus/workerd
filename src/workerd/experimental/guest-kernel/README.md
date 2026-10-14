@@ -315,16 +315,15 @@ apply skipped. The differences, all in the host side of `gk.c` under `GK_HVF`:
   waits at the dispatcher with its last root in `TTBR0_EL1`, which a
   destroyed arena may have freed; HVF keeps no TLB entry for the dispatcher
   across `hv_vcpu_run`, so gk loads the next root from the host before a turn
-  that switches roots (the dispatcher then re-loads it and invalidates). Under
-  KVM the same switch runs with the stale root still in `TTBR0_EL1` and relies
-  on the dispatcher's translation being cached, which it normally is.
+  that switches roots (the dispatcher then re-loads it and invalidates). KVM
+  on arm64 does the same.
 - **No vDSO, no protection keys, no huge-page advice.** The guest reads the
   counter directly (`CNTVCT_EL0` with a zero vtimer offset is
   `mach_absolute_time`), arm64 has no `pkey_*`, and macOS has no
   `MADV_HUGEPAGE`.
 
-Not done on macOS: the Bazel build and the workerd integration, guest-created
-threads, and any performance measurement. `hv_vcpu_exit_t`, which HVF
+On macOS there is no Bazel build or workerd integration, guest-created
+threads are unsupported, and performance is unmeasured. `hv_vcpu_exit_t`, which HVF
 allocates, is readable from the guest, and a shadow pool page is never reused.
 
 ## How it would map to workerd
