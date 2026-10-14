@@ -51,9 +51,7 @@ static gk_thread *thread_get(void) {
     return NULL;
   }
   thread_bind(t, 1);
-#if GK_HVF
   stack_refresh();
-#endif
   return t;
 }
 
@@ -72,30 +70,17 @@ static gk_arena *arena_enter(gk_thread *t, gk_arena *a) {
 // Return the thread's vCPU (and guest stack, if any) to the pool.
 static void vcpu_park(gk_thread *t) {
   if (!t->inited) return;
-#if GK_HVF
-  // An HVF vCPU belongs to the thread that created it and cannot be run or
-  // destroyed by another, so it goes with the thread; its id, vcb and stacks
-  // are pooled and the next thread creates a vCPU around them (vcpu_init).
-  hv_vcpu_destroy(t->vcpu);
-#endif
+  vcpu_detach(t);
   pthread_mutex_lock(&G->lock);
   if (G->parked_n < GK_MAX_VCPUS) {
     gk_parked_vcpu *p = &G->parked[G->parked_n++];
-#if !GK_HVF
-    p->fd = t->fd;
-#endif
+    vcpu_park_hw(t, p);
     p->id = t->id;
-#if !GK_HVF
-    p->run = t->run;
-#endif
     p->stack_top = t->stack_top;
     p->ist = t->ist;
     p->side_stack = t->side_stack;
   } else {  // cannot happen with KVM_CAP_MAX_VCPUS <= GK_MAX_VCPUS; be safe
-#if !GK_HVF
-    munmap(t->run, G->run_size);
-    close(t->fd);
-#endif
+    vcpu_park_hw(t, NULL);
   }
   pthread_mutex_unlock(&G->lock);
   if (G->dbg) fprintf(stderr, "[gk] vcpu %d parked\n", t->id);
@@ -108,9 +93,7 @@ static void thread_release(gk_thread *t) {
   vcpu_park(t);
   arena_enter(t, NULL);
   tls_rec = 0;
-#if GK_HVF
   stack_refresh();
-#endif
   pthread_mutex_lock(&G->lock);
   t->tid = 0;
   t->next_free = G->thread_free;
@@ -120,21 +103,9 @@ static void thread_release(gk_thread *t) {
 
 // pthread key destructor: a host thread with a record is ending. (Guest-created
 // threads end through the exit syscall in forward_syscall instead, which
-// releases explicitly.) The key's value is not trusted; the record is found and
-// checked the usual way.
+// releases explicitly.) The key's value is not trusted; thread_ending finds
+// and checks the record.
 static void thread_key_dtor(void *p) {
-#if GK_HVF
-  // macOS may have finalized the thread's __thread storage (tls_rec) before
-  // this destructor runs, so the key's value is checked the same way instead:
-  // a record in the pool that this thread, by kernel tid, owns.
-  gk_thread *t = (gk_thread *)p;
-  if (t < G->threads || t >= G->threads + GK_MAX_VCPUS ||
-      ((uintptr_t)t - (uintptr_t)G->threads) % sizeof *t != 0 || t->tid != gettid_raw())
-    gk_fatal("thread record does not belong to the ending thread");
-  thread_release(t);
-#else
-  (void)p;
-  gk_thread *t = thread_cur();
+  gk_thread *t = thread_ending(p);
   if (t) thread_release(t);
-#endif
 }

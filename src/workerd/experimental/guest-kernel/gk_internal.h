@@ -552,6 +552,9 @@ static void db_flush(gk_dbuf *d);
 // gk_hvf.c
 static int memslot_add(int slot, uint64_t gpa, uintptr_t s, uintptr_t e);
 static int memslot_remove(gk_region *n, int *keep_gpa);
+static void vcpu_detach(gk_thread *t);
+static void vcpu_park_hw(gk_thread *t, gk_parked_vcpu *p);
+static gk_thread *thread_ending(void *p);
 static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
                          long a6);
 static int copy_in(void *dst, uintptr_t src, size_t n);
@@ -571,10 +574,14 @@ static long run_vcpu(gk_thread *t);
 // gk_kvm.c
 static int memslot_add(int slot, uint64_t gpa, uintptr_t s, uintptr_t e);
 static int memslot_remove(gk_region *n, int *keep_gpa);
+static void vcpu_detach(gk_thread *t);
+static void vcpu_park_hw(gk_thread *t, gk_parked_vcpu *p);
+static void stack_refresh(void);
 #endif
 
 #if !GK_HVF
 // gk_linux.c
+static gk_thread *thread_ending(void *p);
 static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
                          long a6);
 static int copy_in(void *dst, uintptr_t src, size_t n);

@@ -228,6 +228,25 @@ static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms)
 }
 static long gettid_raw(void) { return host_syscall(SYS_thread_selfid, 0, 0, 0, 0, 0, 0); }
 
+// An HVF vCPU belongs to the thread that created it and cannot be run or
+// destroyed by another, so it goes with the thread (vcpu_detach, before the
+// park); its id, vcb and stacks are pooled and the next thread creates a vCPU
+// around them (vcpu_init).
+static void vcpu_detach(gk_thread *t) { hv_vcpu_destroy(t->vcpu); }
+static void vcpu_park_hw(gk_thread *t, gk_parked_vcpu *p) { (void)t; (void)p; }
+
+// The record of the host thread whose pthread key destructor runs. macOS may
+// have finalized the thread's __thread storage (tls_rec) before the
+// destructor, so the key's value `p` is checked instead the way thread_cur
+// checks tls_rec: a record in the pool that this thread, by kernel tid, owns.
+static gk_thread *thread_ending(void *p) {
+  gk_thread *t = (gk_thread *)p;
+  if (t < G->threads || t >= G->threads + GK_MAX_VCPUS ||
+      ((uintptr_t)t - (uintptr_t)G->threads) % sizeof *t != 0 || t->tid != gettid_raw())
+    gk_fatal("thread record does not belong to the ending thread");
+  return t;
+}
+
 // A host thread's stack is a fresh mapping, often at an address an earlier
 // thread's stack had, and stage 2 keeps the pages it was given (see the HVF
 // section): the pages a guest turn on the earlier thread put there would
