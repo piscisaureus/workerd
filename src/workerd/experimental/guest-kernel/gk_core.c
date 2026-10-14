@@ -14,99 +14,9 @@ int gk_init(void) {
   prot_add(GK_CTL_START, GK_CTL_END, GK_PROT_SUPER);
   G->dbg = getenv("GK_DEBUG") != NULL;
   G->thp = getenv("GK_NO_THP") == NULL;
-#if defined(__x86_64__)
-  *(void **)&G->tls_static_info = dlsym(RTLD_DEFAULT, "_dl_get_tls_static_info");
-  if (!G->tls_static_info)
-    fprintf(stderr, "[gk] _dl_get_tls_static_info not found: gk_run_here_user builds no "
-                    "host-frame wall on pthread stacks\n");
-#elif !GK_HVF
-  // glibc publishes sizeof(struct pthread) for libthread_db (GLIBC_PRIVATE).
-  const uint32_t *psz = dlsym(RTLD_DEFAULT, "_thread_db_sizeof_pthread");
-  G->pthread_size = psz ? *psz : 0;
-  if (!G->pthread_size)
-    fprintf(stderr, "[gk] _thread_db_sizeof_pthread not found: gk_run_here_user builds no "
-                    "host-frame wall on pthread stacks\n");
-#endif
-#if defined(__x86_64__)
-  if (sysconf(_SC_PAGESIZE) != 4096) { G->err = "host page size is not 4KiB"; return -1; }
-#else
-  // Any power of two the windows are multiples of (see the page-sizes section).
-  long pagesz = sysconf(_SC_PAGESIZE);
-  if (pagesz < 4096 || (pagesz & (pagesz - 1)) || GK_NEIGHBOR_WIN % (unsigned long)pagesz) {
-    G->err = "unsupported host page size";
-    return -1;
-  }
-  G->host_page = (size_t)pagesz;
-#endif
-#if GK_HVF
-  // The VM, with the largest guest-physical space the framework offers (see
-  // the guest-physical allocator), and the shadow pool (see the HVF section).
-  hv_vm_config_t cfg = hv_vm_config_create();
-  uint32_t ipa = 36;
-  if (!cfg || hv_vm_config_get_max_ipa_size(&ipa) != HV_SUCCESS ||
-      hv_vm_config_set_ipa_size(cfg, ipa) != HV_SUCCESS || hv_vm_create(cfg) != HV_SUCCESS) {
-    G->err = "hv_vm_create (is the binary signed with the hypervisor entitlement?)";
-    return -1;
-  }
-  os_release(cfg);
-  static const int ips_bits[] = {32, 36, 40, 42, 44, 48};
-  for (G->ips = 0; G->ips < 5 && ips_bits[G->ips + 1] <= (int)ipa; G->ips++) {}
-  ipa = (uint32_t)ips_bits[G->ips];
-  G->gpa_next = GK_BACK_WIN;  // guest-physical 0 stays unused
-  G->gpa_limit = 1ULL << ipa;
-  void *pool = mmap(NULL, (size_t)GK_MAX_SHADOWS * GK_HOST_PAGE, PROT_NONE,
-                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-  if (pool == MAP_FAILED) { G->err = "mmap shadow pool"; return -1; }
-  G->shadow_pool = (uintptr_t)pool;
-  prot_add(G->shadow_pool, G->shadow_pool + (size_t)GK_MAX_SHADOWS * GK_HOST_PAGE, GK_PROT_REFUSE);
-  size_t map_bytes = HOST_CEIL(G->gpa_limit / GK_HOST_PAGE / 8);  // touched only where used
-  void *map = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-  if (map == MAP_FAILED) { G->err = "mmap stage-2 map"; return -1; }
-  G->s2_map = map;
-  prot_add((uintptr_t)map, (uintptr_t)map + map_bytes, GK_PROT_REFUSE);
-  if (G->dbg) fprintf(stderr, "[gk] Hypervisor.framework VM, %u-bit guest-physical space\n", ipa);
-#else
-  G->kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
-  if (G->kvm < 0) { G->err = "open /dev/kvm"; return -1; }
-  if (ioctl(G->kvm, KVM_GET_API_VERSION, 0) != 12) { G->err = "KVM API != 12"; return -1; }
-#if defined(__x86_64__)
-  G->vmfd = ioctl(G->kvm, KVM_CREATE_VM, 0);
-  if (G->vmfd < 0) { G->err = "KVM_CREATE_VM"; return -1; }
-#else
-  // The largest guest-physical space KVM offers (see the guest-physical
-  // allocator), and TCR_EL1.IPS to match.
-  int ipa = ioctl(G->kvm, KVM_CHECK_EXTENSION, KVM_CAP_ARM_VM_IPA_SIZE);
-  if (ipa <= 0) ipa = 40;
-  if (ipa > 48) ipa = 48;
-  static const int ips_bits[] = {32, 36, 40, 42, 44, 48};
-  for (G->ips = 0; G->ips < 5 && ips_bits[G->ips + 1] <= ipa; G->ips++) {}
-  ipa = ips_bits[G->ips];
-  G->vmfd = ioctl(G->kvm, KVM_CREATE_VM, KVM_VM_TYPE_ARM_IPA_SIZE(ipa));
-  if (G->vmfd < 0) { G->err = "KVM_CREATE_VM"; return -1; }
-  G->gpa_next = GK_BACK_WIN;  // guest-physical 0 stays unused
-  G->gpa_limit = 1ULL << ipa;
-  // The vector handlers' HVCs come to the host as KVM_EXIT_HYPERCALL; without
-  // the filter KVM would take them as (failed) PSCI calls itself.
-  struct kvm_smccc_filter filter = {.base = GK_HC_BASE, .nr_functions = GK_HC_COUNT,
-                                    .action = KVM_SMCCC_FILTER_FWD_TO_USER};
-  struct kvm_device_attr fa = {.group = KVM_ARM_VM_SMCCC_CTRL, .attr = KVM_ARM_VM_SMCCC_FILTER,
-                               .addr = (uint64_t)(uintptr_t)&filter};
-  if (ioctl(G->vmfd, KVM_SET_DEVICE_ATTR, &fa) < 0) { G->err = "KVM_ARM_VM_SMCCC_FILTER"; return -1; }
-  // The guest runs the host's vDSO, which reads the virtual counter: with a
-  // zero offset it reads the host's, as the zero TSC offset does on x86-64.
-  // Best effort: older kernels lack the ioctl, and the guest's clock is then
-  // off by the VM's start time.
-  struct kvm_arm_counter_offset co = {.counter_offset = 0};
-  if (ioctl(G->vmfd, KVM_ARM_SET_COUNTER_OFFSET, &co) < 0)
-    fprintf(stderr, "[gk] KVM_ARM_SET_COUNTER_OFFSET failed (%s): guest clocks are off\n",
-            strerror(errno));
-  if (ioctl(G->vmfd, KVM_ARM_PREFERRED_TARGET, &G->vcpu_target) < 0) {
-    G->err = "KVM_ARM_PREFERRED_TARGET";
-    return -1;
-  }
-#endif
-#endif  // GK_HVF
+  wall_probe();
+  if (page_size_init() < 0) return -1;
+  if (vm_create() < 0) return -1;
 
   G->pt_bytes = 64 * 1024 * 1024;
   uint8_t *pt = mmap(NULL, G->pt_bytes, PROT_READ | PROT_WRITE,
@@ -117,78 +27,10 @@ int gk_init(void) {
   // (it has memslots), never through guest-virtual PTEs. Refuse it so ring-3
   // code cannot fault it in and rewrite the tables that enforce the arenas.
   prot_add(G->pt_base, G->pt_base + G->pt_bytes, GK_PROT_REFUSE);
-#if defined(__aarch64__)
-#if !GK_HVF
-  vdso_setup();  // before the first region: its windows must avoid [vvar]
-#endif
-  // Table entries hold guest-physical addresses (PTE_TABLE_ENTRY), so the
-  // page-table arena's must be known before the first table is linked in: it
-  // is one region, and one guest-physical range.
-  if (region_ensure(G->pt_base, G->pt_base + G->pt_bytes) < 0) { G->err = "memslot for PT arena"; return -1; }
-  gk_region *ptr = region_find(G->pt_base);
-  if (!ptr || ptr->end < G->pt_base + G->pt_bytes) { G->err = "PT arena memslot split"; return -1; }
-  G->pt_gpa = ptr->gpa + (G->pt_base - ptr->start);
-#endif
+  if (pt_arena_init() < 0) return -1;
   G->pml4 = alloc_table();
 
-#if defined(__x86_64__)
-  uint8_t *tables = mmap(NULL, 0x2000, PROT_READ | PROT_WRITE,
-                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-  if (tables == MAP_FAILED) { G->err = "mmap gdt/idt"; return -1; }
-  G->gdt_va = (uintptr_t)tables;
-  G->idt_va = (uintptr_t)tables + 0x1000;
-  // The GDT and IDT are read by the CPU (a supervisor access) during exception
-  // delivery and ring transitions; ring-3 code has no business touching them.
-  prot_add(G->gdt_va, G->gdt_va + 0x2000, GK_PROT_SUPER);
-  // GDT layout, in the order SYSCALL/SYSRET and the exception frames need:
-  //   0x08 ring-0 code64   (SYSCALL loads CS from STAR[47:32] = 0x08)
-  //   0x10 ring-0 data     (SYSCALL loads SS = 0x08 + 8)
-  //   0x18 unused          (TR's nominal selector; TR uses a cached descriptor)
-  //   0x20 ring-3 data     (SYSRET loads SS = STAR[63:48] + 8 = 0x1b + 8 = 0x23)
-  //   0x28 ring-3 code64   (SYSRET loads CS = STAR[63:48] + 16 = 0x1b + 16 = 0x2b)
-  // STAR[63:48] is 0x1b (RPL 3): SYSRET adds 8/16 and uses the RPL as-is, so
-  // ring 3 runs with SS 0x23 and CS 0x2b. The CPU reloads both from the GDT on
-  // the IRETQ that returns from a ring-3 fault, so the +8/+16 order, RPL and
-  // DPL=3 must all be exact.
-  uint64_t *gdt = (uint64_t *)(uintptr_t)G->gdt_va;
-  gdt[0] = 0;
-  gdt[1] = 0x00AF9A000000FFFFULL;  // ring-0 code64 (DPL 0, L=1)
-  gdt[2] = 0x00CF92000000FFFFULL;  // ring-0 data   (DPL 0)
-  gdt[3] = 0;
-  gdt[4] = 0x00CFF2000000FFFFULL;  // ring-3 data   (DPL 3)
-  gdt[5] = 0x00AFFA000000FFFFULL;  // ring-3 code64 (DPL 3, L=1)
-  uint8_t *idt = (uint8_t *)(uintptr_t)G->idt_va;
-  memset(idt, 0, 0x1000);
-  set_idt_gate(idt, 0, (uintptr_t)&gk_exc_de);
-  set_idt_gate(idt, 6, (uintptr_t)&gk_exc_ud);
-  set_idt_gate(idt, 8, (uintptr_t)&gk_exc_df);
-  set_idt_gate(idt, 13, (uintptr_t)&gk_exc_gp);
-  set_idt_gate(idt, 14, (uintptr_t)&gk_exc_pf);
-
-  // The page-table arena is read by the CPU page walker via guest-physical
-  // addresses, so it needs memslots (but no PTEs of its own).
-  if (region_ensure(G->pt_base, G->pt_base + G->pt_bytes) < 0) { G->err = "memslot for PT arena"; return -1; }
-  // GDT/IDT and the handler text must be present before the first fault.
-  if (mmu_map_range(G->gdt_va, G->gdt_va + 0x2000, 1 | 2) < 0) { G->err = "map gdt/idt"; return -1; }
-  if (map_handler_text() < 0) { G->err = "map handler text"; return -1; }
-
-  GK_CPUID->nent = GK_CPUID_ENTRIES;
-  if (ioctl(G->kvm, KVM_GET_SUPPORTED_CPUID, GK_CPUID) < 0) { G->err = "GET_SUPPORTED_CPUID"; return -1; }
-  flush_stub_select();
-  G->run_size = ioctl(G->kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
-  // Register exchange through kvm_run (see regs_get) when KVM offers it for
-  // both register sets; GK_NO_SYNC_REGS in the environment forces the ioctls.
-  if (!getenv("GK_NO_SYNC_REGS")) {
-    long caps = ioctl(G->kvm, KVM_CHECK_EXTENSION, KVM_CAP_SYNC_REGS);
-    G->sync_regs = caps > 0 && (caps & GK_SYNC_REGS) == GK_SYNC_REGS;
-  }
-  if (G->dbg) fprintf(stderr, "[gk] registers via %s\n", G->sync_regs ? "kvm_run" : "ioctl");
-#else
-  if (map_handler_text() < 0) { G->err = "map handler text"; return -1; }
-#if !GK_HVF
-  G->run_size = ioctl(G->kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
-#endif
-#endif
+  if (guest_tables_init() < 0) return -1;
   if (pthread_key_create(&G->thread_key, thread_key_dtor) != 0) { G->err = "pthread_key_create"; return -1; }
 
   // Bring up the calling thread's record and vCPU.

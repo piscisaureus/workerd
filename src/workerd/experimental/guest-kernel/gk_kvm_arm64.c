@@ -11,6 +11,58 @@ static int s2_ensure(gk_region *rg, uintptr_t hva) {
   return 0;
 }
 
+// ---- VM setup (see gk_init) --------------------------------------------------
+// The host facts the host-frame wall needs (see stack_wall_bounds): the size of
+// glibc's struct pthread.
+static void wall_probe(void) {
+  // glibc publishes sizeof(struct pthread) for libthread_db (GLIBC_PRIVATE).
+  const uint32_t *psz = dlsym(RTLD_DEFAULT, "_thread_db_sizeof_pthread");
+  G->pthread_size = psz ? *psz : 0;
+  if (!G->pthread_size)
+    fprintf(stderr, "[gk] _thread_db_sizeof_pthread not found: gk_run_here_user builds no "
+                    "host-frame wall on pthread stacks\n");
+}
+
+// The VM, its kvm_run size, and the vDSO's data pages, which every region must
+// avoid (see the vDSO section), so before the first one.
+static int vm_create(void) {
+  if (kvm_open() < 0) return -1;
+  // The largest guest-physical space KVM offers (see the guest-physical
+  // allocator), and TCR_EL1.IPS to match.
+  int ipa = ioctl(G->kvm, KVM_CHECK_EXTENSION, KVM_CAP_ARM_VM_IPA_SIZE);
+  if (ipa <= 0) ipa = 40;
+  if (ipa > 48) ipa = 48;
+  static const int ips_bits[] = {32, 36, 40, 42, 44, 48};
+  for (G->ips = 0; G->ips < 5 && ips_bits[G->ips + 1] <= ipa; G->ips++) {}
+  ipa = ips_bits[G->ips];
+  G->vmfd = ioctl(G->kvm, KVM_CREATE_VM, KVM_VM_TYPE_ARM_IPA_SIZE(ipa));
+  if (G->vmfd < 0) { G->err = "KVM_CREATE_VM"; return -1; }
+  G->gpa_next = GK_BACK_WIN;  // guest-physical 0 stays unused
+  G->gpa_limit = 1ULL << ipa;
+  // The vector handlers' HVCs come to the host as KVM_EXIT_HYPERCALL; without
+  // the filter KVM would take them as (failed) PSCI calls itself.
+  struct kvm_smccc_filter filter = {.base = GK_HC_BASE, .nr_functions = GK_HC_COUNT,
+                                    .action = KVM_SMCCC_FILTER_FWD_TO_USER};
+  struct kvm_device_attr fa = {.group = KVM_ARM_VM_SMCCC_CTRL, .attr = KVM_ARM_VM_SMCCC_FILTER,
+                               .addr = (uint64_t)(uintptr_t)&filter};
+  if (ioctl(G->vmfd, KVM_SET_DEVICE_ATTR, &fa) < 0) { G->err = "KVM_ARM_VM_SMCCC_FILTER"; return -1; }
+  // The guest runs the host's vDSO, which reads the virtual counter: with a
+  // zero offset it reads the host's, as the zero TSC offset does on x86-64.
+  // Best effort: older kernels lack the ioctl, and the guest's clock is then
+  // off by the VM's start time.
+  struct kvm_arm_counter_offset co = {.counter_offset = 0};
+  if (ioctl(G->vmfd, KVM_ARM_SET_COUNTER_OFFSET, &co) < 0)
+    fprintf(stderr, "[gk] KVM_ARM_SET_COUNTER_OFFSET failed (%s): guest clocks are off\n",
+            strerror(errno));
+  if (ioctl(G->vmfd, KVM_ARM_PREFERRED_TARGET, &G->vcpu_target) < 0) {
+    G->err = "KVM_ARM_PREFERRED_TARGET";
+    return -1;
+  }
+  G->run_size = ioctl(G->kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
+  vdso_setup();
+  return 0;
+}
+
 // ---- the vDSO (arm64) --------------------------------------------------------
 // The vDSO's functions (clock_gettime and friends) read the kernel's data
 // pages, [vvar], which are a PFNMAP mapping, and arm64 KVM refuses a memslot

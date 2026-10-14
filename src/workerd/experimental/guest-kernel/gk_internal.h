@@ -550,6 +550,8 @@ static void db_flush(gk_dbuf *d);
 
 #if GK_HVF
 // gk_hvf.c
+static void wall_probe(void);
+static int vm_create(void);
 static int memslot_add(int slot, uint64_t gpa, uintptr_t s, uintptr_t e);
 static int memslot_remove(gk_region *n, int *keep_gpa);
 static void vcpu_detach(gk_thread *t);
@@ -572,6 +574,7 @@ static long run_vcpu(gk_thread *t);
 
 #if !GK_HVF
 // gk_kvm.c
+static int kvm_open(void);
 static int memslot_add(int slot, uint64_t gpa, uintptr_t s, uintptr_t e);
 static int memslot_remove(gk_region *n, int *keep_gpa);
 static void vcpu_detach(gk_thread *t);
@@ -631,6 +634,11 @@ static void thread_key_dtor(void *p);
 
 #if defined(__x86_64__)
 // gk_x86_64.c
+static void wall_probe(void);
+static int page_size_init(void);
+static int vm_create(void);
+static int pt_arena_init(void);
+static int guest_tables_init(void);
 static int gpa_assign(uintptr_t s, uintptr_t e, uint64_t *gpa);
 static void gpa_unassign(uintptr_t s, uintptr_t e, uint64_t gpa);
 static void gpa_retire(gk_region *n);
@@ -661,6 +669,9 @@ static long run_vcpu(gk_thread *t);
 
 #if defined(__aarch64__)
 // gk_arm64.c
+static int page_size_init(void);
+static int pt_arena_init(void);
+static int guest_tables_init(void);
 static int gpa_assign(uintptr_t s, uintptr_t e, uint64_t *gpa);
 static void gpa_unassign(uintptr_t s, uintptr_t e, uint64_t gpa);
 static void gpa_retire(gk_region *n);
@@ -690,6 +701,8 @@ static int vcb_exception(gk_thread *t, long *ret);
 
 #if defined(__aarch64__) && !GK_HVF
 // gk_kvm_arm64.c
+static void wall_probe(void);
+static int vm_create(void);
 static int s2_ensure(gk_region *rg, uintptr_t hva);
 static void vdso_setup(void);
 static int vdso_call(gk_frame *f, uint64_t pc);
