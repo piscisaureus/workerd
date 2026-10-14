@@ -1442,6 +1442,15 @@ static int confined_path_syscall(gk_thread *t, long nr, long a1, long a2, long a
 // from reading or writing another arena, gk's control memory, or the caller's
 // host-frame wall. (gk's own dereferences of guest pointers go through copy_in,
 // which is fault-safe; see there.)
+//
+// Known gap: the array descriptors (iovec, msghdr) are read from guest memory
+// both here and, moments later, by the kernel. A second guest thread in the
+// same isolate could rewrite a descriptor's base/length in between, after the
+// check but before the kernel reads it, to redirect a scatter/gather transfer.
+// Closing this needs the descriptor marshalled into gk memory and the kernel
+// pointed at that copy; the plain buffer syscalls (read, write, recvfrom, ...)
+// are unaffected because their pointer and length are register arguments the
+// kernel takes directly, with nothing in guest memory to race.
 #ifndef UIO_MAXIOV
 #define UIO_MAXIOV 1024
 #endif
@@ -1482,9 +1491,13 @@ static int g_iov(gk_thread *t, uintptr_t iov, long cnt, int write) {
 }
 
 // A msghdr and everything it points at (name, control, and the iovec).
+// A msghdr and everything it points at. recvmsg writes the header fields
+// (msg_*len, msg_flags) and the name/control/iov buffers; sendmsg only reads
+// them. So `write` governs the header too, which keeps a recvmsg from writing a
+// header placed in the host-frame wall.
 static int g_msg(gk_thread *t, uintptr_t mp, int write) {
   struct msghdr m;
-  if (!guest_range_ok(t, mp, sizeof m, 0) || copy_in(&m, mp, sizeof m) < 0) return 0;
+  if (!guest_range_ok(t, mp, sizeof m, write) || copy_in(&m, mp, sizeof m) < 0) return 0;
   if (m.msg_name && !guest_range_ok(t, (uintptr_t)m.msg_name, m.msg_namelen, write)) return 0;
   if (m.msg_control &&
       !guest_range_ok(t, (uintptr_t)m.msg_control, m.msg_controllen, write))
@@ -1507,23 +1520,29 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
 #define OPT_WR(p, n) \
   do { if ((p) && !guest_range_ok(t, (uintptr_t)(p), (uintptr_t)(n), 1)) return 0; } while (0)
   switch (nr) {
-    // Scalar-only: no pointer arguments.
+    // Scalar-only: no pointer arguments, and no effect on another isolate.
+    // (A guest thread's exit and a thread-creating clone are intercepted in
+    // forward_syscall; a non-thread clone and exit_group are refused below.)
     case SYS_brk: case SYS_close: case SYS_dup: case SYS_dup3: case SYS_epoll_create1:
-    case SYS_eventfd2: case SYS_exit: case SYS_exit_group: case SYS_fchdir: case SYS_fcntl:
-    case SYS_fsync:
+    case SYS_eventfd2: case SYS_exit: case SYS_fchdir: case SYS_fsync:
     case SYS_ftruncate: case SYS_getpid: case SYS_getppid: case SYS_gettid:
-    case SYS_fdatasync: case SYS_listen: case SYS_lseek: case SYS_madvise:
-    case SYS_mprotect: case SYS_munmap: case SYS_pkey_alloc: case SYS_pkey_free:
+    case SYS_fdatasync: case SYS_listen: case SYS_lseek:
     case SYS_sched_getscheduler: case SYS_sched_yield: case SYS_shutdown:
-    case SYS_socket: case SYS_tgkill: case SYS_restart_syscall: case SYS_kill:
-      // madvise/mprotect/munmap act on the caller's own address range; a range
-      // in another arena or gk memory is already unreachable, so a reflected
-      // one is rejected where it is reflected, but check it here too for the
-      // ones with no reflection.
-      if (nr == SYS_madvise || nr == SYS_mprotect || nr == SYS_munmap ||
-          nr == SYS_pkey_mprotect)
-        WR(a[1], a[2]);
+    case SYS_socket: case SYS_tgkill: case SYS_restart_syscall:
       return 1;
+    case SYS_fcntl:
+      // Only the commands whose third argument is a scalar; the rest (F_GETLK,
+      // F_SETLK, F_GETOWN_EX, ...) carry a pointer gk does not size.
+      switch (a[2]) {
+        case F_GETFD: case F_SETFD: case F_GETFL: case F_SETFL:
+        case F_DUPFD: case F_DUPFD_CLOEXEC: case F_GETOWN: case F_SETOWN:
+          return 1;
+        default: return 0;
+      }
+    // The mapping calls act on a caller-named range; a range outside what this
+    // turn can reach is refused (which also rejects reflecting it later).
+    case SYS_madvise: case SYS_mprotect: case SYS_munmap: WR(a[1], a[2]); return 1;
+    case SYS_pkey_mprotect: WR(a[1], a[2]); return 1;
     case SYS_mmap:
       if (a[4] & MAP_FIXED) WR(a[1], a[2]);  // a fixed map replaces that range
       return 1;
@@ -1531,7 +1550,6 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
       WR(a[1], a[2]);
       if (a[4] & MREMAP_FIXED) WR(a[5], a[3]);
       return 1;
-    case SYS_pkey_mprotect: WR(a[1], a[2]); return 1;
     case SYS_read: case SYS_pread64: WR(a[2], a[3]); return 1;
     case SYS_write: case SYS_pwrite64: RD(a[2], a[3]); return 1;
     case SYS_readv: case SYS_preadv: case SYS_preadv2: return g_iov(t, a[2], a[3], 1);
@@ -1540,10 +1558,10 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
     case SYS_getcwd: WR(a[1], a[2]); return 1;
     case SYS_getdents64: WR(a[2], a[3]); return 1;
     case SYS_recvfrom:
-      WR(a[2], a[3]);
-      OPT_WR(a[5], sizeof(int));  // addrlen, if an address is wanted
-      if (a[5] && a[6]) {
+      WR(a[2], a[3]);  // the receive buffer
+      if (a[6]) {      // the kernel writes the source length, then the address
         socklen_t sl = 0;
+        WR(a[6], sizeof sl);
         if (copy_in(&sl, (uintptr_t)a[6], sizeof sl) < 0) return 0;
         WR(a[5], sl);
       }
@@ -1556,22 +1574,28 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
     case SYS_sendmsg: return g_msg(t, a[2], 0);
     case SYS_sendmmsg: case SYS_recvmmsg: {
       long n = a[3];
+      int recv = nr == SYS_recvmmsg;
       if (n < 0 || n > UIO_MAXIOV) return 0;
-      // struct mmsghdr is a msghdr followed by an unsigned; validate each.
+      // struct mmsghdr is a msghdr followed by an unsigned msg_len the kernel
+      // writes either way, so the array itself is written.
       struct mmsghdr { struct msghdr msg_hdr; unsigned msg_len; };
-      RD(a[2], (uintptr_t)n * sizeof(struct mmsghdr));
+      WR(a[2], (uintptr_t)n * sizeof(struct mmsghdr));
       for (long i = 0; i < n; i++)
-        if (!g_msg(t, a[2] + (uintptr_t)i * sizeof(struct mmsghdr), nr == SYS_recvmmsg))
-          return 0;
+        if (!g_msg(t, a[2] + (uintptr_t)i * sizeof(struct mmsghdr), recv)) return 0;
+      if (recv) OPT_RD(a[5], sizeof(struct timespec));  // timeout
       return 1;
     }
     case SYS_connect: case SYS_bind: RD(a[2], a[3]); return 1;
     case SYS_accept4:
-      OPT_WR(a[2], sizeof(struct sockaddr_storage));
-      OPT_WR(a[3], sizeof(int));
+      if (a[2]) {  // the kernel writes the peer length, then the address
+        socklen_t sl = 0;
+        WR(a[3], sizeof sl);
+        if (copy_in(&sl, (uintptr_t)a[3], sizeof sl) < 0) return 0;
+        WR(a[2], sl);
+      }
       return 1;
     case SYS_getsockname: case SYS_getpeername:
-      WR(a[3], sizeof(int));
+      WR(a[3], sizeof(socklen_t));
       if (a[2]) {
         socklen_t sl = 0;
         if (copy_in(&sl, (uintptr_t)a[3], sizeof sl) < 0) return 0;
@@ -1580,7 +1604,7 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
       return 1;
     case SYS_setsockopt: RD(a[4], a[5]); return 1;
     case SYS_getsockopt:
-      WR(a[5], sizeof(int));
+      WR(a[5], sizeof(socklen_t));
       if (a[4]) {
         socklen_t sl = 0;
         if (copy_in(&sl, (uintptr_t)a[5], sizeof sl) < 0) return 0;
@@ -1612,12 +1636,12 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
       OPT_RD(a[5], sizeof(sigset_t));
       return 1;
     case SYS_ppoll:
-      RD(a[1], (uintptr_t)a[2] * sizeof(struct pollfd));
+      WR(a[1], (uintptr_t)a[2] * sizeof(struct pollfd));  // the kernel writes revents
       OPT_RD(a[3], sizeof(struct timespec));
       OPT_RD(a[4], sizeof(sigset_t));
       return 1;
     case SYS_prlimit64:
-      OPT_RD(a[3], sizeof(struct rlimit));
+      if (a[3]) return 0;  // setting a process-wide limit affects every isolate
       OPT_WR(a[4], sizeof(struct rlimit));
       return 1;
     case SYS_getrusage: WR(a[2], sizeof(struct rusage)); return 1;
@@ -1626,18 +1650,28 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
     case SYS_sched_getparam: WR(a[2], sizeof(struct sched_param)); return 1;
     case SYS_futex:
       RD(a[1], sizeof(int));
-      // FUTEX_WAIT family may pass a timespec in a4; REQUEUE/WAKE_OP a second
-      // futex word in a5.
       switch (a[2] & 0x7f) {
         case 0: case 9: OPT_RD(a[4], sizeof(struct timespec)); break;  // WAIT, WAIT_BITSET
-        case 3: case 4: case 5: case 10: case 11:  // REQUEUE, CMP_REQUEUE, WAKE_OP, ...
-          RD(a[5], sizeof(int));
-          break;
+        case 5: WR(a[5], sizeof(int)); break;                          // WAKE_OP writes uaddr2
+        case 3: case 4: case 10: case 12: RD(a[5], sizeof(int)); break;  // REQUEUE, CMP_REQUEUE[_PI]
       }
       return 1;
     case SYS_set_robust_list: RD(a[1], a[2]); return 1;
     case SYS_rseq: WR(a[1], a[2]); return 1;
     case SYS_sched_setaffinity: RD(a[3], a[2]); return 1;
+    case SYS_rt_sigprocmask: {
+      // Changes only the calling vCPU thread's own mask; abseil also uses it
+      // (with an invalid `how`, so no change) to probe whether an address is
+      // readable, and needs the kernel's EFAULT/EINVAL rather than a refusal.
+      size_t ss = (size_t)a[4];
+      if (ss > 128) ss = 128;  // the kernel accepts only an 8-byte set; bound the walk
+      OPT_RD(a[2], ss);
+      OPT_WR(a[3], ss);
+      return 1;
+    }
+    // Only a thread-creating clone (intercepted in forward_syscall) is allowed
+    // from ring 3; anything else would fork a host process. The tid pointers
+    // the kernel writes must be reachable.
     case GK_SYS_clone3: {
       struct gk_clone_args ca;
       size_t sz = (size_t)a[2];
@@ -1645,15 +1679,26 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
       RD(a[1], sz);
       memset(&ca, 0, sizeof ca);
       if (copy_in(&ca, (uintptr_t)a[1], sz < sizeof ca ? sz : sizeof ca) < 0) return 0;
+      if ((ca.flags & (GK_CLONE_VM | GK_CLONE_THREAD)) != (GK_CLONE_VM | GK_CLONE_THREAD))
+        return 0;
       if (ca.flags & GK_CLONE_PARENT_SETTID) WR(ca.parent_tid, sizeof(int));
       if (ca.flags & (GK_CLONE_CHILD_SETTID | GK_CLONE_CHILD_CLEARTID)) WR(ca.child_tid, sizeof(int));
       OPT_WR(ca.pidfd, sizeof(int));
       return 1;
     }
-    case SYS_clone:
-      if ((unsigned long)a[1] & GK_CLONE_PARENT_SETTID) WR(a[3], sizeof(int));
-      if ((unsigned long)a[1] & (GK_CLONE_CHILD_SETTID | GK_CLONE_CHILD_CLEARTID)) WR(a[4], sizeof(int));
+    case SYS_clone: {
+      unsigned long flags = (unsigned long)a[1];
+      if ((flags & (GK_CLONE_VM | GK_CLONE_THREAD)) != (GK_CLONE_VM | GK_CLONE_THREAD)) return 0;
+      // clone(flags, stack, parent_tid, ...): parent_tid is a[3]; child_tid is
+      // a[4] on x86-64 and a[5] on arm64 (tls and child_tid are swapped).
+      if (flags & GK_CLONE_PARENT_SETTID) WR(a[3], sizeof(int));
+#if defined(__x86_64__)
+      if (flags & (GK_CLONE_CHILD_SETTID | GK_CLONE_CHILD_CLEARTID)) WR(a[4], sizeof(int));
+#else
+      if (flags & (GK_CLONE_CHILD_SETTID | GK_CLONE_CHILD_CLEARTID)) WR(a[5], sizeof(int));
+#endif
       return 1;
+    }
 #if defined(__x86_64__)
     case SYS_open: STR(a[1]); return 1;
     case SYS_stat: case SYS_lstat: STR(a[1]); WR(a[2], sizeof(struct stat)); return 1;
@@ -1661,14 +1706,14 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
     case SYS_readlink: STR(a[1]); WR(a[2], a[3]); return 1;
     case SYS_rename: STR(a[1]); STR(a[2]); return 1;
     case SYS_unlink: case SYS_mkdir: case SYS_rmdir: STR(a[1]); return 1;
-    case SYS_poll: RD(a[1], (uintptr_t)a[2] * sizeof(struct pollfd)); return 1;
+    case SYS_poll: WR(a[1], (uintptr_t)a[2] * sizeof(struct pollfd)); return 1;  // revents written
     case SYS_epoll_wait: WR(a[2], (uintptr_t)a[3] * sizeof(struct epoll_event)); return 1;
     case SYS_eventfd: case SYS_epoll_create: return 1;  // scalar
 #endif
-    // Thread/process control, signal state and anything else acts on the host,
-    // not guest memory, or carries pointers gk cannot size: refuse at ring 3.
-    // (Thread-creating clone/clone3 is handled before this, and the embedder's
-    // filter bounds the set further.)
+    // Signal disposition, the host thread's mask, a non-thread clone,
+    // exit_group, kill and anything else acts on the host or on other isolates,
+    // or carries pointers gk cannot size: refuse. The embedder's filter bounds
+    // the set further.
     default:
       if (G->dbg)
         fprintf(stderr, "[gk] vcpu %d ring-3 syscall %ld has no memory descriptor: refused\n",

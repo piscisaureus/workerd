@@ -443,13 +443,34 @@ static int mach_trap_allowed(long nr, uint64_t target) {
   }
 }
 
+// Of the allowed Mach traps, the ones a ring-3 turn may use: those that carry
+// no guest pointer (so there is nothing to confine) plus the VM traps, whose
+// address range and output pointer are checked where they are reflected below.
+// The port RPC traps (-16..-25), pid_for_task and mach_timebase_info write a
+// result through a guest pointer gk does not validate, so ring-3 is refused
+// them; ring-0 (gk's own code) still gets them through mach_trap_allowed.
+static int mach_trap_ring3_ok(long nr) {
+  switch (nr) {
+    case GK_TRAP_vm_allocate: case GK_TRAP_vm_deallocate:
+    case GK_TRAP_vm_protect: case GK_TRAP_vm_map:
+    case -26: case -27: case -28: case -29:  // reply_port, thread/task/host self
+    case -33: case -34: case -35: case -36: case -37: case -38: case -39:  // semaphores
+    case -50:  // thread_get_special_reply_port
+    case -59: case -60: case -61: case -62:  // swtch_pri, swtch, thread_switch, clock_sleep
+    case -90:  // mach_wait_until
+    case -91: case -92: case -93: case -94:  // mk_timer_create/destroy/arm/cancel
+      return 1;
+    default:
+      return 0;
+  }
+}
 // ---- the ring-3 syscall memory broker (macOS) -------------------------------
 // As on Linux (see the broker in gk_linux.c), a ring-3 turn's forwarded BSD
 // syscall may name only memory the turn could reach itself (guest_range_ok),
 // and a BSD syscall gk has no descriptor for is refused. The Mach traps are
-// policed separately (mach_trap_allowed) and the address-taking VM traps have
-// their range checked where the call is reflected below. Ring-0 turns are gk's
-// own trusted code and are not brokered.
+// policed separately (mach_trap_allowed / mach_trap_ring3_ok) and the
+// address-taking VM traps have their range checked where the call is reflected
+// below. Ring-0 turns are gk's own trusted code and are not brokered.
 #ifndef UIO_MAXIOV
 #define UIO_MAXIOV 1024
 #endif
@@ -509,11 +530,21 @@ static int syscall_mem_ok(gk_thread *t, long nr, const uint64_t a[8]) {
   switch (nr) {
     // Scalar-only, plus the mapping calls whose range is checked where they are
     // reflected below.
-    case SYS_getpid: case SYS_getppid: case SYS_gettid: case SYS_close: case SYS_fcntl:
+    case SYS_getpid: case SYS_getppid: case SYS_gettid: case SYS_close:
     case SYS_lseek: case SYS_socket: case SYS_shutdown: case SYS_listen: case SYS_fsync:
-    case SYS_mprotect: case SYS_munmap: case SYS_madvise: case SYS_mmap: case SYS_exit:
-    case SYS_dup: case SYS_dup2: case SYS_kill: case SYS_fdatasync:
+    case SYS_mprotect: case SYS_munmap: case SYS_mmap: case SYS_exit:
+    case SYS_dup: case SYS_dup2: case SYS_fdatasync:
       return 1;
+    case SYS_madvise: WR(a[0], a[1]); return 1;
+    case SYS_fcntl:
+      // Only the commands whose third argument is a scalar; the rest (F_GETPATH,
+      // F_GETLK, ...) carry a pointer gk does not size.
+      switch (a[1]) {
+        case F_GETFD: case F_SETFD: case F_GETFL: case F_SETFL:
+        case F_DUPFD: case F_DUPFD_CLOEXEC: case F_GETOWN: case F_SETOWN:
+          return 1;
+        default: return 0;
+      }
     case SYS_read: case SYS_pread: WR(a[1], a[2]); return 1;
     case SYS_write: case SYS_pwrite: RD(a[1], a[2]); return 1;
     case SYS_readv: return g_iov(t, a[1], (long)a[2], 1);
@@ -575,6 +606,9 @@ static long forward_syscall(gk_thread *t, gk_regs *r) {
   } else if (nr < 0 && !mach_trap_allowed(nr, a[0])) {
     if (G->dbg) fprintf(stderr, "[gk] vcpu %d Mach trap %ld DENIED\n", t->id, nr);
     deny = 1;
+  } else if (t->user_mode && nr < 0 && !mach_trap_ring3_ok(nr)) {
+    if (G->dbg) fprintf(stderr, "[gk] vcpu %d Mach trap %ld refused at ring 3\n", t->id, nr);
+    deny = 1;
   } else if (t->user_mode && nr >= 0 && !syscall_mem_ok(t, nr, a)) {
     // A ring-3 BSD syscall may name only memory the turn could reach itself.
     deny = 1;
@@ -613,14 +647,25 @@ static long forward_syscall(gk_thread *t, gk_regs *r) {
       break;
   }
   if (len == 0) kind = GK_REFLECT_NONE;
-  // A ring-3 turn may only unmap or reprotect a range it could reach itself; a
-  // placed (anywhere) mapping gets fresh memory and is left to the output path.
-  if (t->user_mode && (kind == GK_REFLECT_UNMAP || kind == GK_REFLECT_PROTECT ||
-                       (kind == GK_REFLECT_MAP && nr == GK_SYS_mmap && (a[3] & MAP_FIXED))) &&
-      !guest_range_ok(t, rs, len, 1)) {
-    if (nr < 0) return KERN_PROTECTION_FAILURE;
-    r->spsr |= GK_SPSR_C;
-    return GK_EPERM;
+  // A ring-3 turn may only unmap or reprotect a range it could reach itself, and
+  // may only place a new mapping where the kernel chooses: a fixed mmap is held
+  // to a reachable range, and a vm_allocate/vm_map must be ANYWHERE (so it gets
+  // fresh memory, not another arena) with its result-address pointer reachable.
+  if (t->user_mode && kind) {
+    int bad = 0;
+    if (kind == GK_REFLECT_UNMAP || kind == GK_REFLECT_PROTECT) {
+      bad = !guest_range_ok(t, rs, len, 1);
+    } else if (nr == GK_SYS_mmap) {
+      if (a[3] & MAP_FIXED) bad = !guest_range_ok(t, rs, len, 1);
+    } else {  // vm_allocate / vm_map
+      uint64_t flags = (nr == GK_TRAP_vm_map) ? a[4] : a[3];
+      bad = !(flags & VM_FLAGS_ANYWHERE) || !guest_range_ok(t, addr_out, sizeof(uint64_t), 1);
+    }
+    if (bad) {
+      if (nr < 0) return KERN_PROTECTION_FAILURE;
+      r->spsr |= GK_SPSR_C;
+      return GK_EPERM;
+    }
   }
   if (kind) {
     rs = HOST_FLOOR(rs);
