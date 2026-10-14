@@ -25,8 +25,8 @@ which runs each isolate's JS turn at guest ring 3.
   share.
   - Shared by every platform: `gk_core.c` (`gk_init`, the run entry points,
     the host-frame wall, diagnostics), `gk_pt.c` (page tables, the
-    supervisor/refuse registry, demand paging), `gk_region.c` (memslot-backed
-    regions), `gk_arena.c`, `gk_thread.c` (thread records, the vCPU pool),
+    supervisor/refuse registry, demand paging), `gk_region.c` (the regions of
+    guest-physical backing), `gk_arena.c`, `gk_thread.c` (thread records, the vCPU pool),
     `gk_pkey.c` and `gk_util.c`.
   - Per architecture: `gk_x86_64.h`/`gk_x86_64.c` (x86-64, which is KVM only)
     and `gk_arm64.h`/`gk_arm64.c` (arm64 under either hypervisor).
@@ -394,9 +394,9 @@ decides the overall cost.
   2 MiB windows rather than exact mapping bounds is a **cost** choice, not a
   correctness one: exact per-page memslots are safe, but each memslot create
   costs ~20 us and a V8-sized heap of 4 KiB slots would exceed KVM's ~32764-slot
-  limit. (The heap corruption once blamed on on-demand memslot creation was
-  actually fault-path re-entrancy into glibc `malloc` — the memslot ioctl is not
-  involved; see the signal-safety note in `gk_region.c`.) A production MMU could track
+  limit. Neither choice lets the fault path allocate: the faulting guest thread
+  may be inside glibc `malloc` (see the signal-safety note in `gk_region.c`).
+  A production MMU could track
   exact VMAs (see the FreeBSD `sys/vm` note in `gk_region.c`) for density and add
   per-range cross-vCPU shootdowns; both are refinements, not correctness fixes.
 
