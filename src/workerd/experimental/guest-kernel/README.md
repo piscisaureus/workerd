@@ -28,6 +28,8 @@ isolate's JS turn at guest ring 3.
   loop) runs correctly with the worker's JS turn at guest ring 3, and that a
   Wasm bounds violation surfaces as a `WebAssembly.RuntimeError` rather than a
   guest fault.
+- `trace-symbolize.py` — turns a foreign-memory trace dump (see below) into
+  a table of named call sites with `llvm-symbolizer`.
 
 ## API
 
@@ -202,6 +204,26 @@ hardware:
   the main thread's growable stack is expanded on demand by a probe syscall,
   since a guest access alone does not trip the kernel's stack growth.
 
+- **Foreign-memory trace.** An instrument for the limitation below: with
+  `GK_TRACE_FOREIGN=1` gk records which pages of the shared runtime memory a
+  ring-3 turn touches, from which instructions, and how often. A writable page
+  outside every arena that is not a guest thread's stack (the brk heap, an
+  anonymous mapping, a `.data` segment, and, indistinguishable from anonymous
+  memory in `/proc/self/maps`, a `.bss`) is mapped with the user bit withheld
+  as it is demand-paged in, so ring 3 faults on its first read; the fault is
+  counted against the faulting RIP and the page let through, first for reads
+  and, at the next fault, for writes too, so each page's first write is seen
+  as well. Nothing is refused: a traced turn computes what an untraced one
+  does. The accounting is a fixed-size per-RIP table, a bounded sample and
+  totals split by access and region kind, all preallocated, since this is the
+  fault path and must not allocate; `GK_TRACE_REARM=1` re-arms the demoted
+  pages at every ring-3 turn entry so each turn is counted afresh. The table
+  is dumped as text at exit and on `SIGUSR2` (`GK_TRACE_OUT` names the file;
+  `GK_TRACE_SIGNAL` the signal), and `trace-symbolize.py` names the sites.
+  The test arms a region, touches it from ring 3 and checks the read/write
+  records, the per-RIP counts, re-arming, and that the trace is off without
+  the switch. Off, it costs a flag test per demand fault and per turn.
+
 The guest CPUID is the host's, so compiled code and glibc's ifunc resolvers
 select the same instruction set inside the guest as outside it, AVX-512
 included where the CPU has it. `gk_init` enables what that needs
@@ -258,6 +280,25 @@ decides the overall cost.
   until those accesses become messages. Moving the malloc'd objects into the
   arena needs a per-isolate allocator arena, which means an allocator with
   extent hooks; workerd uses tcmalloc, which has none.
+
+  The foreign-memory trace (above) measures what a turn needs from that
+  memory. For a hello-world worker (one `fetch` handler returning a constant
+  response, 121 requests, re-arming on) a turn touches 21 to 42 distinct
+  foreign pages (24 to 60 caught first accesses; the first request, which
+  compiles the handler, 51 pages), out of a working set of 70 pages in all,
+  at 82 call sites; 70% of the accesses are reads. None are in the brk heap
+  (tcmalloc does not use it). About 80% are in the workerd binary's `.bss`
+  and `.data`, nearly all of them tcmalloc's allocator state (transfer
+  caches, central free lists, the page heap and its trackers, a spin lock,
+  hooks, statistics: the turn allocates and frees through the process
+  allocator), the rest V8, KJ and workerd globals (the builtins entry table,
+  flags, a microtask-queue global, a promise arena, static counters). About
+  15% are the main thread's static TLS block, a four-page anonymous mapping
+  of ld.so's (V8's per-thread isolate data, tcmalloc's per-thread cache,
+  `thread_local` scopes of KJ and workerd, `pthread_getspecific`); a
+  pthread's TLS sits on its stack mapping and is not traced. The remaining
+  5% are glibc's `.data` and `.bss` (locale tables under `strcasecmp`, the
+  pthread key table, `environ`, mutex and `atexit` internals).
 - **No cross-vCPU TLB shootdown IPIs yet.** Adding mappings needs none (a
   not-present entry has nothing stale to flush), which is why dynamic `mmap`
   and per-thread stacks work across vCPUs. Removing or shrinking a mapping

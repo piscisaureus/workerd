@@ -1586,6 +1586,195 @@ static long avx512_check(void) {
   return ok;
 }
 
+// ---- the foreign-memory trace ----------------------------------------------
+// Two accessors with a known instruction address each: gk_test_trace_rd is
+// the one load and gk_test_trace_wr the one store, so a hit the tracer
+// records against either RIP is unambiguous, and every hit through the same
+// accessor aggregates on the same site.
+__asm__(".text\n"
+        ".globl gk_test_trace_read\n"
+        ".type gk_test_trace_read, @function\n"
+        "gk_test_trace_read:\n"
+        ".globl gk_test_trace_rd\n"
+        "gk_test_trace_rd:\n"
+        "  movzbq (%rdi), %rax\n"
+        "  ret\n"
+        ".globl gk_test_trace_write\n"
+        ".type gk_test_trace_write, @function\n"
+        "gk_test_trace_write:\n"
+        ".globl gk_test_trace_wr\n"
+        "gk_test_trace_wr:\n"
+        "  movb %sil, (%rdi)\n"
+        "  ret\n");
+extern long gk_test_trace_read(const void *p);
+extern void gk_test_trace_write(void *p, int v);
+extern const char gk_test_trace_rd[], gk_test_trace_wr[];
+
+// Runs at ring 3: reads the first byte of two consecutive pages of `arg`,
+// through the one load, then writes 0x5a over each of those bytes, through
+// the one store. Returns the sum of the bytes read. Touches nothing else the
+// tracer could see: the pages are reached from the argument register and the
+// calls use the private guest stack.
+static long __attribute__((noinline)) trace_touch(void *arg) {
+  unsigned char *p = arg;
+  long sum = gk_test_trace_read(p) + gk_test_trace_read(p + 4096);
+  gk_test_trace_write(p, 0x5a);
+  gk_test_trace_write(p + 4096, 0x5a);
+  return sum;
+}
+
+// A 256 KiB window of anonymous memory the guest has no translation of, with
+// one guard page of PROT_NONE on each side so that no neighbor of another
+// mapping is in the same window. The address may have belonged to a mapping
+// an earlier test unmapped on the host, whose PTEs then still stand, so they
+// are dropped and this vCPU's TLB flushed (as nb_fresh does).
+static unsigned char *trace_region(void *dummy) {
+  const size_t win = 256UL << 10;
+  unsigned char *m = mmap(NULL, 2 * win + 2 * 4096, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED) return NULL;
+  unsigned char *w = (unsigned char *)(((uintptr_t)m + 4096 + win - 1) & ~(win - 1));
+  mprotect(w - 4096, 4096, PROT_NONE);
+  mprotect(w + win, 4096, PROT_NONE);
+  for (size_t off = 0; off < win; off += 4096) gk_debug_drop_pte((unsigned long)w + off);
+  struct dp d = {dummy, global_shared};
+  gk_run(flush_then_read, &d);
+  return w;
+}
+
+// With the trace on, a ring-3 turn over a fresh region: the first read of
+// each page faults and is recorded as a read at the load's RIP, the first
+// write faults and is recorded as a write at the store's RIP, the turn
+// completes with the right result and its writes land. A second turn faults
+// nowhere: the pages stay demoted. With re-arming on, the next turn entry
+// arms them again and the same faults recur, and with it off again they do
+// not. A page a ring-0 run touched first is armed, so ring 3's first touch
+// of it faults too. With the trace off, a fresh region costs the one demand
+// fault it always did and nothing is recorded.
+static int trace_check(void) {
+  gk_trace_stats s0, s1, s2, s3, s4, s5, s6;
+  gk_stats g0, g1;
+  gk_trace_site rd0, wr0, rd1, wr1, rd2, wr2, rd3, wr3;
+  memset(&rd0, 0, sizeof rd0); memset(&wr0, 0, sizeof wr0);
+  memset(&rd1, 0, sizeof rd1); memset(&wr1, 0, sizeof wr1);
+  memset(&rd2, 0, sizeof rd2); memset(&wr2, 0, sizeof wr2);
+  memset(&rd3, 0, sizeof rd3); memset(&wr3, 0, sizeof wr3);
+  void *dummy = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  unsigned char *m1 = trace_region(dummy), *m2 = trace_region(dummy), *m3 = trace_region(dummy);
+  if (!m1 || !m2 || !m3) { printf("foreign-memory trace: no region [FAIL]\n"); return 0; }
+  unsigned long rip_rd = (unsigned long)gk_test_trace_rd, rip_wr = (unsigned long)gk_test_trace_wr;
+
+  // 1. First touches from ring 3, re-arming off.
+  gk_trace_reset();
+  gk_debug_trace_set(1, 0);
+  gk_trace_get_stats(&s0);
+  long r1 = gk_run_user(trace_touch, m1);
+  gk_trace_get_stats(&s1);
+  int found1 = gk_trace_site_lookup(rip_rd, &rd1) + gk_trace_site_lookup(rip_wr, &wr1);
+  int landed = m1[0] == 0x5a && m1[4096] == 0x5a;
+  long r1b = gk_run_user(trace_touch, m1);  // demoted: no fault
+  gk_trace_get_stats(&s2);
+  int ok1 = r1 == 0 && landed && r1b == 2 * 0x5a && found1 == 2 &&
+            s1.faults - s0.faults == 4 && s1.reads - s0.reads == 2 && s1.writes - s0.writes == 2 &&
+            s1.pages - s0.pages == 2 && s1.kind_faults[GK_TRACE_KIND_ANON] - s0.kind_faults[GK_TRACE_KIND_ANON] == 4 &&
+            s1.sites >= 2 && s1.turns - s0.turns == 1 && s1.turn_faults_last == 4 && s1.turn_pages_last == 2 &&
+            rd1.count == 2 && rd1.reads == 2 && rd1.writes == 0 && rd1.first_addr == (uintptr_t)m1 &&
+            rd1.first_kind == GK_TRACE_KIND_ANON && wr1.count == 2 && wr1.writes == 2 && wr1.reads == 0 &&
+            s2.faults == s1.faults && s2.turns - s1.turns == 1 && s2.turn_faults_last == 0;
+  printf("foreign-memory trace: ring-3 turn over 2 fresh pages -> %ld (writes landed %s), %ld faults "
+         "(%ld reads, %ld writes, %ld pages, anon %ld), load site n=%ld r=%ld w=%ld first=%#lx kind=%d, "
+         "store site n=%ld r=%ld w=%ld; again -> %ld (%ld faults) [%s]\n", r1, landed ? "yes" : "no",
+         s1.faults - s0.faults, s1.reads - s0.reads, s1.writes - s0.writes, s1.pages - s0.pages,
+         s1.kind_faults[GK_TRACE_KIND_ANON] - s0.kind_faults[GK_TRACE_KIND_ANON], rd1.count, rd1.reads,
+         rd1.writes, (unsigned long)rd1.first_addr, rd1.first_kind, wr1.count, wr1.reads, wr1.writes,
+         r1b, s2.faults - s1.faults, ok1 ? "OK" : "FAIL");
+
+  // 2. Re-arming: the next turn entry arms the pages again, so the same
+  //    accesses fault again; with it off again, the next turn faults nowhere.
+  gk_debug_trace_set(1, 1);
+  long r2 = gk_run_user(trace_touch, m1);   // the pages were demoted before re-arming was on: nothing to re-arm yet
+  gk_trace_get_stats(&s3);
+  long r2b = gk_run_user(trace_touch, m1);  // re-arms what the previous turn demoted... which was nothing
+  gk_trace_get_stats(&s4);
+  // Arm by hand through a ring-0 touch after a drop, to seed the re-arm set:
+  // a ring-0 run touches page 0 first (the page is dropped from the tables
+  // first, so the fresh map is the tracer's), then the ring-3 turn faults on
+  // it, demotes it, and the set has it.
+  gk_debug_drop_pte((unsigned long)m1);
+  gk_debug_drop_pte((unsigned long)m1 + 4096);
+  struct dp flush = {dummy, global_shared};
+  gk_run(flush_then_read, &flush);           // drop the TLB's translations of the dropped PTEs
+  gk_get_stats(&g0);
+  long r0 = gk_run(read_byte, m1);          // ring 0: maps the page armed (and its neighbor)
+  gk_get_stats(&g1);
+  gk_trace_get_stats(&s4);
+  long r2c = gk_run_user(trace_touch, m1);  // ring 3: 2 read hits on armed pages, 2 write hits
+  gk_trace_get_stats(&s5);
+  gk_trace_site_lookup(rip_rd, &rd2); gk_trace_site_lookup(rip_wr, &wr2);
+  long r2d = gk_run_user(trace_touch, m1);  // re-armed at entry: the same 4 faults again
+  gk_trace_get_stats(&s6);
+  gk_trace_site_lookup(rip_rd, &rd3); gk_trace_site_lookup(rip_wr, &wr3);
+  gk_debug_trace_set(1, 0);
+  long r2e = gk_run_user(trace_touch, m1);  // re-arming off: nothing re-armed, no fault
+  gk_trace_stats s7;
+  gk_trace_get_stats(&s7);
+  int ok2 = r2 == 2 * 0x5a && s3.faults == s2.faults && r2b == 2 * 0x5a && s4.faults == s3.faults &&
+            r0 == 0x5a && g1.demand_faults - g0.demand_faults == 1 && s4.armed - s3.armed >= 2 &&
+            r2c == 2 * 0x5a && s5.faults - s4.faults == 4 && s5.pages - s4.pages == 2 &&
+            rd2.count == rd1.count + 2 && wr2.count == wr1.count + 2 &&
+            r2d == 2 * 0x5a && s6.rearmed - s5.rearmed == 2 && s6.faults - s5.faults == 4 &&
+            s6.pages - s5.pages == 2 && rd3.count == rd2.count + 2 && rd3.reads == rd3.count &&
+            wr3.count == wr2.count + 2 && wr3.writes == wr3.count &&
+            r2e == 2 * 0x5a && s7.faults == s6.faults && s7.rearmed == s6.rearmed;
+  printf("foreign-memory trace, re-arming: demoted pages stay demoted (%ld, %ld faults); ring-0 touch "
+         "-> %#lx (%ld demand fault, %ld armed); ring-3 turn -> %ld faults, %ld pages (load n=%ld, store "
+         "n=%ld); next entry re-armed %ld -> %ld faults, %ld pages (load n=%ld, store n=%ld); re-arming "
+         "off -> %ld faults [%s]\n", s3.faults - s2.faults, s4.faults - s3.faults, r0,
+         g1.demand_faults - g0.demand_faults, s4.armed - s3.armed, s5.faults - s4.faults,
+         s5.pages - s4.pages, rd2.count, wr2.count, s6.rearmed - s5.rearmed, s6.faults - s5.faults,
+         s6.pages - s5.pages, rd3.count, wr3.count, s7.faults - s6.faults, ok2 ? "OK" : "FAIL");
+
+  // 3. The write side of a page demoted for reads: a ring-0 write to it
+  //    faults on the withheld W, gets W back and is not recorded; a later
+  //    ring-3 write then finds W present and faults nowhere.
+  gk_trace_get_stats(&s0);
+  long r3 = gk_run_user(read_byte, m2);     // ring 3 reads a fresh page: recorded, demoted for reads
+  gk_trace_get_stats(&s1);
+  struct ap w3 = {m2, 0x3c};
+  long r3b = gk_run(write_byte, &w3);        // ring 0 writes: W given back, nothing recorded
+  gk_trace_get_stats(&s2);
+  long r3c = gk_run_user(write_byte, &w3);   // ring 3 writes: W is there, no fault
+  gk_trace_get_stats(&s3);
+  int ok3 = r3 == 0 && s1.faults - s0.faults == 1 && s1.reads - s0.reads == 1 && r3b == 0x3c &&
+            s2.faults == s1.faults && r3c == 0x3c && s3.faults == s2.faults && m2[0] == 0x3c;
+  printf("foreign-memory trace, writes: ring-3 read of a fresh page -> %ld (%ld fault, read); ring-0 "
+         "write -> %#lx (%ld faults recorded); ring-3 write -> %#lx (%ld faults recorded) [%s]\n", r3,
+         s1.faults - s0.faults, r3b, s2.faults - s1.faults, r3c, s3.faults - s2.faults,
+         ok3 ? "OK" : "FAIL");
+
+  // 4. Off: a fresh region from ring 3 costs one demand fault (the second
+  //    page is its neighbor) and leaves the table alone.
+  gk_debug_trace_set(0, 0);
+  gk_trace_get_stats(&s0);
+  gk_get_stats(&g0);
+  long r4 = gk_run_user(trace_touch, m3);
+  gk_get_stats(&g1);
+  gk_trace_get_stats(&s1);
+  gk_trace_site rd4, wr4;
+  memset(&rd4, 0, sizeof rd4); memset(&wr4, 0, sizeof wr4);
+  gk_trace_site_lookup(rip_rd, &rd4); gk_trace_site_lookup(rip_wr, &wr4);
+  int ok4 = r4 == 0 && m3[0] == 0x5a && m3[4096] == 0x5a && g1.demand_faults - g0.demand_faults == 1 &&
+            s1.faults == s0.faults && s1.pages == s0.pages && s1.sites == s0.sites && s1.turns == s0.turns &&
+            rd4.count == rd3.count && wr4.count == wr3.count && !s1.on;
+  printf("foreign-memory trace, off: ring-3 turn over 2 fresh pages -> %ld, %ld demand fault, %ld "
+         "trace faults, sites %ld -> %ld, load site n=%ld, store site n=%ld [%s]\n", r4,
+         g1.demand_faults - g0.demand_faults, s1.faults - s0.faults, s0.sites, s1.sites, rd4.count,
+         wr4.count, ok4 ? "OK" : "FAIL");
+  printf("foreign-memory trace, dump:\n");
+  gk_trace_dump(1);
+  return ok1 && ok2 && ok3 && ok4;
+}
+
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (gk_init() != 0) {
@@ -2241,9 +2430,15 @@ int main(void) {
   // avx512_check).
   int ok24 = avx512_check() == 1;
 
+  // ---- the foreign-memory trace ----------------------------------------------
+  // Ring 3's first read and first write of a traced page are caught, counted
+  // against the faulting instruction and let through; re-arming, the ring-0
+  // armed path and the off path behave (see trace_check).
+  int ok25 = trace_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
-            ok22 && ok23 && ok24;
+            ok22 && ok23 && ok24 && ok25;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

@@ -24,12 +24,22 @@
 #define PTE_U (1UL << 2)
 #define PTE_G (1UL << 8)         // global: the translation survives a CR3 load (see the global-pages section)
 #define PTE_WALL (1UL << 9)      // CPU-ignored software bit: W withheld by the host-frame wall
+#define PTE_TRACE (1UL << 10)    // CPU-ignored software bit: the foreign-memory tracer owns this
+                                 // page's U and W (see the foreign-memory trace section)
+#define PTE_TRACE_W (1UL << 11)  // CPU-ignored software bit: W withheld by the tracer
+#define PTE_TRACE_KIND_SHIFT 52  // CPU-ignored bits 53:52: the page's region kind, for the tracer
+#define PTE_TRACE_KIND_MASK (3UL << PTE_TRACE_KIND_SHIFT)
 #define PTE_NX (1UL << 63)
 #define PTE_PKEY_SHIFT 59        // bits 62:59 hold the page's protection key
 #define PTE_PKEY_MASK (0xfUL << PTE_PKEY_SHIFT)
 #define GK_MAP_WALLED 8          // map4k_root flag: host-writable page, W withheld (PTE_WALL)
 #define GK_MAP_GLOBAL 16         // map4k_root flag: the page may be global (see the global-pages section)
+#define GK_MAP_TRACE_ARM 32      // map4k_root flag: traced page, armed (U withheld)
+#define GK_MAP_TRACE_RO 64       // map4k_root flag: traced page, demoted for reads (W withheld)
+#define GK_MAP_TRACE_RW 128      // map4k_root flag: traced page, demoted for reads and writes
+#define GK_MAP_KIND_SHIFT 8      // map4k_root flag bits 9:8: the region kind of a traced page
 #define PF_ERR_WR (1UL << 1)     // #PF error code: the access was a write
+#define PF_ERR_US (1UL << 2)     // #PF error code: the access came from ring 3
 #define PF_ERR_PK (1UL << 5)     // #PF error code: protection-key violation
 #define CR0_PE (1UL << 0)
 #define CR0_WP (1UL << 16)
@@ -248,6 +258,73 @@ typedef struct { uintptr_t start, end; int pkey; } gk_pkey_range;
 
 #define GK_CPUID_ENTRIES 128
 
+// The region kind of a host mapping, from its /proc/self/maps pathname (see
+// parse_maps_line). The foreign-memory tracer observes the first three; the
+// values of those three are what the PTE's kind field and gk_trace_stats use.
+enum {
+  GK_RK_NONE = 0,
+  GK_RK_HEAP = 1,   // "[heap]": the brk heap
+  GK_RK_ANON = 2,   // no pathname: an anonymous mapping (also /dev/zero and memfd mappings)
+  GK_RK_FILE = 3,   // a file: a writable mapping of one is a .data segment
+  GK_RK_STACK = 4,  // "[stack]": the main thread's stack
+  GK_RK_OTHER = 5,  // vdso, vvar, vsyscall, anon_inode and the like
+};
+
+// Foreign-memory trace state (see the foreign-memory trace section). Fixed
+// size, in the control block: everything the fault path records goes here,
+// and nothing on that path allocates.
+#define GK_TRACE_SITES 8192          // RIP table capacity (a power of two)
+#define GK_TRACE_SAMPLES 256         // the first hits, kept verbatim
+#define GK_TRACE_DEMOTED_MAX 16384   // pages demoted since the last re-arm
+#define GK_TRACE_MODULES 512         // mappings resolved by the dump
+#define GK_TRACE_NKINDS 4            // GK_RK_NONE..GK_RK_FILE
+_Static_assert(GK_TRACE_NKINDS == (int)GK_TRACE_KINDS && (int)GK_RK_HEAP == (int)GK_TRACE_KIND_HEAP &&
+                   (int)GK_RK_ANON == (int)GK_TRACE_KIND_ANON && (int)GK_RK_FILE == (int)GK_TRACE_KIND_DATA,
+               "the traced region kinds are the public GK_TRACE_KIND_* values");
+typedef struct {
+  uintptr_t rip;               // 0: empty slot
+  long count, reads, writes;
+  long kind_count[GK_TRACE_NKINDS];
+  uintptr_t first_addr;        // the page of the first hit
+  int first_kind;
+} gk_trace_site_rec;
+typedef struct { uintptr_t rip, addr; unsigned char write, kind; } gk_trace_sample;
+typedef struct {
+  uintptr_t start, end, off;   // a mapping of the dump's scan: bounds and file offset
+  unsigned char bss;           // an anonymous mapping directly after `path`'s: its .bss
+  char path[160];
+} gk_trace_module;
+struct gk_trace {
+  int on, rearm;
+  int signal;                  // the dump signal, 0 for none
+  char out_path[256];          // the dump file, "" for stderr
+  // The RIP table: open addressing, linear probing, one slot always left free
+  // so a probe terminates. Guarded by G->lock.
+  gk_trace_site_rec sites[GK_TRACE_SITES];
+  int site_n;
+  long site_overflow;          // hits dropped because the table was full
+  gk_trace_sample samples[GK_TRACE_SAMPLES];
+  int sample_n;
+  // Totals. A hit is a ring-3 access the tracer caught; a page is a page the
+  // tracer demoted (counted once per arming, so once ever without re-arming).
+  long faults, reads, writes, pages, armed;
+  long kind_faults[GK_TRACE_NKINDS], kind_pages[GK_TRACE_NKINDS];
+  // Per-turn figures: the counts between consecutive ring-3 turn ends, on any
+  // thread (see trace_turn_end).
+  long cur_faults, cur_pages;
+  long turns, turn_faults_sum, turn_faults_max, turn_faults_last;
+  long turn_pages_sum, turn_pages_max, turn_pages_last;
+  // The pages demoted since the last re-arm, for trace_rearm.
+  uintptr_t demoted[GK_TRACE_DEMOTED_MAX];
+  int demoted_n;
+  long demoted_overflow;       // demotions the set had no room for
+  long rearmed;
+  // Scratch for the dump (trace_dump_fd), which runs without the lock.
+  int sort_idx[GK_TRACE_SITES];
+  gk_trace_module modules[GK_TRACE_MODULES];
+  int module_n;
+};
+
 struct gk_ctl {
   // Platform state, set once by gk_init.
   int kvm, vmfd;
@@ -344,6 +421,10 @@ struct gk_ctl {
   // Protection-key ranges (see the protection-keys section). Guarded by G->lock.
   gk_pkey_range pkeys[GK_MAX_PKEY_RANGES];
   int pkey_n;
+
+  // The foreign-memory tracer (see its section). Guarded by G->lock, except
+  // for the dump's reads.
+  struct gk_trace trace;
 
   // A word for tests to read and write through the guest (gk_debug_ctl_addr).
   unsigned long debug_scratch;
@@ -442,12 +523,13 @@ static void db_dec(gk_dbuf *d, long v) {
   if (v < 0) *--p = '-';
   while (p < tmp + sizeof tmp && d->n < sizeof d->b - 1) d->b[d->n++] = *p++;
 }
-static void db_flush(gk_dbuf *d) {
+static void db_flush_fd(gk_dbuf *d, int fd) {
   if (d->n < sizeof d->b) d->b[d->n++] = '\n';
-  ssize_t r = write(2, d->b, d->n);
+  ssize_t r = write(fd, d->b, d->n);
   (void)r;
   d->n = 0;
 }
+static void db_flush(gk_dbuf *d) { db_flush_fd(d, 2); }
 
 // Page-table page allocator over a fixed arena: a bump allocator with a free
 // list in front of it, so the tables of a destroyed arena serve the next one.
@@ -661,6 +743,14 @@ static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
   if (flags & GK_MAP_WALLED) pte |= PTE_WALL;
   if (!(flags & 4)) pte |= PTE_NX;
   pte |= ((uint64_t)pkey << PTE_PKEY_SHIFT) & PTE_PKEY_MASK;
+  // A traced page (see the foreign-memory trace section): armed, U is
+  // withheld so ring 3 faults on it; demoted for reads, W is withheld so the
+  // first write faults too; demoted for both, only the tag and kind remain.
+  if (flags & (GK_MAP_TRACE_ARM | GK_MAP_TRACE_RO | GK_MAP_TRACE_RW)) {
+    pte |= PTE_TRACE | (((flags >> GK_MAP_KIND_SHIFT) & 3) << PTE_TRACE_KIND_SHIFT);
+    if (flags & GK_MAP_TRACE_ARM) pte &= ~PTE_U;
+    else if ((flags & GK_MAP_TRACE_RO) && (pte & PTE_W)) pte = (pte & ~PTE_W) | PTE_TRACE_W;
+  }
   if (global) {
     pte |= PTE_G;
     G->slot_pinned[slot] = 1;  // no arena may ever take this slot (see the global-pages section)
@@ -719,11 +809,13 @@ static long pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
         else if ((*pte & (PTE_P | PTE_W)) == (PTE_P | PTE_W)) n++;
         break;
       case PTE_OP_REPROTECT:
-        // Only W, NX and the wall tag change; the frame, P, U (the
-        // supervisor/refuse class), the protection key and the accessed/dirty
-        // bits are the page's own and stay.
+        // Only W, NX and the wall and tracer-W tags change; the frame, P, U
+        // (the supervisor/refuse class, or a traced page's armed state), the
+        // protection key and the accessed/dirty bits are the page's own and
+        // stay. A traced page demoted for reads gets W as the new protection
+        // says, so its first write is no longer caught: the tag goes with it.
         if (*pte & PTE_P) {
-          uint64_t n = *pte & ~(PTE_W | PTE_NX | PTE_WALL);
+          uint64_t n = *pte & ~(PTE_W | PTE_NX | PTE_WALL | PTE_TRACE_W);
           if (!(rp->prot & 4)) n |= PTE_NX;
           if (rp->prot & 2) n |= (v >= rp->wall_lo && v < rp->wall_hi) ? PTE_WALL : PTE_W;
           *pte = n;
@@ -735,19 +827,26 @@ static long pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
   return n;
 }
 
+// The leaf PTE slot a root holds for the page of `va`, or NULL if no table on
+// the way down exists. Never allocates. Caller holds G->lock.
+static uint64_t *pte_slot(uint64_t *root, uintptr_t va) {
+  uint64_t pml4e = root[(va >> 39) & 0x1ff];
+  if (!(pml4e & PTE_P)) return NULL;
+  uint64_t *pdpt = (uint64_t *)(uintptr_t)(pml4e & ~0xfffULL);
+  uint64_t pdpte = pdpt[(va >> 30) & 0x1ff];
+  if (!(pdpte & PTE_P)) return NULL;
+  uint64_t *pd = (uint64_t *)(uintptr_t)(pdpte & ~0xfffULL);
+  uint64_t pde = pd[(va >> 21) & 0x1ff];
+  if (!(pde & PTE_P)) return NULL;
+  uint64_t *pt = (uint64_t *)(uintptr_t)(pde & ~0xfffULL);
+  return &pt[(va >> 12) & 0x1ff];
+}
+
 // The leaf PTE a root holds for the page of `va`, or 0 if no table on the way
 // down exists. Never allocates. Caller holds G->lock.
 static uint64_t pte_lookup(const uint64_t *root, uintptr_t va) {
-  uint64_t pml4e = root[(va >> 39) & 0x1ff];
-  if (!(pml4e & PTE_P)) return 0;
-  const uint64_t *pdpt = (const uint64_t *)(uintptr_t)(pml4e & ~0xfffULL);
-  uint64_t pdpte = pdpt[(va >> 30) & 0x1ff];
-  if (!(pdpte & PTE_P)) return 0;
-  const uint64_t *pd = (const uint64_t *)(uintptr_t)(pdpte & ~0xfffULL);
-  uint64_t pde = pd[(va >> 21) & 0x1ff];
-  if (!(pde & PTE_P)) return 0;
-  const uint64_t *pt = (const uint64_t *)(uintptr_t)(pde & ~0xfffULL);
-  return pt[(va >> 12) & 0x1ff];
+  uint64_t *p = pte_slot((uint64_t *)root, va);
+  return p ? *p : 0;
 }
 
 // Apply `op` over [s, e) in every root that may hold PTEs for it: the base
@@ -1164,44 +1263,79 @@ static int pkey_set_range(uintptr_t s, uintptr_t e, int pkey) {
   return 0;
 }
 
-// Parse one /proc/self/maps line ("start-end perms ...") into its bounds and
-// protection bits (bit0=r, bit1=w, bit2=x). Returns 0 if the line is malformed.
-static int parse_maps_line(const char *l, const char *end, uintptr_t *s,
-                           uintptr_t *e, int *perms) {
-  uintptr_t v[2] = {0, 0};
-  for (int k = 0; k < 2; k++) {
-    int n = 0;
-    while (l < end) {
-      char c = *l;
-      int d;
-      if (c >= '0' && c <= '9') d = c - '0';
-      else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
-      else break;
-      v[k] = (v[k] << 4) | (uintptr_t)d;
-      l++; n++;
-    }
-    if (n == 0 || l >= end || *l != (k == 0 ? '-' : ' ')) return 0;
-    l++;
+// One parsed /proc/self/maps line ("start-end perms offset dev inode path").
+typedef struct {
+  uintptr_t start, end;
+  int perms;               // bit0=r, bit1=w, bit2=x
+  uintptr_t off;           // file offset of `start` (0 for an anonymous mapping)
+  int kind;                // GK_RK_*, from the pathname
+  const char *path;        // the pathname within the line, `path_len` bytes (0: none)
+  size_t path_len;
+} gk_maps_line;
+
+// Hex digits at *l up to `end`, advancing *l; returns the digit count.
+static int parse_hex(const char **l, const char *end, uintptr_t *v) {
+  int n = 0;
+  *v = 0;
+  while (*l < end) {
+    char c = **l;
+    int d;
+    if (c >= '0' && c <= '9') d = c - '0';
+    else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+    else break;
+    *v = (*v << 4) | (uintptr_t)d;
+    (*l)++; n++;
   }
+  return n;
+}
+
+static int str_starts(const char *s, size_t n, const char *prefix) {
+  size_t k = strlen(prefix);
+  return n >= k && memcmp(s, prefix, k) == 0;
+}
+
+// Parse one /proc/self/maps line. Returns 0 if the line is malformed. The
+// offset, kind and path are parsed from the fields after the protection and
+// are only as good as those fields: a line with them missing still parses,
+// with an empty path and kind GK_RK_ANON.
+static int parse_maps_line(const char *l, const char *end, gk_maps_line *o) {
+  memset(o, 0, sizeof *o);
+  if (parse_hex(&l, end, &o->start) == 0 || l >= end || *l != '-') return 0;
+  l++;
+  if (parse_hex(&l, end, &o->end) == 0 || l >= end || *l != ' ') return 0;
+  l++;
   if (l + 3 > end) return 0;
-  int m = 0;
-  if (l[0] == 'r') m |= 1;
-  if (l[1] == 'w') m |= 2;
-  if (l[2] == 'x') m |= 4;
-  *s = v[0]; *e = v[1]; *perms = m;
+  if (l[0] == 'r') o->perms |= 1;
+  if (l[1] == 'w') o->perms |= 2;
+  if (l[2] == 'x') o->perms |= 4;
+  // Past the perms field, the offset, then the device and inode fields.
+  while (l < end && *l != ' ') l++;
+  if (l < end) l++;
+  parse_hex(&l, end, &o->off);
+  for (int field = 0; field < 2; field++) {  // dev, inode
+    while (l < end && *l == ' ') l++;
+    while (l < end && *l != ' ') l++;
+  }
+  while (l < end && *l == ' ') l++;
+  o->path = l;
+  o->path_len = (size_t)(end - l);
+  size_t n = o->path_len;
+  if (n == 0) o->kind = GK_RK_ANON;
+  else if (str_starts(l, n, "[heap]")) o->kind = GK_RK_HEAP;
+  else if (str_starts(l, n, "[stack")) o->kind = GK_RK_STACK;
+  else if (l[0] == '[') o->kind = GK_RK_OTHER;
+  else if (str_starts(l, n, "/dev/zero") || str_starts(l, n, "/memfd:")) o->kind = GK_RK_ANON;
+  else if (l[0] == '/') o->kind = GK_RK_FILE;
+  else o->kind = GK_RK_OTHER;
   return 1;
 }
 
-// Look up the host mapping containing `page` in /proc/self/maps. V8 reserves
-// huge PROT_NONE regions and commits sub-ranges; only committed pages may be
-// mapped. On success sets [*rs, *re) to the mapping's bounds and *perms to its
-// protection (bit0=r, bit1=w, bit2=x) and returns 1; returns 0 if `page` is
-// not mapped.
-//
-// This runs on the fault path, so it uses raw syscalls and a stack buffer only:
-// stdio would call malloc, and the faulting guest thread may be inside malloc
-// holding its arena lock, which the same host thread could then never take.
-static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms) {
+// Open /proc/self/maps and call fn(line, ctx) for every complete line until
+// fn returns nonzero (the scan stops there) or the file ends. Returns fn's
+// nonzero result, or 0 if every line was visited or the file could not be
+// opened. Raw syscalls and a stack buffer only: this runs on the fault path
+// (see host_region) and from the trace dump's signal handler.
+static int maps_scan(int (*fn)(const gk_maps_line *, void *), void *ctx) {
   long fd = host_syscall(SYS_open, (long)"/proc/self/maps", O_RDONLY | O_CLOEXEC,
                          0, 0, 0, 0);
   if (fd < 0) return 0;
@@ -1221,12 +1355,8 @@ static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms)
         if (!eof && pos == 0 && have == sizeof buf) have = 0;  // oversize line: drop it
         break;
       }
-      uintptr_t s, e; int m;
-      if (parse_maps_line(buf + pos, nl, &s, &e, &m) && page >= s && page < e) {
-        *rs = s; *re = e; *perms = m;
-        found = 1;
-        break;
-      }
+      gk_maps_line ml;
+      if (parse_maps_line(buf + pos, nl, &ml) && (found = fn(&ml, ctx)) != 0) break;
       pos = (size_t)(nl - buf) + 1;
     }
     if (!found) {
@@ -1236,6 +1366,32 @@ static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms)
   }
   host_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
   return found;
+}
+
+typedef struct { uintptr_t page; gk_maps_line ml; } gk_region_lookup;
+static int host_region_visit(const gk_maps_line *ml, void *ctx) {
+  gk_region_lookup *q = ctx;
+  if (q->page < ml->start || q->page >= ml->end) return 0;
+  q->ml = *ml;
+  q->ml.path = NULL;  // the line's buffer does not outlive the scan
+  return 1;
+}
+
+// Look up the host mapping containing `page` in /proc/self/maps. V8 reserves
+// huge PROT_NONE regions and commits sub-ranges; only committed pages may be
+// mapped. On success sets [*rs, *re) to the mapping's bounds, *perms to its
+// protection (bit0=r, bit1=w, bit2=x) and *kind (if non-NULL) to its region
+// kind (GK_RK_*), and returns 1; returns 0 if `page` is not mapped.
+//
+// This runs on the fault path, so it uses raw syscalls and a stack buffer only:
+// stdio would call malloc, and the faulting guest thread may be inside malloc
+// holding its arena lock, which the same host thread could then never take.
+static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms, int *kind) {
+  gk_region_lookup q = {.page = page};
+  if (!maps_scan(host_region_visit, &q)) return 0;
+  *rs = q.ml.start; *re = q.ml.end; *perms = q.ml.perms;
+  if (kind) *kind = q.ml.kind;
+  return 1;
 }
 
 // Eager-map [s, e) into the base root with PTE protection `perms`, backing the
@@ -1291,6 +1447,173 @@ void *__wrap_realloc(void *p, size_t n) { gk_guard_alloc("realloc"); return __re
 #define GK_HANDLER_LEAVE() ((void)0)
 #endif
 
+// ---- the foreign-memory trace ----------------------------------------------
+// An instrument, not a protection: with GK_TRACE_FOREIGN=1 in the environment
+// gk records which pages of the shared runtime memory ring-3 code touches,
+// from which instructions, and how often. The shared runtime memory is the
+// mutable memory outside every arena -- the brk heap, anonymous mappings and
+// the writable data segments of the binary and its libraries -- that ring 3
+// can reach today and that the isolation plan has to take away from it (see
+// the README's limitations); this is the inventory of what a turn needs from
+// it. Off, nothing here runs beyond a flag test per demand fault and per
+// ring-3 entry.
+//
+// The mechanism is the ring-3 wall gk already enforces for its own control
+// data, applied page by page as pages are demand-mapped. demand_map decides
+// from the /proc/self/maps line it reads anyway whether a page is traced: a
+// writable mapping of kind heap, anonymous or file, outside every arena,
+// unregistered (KEEP) and not a guest thread's stack (the calling vCPU's wall
+// window and the stack mapping its turns run on, the mapping holding the
+// interrupted code's stack pointer, and the stack mapping of any other thread
+// that has run a turn). A traced page first mapped by ring-0 code or ahead of
+// its fault by demand_map_neighbors is mapped "armed": present, with U
+// withheld, tagged PTE_TRACE. Ring 3 faults on it, the fault is recorded and
+// the page is demoted, which is the end state every page has without the
+// tracer; a traced page first touched by ring 3 itself is recorded and mapped
+// demoted at once, sparing the second fault. Demotion has two steps so that a
+// page's first write is seen as well as its first read: a read demotes to a
+// user page with W withheld (PTE_TRACE_W; ring 0 is not held by it either,
+// since CR0.WP makes a ring-0 write to a W-less page fault too, and that
+// fault gives W back unrecorded), a write to a page in either state demotes
+// it fully. Nothing is ever refused, so a traced turn computes exactly what
+// an untraced one does, only slower, and the fault-repeat limit is told that
+// a trace fault was resolved.
+//
+// The state is in the PTE (PTE_TRACE, PTE_TRACE_W, the kind in bits 53:52),
+// not in the supervisor/refuse registry: the registry is the security-
+// critical structure and has a fixed capacity, and a page-granular demotion
+// would split its ranges without bound; and a mapping that appears after
+// init (the heap grows all the time) is classified when its pages fault,
+// which a one-time enumeration at init would miss. The accounting is
+// aggregated per faulting RIP in a fixed-size open-addressed table, with a
+// bounded sample of (rip, page) pairs and totals split by access and region
+// kind, all preallocated in the control block: this is the fault path and it
+// must not allocate (see the signal-safety note above region_add). With
+// GK_TRACE_REARM=1 the pages demoted since the previous ring-3 turn entry
+// are re-armed at the next one (trace_rearm), so each turn is counted
+// afresh; the demoted set is bounded and an overflow is counted, not fatal.
+// The dump (trace_dump_fd) writes the table as text with raw writes and no
+// lock, so it can run from the process's atexit handler and from a signal
+// handler (SIGUSR2 by default, GK_TRACE_SIGNAL overrides, 0 disables) while
+// the server keeps serving; GK_TRACE_OUT names the file, stderr otherwise.
+//
+// What the trace does not see: a vCPU whose TLB still holds a user
+// translation of a page another vCPU re-armed (no cross-vCPU shootdown, as
+// everywhere in gk), accesses by the host side outside the guest, and a page
+// whose PTE a reflected protection change rewrites in place (its W is then
+// the new protection's, so a pending first-write catch is lost).
+
+// Record one ring-3 hit at `rip` on `page` of region kind `kind`; `new_page`
+// says the page was just demoted (a distinct page of this arming). Fault
+// path; caller holds G->lock.
+static void trace_record(uintptr_t rip, uintptr_t page, int write, int kind, int new_page) {
+  struct gk_trace *tr = &G->trace;
+  if (kind < 0 || kind >= GK_TRACE_NKINDS) kind = GK_RK_NONE;
+  tr->faults++;
+  tr->cur_faults++;
+  if (write) tr->writes++; else tr->reads++;
+  tr->kind_faults[kind]++;
+  if (new_page) {
+    tr->pages++;
+    tr->cur_pages++;
+    tr->kind_pages[kind]++;
+    if (tr->rearm) {
+      if (tr->demoted_n < GK_TRACE_DEMOTED_MAX) tr->demoted[tr->demoted_n++] = page;
+      else tr->demoted_overflow++;
+    }
+  }
+  if (tr->sample_n < GK_TRACE_SAMPLES) {
+    gk_trace_sample *s = &tr->samples[tr->sample_n++];
+    s->rip = rip; s->addr = page; s->write = (unsigned char)write; s->kind = (unsigned char)kind;
+  }
+  unsigned h = (unsigned)(((uint64_t)rip * 0x9E3779B97F4A7C15ULL) >> 51);  // 13 bits
+  for (int i = 0; i < GK_TRACE_SITES; i++) {
+    gk_trace_site_rec *s = &tr->sites[(h + (unsigned)i) & (GK_TRACE_SITES - 1)];
+    if (s->rip == 0) {
+      if (tr->site_n >= GK_TRACE_SITES - 1) break;  // keep a free slot: probes must end
+      memset(s, 0, sizeof *s);
+      s->rip = rip;
+      s->first_addr = page;
+      s->first_kind = kind;
+      tr->site_n++;
+    } else if (s->rip != rip) {
+      continue;
+    }
+    s->count++;
+    if (write) s->writes++; else s->reads++;
+    s->kind_count[kind]++;
+    return;
+  }
+  tr->site_overflow++;
+}
+
+// A fault on a page whose PTE the tracer manages: resolve it in place if the
+// tracer caused it, recording a ring-3 access, and return 1; return 0 for a
+// fault the tracer did not cause, which demand_map then handles as any other.
+// `root` is the root the fault walked, `rip` the faulting instruction and
+// `err` the #PF error code. Fault path; caller holds G->lock.
+static int trace_fault(gk_thread *t, uint64_t *root, uintptr_t page, uintptr_t rip, uint64_t err) {
+  uint64_t *slot = pte_slot(root, page);
+  if (!slot) return 0;
+  uint64_t pte = *slot;
+  if ((pte & (PTE_P | PTE_TRACE)) != (PTE_P | PTE_TRACE)) return 0;
+  int us = (err & PF_ERR_US) != 0, wr = (err & PF_ERR_WR) != 0;
+  int kind = (int)((pte & PTE_TRACE_KIND_MASK) >> PTE_TRACE_KIND_SHIFT);
+  if (us && !(pte & PTE_U)) {
+    // Armed, and ring 3 touched it: demote, for reads only unless this is a write.
+    uint64_t n = pte | PTE_U;
+    if (!wr && (n & PTE_W)) n = (n & ~PTE_W) | PTE_TRACE_W;
+    *slot = n;
+    trace_record(rip, page, wr, kind, 1);
+  } else if (wr && (pte & PTE_TRACE_W)) {
+    // Demoted for reads, and now written (by ring 3, which is recorded, or by
+    // ring 0, which CR0.WP holds the same way): give W back.
+    *slot = (pte | PTE_W) & ~PTE_TRACE_W;
+    if (us) trace_record(rip, page, 1, kind, 0);
+  } else {
+    return 0;
+  }
+  // Resolved by a PTE change the retry will see: not a repeat of anything.
+  t->last_fault = 0;
+  t->fault_repeat = 0;
+  return 1;
+}
+
+// Does [rs, re) hold a stack that some thread runs turns on? Those are left
+// out of the trace (see the section comment). Caller holds G->lock.
+static int trace_is_turn_stack(uintptr_t rs, uintptr_t re) {
+  for (int i = 0; i < G->thread_n; i++) {
+    gk_thread *o = &G->threads[i];
+    if (o->tid == 0) continue;  // a free record: its cache is a dead thread's
+    if (rs < o->wall_map_hi && re > o->wall_map_lo) return 1;
+  }
+  return 0;
+}
+
+// Re-arm every page demoted since the last re-arm (GK_TRACE_REARM): U is
+// withheld again and a withheld W given back, so the page is exactly as it
+// was when first armed. A page whose PTE is gone or no longer the tracer's
+// (unmapped and remapped as something else since) is skipped. Returns the
+// number re-armed; the caller flushes the vCPU's TLB if that is nonzero.
+// Caller holds G->lock.
+static int trace_rearm(void) {
+  struct gk_trace *tr = &G->trace;
+  int n = 0;
+  for (int i = 0; i < tr->demoted_n; i++) {
+    uint64_t *slot = pte_slot(G->pml4, tr->demoted[i]);
+    if (!slot) continue;
+    uint64_t pte = *slot;
+    if ((pte & (PTE_P | PTE_TRACE | PTE_U)) != (PTE_P | PTE_TRACE | PTE_U)) continue;
+    pte &= ~PTE_U;
+    if (pte & PTE_TRACE_W) pte = (pte | PTE_W) & ~PTE_TRACE_W;
+    *slot = pte;
+    n++;
+  }
+  tr->demoted_n = 0;
+  tr->rearmed += n;
+  return n;
+}
+
 // Map the pages around a just-mapped user page ahead of their own faults, from
 // the same /proc/self/maps read that mapped it. That read is the bulk of a
 // demand fault's cost (the kernel renders every mapping of a V8-sized process
@@ -1326,11 +1649,16 @@ void *__wrap_realloc(void *p, size_t n) { gk_guard_alloc("realloc"); return __re
 //    way its own read fault would be: without W, tagged PTE_WALL.
 //  * Its protection key is looked up per page, like the global-pages
 //    decision, which map4k_root re-checks itself.
+//  * In a traced mapping (`trace`, nonzero: the tracer's flags for an armed
+//    page of this mapping's kind), it is mapped armed, as its own fault from
+//    ring 0 would map it; a page that is already demoted has a PTE and is
+//    skipped above, so it is never re-armed here.
 // Faults counted in demand_faults are the guest's own; pages mapped here are
 // counted in neighbor_pages. Caller holds G->lock; `root`, `in`, `rs`, `re`,
 // `perms` and `sp` are demand_map's for the page it just mapped.
 static void demand_map_neighbors(gk_thread *t, uintptr_t page, uint64_t *root, gk_arena *in,
-                                 uintptr_t rs, uintptr_t re, int perms, uintptr_t sp) {
+                                 uintptr_t rs, uintptr_t re, int perms, uintptr_t sp,
+                                 uint64_t trace) {
   uintptr_t lo = page & ~(GK_NEIGHBOR_WIN - 1), hi = lo + GK_NEIGHBOR_WIN;
   if (lo < rs) lo = rs;
   if (hi > re) hi = re;
@@ -1350,11 +1678,12 @@ static void demand_map_neighbors(gk_thread *t, uintptr_t page, uint64_t *root, g
     }
     if (foreign_wall) continue;
     int walled = v >= t->ro_lo && v < t->ro_hi;
-    uint64_t flags = (uint64_t)perms;
+    uint64_t flags = (uint64_t)perms | trace;
     if (walled && (perms & 2)) flags = (flags & ~2ULL) | GK_MAP_WALLED;
     if (!in && !walled && !stack_map) flags |= GK_MAP_GLOBAL;
     if (map4k_root(root, v, flags, pkey_lookup(v)) < 0) continue;
     G->neighbor_pages++;
+    if (trace) G->trace.armed++;
   }
 }
 
@@ -1378,10 +1707,11 @@ static void demand_map_neighbors(gk_thread *t, uintptr_t page, uint64_t *root, g
 // could back it. Outside every arena the PTE goes into the base root, whose
 // subtrees all arena roots share, and is global unless the page is part of a
 // stack (see the global-pages section); `sp` is the interrupted code's stack
-// pointer, which names the mapping its stack lies in.
-static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
+// pointer, which names the mapping its stack lies in. `err` is the #PF error
+// code and `rip` the faulting instruction, for the foreign-memory trace.
+static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp, uint64_t err, uintptr_t rip) {
   uintptr_t page = addr & ~0xfffUL;
-  uintptr_t rs, re; int perms;
+  uintptr_t rs, re; int perms, kind = GK_RK_NONE;
   pthread_mutex_lock(&G->lock);
   uint64_t *root = G->pml4;
   gk_arena *in = arena_containing(page);
@@ -1391,6 +1721,11 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
       return -1;  // another arena's memory: refuse, whatever the host has there
     }
     root = in->pml4;
+  } else if (G->trace.on && trace_fault(t, root, page, rip, err)) {
+    // A traced page's PTE, changed in place (see the foreign-memory trace
+    // section): the retry walks to it as it is now.
+    pthread_mutex_unlock(&G->lock);
+    return 0;
   }
   // Consult the supervisor/refuse registry. A REFUSE page (gk's page tables,
   // kvm_run, the gk-loop stacks) is never mapped, so a fault there is genuine
@@ -1409,7 +1744,7 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
     pthread_mutex_unlock(&G->lock);
     return -1;
   }
-  int mapped = host_region(page, &rs, &re, &perms);
+  int mapped = host_region(page, &rs, &re, &perms, &kind);
   if (!mapped) {
     // The page may lie just below a stack the kernel grows on demand (the main
     // thread's, which gk_run_here runs the guest on). Natively the thread's own
@@ -1420,7 +1755,7 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
     // native write would (and return EFAULT, not a signal, if it cannot).
     // Ordinary unmapped addresses just fail the probe.
     host_syscall(SYS_rt_sigprocmask, SIG_BLOCK, 0, (long)page, 8, 0, 0);
-    mapped = host_region(page, &rs, &re, &perms);
+    mapped = host_region(page, &rs, &re, &perms, &kind);
   }
   if (!mapped || !(perms & 1)) {
     pthread_mutex_unlock(&G->lock);
@@ -1447,13 +1782,36 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
   int stack = (page >= t->ro_lo && page < t->ro_hi) ||
               (rs < t->wall_map_hi && re > t->wall_map_lo) || (sp >= rs && sp < re);
   if (!in && !stack) flags |= GK_MAP_GLOBAL;
+  // The foreign-memory trace (see its section): a writable page of the shared
+  // runtime memory is mapped armed, or, when ring 3 itself is touching it
+  // first, recorded and mapped demoted right away. A page the tracer has
+  // already demoted that faults again for another reason (a stale
+  // translation after another vCPU's reflection, say) stays demoted.
+  uint64_t trace = 0;
+  if (G->trace.on && cls == GK_PROT_KEEP && !in && !stack && (perms & 2) &&
+      (kind == GK_RK_HEAP || kind == GK_RK_ANON || kind == GK_RK_FILE) &&
+      !trace_is_turn_stack(rs, re)) {
+    trace = (uint64_t)kind << GK_MAP_KIND_SHIFT;
+    uint64_t old = pte_lookup(root, page);
+    int wr = (err & PF_ERR_WR) != 0;
+    if ((old & (PTE_P | PTE_TRACE | PTE_U)) == (PTE_P | PTE_TRACE | PTE_U)) {
+      flags |= trace | GK_MAP_TRACE_RW;
+    } else if (err & PF_ERR_US) {
+      trace_record(rip, page, wr, kind, 1);
+      flags |= trace | (wr ? GK_MAP_TRACE_RW : GK_MAP_TRACE_RO);
+    } else {
+      flags |= trace | GK_MAP_TRACE_ARM;
+      G->trace.armed++;
+    }
+    trace |= GK_MAP_TRACE_ARM;  // the neighbors' flags
+  }
   int r = map4k_root(root, page, flags, pkey);  // honor R/W/X for W^X
   if (r >= 0) {
     G->demand_ok++;
     // Settle the page's neighborhood from the same read (an aligned window,
     // so it shares the page's top-level entry, which the carry-over below
     // covers).
-    if (cls == GK_PROT_KEEP) demand_map_neighbors(t, page, root, in, rs, re, perms, sp);
+    if (cls == GK_PROT_KEEP) demand_map_neighbors(t, page, root, in, rs, re, perms, sp, trace);
     // A base-root mapping that populated a fresh top-level entry is not yet in
     // the active arena's root (which copied the base root's entries at entry,
     // see sync_cr3); carry it over now so the retry does not fault again. The
@@ -1838,6 +2196,8 @@ static int map_handler_text(void) {
 // the environment forces the toggle, so the fallback stays testable on a CPU
 // that has both. Both stubs drop every entry, global ones included (see the
 // global-pages section).
+static void trace_init(void);  // the foreign-memory trace's environment switches (see its dump section)
+
 static void flush_stub_select(void) {
   G->flush_stub = gk_flush_stub;
   for (unsigned i = 0; i < GK_CPUID->nent && !getenv("GK_NO_INVPCID"); i++) {
@@ -1984,6 +2344,7 @@ int gk_init(void) {
   }
   if (G->dbg) fprintf(stderr, "[gk] registers via %s\n", G->sync_regs ? "kvm_run" : "ioctl");
   if (pthread_key_create(&G->thread_key, thread_key_dtor) != 0) { G->err = "pthread_key_create"; return -1; }
+  trace_init();
 
   // Bring up the calling thread's record and vCPU.
   gk_thread *t = thread_get();
@@ -2211,7 +2572,7 @@ static long child_entry(void *arg) {
   // before the first fault or that push double-faults.
   uintptr_t rs, re; int perms;
   pthread_mutex_lock(&G->lock);
-  int ok = host_region(t->start.regs.rsp - 1, &rs, &re, &perms) && (perms & 2) &&
+  int ok = host_region(t->start.regs.rsp - 1, &rs, &re, &perms, NULL) && (perms & 2) &&
            mmu_map_range(rs, re, perms) == 0;
   pthread_mutex_unlock(&G->lock);
   if (!ok) {
@@ -2655,8 +3016,40 @@ static int prepare_entry(gk_thread *t, uint64_t *load) {
 // CR3 set through KVM makes KVM flush the whole guest TLB (see the
 // global-pages section). Either way the return value comes back through
 // run_vcpu.
+// A ring-3 turn is starting on this vCPU: with GK_TRACE_REARM, re-arm the
+// pages demoted since the last turn entry and flush this vCPU's TLB, which
+// may hold user translations of them (another vCPU's are not shot down, as
+// everywhere in gk: it may keep using a page re-armed under it until its
+// next flush). Runs before the entry registers are set, as the flush stub
+// clobbers them.
+static void trace_turn_begin(gk_thread *t) {
+  if (!G->trace.on || !G->trace.rearm) return;
+  pthread_mutex_lock(&G->lock);
+  int n = trace_rearm();
+  pthread_mutex_unlock(&G->lock);
+  if (n > 0) flush_run(t);
+}
+
+// A ring-3 turn ended: the hits and demotions since the previous turn end,
+// on any thread, are this turn's figures.
+static void trace_turn_end(void) {
+  if (!G->trace.on) return;
+  struct gk_trace *tr = &G->trace;
+  pthread_mutex_lock(&G->lock);
+  tr->turns++;
+  tr->turn_faults_last = tr->cur_faults;
+  tr->turn_pages_last = tr->cur_pages;
+  tr->turn_faults_sum += tr->cur_faults;
+  tr->turn_pages_sum += tr->cur_pages;
+  if (tr->cur_faults > tr->turn_faults_max) tr->turn_faults_max = tr->cur_faults;
+  if (tr->cur_pages > tr->turn_pages_max) tr->turn_pages_max = tr->cur_pages;
+  tr->cur_faults = tr->cur_pages = 0;
+  pthread_mutex_unlock(&G->lock);
+}
+
 static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t stack_top,
                         int user, uint64_t cr3) {
+  if (user) trace_turn_begin(t);
   uint64_t sp = stack_top - 8;
   *(uint64_t *)sp = user ? (uintptr_t)&gk_user_exit_tramp : (uintptr_t)&gk_exit_tramp;
 
@@ -2683,7 +3076,9 @@ static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t st
   }
   regs_set(t, &regs);
   t->user_mode = user;
-  return run_vcpu(t);
+  long r = run_vcpu(t);
+  if (user) trace_turn_end();
+  return r;
 }
 
 long gk_run(long (*fn)(void *), void *arg) {
@@ -2784,7 +3179,7 @@ static int stack_wall_bounds(gk_thread *t, uintptr_t caller_sp, uintptr_t top,
   *lo = *hi = 0;
   if (caller_sp < t->wall_map_lo || caller_sp >= t->wall_map_hi) {
     uintptr_t rs, re; int perms;
-    if (!host_region(caller_sp & ~0xfffUL, &rs, &re, &perms)) return -1;
+    if (!host_region(caller_sp & ~0xfffUL, &rs, &re, &perms, NULL)) return -1;
     uintptr_t end = re;
     uintptr_t tp = thread_pointer();
     if (tp > caller_sp && tp < re) {
@@ -3163,7 +3558,7 @@ static long run_vcpu(gk_thread *t) {
             return GK_EFAULT;
           }
           GK_HANDLER_ENTER();
-          int dm = demand_map(t, (uintptr_t)cr2, (uintptr_t)pf_sp);
+          int dm = demand_map(t, (uintptr_t)cr2, (uintptr_t)pf_sp, pf_err, (uintptr_t)pf_frame[1]);
           GK_HANDLER_LEAVE();
           if (dm < 0) {
             if (G->dbg) {  // still the fault path: raw output only
@@ -3444,5 +3839,282 @@ void gk_debug_protect_range(unsigned long addr, size_t len, int kind) {
   if (kind == GK_DEBUG_PROT_SUPER) prot_add(s, e, GK_PROT_SUPER);
   else if (kind == GK_DEBUG_PROT_REFUSE) prot_add(s, e, GK_PROT_REFUSE);
   else prot_remove(s, e);
+  pthread_mutex_unlock(&G->lock);
+}
+
+// ---- the foreign-memory trace: dump and switches -----------------------------
+// (See the foreign-memory trace section for the instrument itself.) The dump
+// runs with raw syscalls, a stack buffer and the control block only, and
+// takes no lock: it is called from the atexit handler and from the dump
+// signal's handler, which may interrupt a thread holding G->lock, so the
+// figures it prints can be a hit apart from each other. The mappings the RIPs
+// and pages fall in come from one scan of /proc/self/maps into the modules
+// table, so a site can be named as a file plus offset (trace-symbolize.py
+// turns those into symbols with llvm-symbolizer) and a page as the heap,
+// a data segment, a .bss or plain anonymous memory.
+static const char *const gk_kind_name[GK_TRACE_NKINDS] = {"none", "heap", "anon", "data"};
+
+static int trace_module_visit(const gk_maps_line *ml, void *ctx) {
+  struct gk_trace *tr = ctx;
+  int keep = ml->kind == GK_RK_FILE || ml->kind == GK_RK_HEAP || ml->kind == GK_RK_STACK;
+  int bss = 0;
+  const char *src = ml->path;
+  size_t src_len = ml->path_len;
+  if (!keep && ml->kind == GK_RK_ANON && (ml->perms & 2) && tr->module_n > 0) {
+    // An anonymous writable mapping right after a file's: its .bss.
+    const gk_trace_module *prev = &tr->modules[tr->module_n - 1];
+    if (prev->end == ml->start && !prev->bss && prev->path[0] == '/') {
+      keep = bss = 1;
+      src = prev->path;
+      src_len = strlen(prev->path);
+    }
+  }
+  if (!keep) return 0;
+  if (tr->module_n >= GK_TRACE_MODULES) return 1;  // table full: stop the scan
+  gk_trace_module *m = &tr->modules[tr->module_n++];
+  m->start = ml->start;
+  m->end = ml->end;
+  m->off = ml->off;
+  m->bss = (unsigned char)bss;
+  if (src_len >= sizeof m->path) src_len = sizeof m->path - 1;
+  memcpy(m->path, src, src_len);
+  m->path[src_len] = 0;
+  return 0;
+}
+
+static const gk_trace_module *trace_module_of(uintptr_t a) {
+  const struct gk_trace *tr = &G->trace;
+  for (int i = 0; i < tr->module_n; i++)
+    if (a >= tr->modules[i].start && a < tr->modules[i].end) return &tr->modules[i];
+  return NULL;
+}
+
+// Does site a print before site b? More hits first, then by address.
+static int trace_site_before(const gk_trace_site_rec *a, const gk_trace_site_rec *b) {
+  return a->count > b->count || (a->count == b->count && a->rip < b->rip);
+}
+
+// Heapsort of the occupied slots' indices into print order (no allocation,
+// no recursion). The heap is a max-heap under "prints later", so extracting
+// the maximum to the end leaves the array in print order.
+static int trace_later(const int *idx, int i, int j) {
+  return trace_site_before(&G->trace.sites[idx[j]], &G->trace.sites[idx[i]]);
+}
+static void trace_sift_down(int *idx, int n, int i) {
+  for (;;) {
+    int l = 2 * i + 1, r = l + 1, m = i;
+    if (l < n && trace_later(idx, m, l)) m = l;
+    if (r < n && trace_later(idx, m, r)) m = r;
+    if (m == i) return;
+    int tmp = idx[i]; idx[i] = idx[m]; idx[m] = tmp;
+    i = m;
+  }
+}
+static int trace_sort_sites(void) {
+  struct gk_trace *tr = &G->trace;
+  int *idx = tr->sort_idx, n = 0;
+  for (int i = 0; i < GK_TRACE_SITES; i++)
+    if (tr->sites[i].rip) idx[n++] = i;
+  for (int i = n / 2 - 1; i >= 0; i--) trace_sift_down(idx, n, i);
+  for (int end = n - 1; end > 0; end--) {
+    int tmp = idx[0]; idx[0] = idx[end]; idx[end] = tmp;
+    trace_sift_down(idx, end, 0);
+  }
+  return n;
+}
+
+static void db_kv_dec(gk_dbuf *d, const char *k, long v) { db_str(d, k); db_dec(d, v); }
+static void db_kv_hex(gk_dbuf *d, const char *k, uint64_t v) { db_str(d, k); db_hex(d, v); }
+static void db_module(gk_dbuf *d, const gk_trace_module *m) {
+  db_str(d, m->path);
+  if (m->bss) db_str(d, "(.bss)");
+}
+
+static void trace_dump_fd(int fd) {
+  struct gk_trace *tr = &G->trace;
+  gk_dbuf d = {.n = 0};
+  tr->module_n = 0;
+  maps_scan(trace_module_visit, tr);
+  db_str(&d, "[gk-trace] foreign-memory trace: ");
+  db_kv_dec(&d, "faults=", tr->faults); db_kv_dec(&d, " reads=", tr->reads);
+  db_kv_dec(&d, " writes=", tr->writes); db_kv_dec(&d, " pages=", tr->pages);
+  db_kv_dec(&d, " armed=", tr->armed); db_kv_dec(&d, " sites=", tr->site_n);
+  db_kv_dec(&d, " site_overflow=", tr->site_overflow);
+  db_kv_dec(&d, " samples=", tr->sample_n);
+  db_flush_fd(&d, fd);
+  db_str(&d, "[gk-trace] by region kind:");
+  for (int k = 1; k < GK_TRACE_NKINDS; k++) {
+    db_str(&d, k == 1 ? " " : "; "); db_str(&d, gk_kind_name[k]);
+    db_kv_dec(&d, " faults=", tr->kind_faults[k]); db_kv_dec(&d, " pages=", tr->kind_pages[k]);
+  }
+  db_flush_fd(&d, fd);
+  long turns = tr->turns;
+  db_str(&d, "[gk-trace] turns=");
+  db_dec(&d, turns);
+  db_kv_dec(&d, " faults/turn avg=", turns ? tr->turn_faults_sum / turns : 0);
+  db_kv_dec(&d, " max=", tr->turn_faults_max); db_kv_dec(&d, " last=", tr->turn_faults_last);
+  db_kv_dec(&d, "; pages/turn avg=", turns ? tr->turn_pages_sum / turns : 0);
+  db_kv_dec(&d, " max=", tr->turn_pages_max); db_kv_dec(&d, " last=", tr->turn_pages_last);
+  db_str(&d, "; rearm="); db_str(&d, tr->rearm ? "on" : "off");
+  db_kv_dec(&d, " rearmed=", tr->rearmed); db_kv_dec(&d, " pending=", tr->demoted_n);
+  db_kv_dec(&d, " demoted_overflow=", tr->demoted_overflow);
+  db_flush_fd(&d, fd);
+  db_kv_dec(&d, "[gk-trace] modules=", tr->module_n);
+  db_str(&d, " (sites: n=hits r/w=reads/writes heap/anon/data=hits by kind first=first page "
+             "in=its mapping rip=site mod+off=file and offset)");
+  db_flush_fd(&d, fd);
+  int n = trace_sort_sites();
+  for (int i = 0; i < n; i++) {
+    const gk_trace_site_rec *s = &tr->sites[tr->sort_idx[i]];
+    db_str(&d, "[gk-trace] site");
+    db_kv_dec(&d, " n=", s->count); db_kv_dec(&d, " r=", s->reads); db_kv_dec(&d, " w=", s->writes);
+    db_kv_dec(&d, " heap=", s->kind_count[GK_RK_HEAP]);
+    db_kv_dec(&d, " anon=", s->kind_count[GK_RK_ANON]);
+    db_kv_dec(&d, " data=", s->kind_count[GK_RK_FILE]);
+    db_kv_hex(&d, " first=", s->first_addr);
+    const gk_trace_module *m = trace_module_of(s->first_addr);
+    db_str(&d, " in=");
+    if (m) db_module(&d, m); else db_str(&d, gk_kind_name[s->first_kind]);
+    db_kv_hex(&d, " rip=", s->rip);
+    m = trace_module_of(s->rip);
+    db_str(&d, " mod=");
+    if (m) { db_module(&d, m); db_kv_hex(&d, " off=", s->rip - m->start + m->off); }
+    else db_str(&d, "? off=0x0");
+    db_flush_fd(&d, fd);
+  }
+  for (int i = 0; i < tr->sample_n; i++) {
+    const gk_trace_sample *s = &tr->samples[i];
+    db_kv_hex(&d, "[gk-trace] sample rip=", s->rip); db_kv_hex(&d, " addr=", s->addr);
+    db_str(&d, s->write ? " w=1 kind=" : " w=0 kind=");
+    db_str(&d, gk_kind_name[s->kind < GK_TRACE_NKINDS ? s->kind : 0]);
+    db_flush_fd(&d, fd);
+  }
+  db_str(&d, "[gk-trace] end");
+  db_flush_fd(&d, fd);
+}
+
+// Dump to GK_TRACE_OUT, or stderr. Raw open/write/close only (see above).
+static void trace_dump_default(void) {
+  int fd = 2;
+  if (G->trace.out_path[0]) {
+    long r = host_syscall(SYS_open, (long)G->trace.out_path,
+                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644, 0, 0, 0);
+    if (r >= 0) fd = (int)r;
+  }
+  trace_dump_fd(fd);
+  if (fd != 2) host_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+}
+static void trace_atexit(void) { trace_dump_default(); }
+static void trace_signal(int sig) { (void)sig; trace_dump_default(); }
+
+static int env_flag(const char *name) {
+  const char *v = getenv(name);
+  return v && *v && *v != '0';
+}
+
+// Read the trace's environment switches at gk_init: GK_TRACE_FOREIGN turns
+// it on, GK_TRACE_REARM re-arms at every ring-3 turn entry, GK_TRACE_OUT
+// names the dump file and GK_TRACE_SIGNAL the dump signal (SIGUSR2 unless
+// set; 0 for none). A dump also runs at exit.
+static void trace_init(void) {
+  struct gk_trace *tr = &G->trace;
+  if (!env_flag("GK_TRACE_FOREIGN")) return;
+  tr->on = 1;
+  tr->rearm = env_flag("GK_TRACE_REARM");
+  const char *out = getenv("GK_TRACE_OUT");
+  if (out && *out) {
+    strncpy(tr->out_path, out, sizeof tr->out_path - 1);
+    tr->out_path[sizeof tr->out_path - 1] = 0;
+  }
+  const char *sig = getenv("GK_TRACE_SIGNAL");
+  tr->signal = sig ? atoi(sig) : SIGUSR2;
+  atexit(trace_atexit);
+  if (tr->signal > 0) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = trace_signal;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(tr->signal, &sa, NULL) != 0) tr->signal = 0;
+  }
+  fprintf(stderr, "[gk] foreign-memory trace on%s; dump to %s at exit%s%d\n",
+          tr->rearm ? ", re-arming at every ring-3 turn entry" : "",
+          tr->out_path[0] ? tr->out_path : "stderr",
+          tr->signal > 0 ? " and on signal " : " (no dump signal) ", tr->signal);
+}
+
+void gk_trace_get_stats(gk_trace_stats *s) {
+  const struct gk_trace *tr = &G->trace;
+  pthread_mutex_lock(&G->lock);
+  memset(s, 0, sizeof *s);
+  s->on = tr->on;
+  s->rearm = tr->rearm;
+  s->faults = tr->faults;
+  s->reads = tr->reads;
+  s->writes = tr->writes;
+  s->pages = tr->pages;
+  s->armed = tr->armed;
+  s->turns = tr->turns;
+  for (int k = 0; k < GK_TRACE_NKINDS; k++) {
+    s->kind_faults[k] = tr->kind_faults[k];
+    s->kind_pages[k] = tr->kind_pages[k];
+  }
+  s->sites = tr->site_n;
+  s->site_overflow = tr->site_overflow;
+  s->rearmed = tr->rearmed;
+  s->demoted_overflow = tr->demoted_overflow;
+  s->turn_faults_last = tr->turn_faults_last;
+  s->turn_pages_last = tr->turn_pages_last;
+  s->turn_faults_max = tr->turn_faults_max;
+  s->turn_pages_max = tr->turn_pages_max;
+  pthread_mutex_unlock(&G->lock);
+}
+
+int gk_trace_site_lookup(unsigned long rip, gk_trace_site *out) {
+  const struct gk_trace *tr = &G->trace;
+  int found = 0;
+  pthread_mutex_lock(&G->lock);
+  unsigned h = (unsigned)(((uint64_t)rip * 0x9E3779B97F4A7C15ULL) >> 51);
+  for (int i = 0; i < GK_TRACE_SITES; i++) {
+    const gk_trace_site_rec *s = &tr->sites[(h + (unsigned)i) & (GK_TRACE_SITES - 1)];
+    if (s->rip == 0) break;
+    if (s->rip != (uintptr_t)rip) continue;
+    out->rip = s->rip;
+    out->count = s->count;
+    out->reads = s->reads;
+    out->writes = s->writes;
+    for (int k = 0; k < GK_TRACE_NKINDS; k++) out->kind_count[k] = s->kind_count[k];
+    out->first_addr = s->first_addr;
+    out->first_kind = s->first_kind;
+    found = 1;
+    break;
+  }
+  pthread_mutex_unlock(&G->lock);
+  return found;
+}
+
+void gk_trace_dump(int fd) { trace_dump_fd(fd); }
+
+void gk_trace_reset(void) {
+  struct gk_trace *tr = &G->trace;
+  pthread_mutex_lock(&G->lock);
+  memset(tr->sites, 0, sizeof tr->sites);
+  tr->site_n = 0;
+  tr->site_overflow = 0;
+  tr->sample_n = 0;
+  tr->faults = tr->reads = tr->writes = tr->pages = tr->armed = 0;
+  memset(tr->kind_faults, 0, sizeof tr->kind_faults);
+  memset(tr->kind_pages, 0, sizeof tr->kind_pages);
+  tr->cur_faults = tr->cur_pages = 0;
+  tr->turns = tr->turn_faults_sum = tr->turn_faults_max = tr->turn_faults_last = 0;
+  tr->turn_pages_sum = tr->turn_pages_max = tr->turn_pages_last = 0;
+  tr->rearmed = tr->demoted_overflow = 0;
+  pthread_mutex_unlock(&G->lock);
+}
+
+void gk_debug_trace_set(int on, int rearm) {
+  pthread_mutex_lock(&G->lock);
+  G->trace.on = on != 0;
+  G->trace.rearm = rearm != 0;
   pthread_mutex_unlock(&G->lock);
 }

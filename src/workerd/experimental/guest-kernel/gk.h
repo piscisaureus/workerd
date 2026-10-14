@@ -234,6 +234,61 @@ typedef int (*gk_syscall_filter)(long nr, long a1, long a2, long a3, long a4,
                                  long a5, long a6);
 void gk_set_syscall_filter(gk_syscall_filter f);
 
+// The foreign-memory trace: an instrument that records which pages of the
+// shared runtime memory (the brk heap, anonymous mappings and writable data
+// segments outside every arena) ring-3 code touches, from which instructions.
+// Off unless GK_TRACE_FOREIGN=1 is in the environment at gk_init; then every
+// such page is mapped so that ring 3's first read and first write of it fault,
+// are counted against the faulting RIP, and let the page through, so a turn
+// computes what it would without the trace. GK_TRACE_REARM=1 re-arms the pages
+// at every ring-3 turn entry so each turn is counted afresh. The table is
+// dumped as text to the file named by GK_TRACE_OUT (stderr if unset) at exit
+// and on SIGUSR2 (GK_TRACE_SIGNAL overrides the signal number; 0 disables it);
+// trace-symbolize.py turns the dump's file offsets into symbols. The region
+// kinds, for the per-kind figures below, are GK_TRACE_KIND_*.
+enum { GK_TRACE_KIND_NONE, GK_TRACE_KIND_HEAP, GK_TRACE_KIND_ANON, GK_TRACE_KIND_DATA,
+       GK_TRACE_KINDS };
+typedef struct {
+  int on, rearm;
+  long faults;           // ring-3 accesses the trace caught (first read and first write per page)
+  long reads, writes;    // the same, by access
+  long pages;            // pages demoted (once per arming: once ever without re-arming)
+  long armed;            // pages mapped armed before ring 3 touched them
+  long turns;            // ring-3 turns ended
+  long kind_faults[GK_TRACE_KINDS], kind_pages[GK_TRACE_KINDS];
+  long sites;            // distinct faulting RIPs in the table
+  long site_overflow;    // hits dropped for want of a table slot
+  long rearmed;          // pages re-armed at turn entries
+  long demoted_overflow; // demotions the re-arm set had no room for
+  long turn_faults_last, turn_pages_last, turn_faults_max, turn_pages_max;
+} gk_trace_stats;
+void gk_trace_get_stats(gk_trace_stats *s);
+
+// The table's record for the faulting instruction `rip`; returns 1 and fills
+// *out if there is one, 0 otherwise.
+typedef struct {
+  unsigned long rip;
+  long count, reads, writes;
+  long kind_count[GK_TRACE_KINDS];
+  unsigned long first_addr;  // the page of the first hit
+  int first_kind;            // its region kind
+} gk_trace_site;
+int gk_trace_site_lookup(unsigned long rip, gk_trace_site *out);
+
+// Write the table, samples and counters as text to `fd` (raw writes, no lock,
+// no allocation: callable from a signal handler).
+void gk_trace_dump(int fd);
+
+// Clear the table, samples and counters. The pages' armed/demoted state is
+// untouched.
+void gk_trace_reset(void);
+
+// Test/diagnostic: switch the trace on or off at run time, as the environment
+// would at gk_init (without the exit and signal dumps). Pages already mapped
+// keep their state; the switch decides how pages are mapped and how faults on
+// traced pages are handled from now on.
+void gk_debug_trace_set(int on, int rearm);
+
 #ifdef __cplusplus
 }
 #endif
