@@ -382,9 +382,15 @@ decides the overall cost.
 - **No signal delivery** into the library's API yet; only faults are caught,
   via the in-guest IDT handlers. (Injecting a host signal as a guest interrupt
   is demonstrated separately and would be wired in here.)
-- **Syscall policy is a single filter hook.** `gk_set_syscall_filter` bounds
-  forwarded syscalls, but there is no default allowlist or host-side seccomp on
-  the forwarding thread itself yet.
+- **Syscall policy is an embedder filter over a built-in memory broker.**
+  `gk_set_syscall_filter` bounds which syscalls a turn may forward. On top of
+  that, a ring-3 turn's forwarded syscall goes through a broker (see the ring-3
+  syscall memory broker in `gk_linux.c` and `gk_hvf.c`): every pointer argument,
+  including those nested in an iovec or msghdr, must name memory the turn could
+  reach itself, and a syscall gk has no descriptor for, or one that acts on host
+  rather than guest state, is refused. There is still no default syscall
+  allowlist (the embedder supplies one) or host-side seccomp on the forwarding
+  thread itself yet.
 - **The MMU backs whole 2 MiB windows, not exact VMAs.** It reparses
   `/proc/self/maps` per fault (each read also settles the fault's aligned
   256 KiB neighborhood, see `demand_map_neighbors` in `gk_pt.c`, so a growing
