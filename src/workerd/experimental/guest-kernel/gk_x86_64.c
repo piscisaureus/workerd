@@ -1119,4 +1119,26 @@ static long run_vcpu(gk_thread *t) {
   }
 }
 
+// ---- the host thread (see stack_wall_bounds) ---------------------------------
+// The thread pointer, the fs base: a pthread's TCB, which glibc places at the
+// top of the thread's stack mapping, with its static TLS block just below.
+static uintptr_t thread_pointer(void) {
+  uintptr_t tp;
+  __asm__ __volatile__("mov %%fs:0, %0" : "=r"(tp));
+  return tp;
+}
+
+// The lowest address of the thread's data around thread pointer `tp`: the
+// static TLS block below it. 0 if its size is unknown.
+static uintptr_t thread_data_floor(uintptr_t tp) {
+  if (!G->tls_static_info) return 0;
+  size_t size = 0, align = 0;
+  G->tls_static_info(&size, &align);
+  return GUEST_FLOOR(tp - size);
+}
+
+// ---- diagnostics -------------------------------------------------------------
+static int flush_uses_invpcid(void) { return G->flush_stub == gk_flush_stub_invpcid; }
+static uintptr_t super_page(void) { return G->gdt_va; }
+
 #endif  // defined(__x86_64__)

@@ -583,4 +583,16 @@ static long run_vcpu(gk_thread *t) {
   }
 }
 
+// ---- the host thread (see stack_wall_bounds) ---------------------------------
+// The thread pointer: the thread descriptor itself (pthread_self), which holds
+// the TLS and starts exactly at the top of a pthread's stack, in the stack's
+// own mapping.
+static uintptr_t thread_pointer(void) { return (uintptr_t)pthread_self(); }
+
+// The descriptor and its TLS start at `tp` and extend upward.
+static uintptr_t thread_data_floor(uintptr_t tp) { return GUEST_FLOOR(tp); }
+
+// Before every turn: the commpage shadows follow the kernel's pages.
+static void turn_prepare(void) { commpage_refresh(); }
+
 #endif  // GK_HVF

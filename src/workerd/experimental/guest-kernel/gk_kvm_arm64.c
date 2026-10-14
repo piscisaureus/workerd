@@ -257,5 +257,21 @@ static long run_vcpu(gk_thread *t) {
   }
 }
 
+// ---- the host thread (see stack_wall_bounds) ---------------------------------
+// The thread pointer, TPIDR_EL0, with glibc's struct pthread just below it and
+// the TCB and static TLS block just above.
+static uintptr_t thread_pointer(void) {
+  uintptr_t tp;
+  __asm__ __volatile__("mrs %0, tpidr_el0" : "=r"(tp));
+  return tp;
+}
+
+// The lowest address of the thread's data around thread pointer `tp`: struct
+// pthread (glibc's TLS_PRE_TCB_SIZE, plus slack for its alignment) below it.
+// 0 if its size is unknown.
+static uintptr_t thread_data_floor(uintptr_t tp) {
+  if (!G->pthread_size) return 0;
+  return GUEST_FLOOR(tp - G->pthread_size - 64);
+}
 
 #endif  // defined(__aarch64__) && !GK_HVF
