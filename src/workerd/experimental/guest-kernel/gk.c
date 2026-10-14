@@ -258,6 +258,7 @@ typedef struct kvm_regs gk_regs;
 #define GK_ESRCH 3
 #define GK_E2BIG 7
 #define GK_ENOMEM 12
+#define GK_EADDR 14   // EFAULT: GK_EFAULT is gk_run's guest-fault status
 #define GK_EBUSY 16
 #define GK_EINVAL 22
 #define GK_ENOSYS 38
@@ -1098,6 +1099,24 @@ static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
                        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
                        : "memory");
   return x0;
+#endif
+}
+
+// Copies `n` bytes from a guest-supplied address into host memory, without
+// faulting the host if the address is unmapped or not readable: the kernel
+// does the access and reports failure instead. Returns 0, or -1 if any byte
+// could not be read.
+static int copy_in(void *dst, uintptr_t src, size_t n) {
+#if GK_HVF
+  mach_vm_size_t got = 0;
+  kern_return_t kr = mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)src, n,
+                                            (mach_vm_address_t)(uintptr_t)dst, &got);
+  return kr == KERN_SUCCESS && got == n ? 0 : -1;
+#else
+  struct iovec local = {dst, n}, remote = {(void *)src, n};
+  long pid = host_syscall(SYS_getpid, 0, 0, 0, 0, 0, 0);
+  long r = host_syscall(SYS_process_vm_readv, pid, (long)&local, 1, (long)&remote, 1, 0);
+  return r == (long)n ? 0 : -1;
 #endif
 }
 
@@ -5179,7 +5198,7 @@ static long clone_thread(gk_thread *t, gk_regs *r, long nr) {
     // Need at least the fields through `tls` (CLONE_ARGS_SIZE_VER0).
     if (ca_size < 64 || r->rdi == 0) return -GK_EINVAL;
     memset(&ca, 0, sizeof ca);
-    memcpy(&ca, (void *)(uintptr_t)r->rdi, ca_size < sizeof ca ? ca_size : sizeof ca);
+    if (copy_in(&ca, r->rdi, ca_size < sizeof ca ? ca_size : sizeof ca) < 0) return -GK_EADDR;
     child_sp = ca.stack + ca.stack_size;
   } else {
     child_sp = r->rsi;
@@ -5189,7 +5208,7 @@ static long clone_thread(gk_thread *t, gk_regs *r, long nr) {
     ca_size = r->x[1];
     if (ca_size < 64 || r->x[0] == 0) return -GK_EINVAL;
     memset(&ca, 0, sizeof ca);
-    memcpy(&ca, (void *)(uintptr_t)r->x[0], ca_size < sizeof ca ? ca_size : sizeof ca);
+    if (copy_in(&ca, r->x[0], ca_size < sizeof ca ? ca_size : sizeof ca) < 0) return -GK_EADDR;
     child_sp = ca.stack + ca.stack_size;
   } else {
     child_sp = r->x[1];
@@ -6409,7 +6428,7 @@ static long forward_syscall(gk_thread *t, gk_regs *r) {
   // What the call does to the address space, decided before it runs: the
   // range and, for a protection change, the protection.
   int kind = GK_REFLECT_NONE, prot = 0;
-  uintptr_t rs = 0, re = 0, *addr_out = NULL;
+  uintptr_t rs = 0, re = 0, addr_out = 0;
   size_t len = 0;
   int self = (mach_port_name_t)a[0] == mach_task_self();
   switch (nr) {
@@ -6424,7 +6443,12 @@ static long forward_syscall(gk_thread *t, gk_regs *r) {
       break;
     case GK_TRAP_vm_allocate:
     case GK_TRAP_vm_map:
-      if (self && a[1]) { kind = GK_REFLECT_MAP; addr_out = (uintptr_t *)a[1]; rs = *addr_out; len = a[2]; }
+      if (self && a[1]) {
+        if (copy_in(&rs, a[1], sizeof rs) < 0) return KERN_INVALID_ADDRESS;
+        kind = GK_REFLECT_MAP;
+        addr_out = a[1];
+        len = a[2];
+      }
       break;
   }
   if (len == 0) kind = GK_REFLECT_NONE;
@@ -6441,7 +6465,9 @@ static long forward_syscall(gk_thread *t, gk_regs *r) {
     if (ok) {
       if (kind == GK_REFLECT_MAP) {
         // The range the mapping got (a placed one: the one asked for).
-        uintptr_t got = nr == GK_SYS_mmap ? (uintptr_t)ret : *addr_out;
+        uintptr_t got = rs;
+        if (nr == GK_SYS_mmap) got = (uintptr_t)ret;
+        else if (copy_in(&got, addr_out, sizeof got) < 0) got = rs;
         rs = HOST_FLOOR(got);
         re = HOST_CEIL(got + len);
       }
@@ -6497,7 +6523,10 @@ static long forward_syscall(gk_thread *t, gk_regs *r) {
   if (nr == SYS_clone || nr == GK_SYS_clone3) {
     uint64_t flags = 0;
     if (nr == SYS_clone) flags = (uint64_t)a1;
-    else if (a1 && (uint64_t)a2 >= 64) flags = ((struct gk_clone_args *)a1)->flags;
+    else if (a1 && (uint64_t)a2 >= 64 &&
+             copy_in(&flags, (uintptr_t)a1 + offsetof(struct gk_clone_args, flags),
+                     sizeof flags) < 0)
+      return -GK_EADDR;
     if ((flags & (GK_CLONE_VM | GK_CLONE_THREAD)) == (GK_CLONE_VM | GK_CLONE_THREAD)) {
       long tid = clone_thread(t, r, nr);
       if (G->dbg)

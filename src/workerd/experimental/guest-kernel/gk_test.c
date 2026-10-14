@@ -403,6 +403,20 @@ static long churn_in_guest(void *arg) {
   return 0;
 }
 
+
+// clone3 with arguments gk cannot read must fail with EFAULT, as it would
+// natively, rather than fault the host. `arg` is two host pages, the second
+// PROT_NONE. Case 1: the whole struct is unreadable. Case 2: only `flags`
+// (a thread clone's) is readable, the rest of the struct is not.
+static long clone3_bad_args(void *arg) {
+  char *p = arg;
+  long e1 = syscall(435 /* clone3 */, p + hpage, 88) < 0 ? errno : 0;
+  uint64_t *flags = (uint64_t *)(p + hpage - 8);
+  *flags = 0x100 | 0x10000;  // CLONE_VM | CLONE_THREAD
+  long e2 = syscall(435, flags, 88) < 0 ? errno : 0;
+  return e1 == EFAULT && e2 == EFAULT;
+}
+
 #endif  // GK_TEST_GUEST_THREADS
 
 // Host-side churn: a host thread enters the guest via gk_run and then ends.
@@ -4418,6 +4432,15 @@ int main(void) {
   }
   printf("guest-created threads (ring-0 creator): 3 threads spawned in the guest ran in ring 0 "
          "(gk_run=%ld, cr0=%#lx) [%s]\n", spawned, ts[0].cr0, ok7 ? "OK" : "FAIL");
+  {
+    char *two = mmap(NULL, 2 * hpage, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mprotect(two + hpage, hpage, PROT_NONE);
+    long bad = gk_run(clone3_bad_args, two);
+    munmap(two, 2 * hpage);
+    printf("guest-created threads: clone3 with unreadable arguments fails with EFAULT "
+           "(gk_run=%ld) [%s]\n", bad, bad == 1 ? "OK" : "FAIL");
+    if (bad != 1) ok7 = 0;
+  }
 
   // Thread churn must not grow the vCPU count: 200 iterations of 3 guest-
   // spawned threads may add at most 3 vCPUs (peak concurrency), and 20
