@@ -28,6 +28,7 @@
 #define PTE_IS_W(e) (!((e) & PTE_RDONLY))
 #define PTE_SET_W(e) ((e) & ~PTE_RDONLY)
 #define PTE_CLR_W(e) ((e) | PTE_RDONLY)
+#define PTE_SET_GLOBAL(e) ((e) & ~PTE_NG)
 // No memory protection keys (POE) on the CPUs this targets: pkey syscalls are
 // forwarded to the host unchanged and no PTE carries a key.
 #define GK_HAS_PKEYS 0

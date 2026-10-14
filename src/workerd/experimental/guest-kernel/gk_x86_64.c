@@ -3,6 +3,32 @@
 #include "gk_internal.h"
 #if defined(__x86_64__)
 
+// ---- page-table entries -----------------------------------------------------
+// The leaf PTE map4k_root installs for `va` (see there for `flags`): the frame
+// is the page itself (guest-physical == host-virtual), U unless the page is
+// supervisor, W and NX from the protection, and the page's protection key.
+static int pte_leaf(uint64_t va, uint64_t flags, int pkey, int super, uint64_t *out) {
+  uint64_t pte = (va & ~0xfffULL) | PTE_P;
+  if (!super) pte |= PTE_U;
+  if (flags & 2) pte |= PTE_W;
+  if (flags & GK_MAP_WALLED) pte |= PTE_WALL;
+  if (!(flags & 4)) pte |= PTE_NX;
+  pte |= ((uint64_t)pkey << PTE_PKEY_SHIFT) & PTE_PKEY_MASK;
+  *out = pte;
+  return 0;
+}
+
+// A present leaf rewritten for the protection of `rp` (see gk_reprot): W and
+// NX follow it, and a writable page at `v` inside the host-frame wall gets
+// PTE_WALL instead of W.
+static uint64_t pte_reprotect(uint64_t e, const gk_reprot *rp, uintptr_t v) {
+  uint64_t n = e & ~(PTE_W | PTE_NX | PTE_WALL);
+  if (!(rp->prot & 4)) n |= PTE_NX;
+  if (rp->prot & 2) n |= (v >= rp->wall_lo && v < rp->wall_hi) ? PTE_WALL : PTE_W;
+  return n;
+}
+
+
 // Every gate runs its handler on IST1, the vCPU's exception stack (see
 // vcpu_init), never on the interrupted code's stack.
 static void set_idt_gate(uint8_t *idt, int vec, uint64_t h) {

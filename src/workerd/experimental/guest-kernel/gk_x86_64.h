@@ -48,6 +48,7 @@
 #define PTE_IS_W(e) ((e) & PTE_W)
 #define PTE_SET_W(e) ((e) | PTE_W)
 #define PTE_CLR_W(e) ((e) & ~PTE_W)
+#define PTE_SET_GLOBAL(e) ((e) | PTE_G)
 #define GK_HAS_PKEYS 1           // the guest's protection keys are virtualized (see that section)
 #define GK_USER_SLOTS 256        // PML4 slots 0..255 are the 47-bit user address space
 

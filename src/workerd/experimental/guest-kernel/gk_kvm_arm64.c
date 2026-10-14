@@ -3,6 +3,14 @@
 #include "gk_internal.h"
 #if defined(__aarch64__) && !GK_HVF
 
+// KVM backs a memslot from the host mapping as the guest touches it, so a
+// page needs nothing put into stage 2 before its first PTE (see gk_hvf.c for
+// the hypervisor that does).
+static int s2_ensure(gk_region *rg, uintptr_t hva) {
+  (void)rg; (void)hva;
+  return 0;
+}
+
 // ---- the vDSO (arm64) --------------------------------------------------------
 // The vDSO's functions (clock_gettime and friends) read the kernel's data
 // pages, [vvar], which are a PFNMAP mapping, and arm64 KVM refuses a memslot

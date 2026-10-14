@@ -24,6 +24,41 @@ static int pte_exec_at_el1(gk_thread *t, uintptr_t va) {
   pthread_mutex_unlock(&G->lock);
   return changed;
 }
+// ---- page-table entries -----------------------------------------------------
+// The leaf PTE map4k_root installs for `va` (see there for `flags`). The frame
+// is the page's guest-physical address, through the memslot region backing it
+// (every caller has ensured one), whose host page goes into stage 2 now if the
+// hypervisor needs that (s2_ensure; the caller has read the host mapping).
+// EL0 has no execute permission on a supervisor page whatever AP says, so UXN
+// is set on every supervisor page; and the CPU itself denies EL1 execution of
+// a page EL0 can write. No page carries a protection key. Returns -1 if the
+// page has no region or cannot enter stage 2.
+static int pte_leaf(uint64_t va, uint64_t flags, int pkey, int super, uint64_t *out) {
+  (void)pkey;
+  gk_region *rg = region_find(va);
+  if (!rg) return -1;
+  if (s2_ensure(rg, va) < 0) return -1;
+  uint64_t pte = (rg->gpa + ((va & ~0xfffULL) - rg->start)) | PTE_P | PTE_TABLE | PTE_SH_INNER |
+                 PTE_AF | PTE_NG | PTE_RDONLY;
+  if (!super) pte |= PTE_U;
+  if (flags & 2) pte &= ~PTE_RDONLY;
+  if (flags & GK_MAP_WALLED) pte |= PTE_WALL;
+  if (!(flags & 4)) pte |= PTE_PXN | PTE_UXN;
+  else if (super) pte |= PTE_UXN;
+  *out = pte;
+  return 0;
+}
+
+// pte_reprotect as on x86-64 (see gk_x86_64.c). A supervisor page (U clear)
+// stays not executable at EL0 (see pte_leaf).
+static uint64_t pte_reprotect(uint64_t e, const gk_reprot *rp, uintptr_t v) {
+  uint64_t n = (e & ~(PTE_PXN | PTE_UXN | PTE_WALL)) | PTE_RDONLY;
+  if (!(rp->prot & 4)) n |= PTE_PXN | PTE_UXN;
+  else if (!(n & PTE_U)) n |= PTE_UXN;
+  if (rp->prot & 2) n = (v >= rp->wall_lo && v < rp->wall_hi) ? n | PTE_WALL : PTE_SET_W(n);
+  return n;
+}
+
 // ---- the guest-physical allocator (arm64) -------------------------------------
 // On arm64 the guest-physical space is smaller than the host-virtual one: KVM
 // gives a VM at most KVM_CAP_ARM_VM_IPA_SIZE bits (40 on Apple silicon) while
