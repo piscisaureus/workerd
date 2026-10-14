@@ -31,8 +31,8 @@ which runs each isolate's JS turn at guest ring 3.
   - Per architecture: `gk_x86_64.h`/`gk_x86_64.c` (x86-64, which is KVM only)
     and `gk_arm64.h`/`gk_arm64.c` (arm64 under either hypervisor).
   - Per host and hypervisor: `gk_linux.c` (Linux syscalls, `/proc/self/maps`,
-    guest thread creation), `gk_kvm_arm64.c` (arm64 under KVM) and `gk_hvf.c`
-    (macOS and Hypervisor.framework).
+    guest thread creation), `gk_kvm.c` (KVM memslots), `gk_kvm_arm64.c` (arm64
+    under KVM) and `gk_hvf.c` (macOS and Hypervisor.framework).
 - `gk_asm.S` — the in-guest trampolines and exception handlers, which includes
   `gk_asm_x86_64.S` or `gk_asm_arm64.S`.
 - `gk_test.c` — the test/example.

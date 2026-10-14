@@ -28,6 +28,24 @@ static uint64_t pte_reprotect(uint64_t e, const gk_reprot *rp, uintptr_t v) {
   return n;
 }
 
+// ---- guest-physical addresses -----------------------------------------------
+// Guest-physical is host-virtual on x86-64 (see the MMU layer): a region's
+// guest-physical address is its start, and nothing is allocated or kept.
+static int gpa_assign(uintptr_t s, uintptr_t e, uint64_t *gpa) {
+  (void)e;
+  *gpa = s;
+  return 0;
+}
+static void gpa_unassign(uintptr_t s, uintptr_t e, uint64_t gpa) { (void)s; (void)e; (void)gpa; }
+static void gpa_retire(gk_region *n) { (void)n; }
+static void region_set_gpa(gk_region *n, uint64_t gpa) { (void)n; (void)gpa; }
+static inline uint64_t region_gpa(const gk_region *n) { return n->start; }
+// No host range is kept out of the memslots on x86-64 (see region_ensure).
+static int region_clip_holes(uintptr_t *s, uintptr_t *gap_end) {
+  (void)s; (void)gap_end;
+  return 0;
+}
+
 
 // Every gate runs its handler on IST1, the vCPU's exception stack (see
 // vcpu_init), never on the interrupted code's stack.

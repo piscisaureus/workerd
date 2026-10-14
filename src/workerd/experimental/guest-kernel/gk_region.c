@@ -149,41 +149,12 @@ static int region_add(uintptr_t s, uintptr_t e) {
     n = &G->region_pool[G->region_n];
     slot = G->next_slot;
   }
-  uint64_t gpa = s;
-#if defined(__aarch64__)
-  // A region cut short by a hole (see region_ensure) still gets whole windows
-  // of guest-physical space, at its own offset into them.
-  uintptr_t wlo = s & ~(GK_BACK_WIN - 1), whi = (e + GK_BACK_WIN - 1) & ~(GK_BACK_WIN - 1);
-  if (gpa_alloc(whi - wlo, &gpa) < 0) {
-    if (G->dbg) write_stderr("[gk] guest-physical space exhausted\n");
-    return -1;
-  }
-  gpa += s - wlo;
-#endif
-#if !GK_HVF  // under HVF the window enters stage 2 page by page (see the HVF section)
-  struct kvm_userspace_memory_region r = {.slot = (uint32_t)slot,
-                                          .guest_phys_addr = gpa,
-                                          .memory_size = e - s,
-                                          .userspace_addr = s};
-  if (ioctl(G->vmfd, KVM_SET_USER_MEMORY_REGION, &r) < 0) {
-#if defined(__aarch64__)
-    gpa_release(gpa - (s - wlo), whi - wlo);
-#endif
-    if (G->dbg) {  // fault path: raw output only (no strerror, it may allocate)
-      gk_dbuf d = {.n = 0};
-      db_str(&d, "[gk] memslot "); db_dec(&d, slot);
-      db_str(&d, " ["); db_hex(&d, s); db_str(&d, ","); db_hex(&d, e);
-#if defined(__aarch64__)
-      db_str(&d, ") at guest-physical "); db_hex(&d, gpa);
-      db_str(&d, " failed: errno "); db_dec(&d, errno);
-#else
-      db_str(&d, ") failed: errno "); db_dec(&d, errno);
-#endif
-      db_flush(&d);
-    }
+  uint64_t gpa;
+  if (gpa_assign(s, e, &gpa) < 0) return -1;
+  if (memslot_add(slot, gpa, s, e) < 0) {
+    gpa_unassign(s, e, gpa);
     return -1;  // the node stays where it was (free list or untouched pool tail)
   }
-#endif
   if (recycled) {
     G->region_free = n->l;
   } else {
@@ -194,9 +165,7 @@ static int region_add(uintptr_t s, uintptr_t e) {
   n->start = s;
   n->end = e;
   n->slot = slot;
-#if defined(__aarch64__)
-  n->gpa = gpa;
-#endif
+  region_set_gpa(n, gpa);
   n->prio = gk_rand();
   G->regions = treap_insert(G->regions, n);
   G->region_live++;
@@ -204,45 +173,16 @@ static int region_add(uintptr_t s, uintptr_t e) {
 }
 
 // Delete a region's memslot and drop it from the tree; its node (and memslot
-// id) go to the free list. Caller holds G->lock and has made sure no root maps
-// a page in the region any more, so the guest cannot reach it. Returns the
-// ioctl's result: on failure the region stays.
+// id) go to the free list, and its guest-physical range back to the allocator
+// unless the hypervisor may still map it. Caller holds G->lock and has made
+// sure no root maps a page in the region any more, so the guest cannot reach
+// it. Returns -1 if the memslot could not be deleted: the region then stays.
 static int region_remove(gk_region *n) {
-#if GK_HVF
-  // The region goes either way (the host memory is going); guest-physical
-  // pages stage 2 still maps are quarantined below rather than reused.
-  int keep_gpa = s2_release(n) < 0;
-#else
-  uint64_t gpa = n->start;
-#if defined(__aarch64__)
-  gpa = n->gpa;
-#endif
-  struct kvm_userspace_memory_region r = {.slot = (uint32_t)n->slot,
-                                          .guest_phys_addr = gpa,
-                                          .memory_size = 0,
-                                          .userspace_addr = n->start};
-  if (ioctl(G->vmfd, KVM_SET_USER_MEMORY_REGION, &r) < 0) {
-    if (G->dbg)
-      fprintf(stderr, "[gk] memslot %d [%#lx,%#lx) delete failed: %s\n", n->slot,
-              (unsigned long)n->start, (unsigned long)n->end, strerror(errno));
-    return -1;
-  }
-#endif
+  int keep_gpa = 0;
+  if (memslot_remove(n, &keep_gpa) < 0) return -1;
   G->regions = treap_remove(G->regions, n);
   G->region_live--;
-#if defined(__aarch64__)
-  // A vCPU still running under a destroyed arena's root (see gk_arena_destroy)
-  // may hold translations to this range: it is not handed out again then.
-#if GK_HVF
-  if (!G->gpa_keep && !keep_gpa) {
-#else
-  if (!G->gpa_keep) {
-#endif
-    uintptr_t wlo = n->start & ~(GK_BACK_WIN - 1);
-    uintptr_t whi = (n->end + GK_BACK_WIN - 1) & ~(GK_BACK_WIN - 1);
-    gpa_release(n->gpa - (n->start - wlo), whi - wlo);
-  }
-#endif
+  if (!keep_gpa) gpa_retire(n);
   n->l = G->region_free;
   G->region_free = n;
   return 0;
@@ -290,17 +230,7 @@ static int region_ensure(uintptr_t s, uintptr_t e) {
     uintptr_t gap_end = e;
     gk_region *nx = region_succ(s);  // stop the new region before the next one
     if (nx && nx->start < gap_end) gap_end = nx->start;
-#if defined(__aarch64__)
-    // Nor may it cover a hole (see the vDSO section): KVM refuses a memslot
-    // over the kernel's data pages, so the window is cut around them.
-    int in_hole = 0;
-    for (int i = 0; i < G->hole_n; i++) {
-      const gk_prot_range *h = &G->holes[i];
-      if (s >= h->start && s < h->end) { s = h->end; in_hole = 1; break; }
-      if (h->start > s && h->start < gap_end) gap_end = h->start;
-    }
-    if (in_hole) continue;
-#endif
+    if (region_clip_holes(&s, &gap_end)) continue;
     if (region_add(s, gap_end) < 0) return -1;
     s = gap_end;
   }

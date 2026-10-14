@@ -9,6 +9,7 @@
 #include "gk_util.c"
 #include "gk_hvf.c"
 #include "gk_linux.c"
+#include "gk_kvm.c"
 #include "gk_pt.c"
 #include "gk_region.c"
 #include "gk_pkey.c"
