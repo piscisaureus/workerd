@@ -201,15 +201,9 @@ static uint64_t host_tpidr(int ro) {
 // a vCPU stopped anywhere else: one that faulted inside a handler, or whose
 // KVM_RUN failed (see host_backing_fail).
 static int vcpu_reset_pc(gk_thread *t) {
-#if GK_HVF
-  if (vcpu_set_reg(t->vcpu, HV_REG_PC, (uintptr_t)&gk_dispatch) < 0 ||
-      vcpu_set_reg(t->vcpu, HV_REG_CPSR, PSR_EL1H) < 0)
+  if (vreg_set(t, VREG_PC, (uintptr_t)&gk_dispatch) < 0 ||
+      vreg_set(t, VREG_PSTATE, PSR_EL1H) < 0)
     return -1;
-#else
-  if (vcpu_set(t->fd, GK_CORE_REG(regs.pc), (uintptr_t)&gk_dispatch) < 0 ||
-      vcpu_set(t->fd, GK_CORE_REG(regs.pstate), PSR_EL1H) < 0)
-    return -1;
-#endif
   return 0;
 }
 
@@ -222,110 +216,56 @@ static int vcpu_init(gk_thread *t, int flags) {
   int id, reused = 0;
   uint64_t stack_top = 0, ist = 0;
   void *side_stack = NULL;
-#if GK_HVF
-  hv_vcpu_t vcpu;
-  hv_vcpu_exit_t *exit;
-#else
-  int fd;
-  struct kvm_run *run = NULL;
-#endif
   pthread_mutex_lock(&G->lock);
   if (G->parked_n > 0) {
     gk_parked_vcpu *p = &G->parked[--G->parked_n];
-#if !GK_HVF
-    fd = p->fd; run = p->run;
-#endif
+    vcpu_unpark_hw(t, p);
     id = p->id; stack_top = p->stack_top; ist = p->ist;
     side_stack = p->side_stack;
     reused = 1;
   }
   pthread_mutex_unlock(&G->lock);
-#if GK_HVF
-  // Every thread creates its own vCPU (see vcpu_park); a pooled id brings its
-  // vcb and stacks along.
-  if (hv_vcpu_create(&vcpu, &exit, NULL) != HV_SUCCESS) { G->err = "hv_vcpu_create"; return -1; }
-  uint64_t mmfr0 = 0;
-  if (hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ID_AA64MMFR0_EL1, &mmfr0) != HV_SUCCESS ||
-      ((mmfr0 >> 28) & 0xf) == 0xf) {  // TGran4 (see the page-sizes section)
-    G->err = "CPU has no 4KiB translation granule";
-    hv_vcpu_destroy(vcpu);
-    return -1;
-  }
   if (!reused) id = atomic_fetch_add(&G->vcpus_created, 1);
-#else
-  if (!reused) {
-    id = atomic_fetch_add(&G->vcpus_created, 1);
-    fd = ioctl(G->vmfd, KVM_CREATE_VCPU, id);
-    if (fd < 0) { G->err = "KVM_CREATE_VCPU"; return -1; }
-    struct kvm_vcpu_init init = G->vcpu_target;
-    if (ioctl(fd, KVM_ARM_VCPU_INIT, &init) < 0) { G->err = "KVM_ARM_VCPU_INIT"; return -1; }
-    // The guest's 4KiB granule (see the page-sizes section) needs the CPU's
-    // support, reported by TGran4 (bits 31:28; 0xf means none).
-    uint64_t mmfr0;
-    if (vcpu_get(fd, GK_ID_AA64MMFR0_EL1, &mmfr0) < 0 || ((mmfr0 >> 28) & 0xf) == 0xf) {
-      G->err = "CPU has no 4KiB translation granule";
-      return -1;
-    }
-    run = mmap(NULL, G->run_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (run == MAP_FAILED) { G->err = "mmap kvm_run"; return -1; }
-  }
-#endif
+  int fresh = vcpu_hw_create(t, id, reused);
+  if (fresh < 0) return -1;
   if (!reused) {
     // The vcb, eager-mapped supervisor: the vector handlers store into it
     // before anything else, so it must never fault. Its mapping is a whole
-    // number of host pages, all of them supervisor. kvm_run is refused.
+    // number of host pages, all of them supervisor.
     size_t vcb_bytes = HOST_CEIL(GK_IST_BYTES);
     uint8_t *ir = mmap(NULL, vcb_bytes, PROT_READ | PROT_WRITE,
                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (ir == MAP_FAILED) { G->err = "mmap vcb"; return -1; }
+    if (ir == MAP_FAILED) { G->err = "mmap vcb"; vcpu_hw_abort(t); return -1; }
     pthread_mutex_lock(&G->lock);
-#if !GK_HVF
-    prot_add((uintptr_t)run, (uintptr_t)run + G->run_size, GK_PROT_REFUSE);
-#endif
     prot_add((uintptr_t)ir, (uintptr_t)ir + vcb_bytes, GK_PROT_SUPER);
     int irc = mmu_map_range((uintptr_t)ir, (uintptr_t)ir + vcb_bytes, 1 | 2);
     pthread_mutex_unlock(&G->lock);
-    if (irc < 0) { G->err = "map vcb"; return -1; }
+    if (irc < 0) { G->err = "map vcb"; vcpu_hw_abort(t); return -1; }
     ist = (uint64_t)(uintptr_t)ir;
   }
-#if GK_HVF
-  // The static system registers go into every (new) vCPU.
-  if (vcpu_set_sys(vcpu, HV_SYS_REG_SCTLR_EL1, GK_SCTLR) < 0 ||
-      vcpu_set_sys(vcpu, HV_SYS_REG_TCR_EL1, GK_TCR(G->ips)) < 0 ||
-      vcpu_set_sys(vcpu, HV_SYS_REG_MAIR_EL1, 0xff) < 0 ||       // attribute 0: normal write-back
-      vcpu_set_sys(vcpu, HV_SYS_REG_CPACR_EL1, 3UL << 20) < 0 || // FP/SIMD at EL0 and EL1
-      vcpu_set_sys(vcpu, HV_SYS_REG_VBAR_EL1, G->vbar) < 0 ||
-      vcpu_set_sys(vcpu, HV_SYS_REG_CNTKCTL_EL1, 3) < 0 ||       // EL0 reads the counters (libc)
-      vcpu_set_sys(vcpu, HV_SYS_REG_SP_EL1, ist) < 0 ||
-      // The guest reads the host's clock: CNTVCT_EL0 is mach_absolute_time.
-      hv_vcpu_set_vtimer_offset(vcpu, 0) != HV_SUCCESS) {
-    G->err = "hv_vcpu_set_sys_reg (system registers)";
-    hv_vcpu_destroy(vcpu);
+  // The static system registers go into every new vCPU.
+  if (fresh &&
+      (vreg_set(t, VREG_SCTLR, GK_SCTLR) < 0 || vreg_set(t, VREG_TCR, GK_TCR(G->ips)) < 0 ||
+       vreg_set(t, VREG_MAIR, 0xff) < 0 ||          // attribute 0: normal write-back
+       vreg_set(t, VREG_CPACR, 3UL << 20) < 0 ||    // FP/SIMD at EL0 and EL1
+       vreg_set(t, VREG_VBAR, G->vbar) < 0 ||
+       vreg_set(t, VREG_CNTKCTL, 3) < 0 ||          // EL0 reads the counters (libc, the vDSO)
+       vreg_set(t, VREG_SP_EL1, ist) < 0)) {
+    G->err = "setting the vCPU's system registers";
+    vcpu_hw_abort(t);
     return -1;
   }
-#else
-  if (!reused &&
-      (vcpu_set(fd, GK_SCTLR_EL1, GK_SCTLR) < 0 || vcpu_set(fd, GK_TCR_EL1, GK_TCR(G->ips)) < 0 ||
-       vcpu_set(fd, GK_MAIR_EL1, 0xff) < 0 ||          // attribute 0: normal write-back
-       vcpu_set(fd, GK_CPACR_EL1, 3UL << 20) < 0 ||    // FP/SIMD at EL0 and EL1
-       vcpu_set(fd, GK_VBAR_EL1, G->vbar) < 0 ||
-       vcpu_set(fd, GK_CNTKCTL_EL1, 3) < 0 ||          // EL0 reads the counters (the vDSO)
-       vcpu_set(fd, GK_CORE_REG(sp_el1), ist) < 0)) {
-    G->err = "KVM_SET_ONE_REG (system registers)";
-    return -1;
-  }
-#endif
 
   // A private guest stack for this vCPU (see the x86-64 vcpu_init).
   const size_t stksz = 2 * 1024 * 1024;
   if ((flags & GK_VCPU_STACK) && stack_top == 0) {
     uint8_t *stk = mmap(NULL, stksz, PROT_READ | PROT_WRITE,
                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (stk == MAP_FAILED) { G->err = "mmap guest stack"; return -1; }
+    if (stk == MAP_FAILED) { G->err = "mmap guest stack"; vcpu_hw_abort(t); return -1; }
     pthread_mutex_lock(&G->lock);
     int mrc = mmu_map_range((uintptr_t)stk, (uintptr_t)stk + stksz, 1 | 2);  // rw, NX
     pthread_mutex_unlock(&G->lock);
-    if (mrc < 0) { G->err = "map guest stack"; return -1; }
+    if (mrc < 0) { G->err = "map guest stack"; vcpu_hw_abort(t); return -1; }
     stack_top = (uintptr_t)stk + stksz;
   }
 
@@ -336,41 +276,18 @@ static int vcpu_init(gk_thread *t, int flags) {
   memset(v, 0, sizeof *v);
   v->action = GK_ACT_FLUSH;
   v->cur_ttbr = PT_GPA(G->pml4);
-#if GK_HVF
-  if (vcpu_set_sys(vcpu, HV_SYS_REG_TTBR0_EL1, PT_GPA(G->pml4)) < 0 ||
-      vcpu_set_sys(vcpu, HV_SYS_REG_TPIDR_EL0, host_tpidr(0)) < 0 ||
-      vcpu_set_sys(vcpu, HV_SYS_REG_TPIDRRO_EL0, host_tpidr(1)) < 0 ||
-      vcpu_set_reg(vcpu, HV_REG_PC, (uintptr_t)&gk_dispatch) < 0 ||
-      vcpu_set_reg(vcpu, HV_REG_CPSR, PSR_EL1H) < 0 ||
-      vcpu_set_reg(vcpu, HV_REG_FPCR, 0) < 0 || vcpu_set_reg(vcpu, HV_REG_FPSR, 0) < 0) {
-    G->err = "hv_vcpu_set_reg (thread state)";
-    hv_vcpu_destroy(vcpu);
+  if (vreg_set(t, VREG_TTBR0, PT_GPA(G->pml4)) < 0 ||
+      vreg_set(t, VREG_TPIDR, host_tpidr(0)) < 0 ||
+      vreg_set(t, VREG_TPIDRRO, host_tpidr(1)) < 0 ||
+      vreg_set(t, VREG_PC, (uintptr_t)&gk_dispatch) < 0 ||
+      vreg_set(t, VREG_PSTATE, PSR_EL1H) < 0 ||
+      vreg_set(t, VREG_FPCR, 0) < 0 || vreg_set(t, VREG_FPSR, 0) < 0) {
+    G->err = "setting the vCPU's thread state";
+    vcpu_hw_abort(t);
     return -1;
   }
-#else
-  if (vcpu_set(fd, GK_TTBR0_EL1, PT_GPA(G->pml4)) < 0 ||
-      vcpu_set(fd, GK_TPIDR_EL0, host_tpidr(0)) < 0 ||
-      vcpu_set(fd, GK_TPIDRRO_EL0, host_tpidr(1)) < 0 ||
-      vcpu_set(fd, GK_CORE_REG(regs.pc), (uintptr_t)&gk_dispatch) < 0 ||
-      vcpu_set(fd, GK_CORE_REG(regs.pstate), PSR_EL1H) < 0) {
-    G->err = "KVM_SET_ONE_REG (thread state)";
-    return -1;
-  }
-  if (reused &&
-      (vcpu_set(fd, GK_CORE_REG32(fp_regs.fpcr), 0) < 0 || vcpu_set(fd, GK_CORE_REG32(fp_regs.fpsr), 0) < 0)) {
-    G->err = "KVM_SET_ONE_REG (FP control)";
-    return -1;
-  }
-#endif
 
   t->id = id;
-#if GK_HVF
-  t->vcpu = vcpu;
-  t->exit = exit;
-#else
-  t->fd = fd;
-  t->run = run;
-#endif
   t->stack_top = stack_top;
   t->ist = ist;
   t->side_stack = side_stack;
@@ -439,11 +356,7 @@ static int guest_pkru_update(gk_thread *t, uint32_t keep, uint32_t set, uint32_t
 // itself. Returns 0, or -1 if the register could not be set, in which case
 // the vCPU must not run.
 static int ttbr0_preload(gk_thread *t, uint64_t root) {
-#if GK_HVF
-  return vcpu_set_sys(t->vcpu, HV_SYS_REG_TTBR0_EL1, root);
-#else
-  return vcpu_set(t->fd, GK_TTBR0_EL1, root);
-#endif
+  return vreg_set(t, VREG_TTBR0, root);
 }
 
 // sync_cr3 on arm64: the root is TTBR0's guest-physical address, which the
@@ -532,37 +445,31 @@ static int vcb_exception(gk_thread *t, long *ret) {
   gk_frame *f = &v->f;
   unsigned ec = ESR_EC(f->esr);
   if (ec == ESR_EC_SVC64) {
-#if GK_HVF
-    // svc #0 is gk's own (the turn exit and the ring probe); svc #0x80 is a
-    // macOS syscall; any other immediate is a genuine fault at the instruction.
-    unsigned imm = f->esr & 0xffff;
-    if (imm == 0) {
+    int c = svc_class(f);
+    if (c == SVC_GK) {
+      // The turn exit (gk_user_exit_tramp), for either ring: the result is in x0.
       if (f->x[8] == GK_EXIT_SYSCALL) { *ret = (long)f->x[0]; return 1; }
-      if (f->x[8] == GK_DEBUG_RING_SYSCALL) { f->x[0] = (f->spsr & 0xc) ? 0 : 3; return 0; }
-    } else if (imm == 0x80) {
-      f->x[0] = (uint64_t)forward_syscall(t, f);  // sets x1 and the carry as well
+      if (f->x[8] == GK_DEBUG_RING_SYSCALL) {  // see gk.h
+        f->x[0] = (f->spsr & 0xc) ? 0 : 3;
+        return 0;
+      }
+    } else if (c == SVC_HOST) {
+      // The dispatcher resumes after the SVC with x0 = the result (and, on
+      // macOS, x1 and the carry forward_syscall sets).
+      f->x[0] = (uint64_t)forward_syscall(t, f);
       return 0;
     }
+    // Any other SVC is a genuine fault at the instruction.
     if (G->dbg) {
       gk_dbuf d = {.n = 0};
       db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
-      db_str(&d, ": svc #"); db_hex(&d, imm);
+      db_str(&d, ": svc #"); db_hex(&d, f->esr & 0xffff);
       db_str(&d, " at pc "); db_hex(&d, f->elr);
       db_flush(&d);
     }
     G->fault_addr = f->elr;
     *ret = GK_EFAULT;
     return 1;
-#else
-    // The turn exit (gk_user_exit_tramp), for either ring: the result is in x0.
-    if (f->x[8] == GK_EXIT_SYSCALL) { *ret = (long)f->x[0]; return 1; }
-    if (f->x[8] == GK_DEBUG_RING_SYSCALL) {  // see gk.h
-      f->x[0] = (f->spsr & 0xc) ? 0 : 3;
-      return 0;
-    }
-    f->x[0] = (uint64_t)forward_syscall(t, f);
-    return 0;  // the dispatcher resumes after the SVC with x0 = the result
-#endif
   }
   if (ec != ESR_EC_DABT_LOW && ec != ESR_EC_DABT_CUR && ec != ESR_EC_IABT_LOW &&
       ec != ESR_EC_IABT_CUR) {
@@ -581,9 +488,7 @@ static int vcb_exception(gk_thread *t, long *ret) {
     return 1;
   }
   int data = ec == ESR_EC_DABT_LOW || ec == ESR_EC_DABT_CUR;
-#if !GK_HVF
   if (!data && vdso_call(f, f->elr)) return 0;
-#endif
   unsigned fsc = f->esr & 0x3f;
   uint64_t far = f->far & 0x00ffffffffffffffULL;  // a tagged address's tag (TBI) is no part of it
   int write = data && (f->esr & ESR_WNR);

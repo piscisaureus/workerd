@@ -147,6 +147,70 @@ static int vcpu_get(int fd, uint64_t id, uint64_t *v) {
   struct kvm_one_reg r = {.id = id, .addr = (uint64_t)(uintptr_t)v};
   return ioctl(fd, KVM_GET_ONE_REG, &r);
 }
+
+// ---- vCPUs (see vcpu_init) ---------------------------------------------------
+// Set one of the registers the shared arm64 code names (VREG_*).
+static int vreg_set(gk_thread *t, int reg, uint64_t v) {
+  static const uint64_t ids[VREG_COUNT] = {
+      [VREG_PC] = GK_CORE_REG(regs.pc),
+      [VREG_PSTATE] = GK_CORE_REG(regs.pstate),
+      [VREG_FPCR] = GK_CORE_REG32(fp_regs.fpcr),
+      [VREG_FPSR] = GK_CORE_REG32(fp_regs.fpsr),
+      [VREG_SP_EL1] = GK_CORE_REG(sp_el1),
+      [VREG_SCTLR] = GK_SCTLR_EL1,
+      [VREG_TCR] = GK_TCR_EL1,
+      [VREG_MAIR] = GK_MAIR_EL1,
+      [VREG_CPACR] = GK_CPACR_EL1,
+      [VREG_VBAR] = GK_VBAR_EL1,
+      [VREG_CNTKCTL] = GK_CNTKCTL_EL1,
+      [VREG_TTBR0] = GK_TTBR0_EL1,
+      [VREG_TPIDR] = GK_TPIDR_EL0,
+      [VREG_TPIDRRO] = GK_TPIDRRO_EL0,
+  };
+  return vcpu_set(t->fd, ids[reg], v);
+}
+
+// A pooled vCPU keeps its KVM vCPU and kvm_run.
+static void vcpu_unpark_hw(gk_thread *t, gk_parked_vcpu *p) {
+  t->fd = p->fd;
+  t->run = p->run;
+}
+
+// The KVM vCPU `id` for `t`, unless `reused` says `t` took a pooled one,
+// which keeps its registers. Returns 1 if the vCPU is new, 0 if reused, -1 on
+// failure. kvm_run is refused to the guest.
+static int vcpu_hw_create(gk_thread *t, int id, int reused) {
+  if (reused) return 0;
+  int fd = ioctl(G->vmfd, KVM_CREATE_VCPU, id);
+  if (fd < 0) { G->err = "KVM_CREATE_VCPU"; return -1; }
+  struct kvm_vcpu_init init = G->vcpu_target;
+  if (ioctl(fd, KVM_ARM_VCPU_INIT, &init) < 0) { G->err = "KVM_ARM_VCPU_INIT"; return -1; }
+  // The guest's 4KiB granule (see the page-sizes section) needs the CPU's
+  // support, reported by TGran4 (bits 31:28; 0xf means none).
+  uint64_t mmfr0;
+  if (vcpu_get(fd, GK_ID_AA64MMFR0_EL1, &mmfr0) < 0 || ((mmfr0 >> 28) & 0xf) == 0xf) {
+    G->err = "CPU has no 4KiB translation granule";
+    return -1;
+  }
+  struct kvm_run *run = mmap(NULL, G->run_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (run == MAP_FAILED) { G->err = "mmap kvm_run"; return -1; }
+  pthread_mutex_lock(&G->lock);
+  prot_add((uintptr_t)run, (uintptr_t)run + G->run_size, GK_PROT_REFUSE);
+  pthread_mutex_unlock(&G->lock);
+  t->fd = fd;
+  t->run = run;
+  return 1;
+}
+
+// A vcpu_init that failed after vcpu_hw_create leaves the KVM vCPU to the
+// thread record.
+static void vcpu_hw_abort(gk_thread *t) { (void)t; }
+
+// Every SVC is a Linux syscall but for gk's own (see gk.h), which use numbers
+// Linux does not.
+static int svc_class(const gk_frame *f) {
+  return f->x[8] == GK_EXIT_SYSCALL || f->x[8] == GK_DEBUG_RING_SYSCALL ? SVC_GK : SVC_HOST;
+}
 // cr3_load_host on arm64: the switch and a full flush, as KVM does for a CR3
 // set from the host, both carried out by the dispatcher before the vCPU runs.
 static int cr3_load_host(gk_thread *t, uint64_t cr3) {

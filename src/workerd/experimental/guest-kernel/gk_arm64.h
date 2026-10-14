@@ -89,6 +89,15 @@ _Static_assert(offsetof(struct gk_vcb, f.sp) == 248 && offsetof(struct gk_vcb, f
                "struct gk_vcb must match the VCB_* offsets in gk_asm_arm64.S");
 #define VCB(t) ((struct gk_vcb *)(uintptr_t)(t)->ist)
 typedef gk_frame gk_regs;
+// The vCPU registers the shared arm64 code sets, through the hypervisor's
+// vreg_set.
+enum {
+  VREG_PC, VREG_PSTATE, VREG_FPCR, VREG_FPSR, VREG_SP_EL1, VREG_SCTLR, VREG_TCR, VREG_MAIR,
+  VREG_CPACR, VREG_VBAR, VREG_CNTKCTL, VREG_TTBR0, VREG_TPIDR, VREG_TPIDRRO, VREG_COUNT
+};
+// What the hypervisor's svc_class makes of a guest SVC: one of gk's own (see
+// gk.h), a host syscall to forward, or a genuine fault.
+enum { SVC_GK, SVC_HOST, SVC_BAD };
 #define GK_REGS_SP(r) ((r).sp)
 #if !GK_HVF
 // One register of a vCPU, by KVM_{GET,SET}_ONE_REG id: GK_CORE_REG names a
