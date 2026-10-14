@@ -3913,12 +3913,13 @@ static int cr3_load_host(gk_thread *t, uint64_t cr3) {
 // migration to another CPU, say) promises, so the new root goes into
 // TTBR0_EL1 from the host before the vCPU runs; the dispatcher's load of the
 // same value and its TLBI then take effect as on a switch the guest made
-// itself.
-static void ttbr0_preload(gk_thread *t, uint64_t root) {
+// itself. Returns 0, or -1 if the register could not be set, in which case
+// the vCPU must not run.
+static int ttbr0_preload(gk_thread *t, uint64_t root) {
 #if GK_HVF
-  vcpu_set_sys(t->vcpu, HV_SYS_REG_TTBR0_EL1, root);
+  return vcpu_set_sys(t->vcpu, HV_SYS_REG_TTBR0_EL1, root);
 #else
-  vcpu_set(t->fd, GK_TTBR0_EL1, root);
+  return vcpu_set(t->fd, GK_TTBR0_EL1, root);
 #endif
 }
 
@@ -3949,9 +3950,9 @@ static int sync_cr3(gk_thread *t, uint64_t *load) {
 // set from the host, both carried out by the dispatcher before the vCPU runs.
 static int cr3_load_host(gk_thread *t, uint64_t cr3) {
   struct gk_vcb *v = VCB(t);
+  if (ttbr0_preload(t, cr3) < 0) return -1;
   v->ttbr = cr3;
   v->action |= GK_ACT_TTBR;
-  ttbr0_preload(t, cr3);
   flush_run(t);
   t->tlb_touched = 1;
   return 0;
@@ -4045,16 +4046,16 @@ static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t st
   v->l_sp = stack_top;
   v->l_lr = (uintptr_t)&gk_user_exit_tramp;
   v->l_spsr = user ? PSR_EL0T : PSR_EL1T;
-  v->action |= GK_ACT_LAUNCH;
   if (cr3) {
+    if (ttbr0_preload(t, cr3) < 0) return -1;
     v->ttbr = cr3;
     v->action |= GK_ACT_TTBR;
-    ttbr0_preload(t, cr3);
     atomic_fetch_add_explicit(&G->root_switches, 1, memory_order_relaxed);
     if (G->dbg)
       fprintf(stderr, "[gk] vcpu %d: root switch to %#llx (%s)\n", t->id,
               (unsigned long long)cr3, t->active_arena ? "arena" : "base");
   }
+  v->action |= GK_ACT_LAUNCH;
   t->user_mode = user;
   return run_vcpu(t);
 }
