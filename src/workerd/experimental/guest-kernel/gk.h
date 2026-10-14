@@ -1,15 +1,17 @@
 // gk: a guest-kernel isolation library.
 //
-// gk runs the calling thread inside a KVM virtual machine as guest ring 0 (the
+// gk runs the calling thread inside a virtual machine as guest ring 0 (the
 // Dune model): the process's own memory is visible to the guest and its
 // syscalls are forwarded to the host. On top of that it can give each isolate a
 // private memory arena backed by a separate guest page-table root, so code
 // running for one isolate cannot address another's arena, enforced by hardware.
 //
 // This is the runtime-side shape of security-idea-2.md. Linux on x86-64 or
-// arm64; needs read/write access to /dev/kvm. "Ring 0" and "ring 3" name the
-// guest's privileged and user levels on both: on arm64 they are EL1 (on
-// SP_EL0) and EL0, and a CR3 load is a TTBR0 switch.
+// arm64 under KVM (needs read/write access to /dev/kvm), or macOS on arm64
+// under Hypervisor.framework (the binary must carry the hypervisor
+// entitlement). "Ring 0" and "ring 3" name the guest's privileged and user
+// levels on both: on arm64 they are EL1 (on SP_EL0) and EL0, and a CR3 load is
+// a TTBR0 switch.
 #ifndef GK_H
 #define GK_H
 // A C header: its types are spelled with typedef, which the C++ linter's
