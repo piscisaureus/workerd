@@ -1040,7 +1040,11 @@ write. The differences that matter:
   per page (`pte_exec_at_el1`). Ring 3 is unaffected.
 - **No protection keys.** arm64 Linux has no `pkey_*`, so the PKU
   virtualization described above is absent.
-- **Pages must be 4 KiB.** `gk_init` fails on a 16K or 64K host kernel.
+- **Any host page size.** The guest's own granule is 4 KiB on every host (the
+  CPU must support it: `gk_init` fails otherwise). Everything the host kernel
+  does -- mappings, protection changes and their reflection into the guest,
+  arena size rounding -- follows the kernel's page size, read at `gk_init`, so a
+  16K kernel (Apple Silicon) works as a 4K one does.
 
 gk has been run on an Apple Silicon Mac in an Ubuntu 26.04 VM under Lima (nested
 KVM through macOS Virtualization.framework). Its functional tests pass there, but

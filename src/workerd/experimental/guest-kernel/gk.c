@@ -635,6 +635,29 @@ _Static_assert(GK_MAX_PROT_RANGES >= 2 * GK_MAX_VCPUS + GK_MAX_HOST_REGIONS + 51
 #define GK_BACK_WIN (2UL << 20)   // memslot backing granularity (2MB, aligned)
 // The neighborhood a demand fault maps around its page (see demand_map_neighbors).
 #define GK_NEIGHBOR_WIN (256UL << 10)  // 64 pages, aligned; within one GK_BACK_WIN
+
+// ---- page sizes -------------------------------------------------------------
+// The guest translates with a 4KiB granule on every host. GK_GUEST_PAGE is the
+// unit of every PTE and so of everything decided per PTE: the supervisor/refuse
+// registry, the protection-key ranges, the host-frame wall, demand paging; the
+// 0xfff and >> 12 arithmetic of the page-table code is this granule. The host
+// kernel's page size is the unit of everything the kernel does: mappings and
+// their protections, memslots, the bounds /proc/self/maps reports, so the
+// reflection of a guest's mprotect or munmap and the rounding of an arena's
+// size follow it. On x86-64 the two coincide (always 4KiB) and GK_HOST_PAGE is
+// that constant; an arm64 kernel may use 16KiB or 64KiB pages, so there it is
+// read at gk_init. The 4KiB granule needs the CPU's support
+// (ID_AA64MMFR0_EL1.TGran4), checked when the first vCPU is created.
+#define GK_GUEST_PAGE 4096UL
+#if defined(__x86_64__)
+#define GK_HOST_PAGE 4096UL
+#else
+#define GK_HOST_PAGE ((uintptr_t)G->host_page)
+#endif
+#define GUEST_FLOOR(a) ((a) & ~(GK_GUEST_PAGE - 1))
+#define GUEST_CEIL(a) (((a) + GK_GUEST_PAGE - 1) & ~(GK_GUEST_PAGE - 1))
+#define HOST_FLOOR(a) ((a) & ~(GK_HOST_PAGE - 1))
+#define HOST_CEIL(a) (((a) + GK_HOST_PAGE - 1) & ~(GK_HOST_PAGE - 1))
 #define GK_MAX_REGIONS 65536
 typedef struct gk_region {
   uintptr_t start, end;   // [start, end), GK_BACK_WIN-aligned
@@ -707,6 +730,7 @@ struct gk_ctl {
   int vdso_n;
   gk_prot_range holes[8];            // host ranges no memslot may cover ([vvar])
   int hole_n;
+  size_t host_page;                  // the kernel's page size (see the page-sizes section)
 #endif
   int next_slot;                     // KVM memslot ids handed out, ever (see the region pool)
   int run_size;
@@ -1103,11 +1127,11 @@ static uint64_t *alloc_table(void) {
     G->pt_free = *(uint64_t **)p;
     G->pt_free_n--;
   } else {
-    if (G->pt_next + 0x1000 > G->pt_end) return NULL;
+    if (G->pt_next + GK_GUEST_PAGE > G->pt_end) return NULL;
     p = (uint64_t *)G->pt_next;
-    G->pt_next += 0x1000;
+    G->pt_next += GK_GUEST_PAGE;
   }
-  memset(p, 0, 0x1000);
+  memset(p, 0, GK_GUEST_PAGE);
   G->pt_used++;
   return p;
 }
@@ -1459,7 +1483,13 @@ static gk_hostcall_frame *hostcall_region_of(const gk_thread *t) {
 static int hostcall_record_init_locked(gk_thread *t) {
   gk_hostcall_frame *f = host_alloc_locked(sizeof *f);
   if (!f) return -1;
-  if (mprotect(hostcall_region_of(t), GK_HOSTCALL_REGION_BYTES, PROT_READ | PROT_WRITE) != 0) {
+  // The host pages the region spans: a region is a whole number of guest
+  // pages, not of host pages, so a 16KiB kernel commits a neighbouring region
+  // along with it, which costs nothing (a region is zeroed when its record is
+  // taken) and keeps the mprotect page-aligned.
+  uintptr_t r = (uintptr_t)hostcall_region_of(t);
+  uintptr_t rs = HOST_FLOOR(r), re = HOST_CEIL(r + GK_HOSTCALL_REGION_BYTES);
+  if (mprotect((void *)rs, re - rs, PROT_READ | PROT_WRITE) != 0) {
     host_free_locked(f, sizeof *f);
     return -1;
   }
@@ -2312,7 +2342,7 @@ static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms)
 // ranges are gk's control pages and guest stacks. Caller holds G->lock.
 static int mmu_map_range(uintptr_t s, uintptr_t e, int perms) {
   if (region_ensure(s, e) < 0) return -1;
-  for (uintptr_t v = s & ~0xfffUL; v < e; v += 0x1000) {
+  for (uintptr_t v = GUEST_FLOOR(s); v < e; v += GK_GUEST_PAGE) {
     if (prot_class(v) == GK_PROT_REFUSE || arena_containing(v)) continue;
     if (map4k_root(G->pml4, v, (uint64_t)perms, pkey_lookup(v)) < 0) return -1;
   }
@@ -2507,7 +2537,7 @@ static void demand_map_neighbors(gk_thread *t, uintptr_t page, uint64_t *root, g
   // The mapping is the interrupted code's stack, or this vCPU's ring-3 stack:
   // the same for every page of it (see demand_map).
   int stack_map = (rs < t->wall_map_hi && re > t->wall_map_lo) || (sp >= rs && sp < re);
-  for (uintptr_t v = lo; v < hi; v += 0x1000) {
+  for (uintptr_t v = lo; v < hi; v += GK_GUEST_PAGE) {
     if (v == page) continue;
     if (prot_class(v) != GK_PROT_KEEP) continue;
     if (arena_containing(v) != in) continue;
@@ -2567,7 +2597,7 @@ typedef struct {
 // allocator has not committed; a refused class is gk's own memory. `why` may
 // be NULL.
 static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp, gk_dm_refusal *why) {
-  uintptr_t page = addr & ~0xfffUL;
+  uintptr_t page = GUEST_FLOOR(addr);
   uintptr_t rs, re; int perms;
   pthread_mutex_lock(&G->lock);
   uint64_t *root = G->pml4;
@@ -3679,6 +3709,7 @@ static void flush_stub_select(void) {
 #define GK_MAIR_EL1 ARM64_SYS_REG(3, 0, 10, 2, 0)
 #define GK_VBAR_EL1 ARM64_SYS_REG(3, 0, 12, 0, 0)
 #define GK_CNTKCTL_EL1 ARM64_SYS_REG(3, 0, 14, 1, 0)
+#define GK_ID_AA64MMFR0_EL1 ARM64_SYS_REG(3, 0, 0, 7, 0)
 #define GK_TPIDR_EL0 ARM64_SYS_REG(3, 3, 13, 0, 2)
 #define GK_TPIDRRO_EL0 ARM64_SYS_REG(3, 3, 13, 0, 3)
 // SCTLR_EL1: MMU, caches, stack alignment checks, the RES1 bits of the base
@@ -3753,6 +3784,13 @@ static int vcpu_init(gk_thread *t, int flags) {
     if (fd < 0) { G->err = "KVM_CREATE_VCPU"; return -1; }
     struct kvm_vcpu_init init = G->vcpu_target;
     if (ioctl(fd, KVM_ARM_VCPU_INIT, &init) < 0) { G->err = "KVM_ARM_VCPU_INIT"; return -1; }
+    // The guest's 4KiB granule (see the page-sizes section) needs the CPU's
+    // support, reported by TGran4 (bits 31:28; 0xf means none).
+    uint64_t mmfr0;
+    if (vcpu_get(fd, GK_ID_AA64MMFR0_EL1, &mmfr0) < 0 || ((mmfr0 >> 28) & 0xf) == 0xf) {
+      G->err = "CPU has no 4KiB translation granule";
+      return -1;
+    }
     run = mmap(NULL, G->run_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (run == MAP_FAILED) { G->err = "mmap kvm_run"; return -1; }
 #ifdef KVM_GET_STATS_FD
@@ -3760,14 +3798,16 @@ static int vcpu_init(gk_thread *t, int flags) {
 #endif
     if (G->runner_mode && !(runner = runner_start(fd))) return -1;
     // The vcb, eager-mapped supervisor: the vector handlers store into it
-    // before anything else, so it must never fault. kvm_run is refused.
-    uint8_t *ir = mmap(NULL, GK_IST_BYTES, PROT_READ | PROT_WRITE,
+    // before anything else, so it must never fault. Its mapping is a whole
+    // number of host pages, all of them supervisor. kvm_run is refused.
+    size_t vcb_bytes = HOST_CEIL(GK_IST_BYTES);
+    uint8_t *ir = mmap(NULL, vcb_bytes, PROT_READ | PROT_WRITE,
                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (ir == MAP_FAILED) { G->err = "mmap vcb"; return -1; }
     pthread_mutex_lock(&G->lock);
     prot_add((uintptr_t)run, (uintptr_t)run + G->run_size, GK_PROT_REFUSE);
-    prot_add((uintptr_t)ir, (uintptr_t)ir + GK_IST_BYTES, GK_PROT_SUPER);
-    int irc = mmu_map_range((uintptr_t)ir, (uintptr_t)ir + GK_IST_BYTES, 1 | 2);
+    prot_add((uintptr_t)ir, (uintptr_t)ir + vcb_bytes, GK_PROT_SUPER);
+    int irc = mmu_map_range((uintptr_t)ir, (uintptr_t)ir + vcb_bytes, 1 | 2);
     pthread_mutex_unlock(&G->lock);
     if (irc < 0) { G->err = "map vcb"; return -1; }
     ist = (uint64_t)(uintptr_t)ir;
@@ -3883,7 +3923,7 @@ static int image_add(uintptr_t s, uintptr_t e) {
     image_compact();
     if (G->image_n >= before) { G->image_full = 1; return -1; }
   }
-  G->image[G->image_n++] = (gk_span){s & ~0xfffUL, (e + 0xfffUL) & ~0xfffUL};
+  G->image[G->image_n++] = (gk_span){HOST_FLOOR(s), HOST_CEIL(e)};  // the loader maps host pages
   return 0;
 }
 
@@ -4111,9 +4151,17 @@ int gk_init(void) {
     fprintf(stderr, "[gk] _thread_db_sizeof_pthread not found: gk_run_here_user builds no "
                     "host-frame wall on pthread stacks\n");
 #endif
-  // Guest pages are 4KiB and identity-sized with the host's (an arm64 kernel
-  // may use 16KiB or 64KiB pages).
+#if defined(__x86_64__)
   if (sysconf(_SC_PAGESIZE) != 4096) { G->err = "host page size is not 4KiB"; return -1; }
+#else
+  // Any power of two the windows are multiples of (see the page-sizes section).
+  long pagesz = sysconf(_SC_PAGESIZE);
+  if (pagesz < 4096 || (pagesz & (pagesz - 1)) || GK_NEIGHBOR_WIN % (unsigned long)pagesz) {
+    G->err = "unsupported host page size";
+    return -1;
+  }
+  G->host_page = (size_t)pagesz;
+#endif
   G->kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
   if (G->kvm < 0) { G->err = "open /dev/kvm"; return -1; }
   if (ioctl(G->kvm, KVM_GET_API_VERSION, 0) != 12) { G->err = "KVM API != 12"; return -1; }
@@ -5906,8 +5954,9 @@ static long forward_syscall(gk_thread *t, gk_regs *r) {
   // physical is host virtual, so it would reach whatever the host maps there
   // next without that mapping ever passing the demand fault's class check.
   int reflect_mremap = nr == SYS_mremap && a2 > 0;
-  uintptr_t rs = (uintptr_t)a1 & ~0xfffUL;
-  uintptr_t re = ((uintptr_t)a1 + (uintptr_t)a2 + 0xfff) & ~0xfffUL;
+  // The kernel applies the call to whole host pages (see the page-sizes section).
+  uintptr_t rs = HOST_FLOOR((uintptr_t)a1);
+  uintptr_t re = HOST_CEIL((uintptr_t)a1 + (uintptr_t)a2);
   if (reflect || reflect_mremap) pthread_mutex_lock(&G->lock);
   if (GK_HAS_PKEYS && nr == SYS_pkey_mprotect) {
     long pkey = a4;
@@ -5922,8 +5971,8 @@ static long forward_syscall(gk_thread *t, gk_regs *r) {
   }
   if (reflect_mremap) {
     if ((unsigned long)ret < (unsigned long)-4096) {
-      uintptr_t ns = (uintptr_t)ret & ~0xfffUL;
-      uintptr_t ne = ((uintptr_t)ret + (uintptr_t)a3 + 0xfff) & ~0xfffUL;
+      uintptr_t ns = HOST_FLOOR((uintptr_t)ret);
+      uintptr_t ne = HOST_CEIL((uintptr_t)ret + (uintptr_t)a3);
       if (pkey_set_range(rs, re, 0) < 0 && G->dbg)
         fprintf(stderr, "[gk] pkey table full; [%#lx,%#lx) keeps a stale key\n",
                 (unsigned long)rs, (unsigned long)re);
@@ -5957,8 +6006,8 @@ static long forward_syscall(gk_thread *t, gk_regs *r) {
     // A fresh mapping, placed by the kernel: whatever key was last recorded
     // for those addresses belonged to a mapping that is gone.
     pthread_mutex_lock(&G->lock);
-    if (pkey_set_range((uintptr_t)ret & ~0xfffUL,
-                       ((uintptr_t)ret + (uintptr_t)a2 + 0xfff) & ~0xfffUL, 0) < 0 && G->dbg)
+    if (pkey_set_range(HOST_FLOOR((uintptr_t)ret), HOST_CEIL((uintptr_t)ret + (uintptr_t)a2), 0) < 0 &&
+        G->dbg)
       fprintf(stderr, "[gk] pkey table full; mapping at %#lx keeps a stale key\n",
               (unsigned long)ret);
     pthread_mutex_unlock(&G->lock);
@@ -6034,10 +6083,11 @@ static int range_clear_locked(uintptr_t s, uintptr_t e, const gk_arena *mine) {
 
 int gk_mapping_change_ok(unsigned long addr, unsigned long len) {
   if (len == 0) return 1;  // names no page; the kernel's own answer stands
-  uintptr_t s = (uintptr_t)addr & ~0xfffUL;
+  // The kernel applies the call to whole host pages (see the page-sizes section).
+  uintptr_t s = HOST_FLOOR((uintptr_t)addr);
   uintptr_t e = (uintptr_t)addr + (uintptr_t)len;
   if (e < (uintptr_t)addr) return 0;  // wraps around the address space
-  e = (e + 0xfffUL) & ~0xfffUL;
+  e = HOST_CEIL(e);
   if (e <= s) return 0;  // the rounding wrapped
   // The thread's active arena comes from its own record, in supervisor
   // memory; thread_cur validates the record by kernel tid, so ring 3 cannot
@@ -6481,9 +6531,9 @@ long gk_run_user(long (*fn)(void *), void *arg) {
 // host frame is ever built below caller_sp while the guest runs (a signal
 // arriving then is handled on the side stack, where the thread is), so a
 // red-zone's worth of gap guards the switch itself. The rest of the slack is
-// a whole page, so that the host frames above caller_sp and the guest's own
-// stack never share a page: the host-frame wall below is page-granular.
-#define GK_HERE_SLACK (4096 + 128)
+// a whole guest page, so that the host frames above caller_sp and the guest's
+// own stack never share one: the host-frame wall below is PTE-granular.
+#define GK_HERE_SLACK (GK_GUEST_PAGE + 128)
 typedef struct { gk_thread *t; long (*fn)(void *); void *arg; int user; uint64_t cr3; } gk_here_ctx;
 
 // ---- the host-frame wall --------------------------------------------------
@@ -6554,7 +6604,7 @@ static int stack_wall_bounds(gk_thread *t, uintptr_t caller_sp, uintptr_t top,
   *lo = *hi = 0;
   if (caller_sp < t->wall_map_lo || caller_sp >= t->wall_map_hi) {
     uintptr_t rs, re; int perms;
-    if (!host_region(caller_sp & ~0xfffUL, &rs, &re, &perms)) return -1;
+    if (!host_region(GUEST_FLOOR(caller_sp), &rs, &re, &perms)) return -1;
     uintptr_t end = re;
     uintptr_t tp = thread_pointer();
     if (tp > caller_sp && tp < re) {
@@ -6564,7 +6614,7 @@ static int stack_wall_bounds(gk_thread *t, uintptr_t caller_sp, uintptr_t top,
       } else {
         size_t size = 0, align = 0;
         G->tls_static_info(&size, &align);
-        uintptr_t tls_lo = (tp - size) & ~0xfffUL;
+        uintptr_t tls_lo = GUEST_FLOOR(tp - size);
         if (tls_lo < end) end = tls_lo;
       }
 #else
@@ -6573,7 +6623,7 @@ static int stack_wall_bounds(gk_thread *t, uintptr_t caller_sp, uintptr_t top,
       if (!G->pthread_size) {
         end = 0;  // cannot place the thread descriptor: no wall (warned at init)
       } else {
-        uintptr_t pd_lo = (tp - G->pthread_size - 64) & ~0xfffUL;
+        uintptr_t pd_lo = GUEST_FLOOR(tp - G->pthread_size - 64);
         if (pd_lo < end) end = pd_lo;
       }
 #endif
@@ -6586,7 +6636,7 @@ static int stack_wall_bounds(gk_thread *t, uintptr_t caller_sp, uintptr_t top,
               t->id, (unsigned long)rs, (unsigned long)re, (unsigned long)tp,
               (unsigned long)caller_sp, (unsigned long)end);
   }
-  uintptr_t first = (top + 0xfffUL) & ~0xfffUL;
+  uintptr_t first = GUEST_CEIL(top);
   if (first >= t->wall_end) return 0;
   *lo = first;
   *hi = t->wall_end;
@@ -7409,7 +7459,7 @@ static void arena_thp_advise(uintptr_t s, uintptr_t e) {
 }
 
 gk_arena *gk_arena_create(size_t size) {
-  size = (size + 0xfff) & ~0xfffUL;
+  size = HOST_CEIL(size);  // the owner commits it with host mprotects
   if (size == 0) return NULL;
   int nslots = (int)((size + GK_SLOT_BYTES - 1) >> GK_SLOT_BITS);
   if (nslots > GK_MAX_ARENA_SLOTS) return NULL;
@@ -7715,9 +7765,9 @@ int gk_turn_cpu_clockid(clockid_t *id) {
 // that page minus the calling vCPU's flush, so any translation a vCPU holds
 // keeps working until something flushes it.
 void gk_debug_drop_pte(unsigned long addr) {
-  uintptr_t page = (uintptr_t)addr & ~0xfffUL;
+  uintptr_t page = GUEST_FLOOR((uintptr_t)addr);
   pthread_mutex_lock(&G->lock);
-  unmap_range_all(page, page + 0x1000);
+  unmap_range_all(page, page + GK_GUEST_PAGE);
   pthread_mutex_unlock(&G->lock);
 }
 
@@ -7726,7 +7776,7 @@ void gk_debug_drop_pte(unsigned long addr) {
 // place a SUPER or REFUSE page wherever it wants one. Registering drops any
 // PTE a root holds for the range, as gk's own registrations do.
 void gk_debug_protect_range(unsigned long addr, size_t len, int kind) {
-  uintptr_t s = (uintptr_t)addr & ~0xfffUL, e = ((uintptr_t)addr + len + 0xfffUL) & ~0xfffUL;
+  uintptr_t s = GUEST_FLOOR((uintptr_t)addr), e = GUEST_CEIL((uintptr_t)addr + len);
   if (s >= e) return;
   pthread_mutex_lock(&G->lock);
   if (kind == GK_DEBUG_PROT_SUPER) prot_add(s, e, GK_PROT_SUPER);
