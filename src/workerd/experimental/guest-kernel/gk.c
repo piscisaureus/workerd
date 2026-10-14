@@ -538,6 +538,10 @@ struct gk_ctl {
   // Which PML4 slots live arenas own. A destroyed arena's slots are reused by
   // later arenas, so slot churn does not run through the user address space.
   unsigned char slot_used[GK_USER_SLOTS];
+  // Which unowned slots gk still holds a PROT_NONE reservation over: a
+  // destroyed arena's, kept so that no other mapping can take them (see
+  // gk_arena_create).
+  unsigned char slot_held[GK_USER_SLOTS];
   // Which PML4 slots have ever held a global PTE. No arena is ever placed over
   // one (see the global-pages section).
   unsigned char slot_pinned[GK_USER_SLOTS];
@@ -5021,7 +5025,13 @@ static long run_vcpu(gk_thread *t) {
 // Slots are taken from the lowest run of nslots that no live arena owns and
 // that has never held a global PTE (see the global-pages section), so a
 // destroyed arena's slots serve later arenas: under isolate churn the slot
-// index would otherwise run off the end of the user address space.
+// index would otherwise run off the end of the user address space. For that
+// to hold, a destroyed arena's span is not unmapped but replaced by a fresh
+// reservation that gk keeps (slot_held): a free-address mmap of the process's
+// own, or of a system library's (Hypervisor.framework allocates its vCPU
+// pages wherever the kernel finds room), could otherwise land in a freed slot
+// and keep every later arena out of it. A run is taken over held slots as
+// they are and over the others with MAP_FIXED_NOREPLACE.
 //
 // Huge host pages. The host backs the arena's pages when KVM's nested-page-
 // fault handler first touches them (get_user_pages on the host VMA), and
@@ -5059,6 +5069,31 @@ static void arena_thp_advise(uintptr_t s, uintptr_t e) {
 }
 #endif
 
+// Reserve the run of nslots slots from idx, none of them used or pinned: a
+// held slot is gk's already, and any other must be free host address space,
+// which MAP_FIXED_NOREPLACE takes only if nothing is mapped there. On success
+// the whole run is reserved PROT_NONE and none of it is held any more (the
+// caller takes it); on failure the slots this call reserved are released and
+// the held ones stay held. Caller holds G->lock.
+static int reserve_slots(int idx, int nslots) {
+  int i;
+  for (i = 0; i < nslots; i++) {
+    if (G->slot_held[idx + i]) continue;
+    uintptr_t va = (uintptr_t)(idx + i) << GK_SLOT_BITS;
+    void *m = mmap((void *)va, GK_SLOT_BYTES, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    if (m == MAP_FAILED) break;
+    if ((uintptr_t)m != va) { munmap(m, GK_SLOT_BYTES); break; }  // a kernel that only hints
+  }
+  if (i < nslots) {
+    while (--i >= 0)
+      if (!G->slot_held[idx + i]) munmap((void *)((uintptr_t)(idx + i) << GK_SLOT_BITS), GK_SLOT_BYTES);
+    return -1;
+  }
+  for (i = 0; i < nslots; i++) G->slot_held[idx + i] = 0;
+  return 0;
+}
+
 gk_arena *gk_arena_create(size_t size) {
   size = HOST_CEIL(size);  // the owner commits it with host mprotects
   if (size == 0) return NULL;
@@ -5081,11 +5116,7 @@ gk_arena *gk_arena_create(size_t size) {
     for (int i = 0; i < nslots; i++)
       if (G->slot_used[idx + i] || G->slot_pinned[idx + i]) { free = 0; break; }
     if (!free) continue;
-    uintptr_t va = (uintptr_t)idx << GK_SLOT_BITS;
-    mem = mmap((void *)va, span, PROT_NONE,
-               MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
-    if (mem != MAP_FAILED && (uintptr_t)mem == va) break;
-    if (mem != MAP_FAILED) { munmap(mem, span); mem = MAP_FAILED; }  // old kernel: hint only
+    if (reserve_slots(idx, nslots) == 0) { mem = (void *)((uintptr_t)idx << GK_SLOT_BITS); break; }
   }
   if (mem == MAP_FAILED || G->arena_n >= GK_MAX_ARENAS) goto fail;
   a->base = (uintptr_t)mem;
@@ -5118,8 +5149,9 @@ fail:
   if (a->pml4) free_table(a->pml4);
   a->next_free = G->arena_free;
   G->arena_free = a;
+  if (mem != MAP_FAILED)  // the run stays reserved, for the next arena
+    for (int i = 0; i < nslots; i++) G->slot_held[idx + i] = 1;
   pthread_mutex_unlock(&G->lock);
-  if (mem != MAP_FAILED) munmap(mem, span);
   return NULL;
 }
 
@@ -5141,16 +5173,19 @@ gk_arena *gk_arena_enter(gk_arena *a) {
 //     in the span are cleared (other arena roots share those tables).
 //  3. Every memslot in the span is deleted. Nothing maps into the span at
 //     this point, so no vCPU can reach a memslot as it goes.
-//  4. Its slots are released for the next arena.
-// Only then, outside the lock, is the host reservation unmapped, so KVM never
-// holds a memslot over host memory that is gone while a guest PTE could still
-// lead there. The page-table pages return to the allocator and the slots and
-// memslot ids are reused, so arena churn is bounded in every resource.
+// Only then, outside the lock, is the arena's memory replaced by a fresh
+// reservation, so KVM never holds a memslot over host memory that is gone
+// while a guest PTE could still lead there. Its slots are released for the
+// next arena after that, held by gk (see gk_arena_create): released any
+// earlier, a concurrent gk_arena_create could take them and have its
+// reservation replaced. The page-table pages return to the allocator and the
+// slots and memslot ids are reused, so arena churn is bounded in every
+// resource.
 //
 // A thread that still has the arena active (a caller bug: the arena's memory
 // is being unmapped under it) keeps a root that must stay intact and private,
 // so in that case the tables, slots and struct are leaked instead of recycled;
-// the memslots and reservation still go.
+// the memslots go and the span is unmapped.
 void gk_arena_destroy(gk_arena *a) {
   if (!a) return;
   gk_thread *t = thread_cur();
@@ -5183,8 +5218,8 @@ void gk_arena_destroy(gk_arena *a) {
   G->gpa_keep = 0;
 #endif
   uintptr_t base = a->base, end = a->end;
+  int slot0 = a->slot0, nslots = a->nslots;
   if (in_use == 0) {
-    for (int i = 0; i < a->nslots; i++) G->slot_used[a->slot0 + i] = 0;
     a->next_free = G->arena_free;  // the struct is the pool's again
     G->arena_free = a;
   }
@@ -5192,7 +5227,22 @@ void gk_arena_destroy(gk_arena *a) {
   if (G->dbg)
     fprintf(stderr, "[gk] destroyed arena [%#lx,%#lx): %d memslots deleted, %ld tables in use\n",
             (unsigned long)base, (unsigned long)end, removed, G->pt_used);
-  munmap((void *)base, end - base);
+  if (in_use > 0 || mmap((void *)base, end - base, PROT_NONE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1,
+                         0) == MAP_FAILED) {
+    munmap((void *)base, end - base);
+    if (in_use > 0) return;
+    pthread_mutex_lock(&G->lock);  // unmapped instead: free, not held
+    for (int i = 0; i < nslots; i++) G->slot_used[slot0 + i] = 0;
+    pthread_mutex_unlock(&G->lock);
+    return;
+  }
+  pthread_mutex_lock(&G->lock);
+  for (int i = 0; i < nslots; i++) {
+    G->slot_used[slot0 + i] = 0;
+    G->slot_held[slot0 + i] = 1;
+  }
+  pthread_mutex_unlock(&G->lock);
 }
 
 void gk_get_stats(gk_stats *s) {
