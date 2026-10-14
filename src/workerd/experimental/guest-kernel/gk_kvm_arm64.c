@@ -32,13 +32,9 @@ static int vm_create(void) {
   int ipa = ioctl(G->kvm, KVM_CHECK_EXTENSION, KVM_CAP_ARM_VM_IPA_SIZE);
   if (ipa <= 0) ipa = 40;
   if (ipa > 48) ipa = 48;
-  static const int ips_bits[] = {32, 36, 40, 42, 44, 48};
-  for (G->ips = 0; G->ips < 5 && ips_bits[G->ips + 1] <= ipa; G->ips++) {}
-  ipa = ips_bits[G->ips];
+  ipa = gpa_space_init(ipa);
   G->vmfd = ioctl(G->kvm, KVM_CREATE_VM, KVM_VM_TYPE_ARM_IPA_SIZE(ipa));
   if (G->vmfd < 0) { G->err = "KVM_CREATE_VM"; return -1; }
-  G->gpa_next = GK_BACK_WIN;  // guest-physical 0 stays unused
-  G->gpa_limit = 1ULL << ipa;
   // The vector handlers' HVCs come to the host as KVM_EXIT_HYPERCALL; without
   // the filter KVM would take them as (failed) PSCI calls itself.
   struct kvm_smccc_filter filter = {.base = GK_HC_BASE, .nr_functions = GK_HC_COUNT,

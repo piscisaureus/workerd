@@ -1150,6 +1150,7 @@ static inline uint64_t region_gpa(const gk_region *n);
 static int region_clip_holes(uintptr_t *s, uintptr_t *gap_end);
 static int pte_leaf(uint64_t va, uint64_t flags, int pkey, int super, uint64_t *out);
 static uint64_t pte_reprotect(uint64_t e, const gk_reprot *rp, uintptr_t v);
+static int gpa_space_init(int ipa);
 static int gpa_alloc(uint64_t size, uint64_t *out);
 static void gpa_release(uint64_t start, uint64_t size);
 static int vcpu_reset_pc(gk_thread *t);
