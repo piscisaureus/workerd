@@ -282,6 +282,12 @@ static long clone_thread(gk_thread *t, gk_regs *r, const long args[7]) {
     memset(&ca, 0, sizeof ca);
     if (copy_in(&ca, (uintptr_t)args[1], ca_size < sizeof ca ? ca_size : sizeof ca) < 0)
       return -GK_EADDR;
+    // This copy of the flags, not the one forward_syscall read to get here, is
+    // the one the host clone3 runs with (it is passed &ca below), so the
+    // thread-clone invariant is enforced on it: a racing sibling cannot turn
+    // this into a host process fork after the dispatch decision.
+    if ((ca.flags & (GK_CLONE_VM | GK_CLONE_THREAD)) != (GK_CLONE_VM | GK_CLONE_THREAD))
+      return -GK_EINVAL;
     child_sp = ca.stack + ca.stack_size;
   } else {
     child_sp = (uint64_t)args[2];
@@ -1443,14 +1449,16 @@ static int confined_path_syscall(gk_thread *t, long nr, long a1, long a2, long a
 // host-frame wall. (gk's own dereferences of guest pointers go through copy_in,
 // which is fault-safe; see there.)
 //
-// Known gap: the array descriptors (iovec, msghdr) are read from guest memory
-// both here and, moments later, by the kernel. A second guest thread in the
-// same isolate could rewrite a descriptor's base/length in between, after the
-// check but before the kernel reads it, to redirect a scatter/gather transfer.
-// Closing this needs the descriptor marshalled into gk memory and the kernel
-// pointed at that copy; the plain buffer syscalls (read, write, recvfrom, ...)
-// are unaffected because their pointer and length are register arguments the
-// kernel takes directly, with nothing in guest memory to race.
+// Known gap: a syscall argument that gk reads from guest memory -- an iovec or
+// msghdr array, or a socket length word (addrlen, optlen) -- is read once here
+// and again by the kernel. A second guest thread in the same isolate could
+// rewrite it in between, after the check but before the kernel reads it, to
+// enlarge a length or redirect a scatter/gather transfer past what was checked.
+// Closing this needs those arguments marshalled into gk memory with the kernel
+// pointed at the copy. The plain buffer syscalls (read, write, the recvfrom /
+// sendto data buffer, getrandom, ...) are unaffected: their pointer and length
+// are register arguments the kernel takes directly, with nothing in guest
+// memory to race.
 #ifndef UIO_MAXIOV
 #define UIO_MAXIOV 1024
 #endif
@@ -1524,12 +1532,15 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
     // (A guest thread's exit and a thread-creating clone are intercepted in
     // forward_syscall; a non-thread clone and exit_group are refused below.)
     case SYS_brk: case SYS_close: case SYS_dup: case SYS_dup3: case SYS_epoll_create1:
-    case SYS_eventfd2: case SYS_exit: case SYS_fchdir: case SYS_fsync:
+    case SYS_eventfd2: case SYS_fchdir: case SYS_fsync:
     case SYS_ftruncate: case SYS_getpid: case SYS_getppid: case SYS_gettid:
     case SYS_fdatasync: case SYS_listen: case SYS_lseek:
     case SYS_sched_getscheduler: case SYS_sched_yield: case SYS_shutdown:
-    case SYS_socket: case SYS_tgkill: case SYS_restart_syscall:
+    case SYS_socket: case SYS_restart_syscall:
       return 1;
+    // A thread exit reaches guest_thread_exit in forward_syscall; a non-guest
+    // ring-3 thread has no business exiting its host thread by hand.
+    case SYS_exit: return t->guest_thread ? 1 : 0;
     case SYS_fcntl:
       // Only the commands whose third argument is a scalar; the rest (F_GETLK,
       // F_SETLK, F_GETOWN_EX, ...) carry a pointer gk does not size.
@@ -1582,7 +1593,7 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
       WR(a[2], (uintptr_t)n * sizeof(struct mmsghdr));
       for (long i = 0; i < n; i++)
         if (!g_msg(t, a[2] + (uintptr_t)i * sizeof(struct mmsghdr), recv)) return 0;
-      if (recv) OPT_RD(a[5], sizeof(struct timespec));  // timeout
+      if (recv) OPT_WR(a[5], sizeof(struct timespec));  // timeout; the kernel writes the remainder
       return 1;
     }
     case SYS_connect: case SYS_bind: RD(a[2], a[3]); return 1;
@@ -1631,8 +1642,13 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
       return 1;
     case SYS_nanosleep: RD(a[1], sizeof(struct timespec)); OPT_WR(a[2], sizeof(struct timespec)); return 1;
     case SYS_epoll_ctl: OPT_RD(a[4], sizeof(struct epoll_event)); return 1;
-    case SYS_epoll_pwait: case SYS_epoll_pwait2:
+    case SYS_epoll_pwait:  // timeout is a scalar; sigmask is a pointer
       WR(a[2], (uintptr_t)a[3] * sizeof(struct epoll_event));
+      OPT_RD(a[5], sizeof(sigset_t));
+      return 1;
+    case SYS_epoll_pwait2:  // timeout is a timespec pointer
+      WR(a[2], (uintptr_t)a[3] * sizeof(struct epoll_event));
+      OPT_RD(a[4], sizeof(struct timespec));
       OPT_RD(a[5], sizeof(sigset_t));
       return 1;
     case SYS_ppoll:
@@ -1648,15 +1664,31 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
     case SYS_uname: WR(a[1], sizeof(struct utsname)); return 1;
     case SYS_sched_getaffinity: WR(a[3], a[2]); return 1;
     case SYS_sched_getparam: WR(a[2], sizeof(struct sched_param)); return 1;
-    case SYS_futex:
-      RD(a[1], sizeof(int));
-      switch (a[2] & 0x7f) {
+    case SYS_futex: {
+      int op = a[2] & 0x7f;
+      // The PI operations acquire or release the futex word, writing it; a word
+      // the turn could not write itself (e.g. in the host-frame wall) is refused.
+      if (op == 6 || op == 7 || op == 8 || op == 13)  // LOCK_PI, UNLOCK_PI, TRYLOCK_PI, LOCK_PI2
+        WR(a[1], sizeof(int));
+      else
+        RD(a[1], sizeof(int));
+      switch (op) {
         case 0: case 9: OPT_RD(a[4], sizeof(struct timespec)); break;  // WAIT, WAIT_BITSET
-        case 5: WR(a[5], sizeof(int)); break;                          // WAKE_OP writes uaddr2
-        case 3: case 4: case 10: case 12: RD(a[5], sizeof(int)); break;  // REQUEUE, CMP_REQUEUE[_PI]
+        case 11: OPT_RD(a[4], sizeof(struct timespec)); WR(a[5], sizeof(int)); break;  // WAIT_REQUEUE_PI
+        case 5: case 12: WR(a[5], sizeof(int)); break;  // WAKE_OP, CMP_REQUEUE_PI write uaddr2
+        case 3: case 4: RD(a[5], sizeof(int)); break;   // REQUEUE, CMP_REQUEUE
       }
       return 1;
+    }
     case SYS_set_robust_list: RD(a[1], a[2]); return 1;
+    // rseq registration is not optional: a modern glibc aborts the thread if it
+    // fails, so refusing it breaks every guest thread. The struct rseq is
+    // confined to guest-writable memory here. A residual risk remains and is not
+    // closed by this check: the kernel consults the registered area (including
+    // its rseq_cs pointer) when the vCPU's own host thread returns to user mode,
+    // so a crafted rseq_cs could redirect that host thread's PC. Closing it
+    // needs rseq to be emulated in the guest kernel rather than forwarded; until
+    // then the area is range-checked and allowed so threads run.
     case SYS_rseq: WR(a[1], a[2]); return 1;
     case SYS_sched_setaffinity: RD(a[3], a[2]); return 1;
     case SYS_rt_sigprocmask: {
@@ -1684,6 +1716,7 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
       if (ca.flags & GK_CLONE_PARENT_SETTID) WR(ca.parent_tid, sizeof(int));
       if (ca.flags & (GK_CLONE_CHILD_SETTID | GK_CLONE_CHILD_CLEARTID)) WR(ca.child_tid, sizeof(int));
       OPT_WR(ca.pidfd, sizeof(int));
+      if (ca.set_tid) RD(ca.set_tid, ca.set_tid_size * sizeof(int));  // pids the kernel reads
       return 1;
     }
     case SYS_clone: {
@@ -1774,6 +1807,10 @@ static long forward_syscall(gk_thread *t, gk_regs *r) {
       return tid;
     }
   }
+  // A clone that was not taken as a thread clone above would fork a host process
+  // or thread; ring-3 code must never do that. Refused here, where the decision
+  // is final, so a sibling racing the flags cannot slip one past the broker.
+  if (t->user_mode && (nr == SYS_clone || nr == GK_SYS_clone3)) return -GK_EPERM;
   // A guest-created thread ending (see guest_thread_exit).
   if (nr == SYS_exit && t->guest_thread) {
     if (G->dbg) fprintf(stderr, "[gk] vcpu %d syscall %ld (thread exit %ld)\n", t->id, nr, a1);

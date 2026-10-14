@@ -456,10 +456,13 @@ static int mach_trap_ring3_ok(long nr) {
     case -26: case -27: case -28: case -29:  // reply_port, thread/task/host self
     case -33: case -34: case -35: case -36: case -37: case -38: case -39:  // semaphores
     case -50:  // thread_get_special_reply_port
-    case -59: case -60: case -61: case -62:  // swtch_pri, swtch, thread_switch, clock_sleep
+    case -59: case -60: case -61:  // swtch_pri, swtch, thread_switch
     case -90:  // mach_wait_until
-    case -91: case -92: case -93: case -94:  // mk_timer_create/destroy/arm/cancel
+    case -91: case -92: case -93:  // mk_timer_create/destroy/arm
       return 1;
+    // clock_sleep (-62) and mk_timer_cancel (-94) write a result through a guest
+    // pointer gk does not validate, and the port RPC traps, pid_for_task and
+    // mach_timebase_info do the same, so ring 3 is refused all of them.
     default:
       return 0;
   }
@@ -506,9 +509,12 @@ static int g_iov(gk_thread *t, uintptr_t iov, long cnt, int write) {
   return 1;
 }
 
+// recvmsg writes the header fields and buffers, sendmsg only reads them, so
+// `write` governs the header too (keeping a recvmsg from writing a header in
+// the host-frame wall).
 static int g_msg(gk_thread *t, uintptr_t mp, int write) {
   struct msghdr m;
-  if (!guest_range_ok(t, mp, sizeof m, 0) || copy_in(&m, mp, sizeof m) < 0) return 0;
+  if (!guest_range_ok(t, mp, sizeof m, write) || copy_in(&m, mp, sizeof m) < 0) return 0;
   if (m.msg_name && !guest_range_ok(t, (uintptr_t)m.msg_name, m.msg_namelen, write)) return 0;
   if (m.msg_control &&
       !guest_range_ok(t, (uintptr_t)m.msg_control, m.msg_controllen, write))
@@ -529,10 +535,11 @@ static int syscall_mem_ok(gk_thread *t, long nr, const uint64_t a[8]) {
   do { if ((p) && !guest_range_ok(t, (uintptr_t)(p), (uintptr_t)(n), 1)) return 0; } while (0)
   switch (nr) {
     // Scalar-only, plus the mapping calls whose range is checked where they are
-    // reflected below.
+    // reflected below. macOS exit() is process-wide (there is no guest-thread
+    // exit on macOS, where thread creation is refused), so it is not allowed.
     case SYS_getpid: case SYS_getppid: case SYS_gettid: case SYS_close:
     case SYS_lseek: case SYS_socket: case SYS_shutdown: case SYS_listen: case SYS_fsync:
-    case SYS_mprotect: case SYS_munmap: case SYS_mmap: case SYS_exit:
+    case SYS_mprotect: case SYS_munmap: case SYS_mmap:
     case SYS_dup: case SYS_dup2: case SYS_fdatasync:
       return 1;
     case SYS_madvise: WR(a[0], a[1]); return 1;
@@ -632,6 +639,8 @@ static long forward_syscall(gk_thread *t, gk_regs *r) {
     case GK_SYS_mmap: kind = GK_REFLECT_MAP; rs = a[0]; len = a[1]; break;
     case GK_TRAP_vm_protect:
       if (self && !a[3]) { kind = GK_REFLECT_PROTECT; rs = a[1]; len = a[2]; prot = (int)a[4] & 7; }
+      else if (self && t->user_mode && a[2] && !guest_range_ok(t, a[1], a[2], 1))
+        return KERN_PROTECTION_FAILURE;  // a max-protection change is not reflected, but still confined
       break;
     case GK_TRAP_vm_deallocate:
       if (self) { kind = GK_REFLECT_UNMAP; rs = a[1]; len = a[2]; }
