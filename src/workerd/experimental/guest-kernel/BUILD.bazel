@@ -80,6 +80,15 @@ cc_library(
         "gk_asm.S",
     ],
     hdrs = ["gk.h"],
+    # The parts gk.c and gk_asm.S include (see gk_internal.h).
+    textual_hdrs = glob(
+        [
+            "gk_*.c",
+            "gk_*.h",
+            "gk_asm_*.S",
+        ],
+        exclude = ["gk_test.c"],
+    ),
     # The guest-entry code and anything that runs inside the guest must not carry
     # a stack canary (it reads a TLS slot the guest has not set up) or, on
     # x86-64, CET endbr markers, and must build without them for the whole
