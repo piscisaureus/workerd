@@ -126,6 +126,13 @@ static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms)
 static long gettid_raw(void) { return host_syscall(SYS_gettid, 0, 0, 0, 0, 0, 0); }
 
 
+// The record of the host thread whose pthread key destructor runs, through
+// tls_rec as on every other entry (thread_cur); the key's value is unused.
+static gk_thread *thread_ending(void *p) {
+  (void)p;
+  return thread_cur();
+}
+
 // ---- guest thread creation -------------------------------------------------
 // glibc's pthread_create issues clone3 (or clone) with CLONE_VM|CLONE_THREAD|
 // CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID: the kernel starts the

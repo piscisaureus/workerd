@@ -1,4 +1,4 @@
-// gk: KVM, on either architecture: memslots.
+// gk: KVM, on either architecture: memslots and parked vCPUs.
 #include "gk_internal.h"
 #if !GK_HVF
 
@@ -40,5 +40,30 @@ static int memslot_remove(gk_region *n, int *keep_gpa) {
   }
   return 0;
 }
+
+// Any host thread may run a KVM vCPU, so a vCPU outlives its thread: it is
+// parked with its kvm_run mapping for the next thread that needs one (see the
+// vCPU pool), or closed if the pool has no room (p NULL). Caller holds G->lock.
+static void vcpu_detach(gk_thread *t) {
+  // A pooled vCPU is out of KVM_RUN: the next thread to take it programs it
+  // by ioctl, which would wait behind a run in progress.
+  park_leave(t);
+}
+static void vcpu_park_hw(gk_thread *t, gk_parked_vcpu *p) {
+  if (p) {
+    p->fd = t->fd;
+    p->run = t->run;
+  } else {
+    if (t->runner) runner_stop(t->runner);
+    if (t->efd >= 0) close(t->efd);
+    if (t->stats_fd >= 0) close(t->stats_fd);
+    munmap(t->run, G->run_size);
+    close(t->fd);
+  }
+}
+
+// KVM follows a host remap of a thread's stack mapping (see the host-backing
+// section), so a thread's stack needs no refresh when it comes or goes.
+static void stack_refresh(void) {}
 
 #endif  // !GK_HVF
