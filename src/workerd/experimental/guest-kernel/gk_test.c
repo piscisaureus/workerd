@@ -1229,7 +1229,38 @@ static long user_getpid(void *arg) {
 }
 
 #if GK_TEST_GUEST_THREADS
-// ---- guest-created threads at ring 3 ----------------------------------------
+// ---- the ring-3 syscall memory broker ---------------------------------------
+// A Linux raw syscall with up to three arguments, for the broker probes below.
+static long gk_lsys(long nr, long a1, long a2, long a3) {
+#if defined(__x86_64__)
+  long ret;
+  register long r10 __asm__("r10") = 0, r8 __asm__("r8") = 0, r9 __asm__("r9") = 0;
+  __asm__ __volatile__("syscall" : "=a"(ret)
+                       : "a"(nr), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
+                       : "rcx", "r11", "memory");
+  return ret;
+#else
+  return raw_syscall3(nr, a1, a2, a3);
+#endif
+}
+
+// Probes the ring-3 memory broker from inside the guest. getrandom writes its
+// buffer, so forwarding it is allowed only when the buffer is memory this ring-3
+// turn could reach: `own` (its own arena page) works, while `other` (another
+// arena) and `ctl` (gk control memory) are refused with EPERM before the host
+// ever sees them. A host-state syscall (rt_sigaction) is refused too. Results
+// go back in the struct; returns 1 if the broker behaved.
+struct broker { void *own, *other, *ctl; long r_own, r_other, r_ctl, r_sig; };
+static long broker_probe(void *arg) {
+  struct broker *b = arg;
+  b->r_own = gk_lsys(SYS_getrandom, (long)b->own, 16, 0);
+  b->r_other = gk_lsys(SYS_getrandom, (long)b->other, 16, 0);
+  b->r_ctl = gk_lsys(SYS_getrandom, (long)b->ctl, 16, 0);
+  b->r_sig = gk_lsys(SYS_rt_sigaction, SIGUSR1, 0, 0);
+  return b->r_own == 16 && b->r_other == -EPERM && b->r_ctl == -EPERM && b->r_sig == -EPERM;
+}
+
+
 // A thread that ring-3 code creates must run at ring 3 as well: gaining ring 0
 // through pthread_create would void the privilege split. These bodies run in
 // threads spawned by a gk_run_user function.
@@ -4743,6 +4774,38 @@ int main(void) {
     }
   }
 
+  // The ring-3 syscall memory broker: a forwarded syscall may name only memory
+  // this ring-3 turn could reach itself. Under arena A, getrandom into A's own
+  // page is forwarded, into arena B or gk control memory it is refused with
+  // EPERM before the host runs it, and a host-state syscall is refused too.
+#if GK_TEST_GUEST_THREADS
+  int ok_broker = 1;
+  {
+    gk_arena *A = gk_arena_create(4096), *B = gk_arena_create(4096);
+    unsigned long refuse = 0;
+    gk_debug_control_addrs(NULL, &refuse);
+    if (!A || !B || mprotect(gk_arena_base(A), 4096, PROT_READ | PROT_WRITE) != 0 ||
+        mprotect(gk_arena_base(B), 4096, PROT_READ | PROT_WRITE) != 0) {
+      ok_broker = 0;
+      printf("ring-3 syscall broker: setup failed [FAIL]\n");
+    } else {
+      struct broker b = {gk_arena_base(A), gk_arena_base(B), (void *)refuse, 0, 0, 0, 0};
+      gk_arena_enter(A);
+      long ok = gk_run_user(broker_probe, &b);
+      gk_arena_enter(NULL);
+      gk_arena_destroy(A);
+      gk_arena_destroy(B);
+      ok_broker = ok == 1;
+      printf("ring-3 syscall broker: own arena -> %ld, other arena -> %ld, gk control -> %ld, "
+             "rt_sigaction -> %ld (want 16/-EPERM/-EPERM/-EPERM) [%s]\n", b.r_own, b.r_other,
+             b.r_ctl, b.r_sig, ok_broker ? "OK" : "FAIL");
+    }
+  }
+#else
+  int ok_broker = 1;
+  printf("ring-3 syscall broker: Linux-only; skipped [OK]\n");
+#endif
+
   // ---- guest-created threads at ring 3 --------------------------------------
   // Threads spawned by a ring-3 context run at ring 3 themselves. Each faulting
   // case ends only the thread that faulted: its spawner's join returns and the
@@ -5127,9 +5190,9 @@ int main(void) {
   }
 
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
-            ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
-            ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28 && ok29 && ok30 && ok31 &&
-            ok32 && ok33 && ok34 && ok36 && ok37;
+            ok12 && ok13 && ok_broker && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 &&
+            ok20 && ok21 && ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28 && ok29 &&
+            ok30 && ok31 && ok32 && ok33 && ok34 && ok36 && ok37;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }
