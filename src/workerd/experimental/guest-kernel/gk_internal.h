@@ -1064,6 +1064,7 @@ typedef struct {
   uintptr_t page_base, page_end, turn_base, turn_end;
 } gk_dm_refusal;
 static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp, gk_dm_refusal *why);
+static int guest_range_ok(gk_thread *t, uintptr_t addr, uintptr_t len, int write);
 
 // gk_region.c
 static struct gk_region *region_find(uintptr_t addr);

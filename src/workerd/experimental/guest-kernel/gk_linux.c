@@ -1446,33 +1446,6 @@ static int confined_path_syscall(gk_thread *t, long nr, long a1, long a2, long a
 #define UIO_MAXIOV 1024
 #endif
 
-// Whether the ring-3 turn on `t` may name [addr, addr+len) to a forwarded
-// syscall: every host page of the range must be one ring-3 code could reach by
-// its own load or store under the caller's active root, as demand_map decides.
-// A page in another arena, in gk's supervisor or refuse control memory, or --
-// for a write -- in the caller's host-frame wall is not reachable and fails
-// the range. The host kernel still enforces its own permissions on top; this
-// only keeps a forwarded syscall from reaching memory the guest itself could
-// not. Empty ranges pass; a range that wraps the address space fails. Takes
-// G->lock.
-static int guest_range_ok(gk_thread *t, uintptr_t addr, uintptr_t len, int write) {
-  if (len == 0) return 1;
-  if (addr + len < addr) return 0;  // wrap
-  uintptr_t s = HOST_FLOOR(addr), e = HOST_CEIL(addr + len);
-  int ok = 1;
-  pthread_mutex_lock(&G->lock);
-  for (uintptr_t p = s; p < e; p += GK_HOST_PAGE) {
-    gk_arena *in = arena_containing(p);
-    if ((in && in != t->active_arena) || prot_class(p) != GK_PROT_KEEP ||
-        (write && p >= t->ro_lo && p < t->ro_hi)) {
-      ok = 0;
-      break;
-    }
-  }
-  pthread_mutex_unlock(&G->lock);
-  return ok;
-}
-
 // A guest string argument (a path): readable for gk to scan, and bounded into
 // reachable memory up to its NUL or PATH_MAX. A null pointer is refused.
 static int g_str(gk_thread *t, uintptr_t s) {
