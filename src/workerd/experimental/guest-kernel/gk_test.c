@@ -14,6 +14,36 @@
 #include <unistd.h>
 #include <pthread.h>
 
+// The few instructions the tests need that differ between the architectures:
+// a raw syscall, a read only ring 0 can do (priv_probe), and the selector a
+// ring-3 probe reports (USER_CS).
+#if defined(__x86_64__)
+// CR0, readable only at ring 0; PG (bit 31) is set in the guest.
+#define PRIV_PROBE_OK(v) ((v) & (1UL << 31))
+#define USER_CS 0x2b  // the ring-3 code selector
+#else
+static long raw_syscall3(long nr, long a1, long a2, long a3) {
+  register long x8 __asm__("x8") = nr;
+  register long x0 __asm__("x0") = a1;
+  register long x1 __asm__("x1") = a2;
+  register long x2 __asm__("x2") = a3;
+  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+  return x0;
+}
+// CurrentEL, readable only at EL1 and above: EL1 (1 << 2) at guest ring 0.
+static unsigned long priv_probe(void) {
+  unsigned long el;
+  __asm__ __volatile__("mrs %0, CurrentEL" : "=r"(el));
+  return el;
+}
+#define PRIV_PROBE_OK(v) ((v) == (1UL << 2))
+// arm64 has no unprivileged read of the exception level: gk answers a
+// reserved syscall with the caller's ring (see gk.h), and the tests' "CS" is
+// that ring.
+static unsigned long user_ring(void) { return (unsigned long)raw_syscall3(GK_DEBUG_RING_SYSCALL, 0, 0, 0); }
+#define USER_CS 3
+#endif
+
 // Pure computation, no syscalls: exercises entering and leaving the guest.
 static long test_compute(void *arg) {
   long n = (long)arg, sum = 0;
@@ -41,6 +71,9 @@ static long test_libc(void *arg) {
 static long test_raw_write(void *arg) {
   (void)arg;
   const char msg[] = "raw syscall write from inside gk guest\n";
+#if defined(__aarch64__)
+  return raw_syscall3(SYS_write, 1, (long)msg, (long)sizeof(msg) - 1);
+#else
   long ret;
   register long r10 __asm__("r10") = 0, r8 __asm__("r8") = 0, r9 __asm__("r9") = 0;
   __asm__ __volatile__("syscall"
@@ -49,6 +82,7 @@ static long test_raw_write(void *arg) {
                          "r"(r10), "r"(r8), "r"(r9)
                        : "rcx", "r11", "memory");
   return ret;
+#endif
 }
 
 // Reads the first byte at the address given as arg, and returns it. Used to
@@ -198,6 +232,9 @@ static void *arena_thread(void *arg) {
 static long guest_try_write(void *arg) {
   (void)arg;
   const char msg[] = "this write should be denied by the filter\n";
+#if defined(__aarch64__)
+  return raw_syscall3(SYS_write, 1, (long)msg, (long)sizeof(msg) - 1);
+#else
   long ret;
   register long r10 __asm__("r10") = 0, r8 __asm__("r8") = 0, r9 __asm__("r9") = 0;
   __asm__ __volatile__("syscall"
@@ -206,18 +243,24 @@ static long guest_try_write(void *arg) {
                          "r"(r10), "r"(r8), "r"(r9)
                        : "rcx", "r11", "memory");
   return ret;
+#endif
 }
 
 // ---- guest-created threads --------------------------------------------------
 // Threads created *from inside the guest* (pthread_create -> clone3/clone) must
-// enter the guest themselves. The thread body reads CR0, which only works in
-// ring 0: on the host it would SIGSEGV, in the guest it returns CR0 with PG set.
+// enter the guest themselves. The thread body reads CR0 (CurrentEL on arm64),
+// which only works in ring 0: on the host it would SIGSEGV (SIGILL), in the
+// guest it returns CR0 with PG set (EL1).
 struct gt { int id; long n; unsigned long cr0; long sum; };
 
 static void *guest_thread_body(void *arg) {
   struct gt *t = arg;
   unsigned long cr0;
+#if defined(__x86_64__)
   __asm__ __volatile__("mov %%cr0, %0" : "=r"(cr0));
+#else
+  cr0 = priv_probe();
+#endif
   t->cr0 = cr0;
   long sum = 0;
   for (long i = 0; i < t->n; i++) sum += (i * 3 + t->id) & 0xff;
@@ -252,8 +295,12 @@ struct churn { int iters; int per_iter; long bad; };
 
 static void *churn_body(void *arg) {
   unsigned long cr0;
+#if defined(__x86_64__)
   __asm__ __volatile__("mov %%cr0, %0" : "=r"(cr0));
-  return (void *)(uintptr_t)((cr0 & (1UL << 31)) ? (uintptr_t)arg : 0);
+#else
+  cr0 = priv_probe();
+#endif
+  return (void *)(uintptr_t)(PRIV_PROBE_OK(cr0) ? (uintptr_t)arg : 0);
 }
 
 static long churn_in_guest(void *arg) {
@@ -277,12 +324,13 @@ static void *host_churn_thread(void *arg) {
   return (void *)(uintptr_t)gk_run(test_compute, arg);
 }
 
-// Filter: deny write (nr 1), allow everything else.
+// Filter: deny write, allow everything else.
 static int deny_write(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
   (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
-  return nr != 1;  // 0 = deny
+  return nr != SYS_write;  // 0 = deny
 }
 
+#if defined(__x86_64__)
 // ---- memory protection keys -------------------------------------------------
 // The guest's pkeys must be enforced by the guest CPU: a page assigned a key
 // with pkey_mprotect is only accessible as the calling thread's PKRU allows,
@@ -431,6 +479,13 @@ static int host_key_check(void) {
          h.again, h.bad == 0 ? "yes" : "no", ok ? "OK" : "FAIL");
   return ok;
 }
+#else
+// No protection keys to virtualize on arm64 (see GK_HAS_PKEYS in gk.c).
+static int host_key_check(void) {
+  printf("host-allocated key: no protection keys on arm64; skipped [OK]\n");
+  return 1;
+}
+#endif
 
 // ---- gk_run_here: the guest on the caller's stack ---------------------------
 // The guest function records where its own frame is, then does real work on
@@ -571,9 +626,14 @@ static long __attribute__((noinline)) wall_descend(int depth, struct wall *w) {
 static long __attribute__((noinline)) wall_fn(void *arg) {
   struct wall *w = arg;
   uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+#if defined(__x86_64__)
   // The entry rsp is two words above the frame pointer (return address, saved
   // rbp); the wall starts at the first page boundary at or above it.
   uintptr_t entry = frame + 16;
+#else
+  // A call pushes nothing on arm64: the entry sp is the call's CFA.
+  uintptr_t entry = (uintptr_t)__builtin_dwarf_cfa();
+#endif
   w->frame = frame;
   w->boundary = (entry + 0xfff) & ~0xfffUL;
   w->host_val = *(volatile long *)w->host_frame;  // read a walled host frame: reads work
@@ -705,7 +765,11 @@ static long __attribute__((noinline)) wall_skip_check(const char *who) {
   uintptr_t bound2 = w->boundary;
   int ok2 = r2 == GK_EFAULT && f2 == bound2 && bound2 < bound1 && WALL_DELTA(wall_skipped) == 0 &&
             WALL_DELTA(wall_flushed) == 1 && WALL_DELTA(tlb_flushes) == 1;
+#if defined(__x86_64__)
   const char *stub = b.flush_invpcid ? "invpcid" : "cr4.pge toggle";
+#else
+  const char *stub = "tlbi vmalle1";
+#endif
 
   // 3. Back at the shallower depth the window lies within the deeper one, so
   //    the raise skips again, and the store into the host frame faults.
@@ -972,7 +1036,11 @@ static long thp_check(void) {
 // ring 3, CPL is 3 and CS is the ring-3 code selector (0x2b).
 static long user_cpl(void *arg) {
   unsigned short cs;
+#if defined(__x86_64__)
   __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
+#else
+  cs = (unsigned short)user_ring();
+#endif
   if (arg) *(unsigned long *)arg = cs;
   return (long)(cs & 3);
 }
@@ -983,7 +1051,11 @@ static long user_cpl(void *arg) {
 static long user_read_cr3(void *arg) {
   (void)arg;
   unsigned long v;
+#if defined(__x86_64__)
   __asm__ __volatile__("mov %%cr3, %0" : "=r"(v));
+#else
+  __asm__ __volatile__("mrs %0, ttbr0_el1" : "=r"(v));  // traps at EL0
+#endif
   return (long)v;
 }
 
@@ -1000,12 +1072,16 @@ static long user_write_here(void *arg) {
 // 0, the host forwards it, and SYSRET returns to ring 3 with the pid.
 static long user_getpid(void *arg) {
   (void)arg;
+#if defined(__aarch64__)
+  return raw_syscall3(SYS_getpid, 0, 0, 0);
+#else
   long pid;
   register long r10 __asm__("r10") = 0, r8 __asm__("r8") = 0, r9 __asm__("r9") = 0;
   __asm__ __volatile__("syscall" : "=a"(pid)
                        : "a"((long)SYS_getpid), "r"(r10), "r"(r8), "r"(r9)
                        : "rcx", "r11", "memory");
   return pid;
+#endif
 }
 
 // ---- guest-created threads at ring 3 ----------------------------------------
@@ -1025,7 +1101,11 @@ struct ugt {
 
 static void *user_grandchild(void *arg) {
   unsigned short cs;
+#if defined(__x86_64__)
   __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
+#else
+  cs = (unsigned short)user_ring();
+#endif
   *(unsigned long *)arg = cs;
   return NULL;
 }
@@ -1035,7 +1115,11 @@ static void *user_grandchild(void *arg) {
 static void *user_thread_body(void *arg) {
   struct ugt *u = arg;
   unsigned short cs;
+#if defined(__x86_64__)
   __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
+#else
+  cs = (unsigned short)user_ring();
+#endif
   u->cs = cs;
   u->pid = user_getpid(NULL);
   char *buf = malloc(64);
@@ -1058,10 +1142,17 @@ static void *user_thread_priv(void *arg) {
   struct ugt *u = arg;
   unsigned long v;
   u->before = 1;
+#if defined(__x86_64__)
   __asm__ __volatile__("leaq 1f(%%rip), %0\n\t"
                        "movq %0, %1\n\t"
                        "1: movq %%cr3, %0"
                        : "=&r"(v), "=m"(u->addr));
+#else
+  __asm__ __volatile__("adr %0, 1f\n\t"
+                       "str %0, %1\n\t"
+                       "1: mrs %0, ttbr0_el1"
+                       : "=&r"(v), "=m"(u->addr));
+#endif
   u->after = 1;  // not reached at ring 3
   return (void *)v;
 }
@@ -1195,7 +1286,13 @@ static long global_check(void) {
   int sw_ok = switches == ROUNDS;
 
   // 2a. Same root: an arena page's translation is cached (methodology check).
+  //     A VM that keeps no translation from one guest entry to the next at
+  //     all, with gk flushing nothing in between (seen under nested
+  //     virtualization, where the outer hypervisor may drop the nested
+  //     guest's TLB at every entry), cannot show what survives a switch: the
+  //     survival checks (2a, 2c) are then reported as not observable.
   int cached = 0;
+  long gk_flushed = 0;
   for (int attempt = 0; attempt < 3 && !cached; attempt++) {
     gk_arena_enter(A);
     gk_run(read_byte, pa);
@@ -1204,7 +1301,9 @@ static long global_check(void) {
     long v = gk_run(read_byte, pa);
     gk_get_stats(&s1);
     cached = v == 0xAA && s1.demand_faults == s0.demand_faults;
+    gk_flushed += s1.tlb_flushes - s0.tlb_flushes;
   }
+  int no_tlb = !cached && gk_flushed == 0;
   // 2b. An arena page's translation does not survive a switch away and back,
   //     and the page is unreachable from the other arena in between.
   gk_arena_enter(A);
@@ -1263,17 +1362,20 @@ static long global_check(void) {
   munmap(dummy, 4096);
   if (pinned) sched_setaffinity(0, sizeof old, &old);
 
-  int ok = alt_ok && sw_ok && cached && arena_ok && survived && flush_ok && globals > 0;
+  int ok = alt_ok && sw_ok && (no_tlb || (cached && survived)) && arena_ok && flush_ok && globals > 0;
   printf("global pages: %d/%d alternating turns isolated (%ld root switches); arena page cached "
          "on the same root %s, after a switch away and back %s (%ld fault, unreachable in "
          "between %s); shared page after a switch %s (%ld faults, %d attempt%s); after gk's "
-         "flush %s (%ld fault, warm-up %ld); %ld global PTEs installed [%s]\n",
-         rounds_ok, ROUNDS, switches, cached ? "ok" : "NOT CACHED",
+         "flush %s (%ld fault, warm-up %ld); %ld global PTEs installed%s [%s]\n",
+         rounds_ok, ROUNDS, switches, cached ? "ok" : no_tlb ? "not observable" : "NOT CACHED",
          arena_ok ? "re-walked" : "STALE", arena_faults,
          xb == GK_EFAULT && fxb == (uintptr_t)pa ? "faults" : "READABLE",
          survived ? "survived" : "DROPPED", shared_faults, shared_attempts,
          shared_attempts == 1 ? "" : "s", flush_ok ? "dropped" : "SURVIVED", flush_faults,
-         warm_faults, globals, ok ? "OK" : "FAIL");
+         warm_faults, globals,
+         no_tlb ? "; this VM keeps no TLB entry across guest entries, so what survives a switch "
+                  "is not observable here" : "",
+         ok ? "OK" : "FAIL");
   return ok;
 }
 
@@ -1642,7 +1744,7 @@ int main(void) {
   for (int i = 0; i < 3; i++) {
     long want7 = 0;
     for (long j = 0; j < ts[i].n; j++) want7 += (j * 3 + ts[i].id) & 0xff;
-    if (!(ts[i].cr0 & (1UL << 31)) || ts[i].sum != want7) ok7 = 0;
+    if (!PRIV_PROBE_OK(ts[i].cr0) || ts[i].sum != want7) ok7 = 0;
   }
   printf("guest-created threads (ring-0 creator): 3 threads spawned in the guest ran in ring 0 "
          "(gk_run=%ld, cr0=%#lx) [%s]\n", spawned, ts[0].cr0, ok7 ? "OK" : "FAIL");
@@ -1677,6 +1779,7 @@ int main(void) {
          after_guest, sp1.prot_ranges, sp2.prot_ranges, after_host, ok8 ? "OK" : "FAIL");
 
   // Memory protection keys, enforced by the guest CPU against the guest PKRU.
+#if defined(__x86_64__)
   struct pk pk = {0};
   long pk_rights = gk_run(pk_setup, &pk);          // WD from pkey_alloc
   long pk_r1 = gk_run(pk_read, &pk);               // readable under WD
@@ -1696,6 +1799,10 @@ int main(void) {
          "teardown=%#lx [%s]\n", pk.key, pk_rights, pk_r1,
          pk_w1 == GK_EFAULT ? "FAULT" : "allowed", pk_r2 == GK_EFAULT ? "FAULT" : "allowed",
          pk_r3, pk_inh, pk_end, ok9 ? "OK" : "FAIL");
+#else
+  int ok9 = 1;
+  printf("protection keys: no protection keys on arm64; skipped [OK]\n");
+#endif
 
   // gk_run_here runs the guest on the calling thread's stack: on the main
   // thread (kernel-grown stack) and on a pthread (fixed mapping). gk_run, by
@@ -1917,7 +2024,7 @@ int main(void) {
     long spawned_u = gk_run_user(spawn_users_in_guest, us);
     int p1 = spawned_u == 1 && upages != MAP_FAILED, p3 = 1;
     for (int i = 0; i < 3; i++) {
-      if (us[i].cs != 0x2b || us[i].child_cs != 0x2b) p1 = 0;
+      if (us[i].cs != USER_CS || us[i].child_cs != USER_CS) p1 = 0;
       if (us[i].pid != (long)getpid()) p3 = 0;
       if (us[i].wrote != 0x50 + us[i].id || upages[i * 4096] != 0x50 + us[i].id) p1 = 0;
     }
@@ -1976,7 +2083,7 @@ int main(void) {
       gk_arena *uc = gk_arena_create(4096);
       int slot_reused = uc && gk_arena_base(uc) == abase;
       gk_arena_destroy(uc);
-      p4 = j_own == 1 && own.cs == 0x2b && own.wrote == 0x57 && host_sees &&
+      p4 = j_own == 1 && own.cs == USER_CS && own.wrote == 0x57 && host_sees &&
            j_pt == 1 && tpt.before && !tpt.after && f_pt == refuse &&
            j_peer == 1 && tpeer.before && !tpeer.after && f_peer == (unsigned long)bbase &&
            slot_reused;

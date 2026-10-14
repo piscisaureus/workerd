@@ -6,8 +6,10 @@
 // private memory arena backed by a separate guest page-table root, so code
 // running for one isolate cannot address another's arena, enforced by hardware.
 //
-// This is the runtime-side shape of security-idea-2.md. x86-64 Linux only;
-// needs read/write access to /dev/kvm.
+// This is the runtime-side shape of security-idea-2.md. Linux on x86-64 or
+// arm64; needs read/write access to /dev/kvm. "Ring 0" and "ring 3" name the
+// guest's privileged and user levels on both: on arm64 they are EL1 (on
+// SP_EL0) and EL0, and a CR3 load is a TTBR0 switch.
 #ifndef GK_H
 #define GK_H
 
@@ -39,7 +41,8 @@ const char *gk_last_error(void);
 // thread enters the guest with the PKRU it has on the host; a thread created
 // inside the guest inherits its creator's. A pkey_mprotect from the guest may
 // use any key, including one pkey_alloc'ed on the host outside the guest; a
-// key gk cannot reflect fails with ENOMEM, never EINVAL.
+// key gk cannot reflect fails with ENOMEM, never EINVAL. On arm64 the pkey
+// syscalls are forwarded unchanged and no key reaches the guest page tables.
 long gk_run(long (*fn)(void *), void *arg);
 
 // Like gk_run, but fn runs on the calling thread's own stack rather than on a
@@ -132,6 +135,13 @@ unsigned long gk_debug_ctl_addr(int which);
 #define GK_EFAULT (-1001)  // guest faulted; see gk_fault_addr()
 #define GK_ESHUTDOWN (-1002)  // guest triple-faulted or shut down
 
+#if defined(__aarch64__)
+// Test/diagnostic: a syscall with this number (in x8) is not forwarded but
+// returns the calling guest code's ring, 0 or 3. On x86-64 a test reads CS;
+// arm64 has no unprivileged instruction that tells the exception level.
+#define GK_DEBUG_RING_SYSCALL 0xF4241
+#endif
+
 // The guest-virtual address of the last fault reported by gk_run.
 //
 // A page the host side decommits or unmaps without the change passing through
@@ -202,7 +212,8 @@ typedef struct {
   long tlb_flushes;     // full TLB flushes run on a vCPU, on every path: a wall raise that could not
                         // skip, a reflected mprotect/munmap, freed page tables (wall_flushed is the
                         // wall's share)
-  int flush_invpcid;    // the flush stub in use: 1 = INVPCID (one VM exit), 0 = CR4.PGE toggle (three)
+  int flush_invpcid;    // the flush stub in use: 1 = INVPCID (one VM exit), 0 = CR4.PGE toggle
+                        // (three); always 0 on arm64, which flushes with TLBI VMALLE1
 } gk_stats;
 void gk_get_stats(gk_stats *s);
 

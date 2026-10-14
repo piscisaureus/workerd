@@ -3,6 +3,7 @@
 #include "gk.h"
 #include <dlfcn.h>
 #include <errno.h>
+#include <stddef.h>
 #include <string.h>
 
 #include <fcntl.h>
@@ -17,7 +18,12 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#if defined(__aarch64__)
+#include <elf.h>
+#include <sys/auxv.h>
+#endif
 
+#if defined(__x86_64__)
 // ---- x86-64 paging and control-register bits -------------------------------
 #define PTE_P (1UL << 0)
 #define PTE_W (1UL << 1)
@@ -27,8 +33,6 @@
 #define PTE_NX (1UL << 63)
 #define PTE_PKEY_SHIFT 59        // bits 62:59 hold the page's protection key
 #define PTE_PKEY_MASK (0xfUL << PTE_PKEY_SHIFT)
-#define GK_MAP_WALLED 8          // map4k_root flag: host-writable page, W withheld (PTE_WALL)
-#define GK_MAP_GLOBAL 16         // map4k_root flag: the page may be global (see the global-pages section)
 #define PF_ERR_WR (1UL << 1)     // #PF error code: the access was a write
 #define PF_ERR_PK (1UL << 5)     // #PF error code: protection-key violation
 #define CR0_PE (1UL << 0)
@@ -59,6 +63,80 @@
 #define PORT_PKRU 0xFB
 #define PORT_FLUSH 0xFA
 
+// The PTE operations the shared page-table code is written in (see the arm64
+// definitions below for why they are not plain bit operations).
+#define PTE_TABLE_ENTRY(p) (((uint64_t)(uintptr_t)(p)) | PTE_P | PTE_W | PTE_U)
+#define PTE_TABLE_PTR(e) ((uint64_t *)(uintptr_t)((e) & ~0xfffULL))
+#define PTE_IS_W(e) ((e) & PTE_W)
+#define PTE_SET_W(e) ((e) | PTE_W)
+#define PTE_CLR_W(e) ((e) & ~PTE_W)
+#define GK_HAS_PKEYS 1           // the guest's protection keys are virtualized (see that section)
+#define GK_USER_SLOTS 256        // PML4 slots 0..255 are the 47-bit user address space
+
+#elif defined(__aarch64__)
+// ---- arm64 paging --------------------------------------------------------------
+// 48-bit VA, 4KiB granule: four levels indexed by exactly the bits x86-64's
+// PML4/PDPT/PD/PT use, so the page-table code is shared and the names (pml4,
+// pdpt, ...) are the x86 ones. What differs is the entries. A table entry
+// holds the guest-physical address of the next table, and guest-physical is
+// not host-virtual here (see the guest-physical allocator), so the shared
+// code converts through PTE_TABLE_ENTRY/PTE_TABLE_PTR. A leaf is a page
+// descriptor:
+#define PTE_P (1UL << 0)         // valid; with bit 1, a table or (at level 3) a page
+#define PTE_TABLE (1UL << 1)
+#define PTE_U (1UL << 6)         // AP[1]: EL0 (ring 3) may access the page
+#define PTE_RDONLY (1UL << 7)    // AP[2]: read-only, at every EL. W is its inverse
+#define PTE_SH_INNER (3UL << 8)  // inner shareable
+#define PTE_AF (1UL << 10)       // access flag, set up front: the guest takes no access-flag faults
+#define PTE_NG (1UL << 11)       // not global: cleared for a global page (see the global-pages section)
+#define PTE_PXN (1UL << 53)      // no execution at EL1
+#define PTE_UXN (1UL << 54)      // no execution at EL0
+#define PTE_WALL (1UL << 55)     // software bit: W withheld by the host-frame wall
+#define PTE_ADDR_MASK 0x0000fffffffff000ULL
+// AttrIndx is 0: MAIR_EL1 attribute 0 is normal write-back memory (vcpu_init).
+#define PTE_TABLE_ENTRY(p) (PT_GPA(p) | PTE_P | PTE_TABLE)
+#define PTE_TABLE_PTR(e) ((uint64_t *)(uintptr_t)(G->pt_base + (((e) & PTE_ADDR_MASK) - G->pt_gpa)))
+#define PT_GPA(p) (G->pt_gpa + ((uintptr_t)(p) - G->pt_base))
+#define PTE_IS_W(e) (!((e) & PTE_RDONLY))
+#define PTE_SET_W(e) ((e) & ~PTE_RDONLY)
+#define PTE_CLR_W(e) ((e) | PTE_RDONLY)
+// No memory protection keys (POE) on the CPUs this targets: pkey syscalls are
+// forwarded to the host unchanged and no PTE carries a key.
+#define GK_HAS_PKEYS 0
+#define GK_USER_SLOTS 512        // level-0 slots 0..511 are the 48-bit user address space
+
+// The ESR_EL1 classes and fault status codes run_vcpu tells apart.
+#define ESR_EC(esr) (((esr) >> 26) & 0x3f)
+#define ESR_EC_SVC64 0x15
+#define ESR_EC_IABT_LOW 0x20
+#define ESR_EC_IABT_CUR 0x21
+#define ESR_EC_DABT_LOW 0x24
+#define ESR_EC_DABT_CUR 0x25
+#define ESR_WNR (1UL << 6)       // data abort: the access was a write
+#define ESR_FNV (1UL << 10)      // data abort: FAR is not valid
+// PSTATE/SPSR modes, with D, A, I and F masked: EL0t (ring 3), EL1t (ring 0,
+// on SP_EL0) and EL1h (the handlers and the dispatcher, on SP_EL1 = the vcb).
+#define PSR_EL0T 0x3c0
+#define PSR_EL1T 0x3c4
+#define PSR_EL1H 0x3c5
+// Hypercall function ids the vector handlers issue (see gk_asm.S); an SMCCC
+// OEM-service range the VM's SMCCC filter forwards to the host.
+#define GK_HC_BASE 0xc3000000u
+#define GK_HC_EXC (GK_HC_BASE + 0)
+#define GK_HC_BAD (GK_HC_BASE + 1)
+#define GK_HC_COUNT 16
+// vcb action bits (see gk_dispatch in gk_asm.S). Without GK_ACT_LAUNCH the
+// dispatcher resumes the saved state.
+#define GK_ACT_LAUNCH (1UL << 0)
+#define GK_ACT_FLUSH (1UL << 1)
+#define GK_ACT_TLBI_VA (1UL << 2)
+#define GK_ACT_TTBR (1UL << 3)
+#else
+#error "gk supports x86-64 and arm64 only"
+#endif
+#define GK_MAP_WALLED 8          // map4k_root flag: host-writable page, W withheld (PTE_WALL)
+#define GK_MAP_GLOBAL 16         // map4k_root flag: the page may be global (see the global-pages section)
+
 // Reserved syscall number a ring-3 guest issues to leave the guest (see
 // gk_user_exit_tramp in gk_asm.S). Ring-3 code cannot execute OUT, so it cannot
 // use the PORT_EXIT hypercall the ring-0 path uses; it returns its result
@@ -66,6 +144,37 @@
 // number, so it never collides with a forwarded call. Keep in sync with the
 // literal in gk_asm.S.
 #define GK_EXIT_SYSCALL 0xF4240
+#if defined(__aarch64__)
+// The interrupted state a vector handler saves (gk_exc_sync in gk_asm.S), and
+// the register file of a guest-created thread's start (see clone_thread).
+typedef struct gk_frame {
+  uint64_t x[31];
+  uint64_t sp;             // SP_EL0
+  uint64_t elr, spsr, esr, far;
+} gk_frame;
+// The vcb: a vCPU's control block, the first bytes of its supervisor region
+// (gk_thread.ist) and its SP_EL1. The guest's handlers and dispatcher read and
+// write it at EL1; the host reads and writes it only while the vCPU is out of
+// KVM_RUN. Ring 3 cannot reach it. Offsets are fixed by gk_asm.S.
+struct gk_vcb {
+  gk_frame f;
+  uint64_t action;         // GK_ACT_*: what the dispatcher does next
+  uint64_t ttbr;           // GK_ACT_TTBR: the root to load
+  uint64_t tlbi_va;        // GK_ACT_TLBI_VA: the address to invalidate
+  uint64_t cur_ttbr;       // TTBR0 as the dispatcher last left it
+  uint64_t l_pc, l_sp, l_x0, l_lr, l_spsr;  // GK_ACT_LAUNCH: the turn's entry
+  uint64_t n_elr, n_esr, n_far;             // an exception gk does not take (gk_exc_bad)
+};
+_Static_assert(offsetof(struct gk_vcb, f.sp) == 248 && offsetof(struct gk_vcb, f.elr) == 256 &&
+                   offsetof(struct gk_vcb, f.esr) == 272 && offsetof(struct gk_vcb, action) == 288 &&
+                   offsetof(struct gk_vcb, cur_ttbr) == 312 && offsetof(struct gk_vcb, l_pc) == 320 &&
+                   offsetof(struct gk_vcb, l_spsr) == 352 && offsetof(struct gk_vcb, n_far) == 376,
+               "struct gk_vcb must match the VCB_* offsets in gk_asm.S");
+#define VCB(t) ((struct gk_vcb *)(uintptr_t)(t)->ist)
+typedef gk_frame gk_regs;
+#else
+typedef struct kvm_regs gk_regs;
+#endif
 
 // ---- gk control data ---------------------------------------------------------
 // Everything gk trusts to enforce isolation -- the page-table allocator's
@@ -113,7 +222,11 @@
 #define KVM_SYNC_X86_SREGS (1UL << 1)
 #endif
 #define GK_SYNC_REGS (KVM_SYNC_X86_REGS | KVM_SYNC_X86_SREGS)
+#if defined(__x86_64__)
 #define GK_IST_BYTES (64UL << 10)   // per-vCPU exception stack, TSS in its last page
+#else
+#define GK_IST_BYTES (4UL << 10)    // per-vCPU vcb (struct gk_vcb)
+#endif
 #define GK_SIDE_STACK (512UL << 10) // host-side stack for gk_run_here's gk loop
 typedef struct {
   int fd, id;
@@ -170,7 +283,7 @@ typedef struct gk_thread {
   // A guest-created thread's initial state, filled by its parent (clone_thread)
   // and consumed by the child (child_entry) before it enters the guest.
   struct {
-    struct kvm_regs regs;
+    gk_regs regs;
     uint32_t pkru;         // the parent's guest PKRU, inherited like a real clone
     int user;              // the parent ran at ring 3, so the child starts there too
     int parent_id;
@@ -193,7 +306,6 @@ static __thread int tls_rec;
 #define GK_SLOT_BITS 39
 #define GK_SLOT_BYTES (1UL << GK_SLOT_BITS)
 #define GK_MAX_ARENA_SLOTS 8   // 4TiB per arena; V8's largest sandbox reservation is ~1.34TB
-#define GK_USER_SLOTS 256      // PML4 slots 0..255 are the 47-bit user address space
 #define GK_FIRST_CAGE_SLOT 64  // arenas are placed from here up
 #define GK_MAX_ARENAS 4096
 struct gk_arena {
@@ -238,6 +350,9 @@ _Static_assert(GK_MAX_PROT_RANGES >= 2 * GK_MAX_VCPUS + 512,
 typedef struct gk_region {
   uintptr_t start, end;   // [start, end), GK_BACK_WIN-aligned
   int slot;               // KVM memslot id backing this region
+#if defined(__aarch64__)
+  uint64_t gpa;           // guest-physical address of `start` (see the guest-physical allocator)
+#endif
   unsigned prio;          // treap heap priority
   struct gk_region *l, *r;
 } gk_region;
@@ -247,6 +362,9 @@ typedef struct gk_region {
 typedef struct { uintptr_t start, end; int pkey; } gk_pkey_range;
 
 #define GK_CPUID_ENTRIES 128
+#if defined(__aarch64__)
+typedef struct { uint64_t start, size; } gk_gpa_extent;
+#endif
 
 struct gk_ctl {
   // Platform state, set once by gk_init.
@@ -257,15 +375,36 @@ struct gk_ctl {
   size_t pt_bytes;
   uint64_t *pt_free;                 // freed page-table pages, linked through their first word
   long pt_used, pt_free_n;           // pages handed out and not returned; pages on the free list
+#if defined(__x86_64__)
   uint64_t gdt_va, idt_va;
+#else
+  uint64_t vbar;                     // the vector table: the supervisor text's first page
+  uint64_t pt_gpa;                   // guest-physical address of pt_base
+  int ips;                           // TCR_EL1.IPS for the VM's guest-physical size
+  struct kvm_vcpu_init vcpu_target;  // KVM_ARM_PREFERRED_TARGET, for every vCPU
+  // The guest-physical allocator (see there). Guarded by G->lock.
+  uint64_t gpa_next, gpa_limit;
+  gk_gpa_extent gpa_free[GK_MAX_REGIONS];
+  int gpa_free_n;
+  int gpa_keep;                      // region_remove leaks the space rather than reusing it
+  size_t pthread_size;               // glibc's struct pthread (see stack_wall_bounds), 0 if unknown
+  // The vDSO and the kernel's data pages behind it (see the vDSO section).
+  uintptr_t vdso_lo, vdso_hi;
+  uintptr_t vdso_fn[64];             // the vDSO's function entry points
+  int vdso_n;
+  gk_prot_range holes[8];            // host ranges no memslot may cover ([vvar])
+  int hole_n;
+#endif
   int next_slot;                     // KVM memslot ids handed out, ever (see the region pool)
   int run_size;
+#if defined(__x86_64__)
   int sync_regs;                     // registers go through kvm_run, not ioctls (see regs_get)
   // Host CPUID, applied to every vCPU: a struct kvm_cpuid2 (a flexible-array
   // struct, hence the raw buffer) with room for GK_CPUID_ENTRIES entries.
   _Alignas(struct kvm_cpuid2) unsigned char cpuid_buf[sizeof(struct kvm_cpuid2) +
                                                       GK_CPUID_ENTRIES *
                                                           sizeof(struct kvm_cpuid_entry2)];
+#endif
   const char *err;
   unsigned long fault_addr;
   int dbg;
@@ -283,7 +422,9 @@ struct gk_ctl {
   long neighbor_pages;              // PTEs installed ahead of a fault (see demand_map_neighbors)
   atomic_long root_switches;        // guest entries that loaded another root (enter_guest)
   atomic_long tlb_flushes;          // full flushes run on a vCPU, on any path (see flush_run)
+#if defined(__x86_64__)
   void (*flush_stub)(void);         // the flush stub for this CPU (see flush_stub_select)
+#endif
   // Bumped whenever page-table pages are returned to the allocator (an arena
   // was destroyed). A vCPU whose root is unchanged since it last entered the
   // guest may still hold TLB and paging-structure-cache entries derived from
@@ -364,8 +505,12 @@ static gk_arena *arena_containing(uintptr_t a) {
   return NULL;
 }
 static void arena_thp_advise(uintptr_t s, uintptr_t e);  // see the arenas section
+#if defined(__aarch64__)
+static struct gk_region *region_find(uintptr_t addr);  // see the MMU layer
+#endif
 
 // Trampolines and exception handlers (gk_asm.S), in this binary's mapped text.
+#if defined(__x86_64__)
 extern void gk_syscall_tramp(void);
 extern void gk_syscall_tramp_resume(void);
 extern void gk_user_syscall_resume(void);
@@ -381,6 +526,11 @@ extern void gk_pkru_stub(void);
 extern void gk_flush_stub(void);
 extern void gk_flush_stub_invpcid(void);
 extern const unsigned char gk_invpcid_desc[16];
+#else
+extern void gk_user_exit_tramp(void);
+extern void gk_dispatch(void);
+extern const unsigned char gk_super_start[], gk_super_end[], gk_vectors[];
+#endif
 // Host-side helpers for guest thread creation (gk_asm.S); never run in the guest.
 extern long gk_host_clone_raw(long nr, long a1, long a2, long a3, long a4,
                               long a5);
@@ -393,6 +543,7 @@ extern long gk_host_call_on_stack(void *stack_top,
 // ---- helpers ---------------------------------------------------------------
 static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
                          long a6) {
+#if defined(__x86_64__)
   long ret;
   register long r10 __asm__("r10") = a4;
   register long r8 __asm__("r8") = a5;
@@ -403,6 +554,20 @@ static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
                          "r"(r9)
                        : "rcx", "r11", "memory");
   return ret;
+#else
+  register long x8 __asm__("x8") = nr;
+  register long x0 __asm__("x0") = a1;
+  register long x1 __asm__("x1") = a2;
+  register long x2 __asm__("x2") = a3;
+  register long x3 __asm__("x3") = a4;
+  register long x4 __asm__("x4") = a5;
+  register long x5 __asm__("x5") = a6;
+  __asm__ __volatile__("svc #0"
+                       : "+r"(x0)
+                       : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                       : "memory");
+  return x0;
+#endif
 }
 
 // Raw stderr output for the fault path and for fatal errors: a plain write(2),
@@ -483,7 +648,7 @@ static void free_table(uint64_t *p) {
 static void free_subtree(uint64_t *tbl, int level) {
   if (level > 1)
     for (int i = 0; i < 512; i++)
-      if (tbl[i] & PTE_P) free_subtree((uint64_t *)(uintptr_t)(tbl[i] & ~0xfffULL), level - 1);
+      if (tbl[i] & PTE_P) free_subtree(PTE_TABLE_PTR(tbl[i]), level - 1);
   free_table(tbl);
 }
 
@@ -491,12 +656,12 @@ static uint64_t *next_table(uint64_t *tbl, int idx) {
   if (!(tbl[idx] & PTE_P)) {
     uint64_t *n = alloc_table();
     if (!n) return NULL;
-    tbl[idx] = ((uint64_t)(uintptr_t)n) | PTE_P | PTE_W | PTE_U;
+    tbl[idx] = PTE_TABLE_ENTRY(n);
     // A new base-root top-level entry: every arena root re-syncs at its next
     // entry (see G->pml4_gen). Published after the entry is in place.
     if (tbl == G->pml4) __atomic_fetch_add(&G->pml4_gen, 1, __ATOMIC_RELEASE);
   }
-  return (uint64_t *)(uintptr_t)(tbl[idx] & ~0xfffULL);
+  return PTE_TABLE_PTR(tbl[idx]);
 }
 
 // ---- the supervisor/refuse registry ----------------------------------------
@@ -654,14 +819,36 @@ static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
   // GK_MAP_WALLED marks a page the host allows writes to whose W this vCPU's
   // host-frame wall withholds: it is mapped without W and tagged PTE_WALL so
   // wall_lower can give W back in place.
+#if defined(__x86_64__)
   uint64_t pte = (va & ~0xfffULL) | PTE_P;
   if (cls != GK_PROT_SUPER) pte |= PTE_U;  // user pages only; supervisor clears U
   if (flags & 2) pte |= PTE_W;
   if (flags & GK_MAP_WALLED) pte |= PTE_WALL;
   if (!(flags & 4)) pte |= PTE_NX;
   pte |= ((uint64_t)pkey << PTE_PKEY_SHIFT) & PTE_PKEY_MASK;
+#else
+  // The frame is the page's guest-physical address, through the memslot
+  // region backing it (every caller has ensured one). EL0 has no execute
+  // permission on a supervisor page whatever AP says, so UXN is set on every
+  // supervisor page; and the CPU itself denies EL1 execution of a page EL0 can
+  // write.
+  (void)pkey;
+  gk_region *rg = region_find(va);
+  if (!rg) return -1;
+  uint64_t pte = (rg->gpa + ((va & ~0xfffULL) - rg->start)) | PTE_P | PTE_TABLE | PTE_SH_INNER |
+                 PTE_AF | PTE_NG | PTE_RDONLY;
+  if (cls != GK_PROT_SUPER) pte |= PTE_U;  // user pages only; supervisor clears U
+  if (flags & 2) pte &= ~PTE_RDONLY;
+  if (flags & GK_MAP_WALLED) pte |= PTE_WALL;
+  if (!(flags & 4)) pte |= PTE_PXN | PTE_UXN;
+  else if (cls == GK_PROT_SUPER) pte |= PTE_UXN;
+#endif
   if (global) {
+#if defined(__x86_64__)
     pte |= PTE_G;
+#else
+    pte &= ~PTE_NG;
+#endif
     G->slot_pinned[slot] = 1;  // no arena may ever take this slot (see the global-pages section)
     G->global_pages++;
   }
@@ -698,33 +885,40 @@ static long pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
   for (uintptr_t v = s; v < e;) {
     uint64_t pml4e = root[(v >> 39) & 0x1ff];
     if (!(pml4e & PTE_P)) { v = GK_NEXT_BOUNDARY(v, 39); continue; }
-    uint64_t *pdpt = (uint64_t *)(uintptr_t)(pml4e & ~0xfffULL);
+    uint64_t *pdpt = PTE_TABLE_PTR(pml4e);
     uint64_t pdpte = pdpt[(v >> 30) & 0x1ff];
     if (!(pdpte & PTE_P)) { v = GK_NEXT_BOUNDARY(v, 30); continue; }
-    uint64_t *pd = (uint64_t *)(uintptr_t)(pdpte & ~0xfffULL);
+    uint64_t *pd = PTE_TABLE_PTR(pdpte);
     uint64_t pde = pd[(v >> 21) & 0x1ff];
     if (!(pde & PTE_P)) { v = GK_NEXT_BOUNDARY(v, 21); continue; }
-    uint64_t *pt = (uint64_t *)(uintptr_t)(pde & ~0xfffULL);
+    uint64_t *pt = PTE_TABLE_PTR(pde);
     uint64_t *pte = &pt[(v >> 12) & 0x1ff];
     switch (op) {
       case PTE_OP_UNMAP:
         *pte = 0;
         break;
       case PTE_OP_WALL_RAISE:
-        if ((*pte & (PTE_P | PTE_W)) == (PTE_P | PTE_W)) *pte = (*pte & ~PTE_W) | PTE_WALL;
+        if ((*pte & PTE_P) && PTE_IS_W(*pte)) *pte = PTE_CLR_W(*pte) | PTE_WALL;
         break;
       case PTE_OP_WALL_LOWER:
-        if ((*pte & (PTE_P | PTE_WALL)) == (PTE_P | PTE_WALL)) *pte = (*pte & ~PTE_WALL) | PTE_W;
-        else if ((*pte & (PTE_P | PTE_W)) == (PTE_P | PTE_W)) n++;
+        if ((*pte & (PTE_P | PTE_WALL)) == (PTE_P | PTE_WALL)) *pte = PTE_SET_W(*pte & ~PTE_WALL);
+        else if ((*pte & PTE_P) && PTE_IS_W(*pte)) n++;
         break;
       case PTE_OP_REPROTECT:
         // Only W, NX and the wall tag change; the frame, P, U (the
         // supervisor/refuse class), the protection key and the accessed/dirty
         // bits are the page's own and stay.
         if (*pte & PTE_P) {
+#if defined(__x86_64__)
           uint64_t n = *pte & ~(PTE_W | PTE_NX | PTE_WALL);
           if (!(rp->prot & 4)) n |= PTE_NX;
           if (rp->prot & 2) n |= (v >= rp->wall_lo && v < rp->wall_hi) ? PTE_WALL : PTE_W;
+#else
+          uint64_t n = (*pte & ~(PTE_PXN | PTE_UXN | PTE_WALL)) | PTE_RDONLY;
+          if (!(rp->prot & 4)) n |= PTE_PXN | PTE_UXN;
+          else if (!(n & PTE_U)) n |= PTE_UXN;  // a supervisor page (see map4k_root)
+          if (rp->prot & 2) n = (v >= rp->wall_lo && v < rp->wall_hi) ? n | PTE_WALL : PTE_SET_W(n);
+#endif
           *pte = n;
         }
         break;
@@ -739,15 +933,39 @@ static long pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
 static uint64_t pte_lookup(const uint64_t *root, uintptr_t va) {
   uint64_t pml4e = root[(va >> 39) & 0x1ff];
   if (!(pml4e & PTE_P)) return 0;
-  const uint64_t *pdpt = (const uint64_t *)(uintptr_t)(pml4e & ~0xfffULL);
+  const uint64_t *pdpt = PTE_TABLE_PTR(pml4e);
   uint64_t pdpte = pdpt[(va >> 30) & 0x1ff];
   if (!(pdpte & PTE_P)) return 0;
-  const uint64_t *pd = (const uint64_t *)(uintptr_t)(pdpte & ~0xfffULL);
+  const uint64_t *pd = PTE_TABLE_PTR(pdpte);
   uint64_t pde = pd[(va >> 21) & 0x1ff];
   if (!(pde & PTE_P)) return 0;
-  const uint64_t *pt = (const uint64_t *)(uintptr_t)(pde & ~0xfffULL);
+  const uint64_t *pt = PTE_TABLE_PTR(pde);
   return pt[(va >> 12) & 0x1ff];
 }
+
+#if defined(__aarch64__)
+// arm64 never lets EL1 execute a page EL0 can write (an implicit PXN), so ring
+// 0 cannot run code from a writable and executable user page, which is what
+// V8's code space is on arm64. On such a fault the page's W is withheld,
+// emulating W^X: a later write takes an ordinary permission fault, and
+// demand_map maps the page writable again from the host protection. Returns 1
+// if the PTE was changed, 0 if the fault has some other cause.
+static int pte_exec_at_el1(gk_thread *t, uintptr_t va) {
+  int changed = 0;
+  pthread_mutex_lock(&G->lock);
+  gk_arena *in = arena_containing(va);
+  uint64_t *root = in ? (in == t->active_arena ? in->pml4 : NULL) : G->pml4;
+  uint64_t e = root ? pte_lookup(root, va) : 0;
+  if ((e & PTE_P) && (e & PTE_U) && PTE_IS_W(e) && !(e & PTE_PXN)) {
+    uint64_t *pt = root;
+    for (int shift = 39; shift > 12; shift -= 9) pt = PTE_TABLE_PTR(pt[(va >> shift) & 0x1ff]);
+    pt[(va >> 12) & 0x1ff] = PTE_CLR_W(e);
+    changed = 1;
+  }
+  pthread_mutex_unlock(&G->lock);
+  return changed;
+}
+#endif
 
 // Apply `op` over [s, e) in every root that may hold PTEs for it: the base
 // root (whose subtrees every arena root shares for addresses outside arenas)
@@ -884,7 +1102,7 @@ static gk_region *treap_insert(gk_region *root, gk_region *node) {
 }
 
 // The region containing `addr`, or NULL. Caller holds G->lock.
-static gk_region *region_find(uintptr_t addr) {
+static struct gk_region *region_find(uintptr_t addr) {
   gk_region *n = G->regions;
   while (n) {
     if (addr < n->start) n = n->l;
@@ -927,6 +1145,71 @@ static gk_region *treap_remove(gk_region *root, gk_region *node) {
   return root;
 }
 
+#if defined(__aarch64__)
+// ---- the guest-physical allocator (arm64) -------------------------------------
+// On arm64 the guest-physical space is smaller than the host-virtual one: KVM
+// gives a VM at most KVM_CAP_ARM_VM_IPA_SIZE bits (40 on Apple silicon) while
+// the host's user mappings reach up to 2^48. Guest-virtual is still host-
+// virtual, so the guest runs the host's code and data at their own addresses,
+// but each region's memslot is placed at a guest-physical address of its own,
+// handed out here: a bump pointer with a sorted, coalescing free list of the
+// ranges deleted regions gave back, taken first fit. Ranges are GK_BACK_WIN
+// multiples at GK_BACK_WIN-aligned addresses, and a region's guest-physical
+// address is congruent to its host-virtual one modulo GK_BACK_WIN, so KVM can
+// still back an aligned 2MB with one stage-2 block (see arena_thp_advise).
+// Guarded by G->lock.
+static int gpa_alloc(uint64_t size, uint64_t *out) {
+  for (int i = 0; i < G->gpa_free_n; i++) {
+    gk_gpa_extent *x = &G->gpa_free[i];
+    if (x->size < size) continue;
+    *out = x->start;
+    x->start += size;
+    x->size -= size;
+    if (x->size == 0) {
+      memmove(x, x + 1, (size_t)(G->gpa_free_n - i - 1) * sizeof *x);
+      G->gpa_free_n--;
+    }
+    return 0;
+  }
+  if (G->gpa_next + size > G->gpa_limit) return -1;
+  *out = G->gpa_next;
+  G->gpa_next += size;
+  return 0;
+}
+
+// Return [start, start + size) to the allocator. A full free list leaks the
+// range rather than fail; it is bounded by the number of regions anyway.
+static void gpa_release(uint64_t start, uint64_t size) {
+  int i = 0;
+  while (i < G->gpa_free_n && G->gpa_free[i].start < start) i++;
+  gk_gpa_extent *prev = i > 0 ? &G->gpa_free[i - 1] : NULL;
+  gk_gpa_extent *next = i < G->gpa_free_n ? &G->gpa_free[i] : NULL;
+  if (prev && prev->start + prev->size == start) {
+    prev->size += size;
+    if (next && start + size == next->start) {
+      prev->size += next->size;
+      memmove(next, next + 1, (size_t)(G->gpa_free_n - i - 1) * sizeof *next);
+      G->gpa_free_n--;
+    }
+  } else if (next && start + size == next->start) {
+    next->start = start;
+    next->size += size;
+  } else if (G->gpa_free_n < GK_MAX_REGIONS) {
+    memmove(&G->gpa_free[i + 1], &G->gpa_free[i], (size_t)(G->gpa_free_n - i) * sizeof G->gpa_free[0]);
+    G->gpa_free[i] = (gk_gpa_extent){start, size};
+    G->gpa_free_n++;
+  } else {
+    return;
+  }
+  // The last free range ends at the bump pointer: give it back to the pointer.
+  gk_gpa_extent *last = &G->gpa_free[G->gpa_free_n - 1];
+  if (last->start + last->size == G->gpa_next) {
+    G->gpa_next = last->start;
+    G->gpa_free_n--;
+  }
+}
+#endif
+
 // Create one memslot-backed region for [s, e). Caller holds G->lock and has
 // ensured [s, e) does not overlap any existing region. A pool node freed by a
 // region deletion is reused first, with the KVM memslot id it was created
@@ -942,16 +1225,35 @@ static int region_add(uintptr_t s, uintptr_t e) {
     n = &G->region_pool[G->region_n];
     slot = G->next_slot;
   }
+  uint64_t gpa = s;
+#if defined(__aarch64__)
+  // A region cut short by a hole (see region_ensure) still gets whole windows
+  // of guest-physical space, at its own offset into them.
+  uintptr_t wlo = s & ~(GK_BACK_WIN - 1), whi = (e + GK_BACK_WIN - 1) & ~(GK_BACK_WIN - 1);
+  if (gpa_alloc(whi - wlo, &gpa) < 0) {
+    if (G->dbg) write_stderr("[gk] guest-physical space exhausted\n");
+    return -1;
+  }
+  gpa += s - wlo;
+#endif
   struct kvm_userspace_memory_region r = {.slot = (uint32_t)slot,
-                                          .guest_phys_addr = s,
+                                          .guest_phys_addr = gpa,
                                           .memory_size = e - s,
                                           .userspace_addr = s};
   if (ioctl(G->vmfd, KVM_SET_USER_MEMORY_REGION, &r) < 0) {
+#if defined(__aarch64__)
+    gpa_release(gpa - (s - wlo), whi - wlo);
+#endif
     if (G->dbg) {  // fault path: raw output only (no strerror, it may allocate)
       gk_dbuf d = {.n = 0};
       db_str(&d, "[gk] memslot "); db_dec(&d, slot);
       db_str(&d, " ["); db_hex(&d, s); db_str(&d, ","); db_hex(&d, e);
+#if defined(__aarch64__)
+      db_str(&d, ") at guest-physical "); db_hex(&d, gpa);
+      db_str(&d, " failed: errno "); db_dec(&d, errno);
+#else
       db_str(&d, ") failed: errno "); db_dec(&d, errno);
+#endif
       db_flush(&d);
     }
     return -1;  // the node stays where it was (free list or untouched pool tail)
@@ -966,6 +1268,9 @@ static int region_add(uintptr_t s, uintptr_t e) {
   n->start = s;
   n->end = e;
   n->slot = slot;
+#if defined(__aarch64__)
+  n->gpa = gpa;
+#endif
   n->prio = gk_rand();
   G->regions = treap_insert(G->regions, n);
   G->region_live++;
@@ -977,8 +1282,12 @@ static int region_add(uintptr_t s, uintptr_t e) {
 // a page in the region any more, so the guest cannot reach it. Returns the
 // ioctl's result: on failure the region stays.
 static int region_remove(gk_region *n) {
+  uint64_t gpa = n->start;
+#if defined(__aarch64__)
+  gpa = n->gpa;
+#endif
   struct kvm_userspace_memory_region r = {.slot = (uint32_t)n->slot,
-                                          .guest_phys_addr = n->start,
+                                          .guest_phys_addr = gpa,
                                           .memory_size = 0,
                                           .userspace_addr = n->start};
   if (ioctl(G->vmfd, KVM_SET_USER_MEMORY_REGION, &r) < 0) {
@@ -989,6 +1298,15 @@ static int region_remove(gk_region *n) {
   }
   G->regions = treap_remove(G->regions, n);
   G->region_live--;
+#if defined(__aarch64__)
+  // A vCPU still running under a destroyed arena's root (see gk_arena_destroy)
+  // may hold translations to this range: it is not handed out again then.
+  if (!G->gpa_keep) {
+    uintptr_t wlo = n->start & ~(GK_BACK_WIN - 1);
+    uintptr_t whi = (n->end + GK_BACK_WIN - 1) & ~(GK_BACK_WIN - 1);
+    gpa_release(n->gpa - (n->start - wlo), whi - wlo);
+  }
+#endif
   n->l = G->region_free;
   G->region_free = n;
   return 0;
@@ -1036,6 +1354,17 @@ static int region_ensure(uintptr_t s, uintptr_t e) {
     uintptr_t gap_end = e;
     gk_region *nx = region_succ(s);  // stop the new region before the next one
     if (nx && nx->start < gap_end) gap_end = nx->start;
+#if defined(__aarch64__)
+    // Nor may it cover a hole (see the vDSO section): KVM refuses a memslot
+    // over the kernel's data pages, so the window is cut around them.
+    int in_hole = 0;
+    for (int i = 0; i < G->hole_n; i++) {
+      const gk_prot_range *h = &G->holes[i];
+      if (s >= h->start && s < h->end) { s = h->end; in_hole = 1; break; }
+      if (h->start > s && h->start < gap_end) gap_end = h->start;
+    }
+    if (in_hole) continue;
+#endif
     if (region_add(s, gap_end) < 0) return -1;
     s = gap_end;
   }
@@ -1201,8 +1530,13 @@ static int parse_maps_line(const char *l, const char *end, uintptr_t *s,
 // stdio would call malloc, and the faulting guest thread may be inside malloc
 // holding its arena lock, which the same host thread could then never take.
 static int host_region(uintptr_t page, uintptr_t *rs, uintptr_t *re, int *perms) {
+#if defined(__x86_64__)
   long fd = host_syscall(SYS_open, (long)"/proc/self/maps", O_RDONLY | O_CLOEXEC,
                          0, 0, 0, 0);
+#else
+  long fd = host_syscall(SYS_openat, AT_FDCWD, (long)"/proc/self/maps", O_RDONLY | O_CLOEXEC,
+                         0, 0, 0);
+#endif
   if (fd < 0) return 0;
   char buf[8192];
   size_t have = 0;
@@ -1257,6 +1591,83 @@ static int mmu_map_range(uintptr_t s, uintptr_t e, int perms) {
   }
   return 0;
 }
+
+#if defined(__aarch64__)
+// ---- the vDSO (arm64) --------------------------------------------------------
+// The vDSO's functions (clock_gettime and friends) read the kernel's data
+// pages, [vvar], which are a PFNMAP mapping, and arm64 KVM refuses a memslot
+// over one: those pages cannot be the guest's. So the vDSO does not run in the
+// guest. Its text is refused, like gk's own memory, and a call into it, which
+// faults on the fetch of the function's first instruction, is carried out by
+// the host instead: the very function at that address, with the guest's
+// argument registers, its result returned to the guest's link register as the
+// function itself would (see vdso_call). Only the vDSO's exported entry
+// points are called, never its signal return trampoline, which only the
+// kernel's signal delivery uses (and no signal is delivered inside the guest).
+// The pointers the guest passes are its own memory, as for a forwarded
+// syscall. [vvar] is refused and a hole for the region windows (see
+// region_ensure).
+static void vdso_setup(void) {
+  FILE *f = fopen("/proc/self/maps", "re");
+  if (f) {
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+      unsigned long s, e;
+      char name[64] = "";
+      if (sscanf(line, "%lx-%lx %*s %*s %*s %*s %63s", &s, &e, name) < 3) continue;
+      if (strncmp(name, "[vvar", 5) == 0 && G->hole_n < (int)(sizeof G->holes / sizeof G->holes[0])) {
+        G->holes[G->hole_n++] = (gk_prot_range){s, e, GK_PROT_REFUSE};
+        prot_add(s, e, GK_PROT_REFUSE);
+      } else if (strcmp(name, "[vdso]") == 0) {
+        G->vdso_lo = s;
+        G->vdso_hi = e;
+        prot_add(s, e, GK_PROT_REFUSE);
+      }
+    }
+    fclose(f);
+  }
+  uintptr_t base = (uintptr_t)getauxval(AT_SYSINFO_EHDR);
+  if (!base) return;
+  const Elf64_Ehdr *eh = (const void *)base;
+  const Elf64_Phdr *ph = (const void *)(base + eh->e_phoff);
+  uintptr_t bias = base;
+  for (int i = 0; i < eh->e_phnum; i++)
+    if (ph[i].p_type == PT_LOAD && ph[i].p_offset == 0) bias = base - ph[i].p_vaddr;
+  const Elf64_Shdr *sh = (const void *)(base + eh->e_shoff);
+  for (int i = 0; i < eh->e_shnum; i++) {
+    if (sh[i].sh_type != SHT_DYNSYM) continue;
+    const Elf64_Sym *sym = (const void *)(base + sh[i].sh_offset);
+    const char *str = (const char *)(base + sh[sh[i].sh_link].sh_offset);
+    size_t n = sh[i].sh_size / sizeof *sym;
+    for (size_t k = 0; k < n; k++) {
+      if (ELF64_ST_TYPE(sym[k].st_info) != STT_FUNC || sym[k].st_shndx == SHN_UNDEF) continue;
+      if (strstr(str + sym[k].st_name, "sigreturn")) continue;
+      if (G->vdso_n < (int)(sizeof G->vdso_fn / sizeof G->vdso_fn[0]))
+        G->vdso_fn[G->vdso_n++] = bias + sym[k].st_value;
+    }
+  }
+  if (G->dbg)
+    fprintf(stderr, "[gk] vDSO [%#lx,%#lx), %d functions, run on the host; %d data range(s) "
+            "kept out of memslots\n", (unsigned long)G->vdso_lo, (unsigned long)G->vdso_hi,
+            G->vdso_n, G->hole_n);
+}
+
+// A guest instruction fetch fault at `pc`: if it is the entry of a vDSO
+// function, call that function on the host with the frame's arguments and
+// return the guest to its caller (1). 0 otherwise.
+static int vdso_call(gk_frame *f, uint64_t pc) {
+  if (pc < G->vdso_lo || pc >= G->vdso_hi) return 0;
+  for (int i = 0; i < G->vdso_n; i++) {
+    if (G->vdso_fn[i] != pc) continue;
+    long (*fn)(long, long, long, long, long, long) = (void *)(uintptr_t)pc;
+    f->x[0] = (uint64_t)fn((long)f->x[0], (long)f->x[1], (long)f->x[2], (long)f->x[3],
+                           (long)f->x[4], (long)f->x[5]);
+    f->elr = f->x[30];
+    return 1;
+  }
+  return 0;
+}
+#endif
 
 // Allocation guard for the fault path (off by default). The fault handler must
 // not call malloc (see the region-pool note): the faulting guest thread may be
@@ -1478,6 +1889,7 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
   return r;
 }
 
+#if defined(__x86_64__)
 // Every gate runs its handler on IST1, the vCPU's exception stack (see
 // vcpu_init), never on the interrupted code's stack.
 static void set_idt_gate(uint8_t *idt, int vec, uint64_t h) {
@@ -1489,6 +1901,7 @@ static void set_idt_gate(uint8_t *idt, int vec, uint64_t h) {
   *(uint16_t *)(e + 6) = (h >> 16) & 0xffff;
   *(uint32_t *)(e + 8) = (h >> 32);
 }
+#endif
 
 // ---- thread records ----------------------------------------------------------
 static long gettid_raw(void) { return host_syscall(SYS_gettid, 0, 0, 0, 0, 0, 0); }
@@ -1610,6 +2023,7 @@ static void thread_key_dtor(void *p) {
 // it passes nothing.
 #define GK_VCPU_STACK 2
 
+#if defined(__x86_64__)
 // Load the flat ring-0 code and data descriptors (GDT indices 1 and 2) into
 // s's CS and SS/DS/ES: the privilege every guest entry starts at, and the one
 // the stubs and handlers need.
@@ -1846,6 +2260,185 @@ static void flush_stub_select(void) {
     fprintf(stderr, "[gk] TLB flush stub: %s\n",
             G->flush_stub == gk_flush_stub_invpcid ? "invpcid" : "cr4.pge toggle");
 }
+#else  // __aarch64__
+// One register of a vCPU, by KVM_{GET,SET}_ONE_REG id: GK_CORE_REG names a
+// field of struct kvm_regs, ARM64_SYS_REG a system register.
+#define GK_CORE_REG(x) (KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | KVM_REG_ARM_CORE_REG(x))
+#define GK_CORE_REG32(x) (KVM_REG_ARM64 | KVM_REG_SIZE_U32 | KVM_REG_ARM_CORE | KVM_REG_ARM_CORE_REG(x))
+#define GK_SCTLR_EL1 ARM64_SYS_REG(3, 0, 1, 0, 0)
+#define GK_CPACR_EL1 ARM64_SYS_REG(3, 0, 1, 0, 2)
+#define GK_TTBR0_EL1 ARM64_SYS_REG(3, 0, 2, 0, 0)
+#define GK_TCR_EL1 ARM64_SYS_REG(3, 0, 2, 0, 2)
+#define GK_MAIR_EL1 ARM64_SYS_REG(3, 0, 10, 2, 0)
+#define GK_VBAR_EL1 ARM64_SYS_REG(3, 0, 12, 0, 0)
+#define GK_CNTKCTL_EL1 ARM64_SYS_REG(3, 0, 14, 1, 0)
+#define GK_TPIDR_EL0 ARM64_SYS_REG(3, 3, 13, 0, 2)
+#define GK_TPIDRRO_EL0 ARM64_SYS_REG(3, 3, 13, 0, 3)
+// SCTLR_EL1: MMU, caches, stack alignment checks, the RES1 bits of the base
+// architecture, and EL0 access to what Linux gives user code: DC ZVA (DZE),
+// CTR_EL0 (UCT), cache maintenance for JIT code (UCI), WFI/WFE untrapped. No
+// pointer authentication or BTI: their hint-space instructions in the host's
+// code run as NOPs in the guest.
+#define GK_SCTLR ((1UL << 0) | (1UL << 2) | (1UL << 3) | (1UL << 4) | (1UL << 11) | (1UL << 12) | \
+                  (1UL << 14) | (1UL << 15) | (1UL << 16) | (1UL << 18) | (1UL << 20) |           \
+                  (1UL << 22) | (1UL << 23) | (1UL << 26) | (1UL << 28) | (1UL << 29))
+// TCR_EL1: TTBR0 walks 48-bit VAs with 4KiB pages through write-back inner-
+// shareable tables, TTBR1 walks are off, ASIDs come from TTBR0 (all 0), the
+// top byte is ignored for TTBR0 addresses as Linux does for user code, and
+// IPS is the VM's guest-physical size (G->ips).
+#define GK_TCR(ips) (16UL | (1UL << 8) | (1UL << 10) | (3UL << 12) | (16UL << 16) | (1UL << 23) | \
+                     (2UL << 30) | ((uint64_t)(ips) << 32) | (1UL << 37))
+
+static int vcpu_set(int fd, uint64_t id, uint64_t v) {
+  struct kvm_one_reg r = {.id = id, .addr = (uint64_t)(uintptr_t)&v};
+  return ioctl(fd, KVM_SET_ONE_REG, &r);
+}
+
+static int vcpu_get(int fd, uint64_t id, uint64_t *v) {
+  *v = 0;
+  struct kvm_one_reg r = {.id = id, .addr = (uint64_t)(uintptr_t)v};
+  return ioctl(fd, KVM_GET_ONE_REG, &r);
+}
+
+static uint64_t host_tpidr(int ro) {
+  uint64_t v;
+  if (ro) __asm__ __volatile__("mrs %0, tpidrro_el0" : "=r"(v));
+  else __asm__ __volatile__("mrs %0, tpidr_el0" : "=r"(v));
+  return v;
+}
+
+// Put the vCPU at the dispatcher (gk_dispatch), at EL1 on SP_EL1 = its vcb,
+// as a fresh vCPU starts and as every exception the guest takes leaves it. For
+// a vCPU stopped anywhere else: one that faulted inside a handler, or whose
+// KVM_RUN failed (see host_backing_fail).
+static int vcpu_reset_pc(gk_thread *t) {
+  if (vcpu_set(t->fd, GK_CORE_REG(regs.pc), (uintptr_t)&gk_dispatch) < 0 ||
+      vcpu_set(t->fd, GK_CORE_REG(regs.pstate), PSR_EL1H) < 0)
+    return -1;
+  return 0;
+}
+
+// The arm64 vcpu_init, in the shape of the x86-64 one above: the pool, the
+// guest stack and the per-thread state are the same. A new vCPU gets its vcb,
+// the region SP_EL1 points at, and its static system registers; every thread
+// gets the base root, its TLS registers, and the dispatcher.
+static int vcpu_init(gk_thread *t, int flags) {
+  if (t->inited) return 0;
+  int id, fd, reused = 0;
+  struct kvm_run *run = NULL;
+  uint64_t stack_top = 0, ist = 0;
+  void *side_stack = NULL;
+  pthread_mutex_lock(&G->lock);
+  if (G->parked_n > 0) {
+    gk_parked_vcpu *p = &G->parked[--G->parked_n];
+    fd = p->fd; id = p->id; run = p->run; stack_top = p->stack_top; ist = p->ist;
+    side_stack = p->side_stack;
+    reused = 1;
+  }
+  pthread_mutex_unlock(&G->lock);
+  if (!reused) {
+    id = atomic_fetch_add(&G->vcpus_created, 1);
+    fd = ioctl(G->vmfd, KVM_CREATE_VCPU, id);
+    if (fd < 0) { G->err = "KVM_CREATE_VCPU"; return -1; }
+    struct kvm_vcpu_init init = G->vcpu_target;
+    if (ioctl(fd, KVM_ARM_VCPU_INIT, &init) < 0) { G->err = "KVM_ARM_VCPU_INIT"; return -1; }
+    run = mmap(NULL, G->run_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (run == MAP_FAILED) { G->err = "mmap kvm_run"; return -1; }
+    // The vcb, eager-mapped supervisor: the vector handlers store into it
+    // before anything else, so it must never fault. kvm_run is refused.
+    uint8_t *ir = mmap(NULL, GK_IST_BYTES, PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (ir == MAP_FAILED) { G->err = "mmap vcb"; return -1; }
+    pthread_mutex_lock(&G->lock);
+    prot_add((uintptr_t)run, (uintptr_t)run + G->run_size, GK_PROT_REFUSE);
+    prot_add((uintptr_t)ir, (uintptr_t)ir + GK_IST_BYTES, GK_PROT_SUPER);
+    int irc = mmu_map_range((uintptr_t)ir, (uintptr_t)ir + GK_IST_BYTES, 1 | 2);
+    pthread_mutex_unlock(&G->lock);
+    if (irc < 0) { G->err = "map vcb"; return -1; }
+    ist = (uint64_t)(uintptr_t)ir;
+    if (vcpu_set(fd, GK_SCTLR_EL1, GK_SCTLR) < 0 || vcpu_set(fd, GK_TCR_EL1, GK_TCR(G->ips)) < 0 ||
+        vcpu_set(fd, GK_MAIR_EL1, 0xff) < 0 ||          // attribute 0: normal write-back
+        vcpu_set(fd, GK_CPACR_EL1, 3UL << 20) < 0 ||    // FP/SIMD at EL0 and EL1
+        vcpu_set(fd, GK_VBAR_EL1, G->vbar) < 0 ||
+        vcpu_set(fd, GK_CNTKCTL_EL1, 3) < 0 ||          // EL0 reads the counters (the vDSO)
+        vcpu_set(fd, GK_CORE_REG(sp_el1), ist) < 0) {
+      G->err = "KVM_SET_ONE_REG (system registers)";
+      return -1;
+    }
+  }
+
+  // A private guest stack for this vCPU (see the x86-64 vcpu_init).
+  const size_t stksz = 2 * 1024 * 1024;
+  if ((flags & GK_VCPU_STACK) && stack_top == 0) {
+    uint8_t *stk = mmap(NULL, stksz, PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (stk == MAP_FAILED) { G->err = "mmap guest stack"; return -1; }
+    pthread_mutex_lock(&G->lock);
+    int mrc = mmu_map_range((uintptr_t)stk, (uintptr_t)stk + stksz, 1 | 2);  // rw, NX
+    pthread_mutex_unlock(&G->lock);
+    if (mrc < 0) { G->err = "map guest stack"; return -1; }
+    stack_top = (uintptr_t)stk + stksz;
+  }
+
+  // The calling thread's state. A reused vCPU's TLB is flushed at its first
+  // entry (root_gen below), like a fresh one's; the vcb asks for that flush
+  // too, in case a previous thread left one pending.
+  struct gk_vcb *v = (struct gk_vcb *)(uintptr_t)ist;
+  memset(v, 0, sizeof *v);
+  v->action = GK_ACT_FLUSH;
+  v->cur_ttbr = PT_GPA(G->pml4);
+  if (vcpu_set(fd, GK_TTBR0_EL1, PT_GPA(G->pml4)) < 0 ||
+      vcpu_set(fd, GK_TPIDR_EL0, host_tpidr(0)) < 0 ||
+      vcpu_set(fd, GK_TPIDRRO_EL0, host_tpidr(1)) < 0 ||
+      vcpu_set(fd, GK_CORE_REG(regs.pc), (uintptr_t)&gk_dispatch) < 0 ||
+      vcpu_set(fd, GK_CORE_REG(regs.pstate), PSR_EL1H) < 0) {
+    G->err = "KVM_SET_ONE_REG (thread state)";
+    return -1;
+  }
+  if (reused &&
+      (vcpu_set(fd, GK_CORE_REG32(fp_regs.fpcr), 0) < 0 || vcpu_set(fd, GK_CORE_REG32(fp_regs.fpsr), 0) < 0)) {
+    G->err = "KVM_SET_ONE_REG (FP control)";
+    return -1;
+  }
+
+  t->id = id;
+  t->fd = fd;
+  t->run = run;
+  t->stack_top = stack_top;
+  t->ist = ist;
+  t->side_stack = side_stack;
+  t->root_gen = 0;    // a fresh or reused vCPU flushes its TLB at first entry
+  t->last_fault = 0;
+  t->fault_repeat = 0;
+  t->backing_retries = 0;
+  t->pkru_ready = 0;
+  t->user_mode = 0;   // ring 0 until enter_guest or child_entry selects ring 3
+  t->tlb_touched = 1; // no known TLB state and no previous wall: the first
+  t->prev_ro_lo = t->prev_ro_hi = 0;  // wall_raise on this vCPU flushes
+  if (!t->active_pml4) t->active_pml4 = G->pml4;
+  t->inited = 1;
+  if (G->dbg)
+    fprintf(stderr, "[gk] vcpu %d %s by tid %ld\n", id, reused ? "reused" : "created",
+            host_syscall(SYS_gettid, 0, 0, 0, 0, 0, 0));
+  return 0;
+}
+
+// Eager-map the supervisor text (gk_asm.S): the vector table, the handlers
+// and the dispatcher, which must be present before the first exception. They
+// sit in a page-aligned section of their own, so no other code shares their
+// pages, and the ring-3 exit trampoline is outside it (checked here as on
+// x86-64).
+static int map_handler_text(void) {
+  uintptr_t lo = (uintptr_t)gk_super_start, hi = (uintptr_t)gk_super_end;
+  if (((lo | hi) & 0xfff) || hi <= lo) gk_fatal("gk_asm.S supervisor text is not page-aligned");
+  uintptr_t tramp = (uintptr_t)&gk_user_exit_tramp & ~0xfffUL;
+  if (tramp < hi && tramp + 0x1000 > lo)
+    gk_fatal("gk_user_exit_tramp shares a page with the supervisor handler text");
+  G->vbar = (uintptr_t)gk_vectors;
+  prot_add(lo, hi, GK_PROT_SUPER);
+  return mmu_map_range(lo, hi, 1 | 4);  // r-x
+}
+#endif
 
 int gk_init(void) {
   // The control block first: it is registered before anything is mapped, so
@@ -1859,15 +2452,61 @@ int gk_init(void) {
   prot_add(GK_CTL_START, GK_CTL_END, GK_PROT_SUPER);
   G->dbg = getenv("GK_DEBUG") != NULL;
   G->thp = getenv("GK_NO_THP") == NULL;
+#if defined(__x86_64__)
   *(void **)&G->tls_static_info = dlsym(RTLD_DEFAULT, "_dl_get_tls_static_info");
   if (!G->tls_static_info)
     fprintf(stderr, "[gk] _dl_get_tls_static_info not found: gk_run_here_user builds no "
                     "host-frame wall on pthread stacks\n");
+#else
+  // glibc publishes sizeof(struct pthread) for libthread_db (GLIBC_PRIVATE).
+  const uint32_t *psz = dlsym(RTLD_DEFAULT, "_thread_db_sizeof_pthread");
+  G->pthread_size = psz ? *psz : 0;
+  if (!G->pthread_size)
+    fprintf(stderr, "[gk] _thread_db_sizeof_pthread not found: gk_run_here_user builds no "
+                    "host-frame wall on pthread stacks\n");
+#endif
+  // Guest pages are 4KiB and identity-sized with the host's (an arm64 kernel
+  // may use 16KiB or 64KiB pages).
+  if (sysconf(_SC_PAGESIZE) != 4096) { G->err = "host page size is not 4KiB"; return -1; }
   G->kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
   if (G->kvm < 0) { G->err = "open /dev/kvm"; return -1; }
   if (ioctl(G->kvm, KVM_GET_API_VERSION, 0) != 12) { G->err = "KVM API != 12"; return -1; }
+#if defined(__x86_64__)
   G->vmfd = ioctl(G->kvm, KVM_CREATE_VM, 0);
   if (G->vmfd < 0) { G->err = "KVM_CREATE_VM"; return -1; }
+#else
+  // The largest guest-physical space KVM offers (see the guest-physical
+  // allocator), and TCR_EL1.IPS to match.
+  int ipa = ioctl(G->kvm, KVM_CHECK_EXTENSION, KVM_CAP_ARM_VM_IPA_SIZE);
+  if (ipa <= 0) ipa = 40;
+  if (ipa > 48) ipa = 48;
+  static const int ips_bits[] = {32, 36, 40, 42, 44, 48};
+  for (G->ips = 0; G->ips < 5 && ips_bits[G->ips + 1] <= ipa; G->ips++) {}
+  ipa = ips_bits[G->ips];
+  G->vmfd = ioctl(G->kvm, KVM_CREATE_VM, KVM_VM_TYPE_ARM_IPA_SIZE(ipa));
+  if (G->vmfd < 0) { G->err = "KVM_CREATE_VM"; return -1; }
+  G->gpa_next = GK_BACK_WIN;  // guest-physical 0 stays unused
+  G->gpa_limit = 1ULL << ipa;
+  // The vector handlers' HVCs come to the host as KVM_EXIT_HYPERCALL; without
+  // the filter KVM would take them as (failed) PSCI calls itself.
+  struct kvm_smccc_filter filter = {.base = GK_HC_BASE, .nr_functions = GK_HC_COUNT,
+                                    .action = KVM_SMCCC_FILTER_FWD_TO_USER};
+  struct kvm_device_attr fa = {.group = KVM_ARM_VM_SMCCC_CTRL, .attr = KVM_ARM_VM_SMCCC_FILTER,
+                               .addr = (uint64_t)(uintptr_t)&filter};
+  if (ioctl(G->vmfd, KVM_SET_DEVICE_ATTR, &fa) < 0) { G->err = "KVM_ARM_VM_SMCCC_FILTER"; return -1; }
+  // The guest runs the host's vDSO, which reads the virtual counter: with a
+  // zero offset it reads the host's, as the zero TSC offset does on x86-64.
+  // Best effort: older kernels lack the ioctl, and the guest's clock is then
+  // off by the VM's start time.
+  struct kvm_arm_counter_offset co = {.counter_offset = 0};
+  if (ioctl(G->vmfd, KVM_ARM_SET_COUNTER_OFFSET, &co) < 0)
+    fprintf(stderr, "[gk] KVM_ARM_SET_COUNTER_OFFSET failed (%s): guest clocks are off\n",
+            strerror(errno));
+  if (ioctl(G->vmfd, KVM_ARM_PREFERRED_TARGET, &G->vcpu_target) < 0) {
+    G->err = "KVM_ARM_PREFERRED_TARGET";
+    return -1;
+  }
+#endif
 
   G->pt_bytes = 64 * 1024 * 1024;
   uint8_t *pt = mmap(NULL, G->pt_bytes, PROT_READ | PROT_WRITE,
@@ -1878,8 +2517,19 @@ int gk_init(void) {
   // (it has memslots), never through guest-virtual PTEs. Refuse it so ring-3
   // code cannot fault it in and rewrite the tables that enforce the arenas.
   prot_add(G->pt_base, G->pt_base + G->pt_bytes, GK_PROT_REFUSE);
+#if defined(__aarch64__)
+  vdso_setup();  // before the first region: its windows must avoid [vvar]
+  // Table entries hold guest-physical addresses (PTE_TABLE_ENTRY), so the
+  // page-table arena's must be known before the first table is linked in: it
+  // is one region, and one guest-physical range.
+  if (region_ensure(G->pt_base, G->pt_base + G->pt_bytes) < 0) { G->err = "memslot for PT arena"; return -1; }
+  gk_region *ptr = region_find(G->pt_base);
+  if (!ptr || ptr->end < G->pt_base + G->pt_bytes) { G->err = "PT arena memslot split"; return -1; }
+  G->pt_gpa = ptr->gpa + (G->pt_base - ptr->start);
+#endif
   G->pml4 = alloc_table();
 
+#if defined(__x86_64__)
   uint8_t *tables = mmap(NULL, 0x2000, PROT_READ | PROT_WRITE,
                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
   if (tables == MAP_FAILED) { G->err = "mmap gdt/idt"; return -1; }
@@ -1931,6 +2581,10 @@ int gk_init(void) {
     G->sync_regs = caps > 0 && (caps & GK_SYNC_REGS) == GK_SYNC_REGS;
   }
   if (G->dbg) fprintf(stderr, "[gk] registers via %s\n", G->sync_regs ? "kvm_run" : "ioctl");
+#else
+  if (map_handler_text() < 0) { G->err = "map handler text"; return -1; }
+  G->run_size = ioctl(G->kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
+#endif
   if (pthread_key_create(&G->thread_key, thread_key_dtor) != 0) { G->err = "pthread_key_create"; return -1; }
 
   // Bring up the calling thread's record and vCPU.
@@ -1949,7 +2603,11 @@ void gk_set_syscall_filter(gk_syscall_filter f) { G->filter = f; }
 // page (the page-table arena), so a test can verify that ring-3 code faults on
 // gk's own control memory while its own user pages work.
 void gk_debug_control_addrs(unsigned long *super, unsigned long *refuse) {
+#if defined(__x86_64__)
   if (super) *super = (unsigned long)G->gdt_va;
+#else
+  if (super) *super = (unsigned long)G->vbar;  // the vector table
+#endif
   if (refuse) *refuse = (unsigned long)G->pt_base;
 }
 
@@ -1980,6 +2638,7 @@ unsigned long gk_debug_ctl_addr(int which) {
 #define GK_EINVAL 22
 
 // ---- vCPU registers ---------------------------------------------------------
+#if defined(__x86_64__)
 // With KVM_CAP_SYNC_REGS (G->sync_regs) a vCPU's general and special registers
 // are exchanged through its mmap'd kvm_run instead of by ioctl: KVM stores both
 // sets into run->s.regs at every KVM_RUN return, including a failed one
@@ -2075,6 +2734,24 @@ static int flush_run(gk_thread *t) {
 static void flush_tlb(gk_thread *t, struct kvm_regs *r) {
   if (flush_run(t) == 0) r->rip = (uintptr_t)&gk_syscall_tramp_resume;
 }
+#else  // __aarch64__
+// On arm64 a vCPU's state lives in its vcb (see gk_asm.S): the registers of a
+// stopped vCPU are those its handler saved there, and it resumes through the
+// dispatcher, so no register is exchanged by ioctl on the common paths. A
+// flush is an action the dispatcher carries out before the vCPU next runs
+// guest code, which every caller follows with: it covers global entries too
+// (TLBI VMALLE1), as the x86-64 stubs do.
+static int flush_run(gk_thread *t) {
+  atomic_fetch_add_explicit(&G->tlb_flushes, 1, memory_order_relaxed);
+  VCB(t)->action |= GK_ACT_FLUSH;
+  return 0;
+}
+
+static void flush_tlb(gk_thread *t, gk_regs *r) {
+  (void)r;
+  flush_run(t);
+}
+#endif
 
 // ---- guest thread creation -------------------------------------------------
 // glibc's pthread_create issues clone3 (or clone) with CLONE_VM|CLONE_THREAD|
@@ -2159,12 +2836,17 @@ static long child_entry(void *arg) {
   // before the first fault or that push double-faults.
   uintptr_t rs, re; int perms;
   pthread_mutex_lock(&G->lock);
-  int ok = host_region(t->start.regs.rsp - 1, &rs, &re, &perms) && (perms & 2) &&
+#if defined(__x86_64__)
+#define GK_START_SP(t) ((t)->start.regs.rsp)
+#else
+#define GK_START_SP(t) ((t)->start.regs.sp)
+#endif
+  int ok = host_region(GK_START_SP(t) - 1, &rs, &re, &perms) && (perms & 2) &&
            mmu_map_range(rs, re, perms) == 0;
   pthread_mutex_unlock(&G->lock);
   if (!ok) {
     fprintf(stderr, "[gk] guest thread: cannot map child stack at %#llx\n",
-            (unsigned long long)t->start.regs.rsp);
+            (unsigned long long)GK_START_SP(t));
     host_syscall(SYS_exit_group, 70, 0, 0, 0, 0, 0);
   }
   // The child's vCPU comes up on the base root; a parent in an arena needs
@@ -2178,6 +2860,7 @@ static long child_entry(void *arg) {
   if (guest_pkru_update(t, 0, t->start.pkru, NULL) < 0)
     host_syscall(SYS_exit_group, 70, 0, 0, 0, 0, 0);
   t->pkru_ready = 1;
+#if defined(__x86_64__)
   struct kvm_regs regs = t->start.regs;
   if (t->start.user) {
     // Enter ring 3 through the SYSRET stub. The snapshot's RCX and R11 already
@@ -2191,6 +2874,17 @@ static long child_entry(void *arg) {
     fprintf(stderr, "[gk] vcpu %d: guest thread tid %ld (from vcpu %d) rip=%#llx rsp=%#llx pkru=%#x ring %d\n",
             t->id, t->tid, t->start.parent_id, (unsigned long long)t->start.regs.rip,
             (unsigned long long)t->start.regs.rsp, t->start.pkru, t->start.user ? 3 : 0);
+#else
+  // The dispatcher resumes the parent's frame as the child's: after the SVC,
+  // at the parent's exception level (the frame's SPSR), so a ring-3 creator's
+  // child starts at ring 3 with no stub of its own.
+  VCB(t)->f = t->start.regs;
+  VCB(t)->action &= ~GK_ACT_LAUNCH;
+  if (G->dbg)
+    fprintf(stderr, "[gk] vcpu %d: guest thread tid %ld (from vcpu %d) pc=%#llx sp=%#llx ring %d\n",
+            t->id, t->tid, t->start.parent_id, (unsigned long long)t->start.regs.elr,
+            (unsigned long long)t->start.regs.sp, t->start.user ? 3 : 0);
+#endif
   long r = run_vcpu(t);
   // A guest thread only leaves through exit/exit_group, handled in
   // forward_syscall; reaching here means it faulted or the VM shut down. The
@@ -2208,10 +2902,11 @@ static long child_entry(void *arg) {
 // parent's record and `r` its register snapshot at the syscall trampoline (rip
 // at the outb, rcx = the guest's return address). Returns what the guest sees
 // as the clone result.
-static long clone_thread(gk_thread *t, struct kvm_regs *r, long nr) {
+static long clone_thread(gk_thread *t, gk_regs *r, long nr) {
   struct gk_clone_args ca;
   uint64_t child_sp;
   size_t ca_size = 0;
+#if defined(__x86_64__)
   if (nr == GK_SYS_clone3) {
     ca_size = r->rsi;
     // Need at least the fields through `tls` (CLONE_ARGS_SIZE_VER0).
@@ -2222,12 +2917,25 @@ static long clone_thread(gk_thread *t, struct kvm_regs *r, long nr) {
   } else {
     child_sp = r->rsi;
   }
+#else
+  if (nr == GK_SYS_clone3) {
+    ca_size = r->x[1];
+    if (ca_size < 64 || r->x[0] == 0) return -GK_EINVAL;
+    memset(&ca, 0, sizeof ca);
+    memcpy(&ca, (void *)(uintptr_t)r->x[0], ca_size < sizeof ca ? ca_size : sizeof ca);
+    child_sp = ca.stack + ca.stack_size;
+  } else {
+    child_sp = r->x[1];
+  }
+#endif
   if (child_sp == 0) return -GK_EINVAL;
 
   // The child inherits the parent's PKRU, read from the parent vCPU now.
   uint32_t pkru = 0;
   if (guest_pkru_update(t, ~0u, 0, &pkru) < 0) return -GK_EINVAL;
+#if defined(__x86_64__)
   r->rip = (uintptr_t)&gk_syscall_tramp_resume;  // the stub consumed the outb
+#endif
 
   // The child's host-side gk-loop stack. It is refused, like the pooled side
   // stacks, and unregistered again when the thread exits (forward_syscall) since
@@ -2253,9 +2961,16 @@ static long clone_thread(gk_thread *t, struct kvm_regs *r, long nr) {
   c->host_stack = hs;
   c->host_stack_size = GK_HOST_STACK;
   c->start.regs = *r;
+#if defined(__x86_64__)
   c->start.regs.rax = 0;          // the child's clone return value
   c->start.regs.rsp = child_sp;   // the stack the clone named
   c->start.regs.rip = r->rcx;     // straight to the guest's return address
+#else
+  // ELR and SPSR are the parent's: the child resumes after the SVC, at the
+  // parent's exception level (see child_entry).
+  c->start.regs.x[0] = 0;         // the child's clone return value
+  c->start.regs.sp = child_sp;    // the stack the clone named
+#endif
   c->start.parent_id = t->id;
   c->start.pkru = pkru;
   c->start.user = t->user_mode;   // the child runs at its creator's privilege
@@ -2277,9 +2992,15 @@ static long clone_thread(gk_thread *t, struct kvm_regs *r, long nr) {
     ca.stack_size = GK_HOST_STACK - 16;
     tid = gk_host_clone_raw(GK_SYS_clone3, (long)&ca, (long)ca_size, 0, 0, 0);
   } else {
+#if defined(__x86_64__)
     // clone(flags, stack, parent_tid, child_tid, tls)
     tid = gk_host_clone_raw(SYS_clone, (long)r->rdi, (long)top, (long)r->rdx,
                             (long)r->r10, (long)r->r8);
+#else
+    // clone(flags, stack, parent_tid, tls, child_tid)
+    tid = gk_host_clone_raw(SYS_clone, (long)r->x[0], (long)top, (long)r->x[2],
+                            (long)r->x[3], (long)r->x[4]);
+#endif
   }
   if (tid < 0) {
     if (a) __atomic_fetch_sub(&a->active_threads, 1, __ATOMIC_SEQ_CST);
@@ -2297,9 +3018,14 @@ static long clone_thread(gk_thread *t, struct kvm_regs *r, long nr) {
 // Every syscall is re-issued on the host; guest and host share memory, so
 // pointer arguments work directly. New mappings (mmap/brk/mprotect) are picked
 // up lazily by demand paging on first access, so nothing special is needed here.
-static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
+static long forward_syscall(gk_thread *t, gk_regs *r) {
+#if defined(__x86_64__)
   long nr = r->rax, a1 = r->rdi, a2 = r->rsi, a3 = r->rdx, a4 = r->r10,
        a5 = r->r8, a6 = r->r9;
+#else
+  long nr = r->x[8], a1 = r->x[0], a2 = r->x[1], a3 = r->x[2], a4 = r->x[3],
+       a5 = r->x[4], a6 = r->x[5];
+#endif
   if (G->filter && !G->filter(nr, a1, a2, a3, a4, a5, a6)) {
     if (G->dbg) fprintf(stderr, "[gk] vcpu %d syscall %ld DENIED\n", t->id, nr);
     return -GK_EPERM;
@@ -2360,7 +3086,7 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
   uintptr_t rs = (uintptr_t)a1 & ~0xfffUL;
   uintptr_t re = ((uintptr_t)a1 + (uintptr_t)a2 + 0xfff) & ~0xfffUL;
   if (reflect) pthread_mutex_lock(&G->lock);
-  if (nr == SYS_pkey_mprotect) {
+  if (GK_HAS_PKEYS && nr == SYS_pkey_mprotect) {
     long pkey = a4;
     if (pkey != -1 && (pkey < 0 || pkey > 15 || !pkey_room()))
       ret = -GK_ENOMEM;  // never EINVAL: see the protection-keys section
@@ -2399,6 +3125,7 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
               (unsigned long)ret);
     pthread_mutex_unlock(&G->lock);
   }
+#if GK_HAS_PKEYS
   if (nr == SYS_pkey_alloc && ret >= 0 && ret <= 15) {
     // The kernel gave the calling *host* thread the key's initial rights; the
     // guest thread is this vCPU, so give them to its PKRU (2 bits per key:
@@ -2410,11 +3137,12 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
       fprintf(stderr, "[gk] vcpu %d pkey_alloc -> key %ld, rights %#lx; guest PKRU now %#x\n",
               t->id, ret, (unsigned long)a2, pkru);
   }
+#endif
   if (G->dbg) {
     fprintf(stderr, "[gk] vcpu %d syscall %ld(%#lx, %#lx, %#lx, %#lx) -> %ld\n",
             t->id, nr, (unsigned long)a1, (unsigned long)a2, (unsigned long)a3,
             (unsigned long)a4, ret);
-    if (nr == SYS_pkey_mprotect && ret == 0)
+    if (GK_HAS_PKEYS && nr == SYS_pkey_mprotect && ret == 0)
       fprintf(stderr, "[gk] vcpu %d pkey_mprotect [%#lx,%#lx) key %ld: host mprotect only, "
               "guest PTEs will carry key %d\n", t->id, (unsigned long)rs, (unsigned long)re,
               a4, a4 == -1 ? pkey_lookup(rs) : (int)a4);
@@ -2422,6 +3150,7 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
   return ret;
 }
 
+#if GK_HAS_PKEYS
 // The host thread's PKRU is what KVM's page backing (get_user_pages) checks
 // against a host VMA's key. No host VMA carries a key (pkey_mprotect reaches
 // the host as mprotect), so the host PKRU cannot deny a backing; it is cleared
@@ -2455,6 +3184,16 @@ static int guest_pkru_update(gk_thread *t, uint32_t keep, uint32_t set, uint32_t
   if (out) *out = (uint32_t)regs.rax;
   return 0;
 }
+#else
+// No protection keys to virtualize (see GK_HAS_PKEYS): every guest PKRU is 0.
+static void host_pkru_allow_all(void) {}
+static uint32_t host_pkru(void) { return 0; }
+static int guest_pkru_update(gk_thread *t, uint32_t keep, uint32_t set, uint32_t *out) {
+  (void)t; (void)keep; (void)set;
+  if (out) *out = 0;
+  return 0;
+}
+#endif
 
 // Refresh an arena root's shared entries from the base root so it sees every
 // mapping added since it was last synced, and put the arena's private PDPT
@@ -2536,6 +3275,7 @@ static void arena_sync_if_stale(gk_arena *a) {
 // stale. The freed tables were an arena's private ones, whose translations are
 // never global, so on a changed CR3 the load alone covers the generation
 // change too.
+#if defined(__x86_64__)
 static int sync_cr3(gk_thread *t, uint64_t *load) {
   if (t->active_arena) arena_sync_if_stale(t->active_arena);
   unsigned gen = __atomic_load_n(&G->root_gen, __ATOMIC_ACQUIRE);
@@ -2563,6 +3303,40 @@ static int cr3_load_host(gk_thread *t, uint64_t cr3) {
   t->tlb_touched = 1;  // the TLB changes under the host's hand (see wall_raise)
   return sregs_set(t, &s);
 }
+#else  // __aarch64__
+// sync_cr3 on arm64: the root is TTBR0's guest-physical address, which the
+// dispatcher records in the vcb (cur_ttbr) every time it runs, so the vCPU's
+// actual root is read back from there; a switch the host has asked for and
+// the vCPU not yet made counts as made, since nothing runs before it. *load
+// is the root to switch to, which the turn's dispatcher pass loads (see
+// enter_guest), keeping global entries as the x86-64 MOV CR3 does.
+static int sync_cr3(gk_thread *t, uint64_t *load) {
+  if (t->active_arena) arena_sync_if_stale(t->active_arena);
+  unsigned gen = __atomic_load_n(&G->root_gen, __ATOMIC_ACQUIRE);
+  uint64_t want = PT_GPA(t->active_pml4);
+  struct gk_vcb *v = VCB(t);
+  uint64_t cur = (v->action & GK_ACT_TTBR) ? v->ttbr : v->cur_ttbr;
+  *load = 0;
+  if (cur != want) {
+    *load = want;
+  } else if (t->root_gen != gen) {
+    if (flush_run(t) < 0) return -1;
+  }
+  t->root_gen = gen;
+  return 0;
+}
+
+// cr3_load_host on arm64: the switch and a full flush, as KVM does for a CR3
+// set from the host, both carried out by the dispatcher before the vCPU runs.
+static int cr3_load_host(gk_thread *t, uint64_t cr3) {
+  struct gk_vcb *v = VCB(t);
+  v->ttbr = cr3;
+  v->action |= GK_ACT_TTBR;
+  flush_run(t);
+  t->tlb_touched = 1;
+  return 0;
+}
+#endif
 
 // Ready this thread's vCPU for a guest invocation: its root (*load, see
 // sync_cr3), its PKRU on first entry, and the per-invocation fault-repeat
@@ -2603,6 +3377,7 @@ static int prepare_entry(gk_thread *t, uint64_t *load) {
 // CR3 set through KVM makes KVM flush the whole guest TLB (see the
 // global-pages section). Either way the return value comes back through
 // run_vcpu.
+#if defined(__x86_64__)
 static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t stack_top,
                         int user, uint64_t cr3) {
   uint64_t sp = stack_top - 8;
@@ -2633,6 +3408,32 @@ static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t st
   t->user_mode = user;
   return run_vcpu(t);
 }
+#else  // __aarch64__
+// enter_guest on arm64: the turn's entry state goes into the vcb and the
+// dispatcher launches it, at EL1t (ring 0) or EL0t (ring 3), with LR =
+// gk_user_exit_tramp, the turn exit for both rings. `cr3`, when nonzero, is
+// the root the dispatcher loads first (see sync_cr3).
+static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t stack_top,
+                        int user, uint64_t cr3) {
+  struct gk_vcb *v = VCB(t);
+  v->l_pc = (uintptr_t)fn;
+  v->l_x0 = (uintptr_t)arg;
+  v->l_sp = stack_top;
+  v->l_lr = (uintptr_t)&gk_user_exit_tramp;
+  v->l_spsr = user ? PSR_EL0T : PSR_EL1T;
+  v->action |= GK_ACT_LAUNCH;
+  if (cr3) {
+    v->ttbr = cr3;
+    v->action |= GK_ACT_TTBR;
+    atomic_fetch_add_explicit(&G->root_switches, 1, memory_order_relaxed);
+    if (G->dbg)
+      fprintf(stderr, "[gk] vcpu %d: root switch to %#llx (%s)\n", t->id,
+              (unsigned long long)cr3, t->active_arena ? "arena" : "base");
+  }
+  t->user_mode = user;
+  return run_vcpu(t);
+}
+#endif
 
 long gk_run(long (*fn)(void *), void *arg) {
   gk_thread *t = thread_get();
@@ -2709,9 +3510,15 @@ typedef struct { gk_thread *t; long (*fn)(void *); void *arg; int user; uint64_t
 
 // The thread pointer (the fs base): a pthread's TCB, which glibc places at the
 // top of the thread's stack mapping, with its static TLS block just below.
+// On arm64 it is TPIDR_EL0, with glibc's struct pthread just below it and the
+// static TLS block just above.
 static uintptr_t thread_pointer(void) {
   uintptr_t tp;
+#if defined(__x86_64__)
   __asm__ __volatile__("mov %%fs:0, %0" : "=r"(tp));
+#else
+  __asm__ __volatile__("mrs %0, tpidr_el0" : "=r"(tp));
+#endif
   return tp;
 }
 
@@ -2736,6 +3543,7 @@ static int stack_wall_bounds(gk_thread *t, uintptr_t caller_sp, uintptr_t top,
     uintptr_t end = re;
     uintptr_t tp = thread_pointer();
     if (tp > caller_sp && tp < re) {
+#if defined(__x86_64__)
       if (!G->tls_static_info) {
         end = 0;  // cannot place the TLS: no wall (warned at init)
       } else {
@@ -2744,6 +3552,16 @@ static int stack_wall_bounds(gk_thread *t, uintptr_t caller_sp, uintptr_t top,
         uintptr_t tls_lo = (tp - size) & ~0xfffUL;
         if (tls_lo < end) end = tls_lo;
       }
+#else
+      // The TCB and static TLS sit above tp; struct pthread (glibc's
+      // TLS_PRE_TCB_SIZE, plus slack for its alignment) below it.
+      if (!G->pthread_size) {
+        end = 0;  // cannot place the thread descriptor: no wall (warned at init)
+      } else {
+        uintptr_t pd_lo = (tp - G->pthread_size - 64) & ~0xfffUL;
+        if (pd_lo < end) end = pd_lo;
+      }
+#endif
     }
     t->wall_map_lo = rs;
     t->wall_map_hi = re;
@@ -2937,6 +3755,7 @@ long gk_run_here_user(long (*fn)(void *), void *arg) {
 // invocation in case the host keeps pulling pages from under the guest.
 // Returns 1 to retry KVM_RUN, 0 to give the fault up (host_backing_fail).
 #define GK_BACKING_RETRIES 3
+#if defined(__x86_64__)
 static int host_backing_retry(gk_thread *t) {
   gk_arena *a = t->active_arena;
   if (!a || t->backing_retries >= GK_BACKING_RETRIES) return 0;
@@ -3169,6 +3988,242 @@ static long run_vcpu(gk_thread *t) {
     }
   }
 }
+#else  // __aarch64__
+// The host-backing paths on arm64. The stopped vCPU's state is in the CPU,
+// not in its vcb, so the retry copies it there by ioctl (a rare path) and
+// restarts the instruction through the dispatcher with a full flush, which
+// is what the CR3 swing does on x86-64; ring 3 or not, the dispatcher runs at
+// EL1. The failure puts the vCPU back at the dispatcher, where every turn
+// starts.
+static int host_backing_retry(gk_thread *t) {
+  gk_arena *a = t->active_arena;
+  if (!a || t->backing_retries >= GK_BACKING_RETRIES) return 0;
+  uint64_t pstate;
+  if (vcpu_get(t->fd, GK_CORE_REG(regs.pstate), &pstate) < 0 || (pstate & 0xf) == (PSR_EL1H & 0xf))
+    return 0;  // stopped inside a handler or the dispatcher: nothing to restart
+  t->backing_retries++;
+  pthread_mutex_lock(&G->lock);
+  unmap_range_root(a->pml4, a->base, a->end);
+  pthread_mutex_unlock(&G->lock);
+  struct gk_vcb *v = VCB(t);
+  gk_frame f;
+  for (int i = 0; i < 31; i++)
+    if (vcpu_get(t->fd, GK_CORE_REG(regs.regs[i]), &f.x[i]) < 0) return 0;
+  if (vcpu_get(t->fd, GK_CORE_REG(regs.sp), &f.sp) < 0 ||
+      vcpu_get(t->fd, GK_CORE_REG(regs.pc), &f.elr) < 0)
+    return 0;
+  f.spsr = pstate;
+  f.esr = f.far = 0;
+  v->f = f;
+  v->action = GK_ACT_FLUSH;  // resume, after the flush
+  atomic_fetch_add_explicit(&G->tlb_flushes, 1, memory_order_relaxed);
+  if (vcpu_reset_pc(t) < 0) return 0;
+  if (G->dbg) {  // fault path: raw output only
+    gk_dbuf d = {.n = 0};
+    db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+    db_str(&d, ": host backing gone under an arena PTE; retrying as a guest fault (");
+    db_dec(&d, t->backing_retries); db_str(&d, ")");
+    db_flush(&d);
+  }
+  return 1;
+}
+
+// The region whose memslot holds guest-physical `gpa`, for a failure report.
+// Caller holds G->lock.
+static gk_region *region_by_gpa(gk_region *n, uint64_t gpa) {
+  if (!n) return NULL;
+  if (gpa >= n->gpa && gpa < n->gpa + (n->end - n->start)) return n;
+  gk_region *l = region_by_gpa(n->l, gpa);
+  return l ? l : region_by_gpa(n->r, gpa);
+}
+
+static long host_backing_fail(gk_thread *t, int err) {
+  uint64_t addr = 0;
+  vcpu_get(t->fd, GK_CORE_REG(regs.pc), &addr);
+  int exact = 0;
+#ifdef KVM_EXIT_MEMORY_FAULT
+  if (t->run->exit_reason == KVM_EXIT_MEMORY_FAULT) {
+    pthread_mutex_lock(&G->lock);
+    gk_region *r = region_by_gpa(G->regions, t->run->memory_fault.gpa);
+    if (r) {
+      addr = r->start + (t->run->memory_fault.gpa - r->gpa);
+      exact = 1;
+    }
+    pthread_mutex_unlock(&G->lock);
+  }
+#endif
+  if (G->dbg) {  // fault path: raw output only
+    gk_dbuf d = {.n = 0};
+    db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+    db_str(&d, ": KVM_RUN failed, errno "); db_dec(&d, err);
+    if (err == EFAULT)
+      db_str(&d, exact ? ": host backing gone at " : ": host backing gone under an access at pc ");
+    else
+      db_str(&d, ": pc ");
+    db_hex(&d, addr);
+    db_flush(&d);
+  }
+  VCB(t)->action = 0;
+  vcpu_reset_pc(t);
+  if (err != EFAULT) return -1;
+  G->fault_addr = addr;
+  return GK_EFAULT;
+}
+
+// run_vcpu on arm64: every exit is a hypercall from the vector handlers,
+// with the exception's state in the vcb. The cases are those of the x86-64
+// run_vcpu above: the turn exit and forwarded syscalls (SVC), demand faults
+// (translation and permission aborts), and genuine faults, which end the
+// turn with GK_EFAULT. Whatever ends the turn leaves the vCPU at the
+// dispatcher, where the next turn's launch finds it.
+static long run_vcpu(gk_thread *t) {
+  struct gk_vcb *v = VCB(t);
+  for (;;) {
+    t->tlb_touched = 1;  // the vCPU runs: its TLB is no longer known (see wall_raise)
+    if (ioctl(t->fd, KVM_RUN, 0) < 0) {
+      int err = errno;
+      if (err == EINTR) continue;
+      if (err == EFAULT && host_backing_retry(t)) continue;
+      return host_backing_fail(t, err);
+    }
+    if (t->run->exit_reason == KVM_EXIT_SYSTEM_EVENT) return GK_ESHUTDOWN;
+    if (t->run->exit_reason != KVM_EXIT_HYPERCALL) {
+      if (G->dbg) fprintf(stderr, "[gk] unexpected exit reason=%u\n", t->run->exit_reason);
+      vcpu_reset_pc(t);
+      return -1;
+    }
+    if (t->run->hypercall.nr != GK_HC_EXC) {
+      // An interrupt, or a fault inside a handler or the dispatcher (gk_exc_bad).
+      if (G->dbg) {
+        gk_dbuf d = {.n = 0};
+        db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+        db_str(&d, ": fatal exception, elr="); db_hex(&d, v->n_elr);
+        db_str(&d, " esr="); db_hex(&d, v->n_esr);
+        db_str(&d, " far="); db_hex(&d, v->n_far);
+        db_flush(&d);
+      }
+      G->fault_addr = v->n_elr;
+      v->action = 0;
+      vcpu_reset_pc(t);
+      return GK_EFAULT;
+    }
+    gk_frame *f = &v->f;
+    unsigned ec = ESR_EC(f->esr);
+    if (ec == ESR_EC_SVC64) {
+      // The turn exit (gk_user_exit_tramp), for either ring: the result is in x0.
+      if (f->x[8] == GK_EXIT_SYSCALL) return (long)f->x[0];
+      if (f->x[8] == GK_DEBUG_RING_SYSCALL) {  // see gk.h
+        f->x[0] = (f->spsr & 0xc) ? 0 : 3;
+        continue;
+      }
+      f->x[0] = (uint64_t)forward_syscall(t, f);
+      continue;  // the dispatcher resumes after the SVC with x0 = the result
+    }
+    if (ec != ESR_EC_DABT_LOW && ec != ESR_EC_DABT_CUR && ec != ESR_EC_IABT_LOW &&
+        ec != ESR_EC_IABT_CUR) {
+      // An undefined or trapped instruction (a privileged one at ring 3, say),
+      // a breakpoint, a misaligned PC or SP: genuine, at the instruction.
+      if (G->dbg) {
+        gk_dbuf d = {.n = 0};
+        db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+        db_str(&d, ": exception class "); db_hex(&d, ec);
+        db_str(&d, " at pc "); db_hex(&d, f->elr);
+        db_str(&d, " (esr "); db_hex(&d, f->esr); db_str(&d, ")");
+        db_flush(&d);
+      }
+      G->fault_addr = f->elr;
+      return GK_EFAULT;
+    }
+    int data = ec == ESR_EC_DABT_LOW || ec == ESR_EC_DABT_CUR;
+    if (!data && vdso_call(f, f->elr)) continue;
+    unsigned fsc = f->esr & 0x3f;
+    uint64_t far = f->far & 0x00ffffffffffffffULL;  // a tagged address's tag (TBI) is no part of it
+    int write = data && (f->esr & ESR_WNR);
+    // Translation, access-flag and permission faults, at any level, are what
+    // demand paging resolves; anything else (alignment, an external abort, an
+    // address-size fault, a FAR the CPU could not supply) is genuine.
+    if ((data && (f->esr & ESR_FNV)) || fsc < 0x04 || fsc > 0x0f) {
+      G->fault_addr = data && !(f->esr & ESR_FNV) ? far : f->elr;
+      if (G->dbg) {
+        gk_dbuf d = {.n = 0};
+        db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+        db_str(&d, ": abort fsc="); db_hex(&d, fsc);
+        db_str(&d, " far="); db_hex(&d, far);
+        db_str(&d, " pc="); db_hex(&d, f->elr);
+        db_flush(&d);
+      }
+      return GK_EFAULT;
+    }
+    if (ec == ESR_EC_IABT_CUR && fsc >= 0x0c && pte_exec_at_el1(t, (uintptr_t)far)) {
+      v->tlbi_va = far;
+      v->action |= GK_ACT_TLBI_VA;
+      continue;
+    }
+    int repeat = (far == t->last_fault);
+    if (repeat) {
+      if (++t->fault_repeat > 2) {
+        if (G->dbg) {
+          gk_dbuf d = {.n = 0};
+          db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+          db_str(&d, ": fault repeats after mapping, far="); db_hex(&d, far);
+          db_str(&d, " pc="); db_hex(&d, f->elr);
+          db_str(&d, " esr="); db_hex(&d, f->esr);
+          db_flush(&d);
+        }
+        G->fault_addr = far;
+        return GK_EFAULT;
+      }
+    } else { t->last_fault = far; t->fault_repeat = 0; }
+    // A write into this turn's host-frame wall (see run_here) is the wall
+    // holding: genuine, whatever the host protection of the page.
+    if (write && far >= t->ro_lo && far < t->ro_hi) {
+      if (G->dbg) {
+        gk_dbuf d = {.n = 0};
+        db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+        db_str(&d, ": write into the host-frame wall at "); db_hex(&d, far);
+        db_str(&d, " (wall ["); db_hex(&d, t->ro_lo); db_str(&d, ", ");
+        db_hex(&d, t->ro_hi); db_str(&d, "), esr="); db_hex(&d, f->esr);
+        db_str(&d, ", pc="); db_hex(&d, f->elr);
+        db_str(&d, ", sp="); db_hex(&d, f->sp); db_str(&d, ")");
+        db_flush(&d);
+      }
+      G->fault_addr = far;
+      return GK_EFAULT;
+    }
+    GK_HANDLER_ENTER();
+    int dm = demand_map(t, (uintptr_t)far, (uintptr_t)f->sp);
+    GK_HANDLER_LEAVE();
+    if (dm < 0) {
+      if (G->dbg) {  // still the fault path: raw output only
+        gk_dbuf d = {.n = 0};
+        db_str(&d, "[gk] vcpu "); db_dec(&d, t->id);
+        db_str(&d, ": unmappable fault far="); db_hex(&d, far);
+        db_str(&d, " pc="); db_hex(&d, f->elr);
+        db_str(&d, " esr="); db_hex(&d, f->esr);
+        db_str(&d, " sp="); db_hex(&d, f->sp);
+        db_flush(&d);
+        // Best-effort frame-record walk of the guest stack ([fp, lr] at x29).
+        uint64_t bp = f->x[29], lo = f->sp, hi = f->sp + (8UL << 20);
+        for (int i = 0; i < 16 && bp >= lo && bp + 16 <= hi; i++) {
+          uint64_t *fr = (uint64_t *)(uintptr_t)bp;
+          db_str(&d, "[gk]   frame "); db_dec(&d, i);
+          db_str(&d, ": ret="); db_hex(&d, fr[1]);
+          db_flush(&d);
+          if (fr[0] <= bp) break;
+          bp = fr[0];
+        }
+      }
+      G->fault_addr = far;
+      return GK_EFAULT;
+    }
+    // An arm64 fault leaves the entry it was taken through in the TLB (a
+    // permission fault's read-only one, say), so the retry would take it
+    // again: the dispatcher invalidates the page first.
+    v->tlbi_va = far;
+    v->action |= GK_ACT_TLBI_VA;
+  }
+}
+#endif
 
 // ---- arenas ----------------------------------------------------------------
 // The reservation must own whole PML4 slots: an arena root's private entry for
@@ -3261,7 +4316,7 @@ gk_arena *gk_arena_create(size_t size) {
   for (int i = 0; i < nslots; i++) {
     uint64_t *pdpt = alloc_table();
     if (!pdpt) goto fail;
-    a->slot_entry[i] = ((uint64_t)(uintptr_t)pdpt) | PTE_P | PTE_W | PTE_U;
+    a->slot_entry[i] = PTE_TABLE_ENTRY(pdpt);
   }
   // The span was free host address space, so any base-root PTE in it (from
   // memory that once lived there) is stale; drop them so nothing maps into
@@ -3275,7 +4330,7 @@ gk_arena *gk_arena_create(size_t size) {
   return a;
 fail:
   for (int i = 0; i < GK_MAX_ARENA_SLOTS; i++)
-    if (a->slot_entry[i]) free_table((uint64_t *)(uintptr_t)(a->slot_entry[i] & ~0xfffULL));
+    if (a->slot_entry[i]) free_table(PTE_TABLE_PTR(a->slot_entry[i]));
   if (a->pml4) free_table(a->pml4);
   a->next_free = G->arena_free;
   G->arena_free = a;
@@ -3328,7 +4383,7 @@ void gk_arena_destroy(gk_arena *a) {
             (unsigned long)a->end, in_use);
   } else {
     for (int i = 0; i < a->nslots; i++) {
-      free_subtree((uint64_t *)(uintptr_t)(a->slot_entry[i] & ~0xfffULL), 3);
+      free_subtree(PTE_TABLE_PTR(a->slot_entry[i]), 3);
       a->slot_entry[i] = 0;
       a->pml4[a->slot0 + i] = 0;
     }
@@ -3336,7 +4391,13 @@ void gk_arena_destroy(gk_arena *a) {
     __atomic_fetch_add(&G->root_gen, 1, __ATOMIC_RELEASE);
   }
   unmap_range_root(G->pml4, a->base, a->end);
+#if defined(__aarch64__)
+  G->gpa_keep = in_use > 0;
+#endif
   int removed = region_remove_range(a->base, a->end);
+#if defined(__aarch64__)
+  G->gpa_keep = 0;
+#endif
   uintptr_t base = a->base, end = a->end;
   if (in_use == 0) {
     for (int i = 0; i < a->nslots; i++) G->slot_used[a->slot0 + i] = 0;
@@ -3366,7 +4427,11 @@ void gk_get_stats(gk_stats *s) {
   s->neighbor_pages = G->neighbor_pages;
   s->root_switches = atomic_load_explicit(&G->root_switches, memory_order_relaxed);
   s->tlb_flushes = atomic_load_explicit(&G->tlb_flushes, memory_order_relaxed);
+#if defined(__x86_64__)
   s->flush_invpcid = G->flush_stub == gk_flush_stub_invpcid;
+#else
+  s->flush_invpcid = 0;
+#endif
   pthread_mutex_unlock(&G->lock);
 }
 

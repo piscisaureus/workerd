@@ -455,7 +455,7 @@ static v8::Isolate* newIsolate(
 // GuestArena).
 constexpr size_t GUEST_ARENA_SLOT_SIZE = size_t(1) << 39;
 
-// The page size gk maps guest memory at, and the host's on x86-64 Linux.
+// The page size gk maps guest memory at, and the host's (gk_init refuses any other).
 constexpr size_t GUEST_ARENA_PAGE_SIZE = 4096;
 
 int protectionFor(v8::PageAllocator::Permission permission) {

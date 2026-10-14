@@ -104,7 +104,8 @@ namespace {
 // in the guest (an escaped ring-3 isolate then cannot open files, exec, ptrace,
 // and so on). Runs on gk's syscall-forward path, so it must not allocate.
 //
-// Adapted from Deno Deploy's V8 seccomp allowlist (x86_64 set).
+// Adapted from Deno Deploy's V8 seccomp allowlist (x86_64 set), with the arm64
+// equivalents of the legacy x86-64 calls.
 // TODO: see if this can be tightened further.
 int guestKernelSyscallFilter(long nr, long, long, long, long, long, long) {
 #ifndef SYS_clone3
@@ -115,7 +116,6 @@ int guestKernelSyscallFilter(long nr, long, long, long, long, long, long) {
 #endif
   switch (nr) {
     case SYS_accept4:
-    case SYS_access:
     case SYS_bind:
     case SYS_brk:
     case SYS_clock_gettime:
@@ -126,8 +126,6 @@ int guestKernelSyscallFilter(long nr, long, long, long, long, long, long) {
     case SYS_connect:
     case SYS_epoll_create1:
     case SYS_epoll_ctl:
-    case SYS_epoll_wait:
-    case SYS_eventfd:
     case SYS_eventfd2:
     case SYS_exit_group:
     case SYS_exit:
@@ -151,14 +149,12 @@ int guestKernelSyscallFilter(long nr, long, long, long, long, long, long) {
     case SYS_newfstatat:
     case SYS_openat:
     case SYS_pkey_mprotect:
-    case SYS_poll:
     case SYS_prctl:
     case SYS_prlimit64:
     case SYS_pwrite64:
     case SYS_read:
     case SYS_recvfrom:
     case SYS_recvmsg:
-    case SYS_rename:
     case SYS_rseq:
     case SYS_rt_sigaction:
     case SYS_rt_sigprocmask:
@@ -175,7 +171,6 @@ int guestKernelSyscallFilter(long nr, long, long, long, long, long, long) {
     case SYS_shutdown:
     case SYS_sigaltstack:
     case SYS_socket:
-    case SYS_stat:
     case SYS_statx:
     case SYS_restart_syscall:
     case SYS_tgkill:
@@ -183,7 +178,24 @@ int guestKernelSyscallFilter(long nr, long, long, long, long, long, long) {
     case SYS_write:
     case SYS_writev:
     case SYS_getcwd:
+#if defined(__x86_64__)
+    case SYS_access:
+    case SYS_epoll_wait:
+    case SYS_eventfd:
+    case SYS_poll:
     case SYS_readlink:
+    case SYS_rename:
+    case SYS_stat:
+#else
+    // arm64 has none of the legacy calls above; glibc issues these instead.
+    case SYS_epoll_pwait:
+    case SYS_faccessat:
+    case SYS_faccessat2:
+    case SYS_ppoll:
+    case SYS_readlinkat:
+    case SYS_renameat:
+    case SYS_renameat2:
+#endif
       return 1;
     default:
       return 0;

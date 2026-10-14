@@ -6,9 +6,10 @@ isolate a private memory arena backed by a separate guest page-table root. The
 goal is per-isolate, hardware-enforced memory isolation with no fixed cap on
 the number of isolates, using upstream KVM rather than a bespoke hypervisor.
 
-This is a research prototype. It is x86-64 Linux only and needs read/write
-access to `/dev/kvm` (no root, no kernel module). The library builds and runs
-standalone with the included Makefile (`make run`); on x86-64 Linux it is also
+This is a research prototype. It runs on Linux on x86-64 or arm64 (see
+[arm64](#arm64)) and needs read/write access to `/dev/kvm` (no root, no kernel
+module). The library builds and runs standalone with the included Makefile
+(`make run`); on those platforms it is also
 built as a Bazel `cc_library` and wired into the workerd runtime behind the
 `WORKERD_EXPERIMENTAL_GUEST_KERNEL` environment variable, which runs each
 isolate's JS turn at guest ring 3.
@@ -205,6 +206,57 @@ hardware:
 Enabling SSE and AVX in the guest (`CR4.OSFXSR`, `OSXSAVE`, and `XCR0`) is
 required before compiled code and glibc, which use those instructions, will
 run; `gk_init` does this.
+
+## arm64
+
+The design is the same on arm64; the sections above use x86 terms. Guest ring 0
+is EL1 (running on `SP_EL0`) and ring 3 is EL0, and a CR3 load is a `TTBR0_EL1`
+write. The differences that matter:
+
+- **Exceptions go out by hypercall.** The vector table at `VBAR_EL1` saves the
+  frame into the vCPU's control block (`struct gk_vcb`, a supervisor page that
+  `SP_EL1` points at) and issues an `hvc`. A KVM SMCCC filter turns that into a
+  `KVM_EXIT_HYPERCALL` for gk. A guest `svc` (a syscall) and a data or
+  instruction abort (a fault) take the same route. On resume the vCPU enters
+  `gk_dispatch`, which applies any TLB maintenance gk deferred to it
+  (`tlbi vmalle1`, a single-address `tlbi vaae1` after a demand fault, or a new
+  `TTBR0`), then resumes the frame or launches a turn.
+- **Guest-physical addresses differ from host-virtual ones.** The IPA space (40
+  bits at most, often less) is smaller than the 48-bit host address space, so
+  memslots get their guest-physical range from a bump-and-free-list allocator,
+  kept congruent to the host address modulo 2 MiB. Page-table entries hold those
+  addresses. A destroyed arena's guest-physical ranges are not reused while a
+  vCPU may still be running under its root.
+- **The vDSO runs on the host.** arm64 KVM refuses a memslot over `[vvar]`, so
+  `[vvar]` is a hole in the memslot map and `[vdso]` is never mapped into the
+  guest. A guest call into a vDSO function takes an instruction abort at its
+  entry, and gk runs the function on the host with the guest's arguments
+  (`vdso_call`).
+- **Ring 0 cannot execute writable user pages.** arm64 treats a page EL0 can
+  write as privileged execute-never, and V8's code space is writable and
+  executable on arm64. When ring 0 executes such a page, gk withholds its W in
+  the guest page table, and a later write maps it writable again: W^X emulated
+  per page (`pte_exec_at_el1`). Ring 3 is unaffected.
+- **No protection keys.** arm64 Linux has no `pkey_*`, so the PKU
+  virtualization described above is absent.
+- **Pages must be 4 KiB.** `gk_init` fails on a 16K or 64K host kernel.
+
+gk has been run on an Apple Silicon Mac in an Ubuntu 26.04 VM under Lima (nested
+KVM through macOS Virtualization.framework). Its functional tests pass there, but
+the setup is not representative for performance:
+
+- A stage-2 invalidation by the Linux VM's KVM, which any `mprotect` or
+  copy-on-write break of guest-backed memory causes, appears to discard all of
+  the macOS hypervisor's shadow translations for the guest. Every page the guest
+  touches next is translated again by the hypervisor, at about 1 us per page. A
+  ring-3 pointer chase over 64 MiB runs at native speed in the steady state and
+  about 10 times slower after a few such invalidations on unrelated pages. In
+  workerd, where V8 changes page protections continuously, this turns young-
+  generation GC pauses of a few milliseconds into pauses of up to seconds, so
+  latency measured with the guest kernel on in this setup says nothing about gk
+  itself.
+- A vCPU sometimes keeps no TLB entries across `KVM_RUN` at all, so `gk_test`
+  reports the global-page survival checks as not observable rather than failed.
 
 ## How it would map to workerd
 

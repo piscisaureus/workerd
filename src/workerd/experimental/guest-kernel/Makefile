@@ -1,7 +1,10 @@
 CC ?= cc
 # The library and any code that runs inside the guest must avoid a stack canary
-# (needs TLS) and CET markers.
-CFLAGS = -O2 -Wall -fno-stack-protector -fcf-protection=none -pthread
+# (needs TLS) and, on x86-64, CET markers.
+CFLAGS = -O2 -Wall -fno-stack-protector -pthread
+ifeq ($(shell $(CC) -dumpmachine | cut -d- -f1),x86_64)
+CFLAGS += -fcf-protection=none
+endif
 
 gk_test: gk.c gk_asm.S gk_test.c gk.h
 	$(CC) $(CFLAGS) -o $@ gk.c gk_asm.S gk_test.c
