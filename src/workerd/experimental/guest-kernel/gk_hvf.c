@@ -225,7 +225,7 @@ static int memslot_add(int slot, uint64_t gpa, uintptr_t s, uintptr_t e) {
 // with it; guest-physical pages stage 2 still maps (see s2_drop) are
 // quarantined (*keep_gpa) rather than reused.
 static int memslot_remove(gk_region *n, int *keep_gpa) {
-  *keep_gpa = s2_release(n) < 0;
+  if (s2_release(n) < 0) *keep_gpa = 1;
   return 0;
 }
 
@@ -411,17 +411,18 @@ enum { GK_REFLECT_NONE, GK_REFLECT_PROTECT, GK_REFLECT_UNMAP, GK_REFLECT_MAP };
 // do anything the sending task's ports allow, including reading and writing
 // any memory of the process and starting host threads outside the VM, so
 // mach_msg and every trap not listed here is refused. What remains acts only
-// on the calling task's own port names, its own address space (the VM traps,
-// with the task's own port; gk reflects their effect), semaphores, and time.
+// on the calling task: its port names and its address space (the port and VM
+// traps, with the task's own port as the target; gk reflects the VM traps'
+// effect), its semaphores, and time.
 static int mach_trap_allowed(long nr, uint64_t target) {
   switch (nr) {
     case GK_TRAP_vm_allocate:
     case GK_TRAP_vm_deallocate:
     case GK_TRAP_vm_protect:
     case GK_TRAP_vm_map:
-      return (mach_port_name_t)target == mach_task_self();
     case -16: case -17: case -18: case -19: case -20:  // _kernelrpc_mach_port_*
     case -21: case -22: case -23: case -24: case -25:
+      return (mach_port_name_t)target == mach_task_self();
     case -26:  // mach_reply_port
     case -27:  // thread_self_trap
     case -28:  // task_self_trap
