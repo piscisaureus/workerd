@@ -202,9 +202,13 @@ hardware:
   the main thread's growable stack is expanded on demand by a probe syscall,
   since a guest access alone does not trip the kernel's stack growth.
 
-Enabling SSE and AVX in the guest (`CR4.OSFXSR`, `OSXSAVE`, and `XCR0`) is
-required before compiled code and glibc, which use those instructions, will
-run; `gk_init` does this.
+The guest CPUID is the host's, so compiled code and glibc's ifunc resolvers
+select the same instruction set inside the guest as outside it, AVX-512
+included where the CPU has it. `gk_init` enables what that needs
+(`CR4.OSFXSR`, `OSXSAVE`) and gives every vCPU an `XCR0` with every user state
+component the CPUID advertises, so an instruction the CPUID promises never
+raises `#UD` for a disabled state component. The test runs an AVX-512
+instruction at ring 3 and ring 0 and checks its result on a CPU that has one.
 
 ## How it would map to workerd
 

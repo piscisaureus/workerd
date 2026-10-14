@@ -1505,6 +1505,87 @@ static long neighborhood_check(void) {
   return ok1 && ok2 && ok3 && ok4;
 }
 
+// ---- AVX-512 state in the guest ----------------------------------------------
+// The guest CPUID is the host's, so glibc's ifunc resolvers and any JIT pick
+// AVX-512 code paths on a CPU that has them; the guest's XCR0 must then have
+// the opmask, ZMM_Hi256 and Hi16_ZMM components enabled, or the first such
+// instruction raises #UD, which gk reports as GK_EFAULT. Runs an AVX-512
+// instruction that needs all three components at ring 3 and at ring 0 and
+// checks its result, so the state is shown enabled rather than merely not
+// reached. Skipped on a CPU without AVX-512.
+
+// Host-side probe: AVX-512F in CPUID leaf 7 and its three state components in
+// the host's XCR0. (The same probe inside the guest is the thing under test.)
+static int host_has_avx512(uint64_t *host_xcr0) {
+  unsigned eax, ebx, ecx, edx, lo, hi;
+  __asm__ __volatile__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7u), "c"(0u));
+  __asm__ __volatile__("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0u));
+  uint64_t xcr0 = ((uint64_t)hi << 32) | lo;
+  if (host_xcr0) *host_xcr0 = xcr0;
+  return (ebx & (1u << 16)) != 0 && (xcr0 & 0xe0) == 0xe0;
+}
+
+struct avx512_probe { uint64_t xcr0; int32_t out[16]; };
+
+// Runs in the guest. Records the guest's XCR0 (xgetbv is unprivileged under
+// CR4.OSXSAVE), then adds two 16-lane vectors held in zmm16 and zmm17 under
+// opmask k1 with zeroing, which needs all three AVX-512 components: k1 (the
+// opmask state), the upper 256 bits of the registers (ZMM_Hi256) and registers
+// 16-31 (Hi16_ZMM). Lanes 0-7 get a[i]+b[i] and lanes 8-15 zero. Returns the
+// number of lanes that came out wrong.
+static long __attribute__((noinline)) guest_avx512(void *arg) {
+  struct avx512_probe *p = arg;
+  unsigned lo, hi;
+  __asm__ __volatile__("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0u));
+  p->xcr0 = ((uint64_t)hi << 32) | lo;
+  _Alignas(64) int32_t a[16], b[16];
+  for (int i = 0; i < 16; i++) { a[i] = 1000 + i; b[i] = 7 * i; }
+  __asm__ __volatile__("kmovw %k[mask], %%k1\n\t"
+                       "vmovdqa32 (%[a]), %%zmm16\n\t"
+                       "vmovdqa32 (%[b]), %%zmm17\n\t"
+                       "vpaddd %%zmm17, %%zmm16, %%zmm18%{%%k1%}%{z%}\n\t"
+                       "vmovdqu32 %%zmm18, (%[out])\n\t"
+                       "vzeroupper"
+                       :
+                       : [a] "r"(a), [b] "r"(b), [out] "r"(p->out), [mask] "r"(0x00ffu)
+                       : "memory");  // zmm16-18 and k1 are not registers the
+                                      // compiler uses or accepts as clobbers
+                                      // without -mavx512f
+  long bad = 0;
+  for (int i = 0; i < 16; i++) bad += p->out[i] != (i < 8 ? a[i] + b[i] : 0);
+  return bad;
+}
+
+// Formats a guest_avx512 result: a fault (the #UD of a disabled component),
+// or the count of wrong lanes.
+static const char *avx512_result(long r, unsigned long fault, char *buf, size_t n) {
+  if (r == GK_EFAULT) snprintf(buf, n, "FAULT (fault %#lx)", fault);
+  else snprintf(buf, n, "%ld lanes wrong", r);
+  return buf;
+}
+
+static long avx512_check(void) {
+  uint64_t host_xcr0 = 0;
+  if (!host_has_avx512(&host_xcr0)) {
+    printf("avx512 in guest: host CPU lacks AVX-512 (host XCR0 %#llx); skipped [OK]\n",
+           (unsigned long long)host_xcr0);
+    return 1;
+  }
+  struct avx512_probe u = {0}, k = {0};
+  long ru = gk_run_user(guest_avx512, &u);
+  unsigned long fu = gk_fault_addr();
+  long rk = gk_run(guest_avx512, &k);
+  unsigned long fk = gk_fault_addr();
+  int ok = ru == 0 && rk == 0 && (u.xcr0 & 0xe7) == 0xe7 && (k.xcr0 & 0xe7) == 0xe7;
+  char bu[64], bk[64];
+  printf("avx512 in guest: host XCR0 %#llx; ring 3: XCR0 %#llx, masked zmm16+zmm17 -> %s "
+         "(lanes 0/7/8: %d %d %d); ring 0: XCR0 %#llx, -> %s [%s]\n",
+         (unsigned long long)host_xcr0, (unsigned long long)u.xcr0,
+         avx512_result(ru, fu, bu, sizeof bu), u.out[0], u.out[7], u.out[8],
+         (unsigned long long)k.xcr0, avx512_result(rk, fk, bk, sizeof bk), ok ? "OK" : "FAIL");
+  return ok;
+}
+
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (gk_init() != 0) {
@@ -2154,9 +2235,15 @@ int main(void) {
   // recommit (see thp_check).
   int ok23 = thp_check() == 1;
 
+  // ---- AVX-512 state in the guest --------------------------------------------
+  // An instruction that needs every AVX-512 state component runs at ring 3
+  // and ring 0 and computes the right result, on a CPU that has AVX-512 (see
+  // avx512_check).
+  int ok24 = avx512_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
-            ok22 && ok23;
+            ok22 && ok23 && ok24;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }
