@@ -1,6 +1,21 @@
 // Guest-side trampolines and exception handlers for gk. These run inside the
 // guest in ring 0 and live in this binary's text, which gk maps into the guest.
 // The x86-64 code comes first; the arm64 code follows in its own #elif block.
+//
+// The arm64 code assembles for ELF (Linux) and Mach-O (macOS). Mach-O prefixes
+// C-visible symbols with an underscore, names a section by segment and section,
+// and has no .type directive; the macros below spell each form.
+#if defined(__APPLE__)
+#define SYM(name) _##name
+#define FUNC_TYPE(name)
+#define SECTION_GK_SUPER .section __TEXT,__gk_super,regular,pure_instructions
+#define SECTION_GK_USER_EXIT .section __TEXT,__gk_user_exit,regular,pure_instructions
+#else
+#define SYM(name) name
+#define FUNC_TYPE(name) .type name, @function
+#define SECTION_GK_SUPER .section .text.gk_super,"ax",@progbits
+#define SECTION_GK_USER_EXIT .section .text.gk_user_exit,"ax",@progbits
+#endif
 #if defined(__x86_64__)
     .text
 
@@ -304,12 +319,12 @@ gk_host_call_on_stack:
 // The supervisor text: the vector table, the handlers and the dispatcher, in
 // their own page-aligned section so that no other code shares their pages
 // (gk maps [gk_super_start, gk_super_end) supervisor r-x).
-    .section .text.gk_super,"ax",@progbits
+    SECTION_GK_SUPER
     .p2align 12
-    .globl gk_super_start
-gk_super_start:
-    .globl gk_vectors
-gk_vectors:
+    .globl SYM(gk_super_start)
+SYM(gk_super_start):
+    .globl SYM(gk_vectors)
+SYM(gk_vectors):
     // Current EL with SP_EL0: ring 0 (EL1t).
     b gk_exc_sync          // synchronous
     .balign 0x80
@@ -385,8 +400,8 @@ gk_exc_sync:
 // after its last hypercall. It applies the TLB maintenance and the root switch
 // the host asked for, then either launches a turn (GK_ACT_LAUNCH) or resumes
 // the saved state, with x0 (a syscall's result) as the host left it.
-    .globl gk_dispatch
-gk_dispatch:
+    .globl SYM(gk_dispatch)
+SYM(gk_dispatch):
     ldr x0, [sp, #VCB_ACTION]
     str xzr, [sp, #VCB_ACTION]
     // A root switch drops every non-global translation, as a CR3 load does on
@@ -501,18 +516,18 @@ gk_exc_bad:
     hvc #0
     b .
     .p2align 12
-    .globl gk_super_end
-gk_super_end:
+    .globl SYM(gk_super_end)
+SYM(gk_super_end):
 
 // The turn exit, for both rings: fn returns here with its result in x0 and
 // issues the reserved syscall GK_EXIT_SYSCALL (0xF4240, see gk.c), which the
 // host's syscall path recognizes as the end of the turn. It runs at ring 3 for
 // a ring-3 turn, so it lives on a user-executable page of its own.
-    .section .text.gk_user_exit,"ax",@progbits
+    SECTION_GK_USER_EXIT
     .p2align 12
-    .globl gk_user_exit_tramp
-    .type gk_user_exit_tramp, @function
-gk_user_exit_tramp:
+    .globl SYM(gk_user_exit_tramp)
+    FUNC_TYPE(SYM(gk_user_exit_tramp))
+SYM(gk_user_exit_tramp):
     movz x8, #0x4240
     movk x8, #0xf, lsl #16
     svc #0
@@ -520,8 +535,10 @@ gk_user_exit_tramp:
     .p2align 12
 
     .text
+#if !defined(__APPLE__)
 // Host-side helpers for guest thread creation, as on x86-64 above. These run
-// on the host, never in the guest.
+// on the host, never in the guest. Linux only: gk does not create guest
+// threads on macOS.
 //
 // long gk_host_clone_raw(long nr, long a1, long a2, long a3, long a4, long a5)
 // The child's initial stack holds [arg, fn] at its top two words.
@@ -556,15 +573,16 @@ gk_host_unmapself_exit:
     mov x8, #93        /* exit (thread) */
     svc #0
     brk #0
+#endif
 
 // long gk_host_call_on_stack(void *stack_top,
 //                            long (*f)(void *ctx, unsigned long caller_sp),
 //                            void *ctx)
 // As on x86-64: caller_sp is the frame record pushed here, the lowest address
 // the original stack is in use down to; x29 holds it across the call.
-    .globl gk_host_call_on_stack
-    .type gk_host_call_on_stack, @function
-gk_host_call_on_stack:
+    .globl SYM(gk_host_call_on_stack)
+    FUNC_TYPE(SYM(gk_host_call_on_stack))
+SYM(gk_host_call_on_stack):
     stp x29, x30, [sp, #-16]!
     mov x29, sp
     mov sp, x0         /* now on the side stack */
@@ -580,4 +598,6 @@ gk_host_call_on_stack:
 #error "gk supports x86-64 and arm64 only"
 #endif
 
+#if !defined(__APPLE__)
     .section .note.GNU-stack,"",@progbits
+#endif
