@@ -308,6 +308,74 @@ static int vcpu_set_sys(hv_vcpu_t v, hv_sys_reg_t id, uint64_t val) {
 static int vcpu_set_reg(hv_vcpu_t v, hv_reg_t id, uint64_t val) {
   return hv_vcpu_set_reg(v, id, val) == HV_SUCCESS ? 0 : -1;
 }
+// Set one of the registers the shared arm64 code names (VREG_*): a general
+// register or a system register, in HVF's two id spaces.
+static int vreg_set(gk_thread *t, int reg, uint64_t v) {
+  static const struct { int sys; uint16_t id; } ids[VREG_COUNT] = {
+      [VREG_PC] = {0, HV_REG_PC},
+      [VREG_PSTATE] = {0, HV_REG_CPSR},
+      [VREG_FPCR] = {0, HV_REG_FPCR},
+      [VREG_FPSR] = {0, HV_REG_FPSR},
+      [VREG_SP_EL1] = {1, HV_SYS_REG_SP_EL1},
+      [VREG_SCTLR] = {1, HV_SYS_REG_SCTLR_EL1},
+      [VREG_TCR] = {1, HV_SYS_REG_TCR_EL1},
+      [VREG_MAIR] = {1, HV_SYS_REG_MAIR_EL1},
+      [VREG_CPACR] = {1, HV_SYS_REG_CPACR_EL1},
+      [VREG_VBAR] = {1, HV_SYS_REG_VBAR_EL1},
+      [VREG_CNTKCTL] = {1, HV_SYS_REG_CNTKCTL_EL1},
+      [VREG_TTBR0] = {1, HV_SYS_REG_TTBR0_EL1},
+      [VREG_TPIDR] = {1, HV_SYS_REG_TPIDR_EL0},
+      [VREG_TPIDRRO] = {1, HV_SYS_REG_TPIDRRO_EL0},
+  };
+  return ids[reg].sys ? vcpu_set_sys(t->vcpu, (hv_sys_reg_t)ids[reg].id, v)
+                      : vcpu_set_reg(t->vcpu, (hv_reg_t)ids[reg].id, v);
+}
+
+// A pooled id brings only its vcb and stacks along (see vcpu_park).
+static void vcpu_unpark_hw(gk_thread *t, gk_parked_vcpu *p) { (void)t; (void)p; }
+
+// Every thread creates its own HVF vCPU (see vcpu_park), so it is always new:
+// returns 1, or -1 on failure.
+static int vcpu_hw_create(gk_thread *t, int id, int reused) {
+  (void)id; (void)reused;
+  hv_vcpu_t vcpu;
+  hv_vcpu_exit_t *exit;
+  if (hv_vcpu_create(&vcpu, &exit, NULL) != HV_SUCCESS) { G->err = "hv_vcpu_create"; return -1; }
+  uint64_t mmfr0 = 0;
+  if (hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ID_AA64MMFR0_EL1, &mmfr0) != HV_SUCCESS ||
+      ((mmfr0 >> 28) & 0xf) == 0xf) {  // TGran4 (see the page-sizes section)
+    G->err = "CPU has no 4KiB translation granule";
+    hv_vcpu_destroy(vcpu);
+    return -1;
+  }
+  // The guest reads the host's clock: CNTVCT_EL0 is mach_absolute_time.
+  if (hv_vcpu_set_vtimer_offset(vcpu, 0) != HV_SUCCESS) {
+    G->err = "hv_vcpu_set_vtimer_offset";
+    hv_vcpu_destroy(vcpu);
+    return -1;
+  }
+  t->vcpu = vcpu;
+  t->exit = exit;
+  return 1;
+}
+
+// A vcpu_init that failed after vcpu_hw_create destroys the vCPU, so the
+// thread can create another.
+static void vcpu_hw_abort(gk_thread *t) { hv_vcpu_destroy(t->vcpu); }
+
+// svc #0 is gk's own (the turn exit and the ring probe); svc #0x80 is a macOS
+// syscall (see forward_syscall); any other immediate is a genuine fault.
+static int svc_class(const gk_frame *f) {
+  unsigned imm = f->esr & 0xffff;
+  return imm == 0 ? SVC_GK : imm == 0x80 ? SVC_HOST : SVC_BAD;
+}
+
+// macOS has no vDSO: its user code reads the commpage (see commpage_refresh).
+static int vdso_call(gk_frame *f, uint64_t pc) {
+  (void)f; (void)pc;
+  return 0;
+}
+
 static uint64_t vcpu_reg(hv_vcpu_t v, hv_reg_t id) {
   uint64_t val = 0;
   hv_vcpu_get_reg(v, id, &val);

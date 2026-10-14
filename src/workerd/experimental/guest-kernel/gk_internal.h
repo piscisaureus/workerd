@@ -1009,6 +1009,12 @@ static int vcpu_set_sys(hv_vcpu_t v, hv_sys_reg_t id, uint64_t val);
 static int vcpu_set_reg(hv_vcpu_t v, hv_reg_t id, uint64_t val);
 static long forward_syscall(gk_thread *t, gk_regs *r);
 static long run_vcpu(gk_thread *t);
+static int vreg_set(gk_thread *t, int reg, uint64_t v);
+static void vcpu_unpark_hw(gk_thread *t, gk_parked_vcpu *p);
+static int vcpu_hw_create(gk_thread *t, int id, int reused);
+static void vcpu_hw_abort(gk_thread *t);
+static int svc_class(const gk_frame *f);
+static int vdso_call(gk_frame *f, uint64_t pc);
 #endif
 
 #if !GK_HVF
@@ -1174,6 +1180,11 @@ static void vdso_setup(void);
 static int vdso_call(gk_frame *f, uint64_t pc);
 static int vcpu_set(int fd, uint64_t id, uint64_t v);
 static int vcpu_get(int fd, uint64_t id, uint64_t *v);
+static int vreg_set(gk_thread *t, int reg, uint64_t v);
+static void vcpu_unpark_hw(gk_thread *t, gk_parked_vcpu *p);
+static int vcpu_hw_create(gk_thread *t, int id, int reused);
+static void vcpu_hw_abort(gk_thread *t);
+static int svc_class(const gk_frame *f);
 static int cr3_load_host(gk_thread *t, uint64_t cr3);
 static int host_backing_retry(gk_thread *t);
 static long host_backing_fail(gk_thread *t, int err);
