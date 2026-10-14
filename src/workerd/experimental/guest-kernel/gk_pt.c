@@ -462,39 +462,10 @@ static int map4k_root(uint64_t *root, uint64_t va, uint64_t flags, int pkey) {
   // GK_MAP_WALLED marks a page the host allows writes to whose W this vCPU's
   // host-frame wall withholds: it is mapped without W and tagged PTE_WALL so
   // wall_lower can give W back in place.
-#if defined(__x86_64__)
-  uint64_t pte = (va & ~0xfffULL) | PTE_P;
-  if (cls != GK_PROT_SUPER) pte |= PTE_U;  // user pages only; supervisor clears U
-  if (flags & 2) pte |= PTE_W;
-  if (flags & GK_MAP_WALLED) pte |= PTE_WALL;
-  if (!(flags & 4)) pte |= PTE_NX;
-  pte |= ((uint64_t)pkey << PTE_PKEY_SHIFT) & PTE_PKEY_MASK;
-#else
-  // The frame is the page's guest-physical address, through the memslot
-  // region backing it (every caller has ensured one). EL0 has no execute
-  // permission on a supervisor page whatever AP says, so UXN is set on every
-  // supervisor page; and the CPU itself denies EL1 execution of a page EL0 can
-  // write.
-  (void)pkey;
-  gk_region *rg = region_find(va);
-  if (!rg) return -1;
-#if GK_HVF
-  if (s2_ensure(rg, va) < 0) return -1;  // the caller has read the host mapping (see the HVF section)
-#endif
-  uint64_t pte = (rg->gpa + ((va & ~0xfffULL) - rg->start)) | PTE_P | PTE_TABLE | PTE_SH_INNER |
-                 PTE_AF | PTE_NG | PTE_RDONLY;
-  if (cls != GK_PROT_SUPER) pte |= PTE_U;  // user pages only; supervisor clears U
-  if (flags & 2) pte &= ~PTE_RDONLY;
-  if (flags & GK_MAP_WALLED) pte |= PTE_WALL;
-  if (!(flags & 4)) pte |= PTE_PXN | PTE_UXN;
-  else if (cls == GK_PROT_SUPER) pte |= PTE_UXN;
-#endif
+  uint64_t pte;
+  if (pte_leaf(va, flags, pkey, cls == GK_PROT_SUPER, &pte) < 0) return -1;
   if (global) {
-#if defined(__x86_64__)
-    pte |= PTE_G;
-#else
-    pte &= ~PTE_NG;
-#endif
+    pte = PTE_SET_GLOBAL(pte);
     G->slot_pinned[slot] = 1;  // no arena may ever take this slot (see the global-pages section)
     G->global_pages++;
   }
@@ -541,17 +512,7 @@ static long pte_range_root(uint64_t *root, uintptr_t s, uintptr_t e, int op,
         // supervisor/refuse class), the protection key and the accessed/dirty
         // bits are the page's own and stay.
         if (*pte & PTE_P) {
-#if defined(__x86_64__)
-          uint64_t n = *pte & ~(PTE_W | PTE_NX | PTE_WALL);
-          if (!(rp->prot & 4)) n |= PTE_NX;
-          if (rp->prot & 2) n |= (v >= rp->wall_lo && v < rp->wall_hi) ? PTE_WALL : PTE_W;
-#else
-          uint64_t n = (*pte & ~(PTE_PXN | PTE_UXN | PTE_WALL)) | PTE_RDONLY;
-          if (!(rp->prot & 4)) n |= PTE_PXN | PTE_UXN;
-          else if (!(n & PTE_U)) n |= PTE_UXN;  // a supervisor page (see map4k_root)
-          if (rp->prot & 2) n = (v >= rp->wall_lo && v < rp->wall_hi) ? n | PTE_WALL : PTE_SET_W(n);
-#endif
-          *pte = n;
+          *pte = pte_reprotect(*pte, rp, v);
         }
         break;
     }

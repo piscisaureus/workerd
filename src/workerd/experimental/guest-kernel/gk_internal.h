@@ -1062,6 +1062,8 @@ static void thread_key_dtor(void *p);
 
 #if defined(__x86_64__)
 // gk_x86_64.c
+static int pte_leaf(uint64_t va, uint64_t flags, int pkey, int super, uint64_t *out);
+static uint64_t pte_reprotect(uint64_t e, const gk_reprot *rp, uintptr_t v);
 static void set_idt_gate(uint8_t *idt, int vec, uint64_t h);
 static int vcpu_init(gk_thread *t, int flags);
 static int map_handler_text(void);
@@ -1084,6 +1086,8 @@ static long run_vcpu(gk_thread *t);
 
 #if defined(__aarch64__)
 // gk_arm64.c
+static int pte_leaf(uint64_t va, uint64_t flags, int pkey, int super, uint64_t *out);
+static uint64_t pte_reprotect(uint64_t e, const gk_reprot *rp, uintptr_t v);
 static int gpa_alloc(uint64_t size, uint64_t *out);
 static void gpa_release(uint64_t start, uint64_t size);
 static int vcpu_reset_pc(gk_thread *t);
@@ -1105,6 +1109,7 @@ static int vcb_exception(gk_thread *t, long *ret);
 
 #if defined(__aarch64__) && !GK_HVF
 // gk_kvm_arm64.c
+static int s2_ensure(gk_region *rg, uintptr_t hva);
 static void vdso_setup(void);
 static int vdso_call(gk_frame *f, uint64_t pc);
 static int vcpu_set(int fd, uint64_t id, uint64_t v);
