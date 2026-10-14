@@ -450,9 +450,9 @@ static v8::Isolate* newIsolate(
 
 #ifdef WORKERD_HAS_GUEST_KERNEL
 // gk places every arena on a boundary of one of the 512 GiB top-level page-table slots and
-// reserves whole slots (GK_SLOT_BITS in gk.c), so the arena's reservation runs from its base to
-// the end of the last slot the sandbox reservation reaches into. The remainder of that last
-// slot is the arena's tail, from which the isolate's out-of-sandbox memory is allocated (see
+// reserves whole slots (GK_SLOT_BITS in gk_internal.h), so the arena's reservation runs from its
+// base to the end of the last slot the sandbox reservation reaches into. The remainder of that
+// last slot is the arena's tail, from which the isolate's out-of-sandbox memory is allocated (see
 // GuestArena).
 constexpr size_t GUEST_ARENA_SLOT_SIZE = size_t(1) << 39;
 

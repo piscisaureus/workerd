@@ -15,7 +15,10 @@ else
 SIGN = @:
 endif
 
-gk_test: gk.c gk_asm.S gk_test.c gk.h gk.entitlements
+# gk.c and gk_asm.S include the rest of the sources (see gk_internal.h).
+GK_SRCS = $(wildcard gk*.c gk*.h gk_asm*.S)
+
+gk_test: $(GK_SRCS) gk_test.c gk.entitlements
 	$(CC) $(CFLAGS) -o $@ gk.c gk_asm.S gk_test.c $(LDLIBS)
 	$(SIGN)
 
@@ -23,7 +26,7 @@ gk_test: gk.c gk_asm.S gk_test.c gk.h gk.entitlements
 # GK_HANDLER_ENTER/LEAVE aborts. The tests exercise the fault path heavily (libc
 # malloc inside the guest), so a clean pass proves the handler stays malloc-free.
 # Linux only: the symbol wrapping relies on GNU ld's --wrap.
-gk_test_guard: gk.c gk_asm.S gk_test.c gk.h
+gk_test_guard: $(GK_SRCS) gk_test.c
 	$(CC) $(CFLAGS) -DGK_GUARD_HANDLER_ALLOC \
 		-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc \
 		-o $@ gk.c gk_asm.S gk_test.c

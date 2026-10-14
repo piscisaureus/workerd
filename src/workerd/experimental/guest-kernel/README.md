@@ -17,8 +17,24 @@ which runs each isolate's JS turn at guest ring 3.
 
 ## Files
 
-- `gk.h`, `gk.c` — the library.
-- `gk_asm.S` — the in-guest trampolines and exception handlers.
+- `gk.h` — the library's interface.
+- `gk.c` — the library, compiled as one translation unit that includes the
+  parts below; each part compiles to nothing on a platform it is not for, so the
+  backend, architecture and host OS are fixed at compile time and the parts call
+  each other directly. `gk_internal.h` holds the state and declarations they
+  share.
+  - Shared by every platform: `gk_core.c` (`gk_init`, the run entry points,
+    the host-frame wall, diagnostics), `gk_pt.c` (page tables, the
+    supervisor/refuse registry, demand paging), `gk_region.c` (memslot-backed
+    regions), `gk_arena.c`, `gk_thread.c` (thread records, the vCPU pool),
+    `gk_pkey.c` and `gk_util.c`.
+  - Per architecture: `gk_x86_64.h`/`gk_x86_64.c` (x86-64, which is KVM only)
+    and `gk_arm64.h`/`gk_arm64.c` (arm64 under either hypervisor).
+  - Per host and hypervisor: `gk_linux.c` (Linux syscalls, `/proc/self/maps`,
+    guest thread creation), `gk_kvm_arm64.c` (arm64 under KVM) and `gk_hvf.c`
+    (macOS and Hypervisor.framework).
+- `gk_asm.S` — the in-guest trampolines and exception handlers, which includes
+  `gk_asm_x86_64.S` or `gk_asm_arm64.S`.
 - `gk_test.c` — the test/example.
 - `Makefile` — `make run` builds and runs the test.
 - `gk.entitlements` — the hypervisor entitlement the macOS binary is signed with.
@@ -271,7 +287,7 @@ links the framework and ad-hoc signs `gk_test` with `gk.entitlements`
 (`com.apple.security.hypervisor`), which HVF requires; no root and no system
 changes. The guest model is the arm64 one above, with the same vector table,
 dispatcher and page tables, and `gk_test` passes with the checks that do not
-apply skipped. The differences, all in the host side of `gk.c` under `GK_HVF`:
+apply skipped. The differences, mostly in `gk_hvf.c`:
 
 - **Stage 2 is filled page by page and pins what it maps.** KVM backs a memslot
   from the host page tables as the guest touches it and follows the host's
@@ -371,7 +387,7 @@ decides the overall cost.
   the forwarding thread itself yet.
 - **The MMU backs whole 2 MiB windows, not exact VMAs.** It reparses
   `/proc/self/maps` per fault (each read also settles the fault's aligned
-  256 KiB neighborhood, see `demand_map_neighbors` in `gk.c`, so a growing
+  256 KiB neighborhood, see `demand_map_neighbors` in `gk_pt.c`, so a growing
   mapping costs a read per 64 pages rather than per page), flushes the whole
   TLB on each `mprotect`/`munmap`,
   and only the faulting thread's TLB (no cross-vCPU shootdown). Backing in aligned
@@ -380,8 +396,8 @@ decides the overall cost.
   costs ~20 us and a V8-sized heap of 4 KiB slots would exceed KVM's ~32764-slot
   limit. (The heap corruption once blamed on on-demand memslot creation was
   actually fault-path re-entrancy into glibc `malloc` — the memslot ioctl is not
-  involved; see the signal-safety note in `gk.c`.) A production MMU could track
-  exact VMAs (see the FreeBSD `sys/vm` note in `gk.c`) for density and add
+  involved; see the signal-safety note in `gk_region.c`.) A production MMU could track
+  exact VMAs (see the FreeBSD `sys/vm` note in `gk_region.c`) for density and add
   per-range cross-vCPU shootdowns; both are refinements, not correctness fixes.
 
 ## Running V8 inside gk (status)
