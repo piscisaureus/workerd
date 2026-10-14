@@ -1,4 +1,4 @@
-// gk: the MMU layer: the interval tree of memslot-backed regions.
+// gk: the MMU layer: the interval tree of backed regions.
 #include "gk_internal.h"
 
 // ---- the MMU layer: interval-tree memslot manager --------------------------
@@ -6,7 +6,8 @@
 // guest-physical to the identical host-virtual range. Backed ranges ("regions")
 // are tracked in an interval tree (a treap keyed by start) of non-overlapping
 // [start, end) windows; every mapped PTE must have a backing memslot, or KVM
-// takes the MMIO/emulation path and KVM_RUN returns EFAULT.
+// takes the MMIO/emulation path and KVM_RUN returns EFAULT. (Under HVF a
+// region has no memslot; its pages enter stage 2 one by one, see gk_hvf.c.)
 //
 // Memory is backed one aligned GK_BACK_WIN window at a time (region_ensure
 // rounds outward to the window), rather than one memslot per exact host mapping.
@@ -50,9 +51,7 @@
 // async-signal-safe with respect to the guest thread: no malloc/free, no
 // allocating stdio, no lock the guest may hold. That is why host_region reads
 // /proc/self/maps with raw open/read rather than fopen, and region nodes come
-// from this pool rather than calloc. (This corruption was once attributed to
-// KVM's on-demand memslot creation; the memslot ioctl is not involved -- an
-// added, abutting memslot invalidates nothing. See the backing-window note.)
+// from this pool rather than calloc.
 
 // xorshift32 PRNG for treap priorities. Caller holds G->lock.
 static unsigned gk_rand(void) {
