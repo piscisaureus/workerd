@@ -986,6 +986,8 @@ static void db_flush(gk_dbuf *d);
 
 #if GK_HVF
 // gk_hvf.c
+static int memslot_add(int slot, uint64_t gpa, uintptr_t s, uintptr_t e);
+static int memslot_remove(gk_region *n, int *keep_gpa);
 static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
                          long a6);
 static int copy_in(void *dst, uintptr_t src, size_t n);
@@ -999,6 +1001,12 @@ static int vcpu_set_sys(hv_vcpu_t v, hv_sys_reg_t id, uint64_t val);
 static int vcpu_set_reg(hv_vcpu_t v, hv_reg_t id, uint64_t val);
 static long forward_syscall(gk_thread *t, gk_regs *r);
 static long run_vcpu(gk_thread *t);
+#endif
+
+#if !GK_HVF
+// gk_kvm.c
+static int memslot_add(int slot, uint64_t gpa, uintptr_t s, uintptr_t e);
+static int memslot_remove(gk_region *n, int *keep_gpa);
 #endif
 
 #if !GK_HVF
@@ -1062,6 +1070,12 @@ static void thread_key_dtor(void *p);
 
 #if defined(__x86_64__)
 // gk_x86_64.c
+static int gpa_assign(uintptr_t s, uintptr_t e, uint64_t *gpa);
+static void gpa_unassign(uintptr_t s, uintptr_t e, uint64_t gpa);
+static void gpa_retire(gk_region *n);
+static void region_set_gpa(gk_region *n, uint64_t gpa);
+static inline uint64_t region_gpa(const gk_region *n);
+static int region_clip_holes(uintptr_t *s, uintptr_t *gap_end);
 static int pte_leaf(uint64_t va, uint64_t flags, int pkey, int super, uint64_t *out);
 static uint64_t pte_reprotect(uint64_t e, const gk_reprot *rp, uintptr_t v);
 static void set_idt_gate(uint8_t *idt, int vec, uint64_t h);
@@ -1086,6 +1100,12 @@ static long run_vcpu(gk_thread *t);
 
 #if defined(__aarch64__)
 // gk_arm64.c
+static int gpa_assign(uintptr_t s, uintptr_t e, uint64_t *gpa);
+static void gpa_unassign(uintptr_t s, uintptr_t e, uint64_t gpa);
+static void gpa_retire(gk_region *n);
+static void region_set_gpa(gk_region *n, uint64_t gpa);
+static inline uint64_t region_gpa(const gk_region *n);
+static int region_clip_holes(uintptr_t *s, uintptr_t *gap_end);
 static int pte_leaf(uint64_t va, uint64_t flags, int pkey, int super, uint64_t *out);
 static uint64_t pte_reprotect(uint64_t e, const gk_reprot *rp, uintptr_t v);
 static int gpa_alloc(uint64_t size, uint64_t *out);

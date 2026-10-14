@@ -182,6 +182,21 @@ static int s2_release(gk_region *rg) {
   return rg->s2_n ? s2_drop(rg, rg->gpa, rg->end - rg->start) : 0;
 }
 
+// A region has no memslot under HVF: its window enters stage 2 page by page
+// (see s2_ensure).
+static int memslot_add(int slot, uint64_t gpa, uintptr_t s, uintptr_t e) {
+  (void)slot; (void)gpa; (void)s; (void)e;
+  return 0;
+}
+
+// The region goes either way (the host memory is going) and its stage-2 pages
+// with it; guest-physical pages stage 2 still maps (see s2_drop) are
+// quarantined (*keep_gpa) rather than reused.
+static int memslot_remove(gk_region *n, int *keep_gpa) {
+  *keep_gpa = s2_release(n) < 0;
+  return 0;
+}
+
 // Bring the commpage shadows up to date with the kernel's pages, before a turn.
 static void commpage_refresh(void) {
   for (int i = 0; i < G->commpage_n; i++)

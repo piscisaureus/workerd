@@ -24,6 +24,48 @@ static int pte_exec_at_el1(gk_thread *t, uintptr_t va) {
   pthread_mutex_unlock(&G->lock);
   return changed;
 }
+
+// A region's guest-physical range: whole GK_BACK_WIN windows, even for a
+// region a hole (see region_ensure) cut short, at the region's own offset into
+// them.
+static int gpa_assign(uintptr_t s, uintptr_t e, uint64_t *gpa) {
+  uintptr_t wlo = s & ~(GK_BACK_WIN - 1), whi = (e + GK_BACK_WIN - 1) & ~(GK_BACK_WIN - 1);
+  if (gpa_alloc(whi - wlo, gpa) < 0) {
+    if (G->dbg) write_stderr("[gk] guest-physical space exhausted\n");
+    return -1;
+  }
+  *gpa += s - wlo;
+  return 0;
+}
+
+// Give back the range gpa_assign handed out for [s, e) at `gpa`.
+static void gpa_unassign(uintptr_t s, uintptr_t e, uint64_t gpa) {
+  uintptr_t wlo = s & ~(GK_BACK_WIN - 1), whi = (e + GK_BACK_WIN - 1) & ~(GK_BACK_WIN - 1);
+  gpa_release(gpa - (s - wlo), whi - wlo);
+}
+
+// A deleted region's range goes back to the allocator, unless a vCPU still
+// running under a destroyed arena's root (see gk_arena_destroy) may hold
+// translations to it.
+static void gpa_retire(gk_region *n) {
+  if (!G->gpa_keep) gpa_unassign(n->start, n->end, n->gpa);
+}
+
+static void region_set_gpa(gk_region *n, uint64_t gpa) { n->gpa = gpa; }
+static inline uint64_t region_gpa(const gk_region *n) { return n->gpa; }
+
+// Clip the window [*s, *gap_end) region_ensure is about to back around the
+// holes (see the vDSO section): KVM refuses a memslot over the kernel's data
+// pages. Returns 1 if *s was inside one, which then moves *s past it.
+static int region_clip_holes(uintptr_t *s, uintptr_t *gap_end) {
+  for (int i = 0; i < G->hole_n; i++) {
+    const gk_prot_range *h = &G->holes[i];
+    if (*s >= h->start && *s < h->end) { *s = h->end; return 1; }
+    if (h->start > *s && h->start < *gap_end) *gap_end = h->start;
+  }
+  return 0;
+}
+
 // ---- page-table entries -----------------------------------------------------
 // The leaf PTE map4k_root installs for `va` (see there for `flags`). The frame
 // is the page's guest-physical address, through the memslot region backing it
