@@ -28,6 +28,9 @@ isolate's JS turn at guest ring 3.
   loop) runs correctly with the worker's JS turn at guest ring 3, and that a
   Wasm bounds violation surfaces as a `WebAssembly.RuntimeError` rather than a
   guest fault.
+- `bench/` — the benchmarks: stock-workerd baselines, standalone KVM
+  microbenchmarks for the exit and switch costs, and the end-to-end
+  isolation-off-versus-on suite. See `bench/README.md`.
 
 ## API
 
