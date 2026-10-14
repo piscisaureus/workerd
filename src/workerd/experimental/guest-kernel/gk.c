@@ -6880,6 +6880,23 @@ static int cr3_load_host(gk_thread *t, uint64_t cr3) {
   return sregs_set(t, &s);
 }
 #else  // __aarch64__
+// The vCPU waits at the dispatcher with its last root in TTBR0_EL1, and that
+// root may be gone by the time the host asks for another (a destroyed arena's
+// pml4, back in the table pool with a free-list link in its first entry). The
+// dispatcher's own first fetch walks TTBR0 unless the TLB still holds the
+// dispatcher's page, which neither HVF (on every entry) nor KVM (after a
+// migration to another CPU, say) promises, so the new root goes into
+// TTBR0_EL1 from the host before the vCPU runs; the dispatcher's load of the
+// same value and its TLBI then take effect as on a switch the guest made
+// itself.
+static void ttbr0_preload(gk_thread *t, uint64_t root) {
+#if GK_HVF
+  vcpu_set_sys(t->vcpu, HV_SYS_REG_TTBR0_EL1, root);
+#else
+  vcpu_set(t->fd, GK_TTBR0_EL1, root);
+#endif
+}
+
 // sync_cr3 on arm64: the root is TTBR0's guest-physical address, which the
 // dispatcher records in the vcb (cur_ttbr) every time it runs, so the vCPU's
 // actual root is read back from there; a switch the host has asked for and
@@ -6909,6 +6926,7 @@ static int cr3_load_host(gk_thread *t, uint64_t cr3) {
   struct gk_vcb *v = VCB(t);
   v->ttbr = cr3;
   v->action |= GK_ACT_TTBR;
+  ttbr0_preload(t, cr3);
   flush_run(t);
   t->tlb_touched = 1;
   return 0;
@@ -7070,15 +7088,7 @@ static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t st
   if (cr3) {
     v->ttbr = cr3;
     v->action |= GK_ACT_TTBR;
-#if GK_HVF
-    // The vCPU waits at the dispatcher with its last root in TTBR0_EL1, and
-    // that root may be gone by now (a destroyed arena's pml4, back in the
-    // table pool). The dispatcher's own first fetch walks TTBR0 when the TLB
-    // does not hold it, and HVF gives the vCPU no such TLB entry on entry, so
-    // the new root goes in from here; the dispatcher's load of the same value
-    // and its TLBI then take effect as on a switch the guest made itself.
-    vcpu_set_sys(t->vcpu, HV_SYS_REG_TTBR0_EL1, cr3);
-#endif
+    ttbr0_preload(t, cr3);
     atomic_fetch_add_explicit(&G->root_switches, 1, memory_order_relaxed);
     if (G->dbg)
       fprintf(stderr, "[gk] vcpu %d: root switch to %#llx (%s)\n", t->id,
