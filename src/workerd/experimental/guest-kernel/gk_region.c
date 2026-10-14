@@ -176,9 +176,11 @@ static int region_add(uintptr_t s, uintptr_t e) {
 // id) go to the free list, and its guest-physical range back to the allocator
 // unless the hypervisor may still map it. Caller holds G->lock and has made
 // sure no root maps a page in the region any more, so the guest cannot reach
-// it. Returns -1 if the memslot could not be deleted: the region then stays.
-static int region_remove(gk_region *n) {
-  int keep_gpa = 0;
+// it. `keep_gpa`: the guest-physical range is not reused even so, as a vCPU
+// running under a destroyed arena's root may hold translations to it (see
+// gk_arena_destroy). Returns -1 if the memslot could not be deleted: the
+// region then stays.
+static int region_remove(gk_region *n, int keep_gpa) {
   if (memslot_remove(n, &keep_gpa) < 0) return -1;
   G->regions = treap_remove(G->regions, n);
   G->region_live--;
@@ -203,13 +205,14 @@ static gk_region *region_lower_bound(uintptr_t s) {
 // slot boundary (windows are created within host mappings and arena spans,
 // both of which lie within slots), so for a whole-slot range this is every
 // region that overlaps it; one that did straddle would be left alone. Returns
-// how many were deleted. Caller holds G->lock.
-static int region_remove_range(uintptr_t s, uintptr_t e) {
+// how many were deleted (see region_remove for `keep_gpa`). Caller holds
+// G->lock.
+static int region_remove_range(uintptr_t s, uintptr_t e, int keep_gpa) {
   int n = 0;
   gk_region *r = region_lower_bound(s);
   while (r && r->start < e) {
     gk_region *next = region_succ(r->start);
-    if (r->end <= e && region_remove(r) == 0) n++;
+    if (r->end <= e && region_remove(r, keep_gpa) == 0) n++;
     r = next;
   }
   return n;

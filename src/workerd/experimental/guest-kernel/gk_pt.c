@@ -470,20 +470,7 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
     return -1;
   }
   int mapped = host_region(page, &rs, &re, &perms);
-#if !GK_HVF  // a macOS stack is a mapping of its full size
-  if (!mapped) {
-    // The page may lie just below a stack the kernel grows on demand (the main
-    // thread's, which gk_run_here runs the guest on). Natively the thread's own
-    // access would grow it; a guest access never reaches the host's fault
-    // handler, so ask the kernel to fault the page here. rt_sigprocmask with a
-    // NULL `set` changes nothing, but writing the old mask to `oldset` = page
-    // makes the kernel's copy_to_user grow a VM_GROWSDOWN stack exactly as a
-    // native write would (and return EFAULT, not a signal, if it cannot).
-    // Ordinary unmapped addresses just fail the probe.
-    host_syscall(SYS_rt_sigprocmask, SIG_BLOCK, 0, (long)page, 8, 0, 0);
-    mapped = host_region(page, &rs, &re, &perms);
-  }
-#endif
+  if (!mapped && host_stack_grow(page)) mapped = host_region(page, &rs, &re, &perms);
   if (!mapped || !(perms & 1)) {
     pthread_mutex_unlock(&G->lock);
     return -1;  // not host-readable: a genuine fault
