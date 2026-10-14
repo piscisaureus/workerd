@@ -1643,10 +1643,16 @@ so a crossing a turn makes on every dereference belongs on that path.
 - **No signal delivery** into the library's API yet; only faults are caught,
   via the in-guest IDT handlers. (Injecting a host signal as a guest interrupt
   is demonstrated separately and would be wired in here.)
-- **Syscall policy is a single filter hook, and it leaves files and the
-  network open.** `gk_set_syscall_filter` is the only gate on a forwarded
-  syscall: gk has no default allowlist, and no host-side seccomp on the
-  forwarding thread. workerd's filter (`guestKernelSyscallFilter` in
+- **Syscall policy is an embedder filter over a built-in memory broker.**
+  `gk_set_syscall_filter` bounds which syscalls a turn may forward. On top of
+  that, a ring-3 turn's forwarded syscall goes through a broker (see the ring-3
+  syscall memory broker in `gk_linux.c` and `gk_hvf.c`): every pointer argument,
+  including those nested in an iovec or msghdr, must name memory the turn could
+  reach itself, and a syscall gk has no descriptor for, or one that acts on host
+  rather than guest state, is refused. There is still no default syscall
+  allowlist (the embedder supplies one) or host-side seccomp on the forwarding
+  thread itself yet.
+  workerd's filter (`guestKernelSyscallFilter` in
   `src/workerd/server/workerd.c++`) admits syscalls by number, and for the
   ones that change mappings also by range, through `gk_mapping_syscall_ok`:
   `mprotect`, `pkey_mprotect`, `munmap`, `madvise`, `mmap` with `MAP_FIXED`
