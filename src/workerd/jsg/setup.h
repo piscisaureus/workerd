@@ -122,7 +122,8 @@ bool isGuestKernelEnabled();
 // any thread: V8 allocates and changes permissions from its background threads too.
 class ArenaPageAllocator final: public v8::PageAllocator {
  public:
-  // Manages [begin, end), which must be page-aligned and reserved as described above.
+  // Manages [begin, end), which must be aligned to the host page size and reserved as
+  // described above.
   ArenaPageAllocator(uintptr_t begin, uintptr_t end);
   // v8::PageAllocator's destructor is noexcept, which the KJ members' destructors are not.
   ~ArenaPageAllocator() noexcept override {}
@@ -160,6 +161,10 @@ class ArenaPageAllocator final: public v8::PageAllocator {
 
   const uintptr_t rangeBegin;
   const uintptr_t rangeEnd;
+  // The host's page size: the granularity of every mprotect() and mmap() this allocator makes,
+  // hence of every range it hands out. gk's guest page tables use 4 KiB pages whatever the host
+  // page size is, so this is the only page size V8 needs to know.
+  const size_t pageSize;
   // The free ranges, sorted by address, pairwise disjoint and never adjacent (adjacent ranges
   // are merged when one is freed).
   kj::MutexGuarded<kj::Vector<Range>> freeList;
