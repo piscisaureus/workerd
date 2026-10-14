@@ -10,12 +10,15 @@
 #include <kj/debug.h>
 
 #include <atomic>
+#include <cstring>
 
 namespace workerd::jsg::_ {
 namespace {
 
 // Depth of guest-kernel turns on this thread. A nested turn already executes in the guest and
-// must not call gk_run_here_user() again from inside it.
+// must not call gk_run_here_user() again from inside it. Thread-local storage is memory the
+// guest can write, so the outermost turn restores the depth from the value it saved in its own
+// host frame (read-only under the wall) rather than by decrementing.
 thread_local uint guestTurnDepth = 0;
 
 // The arena the outermost guest turn on this thread entered the guest with. A nested turn runs
@@ -51,8 +54,9 @@ void runTrampolineInGuest(
     return;
   }
 
-  ++guestTurnDepth;
-  KJ_DEFER(--guestTurnDepth);
+  uint depth = guestTurnDepth;
+  guestTurnDepth = depth + 1;
+  KJ_DEFER(guestTurnDepth = depth);
   guestTurnArena = arena;
   KJ_DEFER(guestTurnArena = nullptr);
 
@@ -68,6 +72,35 @@ void runTrampolineInGuest(
         gk_fault_addr());
     onFault(e);
     kj::throwFatalException(kj::mv(e));
+  }
+}
+
+void GuestTurnOutcome::setException(const kj::Exception& e) {
+  auto description = e.getDescription();
+  uint32_t length = static_cast<uint32_t>(kj::min(description.size(), MAX_DESCRIPTION));
+  memcpy(this->description, description.begin(), length);
+  descriptionLength = length;
+  exceptionType = static_cast<uint32_t>(e.getType());
+  status = EXCEPTION;
+}
+
+void throwIfGuestTurnFailed(const GuestTurnOutcome& outcome) {
+  switch (outcome.status) {
+    case GuestTurnOutcome::RETURNED:
+      return;
+    case GuestTurnOutcome::JS_EXCEPTION_THROWN:
+      throw JsExceptionThrown();
+    case GuestTurnOutcome::EXCEPTION: {
+      auto type = kj::Exception::Type::FAILED;
+      if (outcome.exceptionType <= static_cast<uint32_t>(kj::Exception::Type::UNIMPLEMENTED)) {
+        type = static_cast<kj::Exception::Type>(outcome.exceptionType);
+      }
+      uint32_t length = kj::min(outcome.descriptionLength, GuestTurnOutcome::MAX_DESCRIPTION);
+      kj::throwFatalException(
+          kj::Exception(type, __FILE__, __LINE__, kj::heapString(outcome.description, length)));
+    }
+    default:
+      KJ_FAIL_REQUIRE("guest-kernel: JS turn reported an invalid status", outcome.status);
   }
 }
 

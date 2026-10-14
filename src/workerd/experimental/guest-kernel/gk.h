@@ -120,7 +120,7 @@ enum {
   GK_CTL_REGIONS,      // the memslot interval tree's root
   GK_CTL_REGION_POOL,  // its node pool
   GK_CTL_PT_ALLOC,     // the page-table page allocator's free list
-  GK_CTL_THREADS,      // the per-thread records (active root, vCPU, ring)
+  GK_CTL_THREADS,      // the per-thread records (active root, arena nesting, vCPU, ring)
   GK_CTL_VCPU_POOL,    // the parked-vCPU pool
   GK_CTL_PKEYS,        // the protection-key ranges
   GK_CTL_ROOT,         // the base page-table root pointer
@@ -169,11 +169,29 @@ gk_arena *gk_arena_create(size_t size);
 void *gk_arena_base(const gk_arena *a);
 size_t gk_arena_size(const gk_arena *a);
 
-// Make `a` the active arena for subsequent guest execution, returning the
-// previously active arena (or NULL for the base root with no private arena).
-// Passing NULL selects the base root. Takes effect on the next gk_run, and,
-// when called from within forwarded code, immediately.
-gk_arena *gk_arena_enter(gk_arena *a);
+// Make `a` the active arena for subsequent guest execution: the thread's guest
+// entries run under `a`'s page-table root from the next gk_run on (and, when
+// called from within forwarded code, immediately). The arena that was active
+// before is recorded in the thread's own record, in gk's supervisor memory, and
+// gk_arena_leave returns to it; the caller never names the arena to return to,
+// so no value that guest code could have rewritten ever selects a root. Enters
+// nest up to GK_ARENA_NEST deep per thread.
+//
+// `a` must be a live arena, between its gk_arena_create and gk_arena_destroy.
+// Any other pointer is refused before anything is read through it (it is
+// checked against gk's own arena pool, not by inspecting what it points at),
+// with -EINVAL, a message on stderr, and the thread's root left as it was.
+// Nesting past the bound is refused the same way with -ENOMEM. NULL is the
+// outermost leave: it selects the base root and empties the thread's nesting
+// history. Returns 0 on success.
+#define GK_ARENA_NEST 16
+int gk_arena_enter(gk_arena *a);
+
+// Return to the arena that was active before the innermost gk_arena_enter on
+// this thread, as gk recorded it; an arena destroyed since then counts as the
+// base root. A leave with nothing entered on this thread selects the base root,
+// prints a message on stderr and returns -EINVAL. Returns 0 on success.
+int gk_arena_leave(void);
 
 // Tear an arena down: its reservation is unmapped, every mapping and KVM
 // memslot inside it is removed, and its page tables and address-space slots

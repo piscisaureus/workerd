@@ -1505,6 +1505,107 @@ static long neighborhood_check(void) {
   return ok1 && ok2 && ok3 && ok4;
 }
 
+// ---- arena nesting and the restore path ------------------------------------
+// gk_arena_leave returns to the arena gk recorded for the thread, never to one
+// the caller names, and gk_arena_enter accepts only a live arena. A pointer to
+// memory that is not an arena struct (heap memory shaped like one) is refused
+// unread, and so is a pool struct whose arena has been destroyed; either way
+// the thread's root stays as it was. Nested enters restore in order. An arena
+// destroyed while it sits in a thread's history is replaced by the base root
+// there, even once its struct has been recycled for a new arena. A leave with
+// nothing entered selects the base root, and nesting past GK_ARENA_NEST is
+// refused with the root unchanged.
+static int nesting_check(void) {
+  gk_arena *A = gk_arena_create(4096), *B = gk_arena_create(4096);
+  if (!A || !B) { printf("nesting: create failed\n"); return 0; }
+  unsigned char *pa = gk_arena_base(A), *pb = gk_arena_base(B);
+  struct ap wa = {pa, 0xA5}, wb = {pb, 0xB6};
+  gk_arena_enter(NULL);
+
+  // Nesting: A, then B inside it. Under B only B is reachable; the first leave
+  // is back under A, the second on the base root.
+  int e1 = gk_arena_enter(A);
+  long ra = gk_run(commit_write, &wa);
+  int e2 = gk_arena_enter(B);
+  long rb = gk_run(commit_write, &wb);
+  long rb_a = gk_run(read_byte, pa);
+  int l1 = gk_arena_leave();
+  long ra2 = gk_run(read_byte, pa);
+  long ra_b = gk_run(read_byte, pb);
+  int l2 = gk_arena_leave();
+  long r0_a = gk_run(read_byte, pa), r0_b = gk_run(read_byte, pb);
+  int nest_ok = e1 == 0 && ra == 0xA5 && e2 == 0 && rb == 0xB6 && rb_a == GK_EFAULT &&
+                l1 == 0 && ra2 == 0xA5 && ra_b == GK_EFAULT && l2 == 0 &&
+                r0_a == GK_EFAULT && r0_b == GK_EFAULT;
+
+  // A bogus arena: heap memory the caller controls, shaped like an arena struct.
+  // It is refused, nothing in it is touched (no reference count is written
+  // through it), and the thread stays under A.
+  enum { JUNK = 8192 };
+  unsigned char *junk = malloc(JUNK);
+  memset(junk, 0xEE, JUNK);
+  gk_arena_enter(A);
+  int eb = gk_arena_enter((gk_arena *)junk);
+  long ra3 = gk_run(read_byte, pa);
+  int junk_intact = 1;
+  for (int i = 0; i < JUNK; i++) if (junk[i] != 0xEE) junk_intact = 0;
+  free(junk);
+  // A pool struct that no live arena owns: C's, after C is destroyed. Refused
+  // too, and the thread stays under A.
+  gk_arena *C = gk_arena_create(4096);
+  gk_arena_destroy(C);
+  int ec = gk_arena_enter(C);
+  long ra4 = gk_run(read_byte, pa);
+  int bogus_ok = eb == -22 && ra3 == 0xA5 && junk_intact && ec == -22 && ra4 == 0xA5;
+
+  // A destroyed arena in the history. Under B on top of A, A is destroyed and a
+  // new arena D takes its struct (the pool recycles it); leaving B must land on
+  // the base root, not under D, which is reachable only once entered itself.
+  gk_arena_enter(B);
+  gk_arena_destroy(A);
+  gk_arena *D = gk_arena_create(4096);
+  unsigned char *pd = gk_arena_base(D);
+  int recycled = D == A;
+  int md = mprotect(pd, 4096, PROT_READ | PROT_WRITE) == 0;  // committed by the host
+  pd[0] = 0xD4;
+  int l3 = gk_arena_leave();
+  long rd0 = gk_run(read_byte, pd), rb0 = gk_run(read_byte, pb);
+  gk_arena_enter(D);
+  long rd1 = gk_run(read_byte, pd);
+  gk_arena_enter(NULL);
+  int scrub_ok = md && l3 == 0 && rd0 == GK_EFAULT && rb0 == GK_EFAULT && rd1 == 0xD4;
+
+  // Underflow: a leave with nothing entered selects the base root and says so.
+  gk_arena_enter(B);
+  int l4 = gk_arena_leave(), l5 = gk_arena_leave();
+  long ru = gk_run(read_byte, pb);
+  int under_ok = l4 == 0 && l5 == -22 && ru == GK_EFAULT;
+
+  // Overflow: the bound holds, the refused enter leaves the thread under B, and
+  // the matching leaves unwind to the base root.
+  int over_ok = 1;
+  for (int i = 0; i < GK_ARENA_NEST; i++) if (gk_arena_enter(B) != 0) over_ok = 0;
+  int eo = gk_arena_enter(B);
+  long ro = gk_run(read_byte, pb);
+  for (int i = 0; i < GK_ARENA_NEST; i++) if (gk_arena_leave() != 0) over_ok = 0;
+  long ro0 = gk_run(read_byte, pb);
+  over_ok = over_ok && eo == -12 && ro == 0xB6 && ro0 == GK_EFAULT;
+
+  gk_arena_enter(NULL);
+  gk_arena_destroy(B);
+  gk_arena_destroy(D);
+  int ok = nest_ok && bogus_ok && scrub_ok && under_ok && over_ok;
+  printf("arena nesting: A/B nest+leave %s; bogus heap pointer -> %d (root kept %s, memory "
+         "untouched %s), destroyed pool struct -> %d (root kept %s); destroyed-in-history "
+         "(struct recycled: %s) leave -> base root %s; underflow -> %d (base root %s); "
+         "overflow at %d -> %d (root kept %s, unwinds %s) [%s]\n",
+         nest_ok ? "OK" : "FAIL", eb, ra3 == 0xA5 ? "yes" : "no", junk_intact ? "yes" : "no",
+         ec, ra4 == 0xA5 ? "yes" : "no", recycled ? "yes" : "no",
+         scrub_ok ? "yes" : "no", l5, ru == GK_EFAULT ? "yes" : "no", GK_ARENA_NEST, eo,
+         ro == 0xB6 ? "yes" : "no", ro0 == GK_EFAULT ? "yes" : "no", ok ? "OK" : "FAIL");
+  return ok;
+}
+
 // ---- AVX-512 state in the guest ----------------------------------------------
 // The guest CPUID is the host's, so glibc's ifunc resolvers and any JIT pick
 // AVX-512 code paths on a CPU that has them; the guest's XCR0 must then have
@@ -1828,9 +1929,9 @@ int main(void) {
         // in separate 2MiB backing windows.
         struct churn_arena c = {base, big ? (2 * SLOT / 3) & ~(size_t)0xfff : (2UL << 20),
                                 PAGES, (unsigned)(it * 2 + k)};
-        gk_arena *prev = gk_arena_enter(a);
+        gk_arena_enter(a);
         long r = (it & 1) ? gk_run_here(churn_use, &c) : gk_run(churn_use, &c);
-        if (it % 7 != 3) gk_arena_enter(prev);  // sometimes destroy while still entered
+        if (it % 7 != 3) gk_arena_leave();  // sometimes destroy while still entered
         if (r != churn_want(&c)) {
           printf("  churn %d.%d: arena %p run -> %ld, want %ld (fault %#lx)\n", it, k,
                  (void *)base, r, churn_want(&c), gk_fault_addr());
@@ -1839,7 +1940,7 @@ int main(void) {
           fresh_ok++;
         }
         gk_arena_destroy(a);
-        if (it % 7 == 3) gk_arena_enter(prev);
+        if (it % 7 == 3) gk_arena_leave();
         long rf = gk_run(read_byte, base);  // the freed span: a plain demand fault
         if (rf != GK_EFAULT || gk_fault_addr() != (uintptr_t)base) {
           printf("  churn %d.%d: freed span read -> %ld (fault %#lx), want GK_EFAULT at %p\n",
@@ -2241,9 +2342,14 @@ int main(void) {
   // avx512_check).
   int ok24 = avx512_check() == 1;
 
+  // ---- arena nesting and the restore path ------------------------------------
+  // gk_arena_leave restores the arena gk recorded; a bogus or stale pointer
+  // cannot select a root, and the nesting bound holds (see nesting_check).
+  int ok25 = nesting_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
-            ok22 && ok23 && ok24;
+            ok22 && ok23 && ok24 && ok25;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

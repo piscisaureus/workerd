@@ -2702,11 +2702,14 @@ class MemoryProtectionKeyScope final {
 };
 
 // Makes the isolate's guest-kernel arena (IsolateBase::getGuestArena()), if it has one, the
-// calling thread's active arena for the scope's lifetime, and restores the previously active
-// arena afterwards so that locks on different isolates nest. While the scope is active, guest
-// execution on this thread can address this isolate's V8 sandbox and no other isolate's. A no-op
-// when the isolate has no arena, which is always the case unless guest-kernel isolation is
-// enabled (see setup.h).
+// calling thread's active arena for the scope's lifetime, and leaves it afterwards so that locks
+// on different isolates nest. While the scope is active, guest execution on this thread can
+// address this isolate's V8 sandbox and no other isolate's. A no-op when the isolate has no
+// arena, which is always the case unless guest-kernel isolation is enabled (see setup.h).
+//
+// The scope records nothing that selects a page-table root: the arena to return to is kept by
+// gk itself, per thread, in its supervisor memory (gk_arena_leave in gk.h). A jsg::Lock, and so
+// this scope, may live on the heap, which guest execution can write; a flag is all it holds.
 class GuestArenaScope final {
  public:
   explicit GuestArenaScope(v8::Isolate* isolate);
@@ -2714,10 +2717,6 @@ class GuestArenaScope final {
   KJ_DISALLOW_COPY_AND_MOVE(GuestArenaScope);
 
  private:
-  // The arena that was active before this scope entered the isolate's, meaningful only when
-  // `entered` is set. It is legitimately null (the base root with no private arena), so it is
-  // not a kj::Maybe.
-  gk_arena* previous = nullptr;
   bool entered = false;
 };
 

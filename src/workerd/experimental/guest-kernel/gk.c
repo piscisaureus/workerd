@@ -103,6 +103,9 @@
 // too, when the vCPU had them, so stacks are recycled rather than leaked.
 // Guarded by G->lock.
 #define GK_MAX_VCPUS 4096
+#define GK_EPERM 1
+#define GK_ENOMEM 12
+#define GK_EINVAL 22
 // The kvm_run register sets gk exchanges with KVM_CAP_SYNC_REGS (see regs_get).
 // The constants are KVM ABI; spelled out for headers that predate them.
 #ifndef KVM_CAP_SYNC_REGS
@@ -161,6 +164,14 @@ typedef struct gk_thread {
   uintptr_t wall_map_lo, wall_map_hi, wall_end;
   uint64_t *active_pml4;   // root this thread runs under
   gk_arena *active_arena;
+  // The arenas that gk_arena_enter displaced on this thread, innermost last:
+  // gk_arena_leave returns to the last of them. The history lives here, in
+  // supervisor memory, so that the arena a thread returns to is never taken
+  // from a value the caller holds (which guest code may have rewritten). Every
+  // entry was a live arena when it was pushed, and gk_arena_destroy clears a
+  // destroyed arena from every thread's history. Guarded by G->lock.
+  gk_arena *arena_stack[GK_ARENA_NEST];
+  int arena_depth;
   // Set for a thread the guest created via clone (see clone_thread): it runs
   // its gk loop on this private host stack and leaves only through the guest's
   // exit syscall.
@@ -208,6 +219,10 @@ struct gk_arena {
   // arena's page tables, slots and struct while any remain, since their
   // vCPUs would otherwise run under tables that now belong to someone else.
   int active_threads;
+  // Set while the arena is in G->arenas, from gk_arena_create to
+  // gk_arena_destroy; gk_arena_enter accepts no arena without it (see
+  // arena_live_locked). Guarded by G->lock.
+  int registered;
   // G->pml4_gen as of the last arena_sync_root of this root (see sync_cr3).
   // Written under G->lock, read without it.
   unsigned synced_gen;
@@ -1545,15 +1560,30 @@ static gk_thread *thread_get(void) {
 }
 
 // Select `a` (NULL: the base root) as the active arena of the thread `t`
-// belongs to, returning the previous one.
-static gk_arena *arena_enter(gk_thread *t, gk_arena *a) {
+// belongs to. `a` is NULL or an arena the caller has established as live: the
+// public entry points validate (arena_live_locked), the history restores what
+// was validated when it was pushed, and the teardown paths pass NULL.
+static void arena_select(gk_thread *t, gk_arena *a) {
   gk_arena *prev = t->active_arena;
-  if (prev == a) return prev;
+  if (prev == a) return;
   if (a) __atomic_fetch_add(&a->active_threads, 1, __ATOMIC_SEQ_CST);
   t->active_arena = a;
   t->active_pml4 = a ? a->pml4 : G->pml4;
   if (prev) __atomic_fetch_sub(&prev->active_threads, 1, __ATOMIC_SEQ_CST);
-  return prev;
+}
+
+// Whether `a` names a live arena: one of the structs in gk's own pool, at a
+// slot the pool has handed out, that is currently registered. The pool lives in
+// the supervisor control block, so the pointer is checked against the pool's
+// bounds before anything is read through it: a pointer into memory gk does not
+// own is refused unread, and a pool struct that is free, or belongs to an arena
+// that has been destroyed, is refused by its flag. Caller holds G->lock.
+static int arena_live_locked(const gk_arena *a) {
+  uintptr_t p = (uintptr_t)a, pool = (uintptr_t)&G->arena_pool[0];
+  if (p < pool || p >= pool + sizeof G->arena_pool) return 0;
+  if ((p - pool) % sizeof(gk_arena) != 0) return 0;
+  if ((p - pool) / sizeof(gk_arena) >= (size_t)G->arena_pool_n) return 0;
+  return a->registered;
 }
 
 // Return the thread's vCPU (and guest stack, if any) to the pool.
@@ -1581,7 +1611,8 @@ static void vcpu_park(gk_thread *t) {
 // arena's user count, and return the record to the pool.
 static void thread_release(gk_thread *t) {
   vcpu_park(t);
-  arena_enter(t, NULL);
+  arena_select(t, NULL);
+  t->arena_depth = 0;
   tls_rec = 0;
   pthread_mutex_lock(&G->lock);
   t->tid = 0;
@@ -2026,10 +2057,6 @@ unsigned long gk_debug_ctl_addr(int which) {
     default: return 0;
   }
 }
-
-#define GK_EPERM 1
-#define GK_ENOMEM 12
-#define GK_EINVAL 22
 
 // ---- vCPU registers ---------------------------------------------------------
 // With KVM_CAP_SYNC_REGS (G->sync_regs) a vCPU's general and special registers
@@ -3323,6 +3350,7 @@ gk_arena *gk_arena_create(size_t size) {
   a->synced_gen = G->pml4_gen;  // under G->lock: no entry can be added in between
   for (int i = 0; i < nslots; i++) G->slot_used[idx + i] = 1;
   G->arenas[G->arena_n++] = a;
+  a->registered = 1;
   pthread_mutex_unlock(&G->lock);
   return a;
 fail:
@@ -3339,10 +3367,55 @@ fail:
 void *gk_arena_base(const gk_arena *a) { return a ? (void *)a->base : NULL; }
 size_t gk_arena_size(const gk_arena *a) { return a ? a->size : 0; }
 
-gk_arena *gk_arena_enter(gk_arena *a) {
+int gk_arena_enter(gk_arena *a) {
   gk_thread *t = thread_get();
-  if (!t) return NULL;  // record pool exhausted: the thread stays on the base root
-  return arena_enter(t, a);
+  if (!t) return -GK_ENOMEM;  // record pool exhausted: the thread stays on the base root
+  int r = 0;
+  pthread_mutex_lock(&G->lock);
+  if (!a) {
+    // The outermost leave: the base root, with nothing to return to.
+    arena_select(t, NULL);
+    t->arena_depth = 0;
+  } else if (!arena_live_locked(a)) {
+    fprintf(stderr, "[gk] gk_arena_enter: %p is not a live arena; the thread stays on its "
+            "current root\n", (void *)a);
+    r = -GK_EINVAL;
+  } else if (t->arena_depth >= GK_ARENA_NEST) {
+    fprintf(stderr, "[gk] gk_arena_enter: arenas nested more than %d deep on this thread; the "
+            "thread stays on its current root\n", GK_ARENA_NEST);
+    r = -GK_ENOMEM;
+  } else {
+    t->arena_stack[t->arena_depth++] = t->active_arena;
+    arena_select(t, a);
+  }
+  pthread_mutex_unlock(&G->lock);
+  return r;
+}
+
+int gk_arena_leave(void) {
+  gk_thread *t = thread_cur();
+  if (!t) {
+    // No record: nothing was ever entered on this thread, and it runs on the
+    // base root already.
+    fprintf(stderr, "[gk] gk_arena_leave: no arena is entered on this thread\n");
+    return -GK_EINVAL;
+  }
+  int r = 0;
+  pthread_mutex_lock(&G->lock);
+  if (t->arena_depth == 0) {
+    // A leave without a matching enter. The base root is the only root this
+    // thread can be returned to.
+    fprintf(stderr, "[gk] gk_arena_leave: no arena is entered on this thread; the base root "
+            "is selected\n");
+    arena_select(t, NULL);
+    r = -GK_EINVAL;
+  } else {
+    gk_arena *prev = t->arena_stack[--t->arena_depth];
+    t->arena_stack[t->arena_depth] = NULL;
+    arena_select(t, prev);
+  }
+  pthread_mutex_unlock(&G->lock);
+  return r;
 }
 
 // Teardown reconciles gk and KVM with the reservation going away, in this
@@ -3367,10 +3440,20 @@ gk_arena *gk_arena_enter(gk_arena *a) {
 void gk_arena_destroy(gk_arena *a) {
   if (!a) return;
   gk_thread *t = thread_cur();
-  if (t && t->active_arena == a) arena_enter(t, NULL);
+  if (t && t->active_arena == a) arena_select(t, NULL);
   pthread_mutex_lock(&G->lock);
   for (int i = 0; i < G->arena_n; i++)
     if (G->arenas[i] == a) { G->arenas[i] = G->arenas[--G->arena_n]; break; }
+  a->registered = 0;
+  // A thread whose nesting history holds this arena returns to the base root
+  // instead when it leaves the arena it entered on top of this one; the struct
+  // may be another arena's by then.
+  for (int i = 0; i < G->thread_n; i++) {
+    gk_thread *o = &G->threads[i];
+    if (!o->tid) continue;
+    for (int d = 0; d < o->arena_depth; d++)
+      if (o->arena_stack[d] == a) o->arena_stack[d] = NULL;
+  }
   if (pkey_set_range(a->base, a->end, 0) < 0 && G->dbg)
     fprintf(stderr, "[gk] pkey table full; destroyed arena keeps stale keys\n");
   int in_use = __atomic_load_n(&a->active_threads, __ATOMIC_SEQ_CST);

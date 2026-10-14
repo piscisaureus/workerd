@@ -145,7 +145,8 @@ void Data::moveFromTraced(Data& other, v8::TracedReference<v8::Data>& otherTrace
 GuestArenaScope::GuestArenaScope(v8::Isolate* isolate) {
 #ifdef WORKERD_HAS_GUEST_KERNEL
   KJ_IF_SOME(arena, IsolateBase::from(isolate).getGuestArena()) {
-    previous = gk_arena_enter(arena.get());
+    int result = gk_arena_enter(arena.get());
+    KJ_REQUIRE(result == 0, "guest-kernel: could not enter the isolate's arena", result);
     entered = true;
   }
 #endif
@@ -154,7 +155,11 @@ GuestArenaScope::GuestArenaScope(v8::Isolate* isolate) {
 GuestArenaScope::~GuestArenaScope() noexcept(false) {
 #ifdef WORKERD_HAS_GUEST_KERNEL
   if (entered) {
-    gk_arena_enter(previous);
+    // Leaves what gk recorded this thread as having entered, whatever this object says.
+    int result = gk_arena_leave();
+    if (result != 0) {
+      KJ_LOG(ERROR, "guest-kernel: leaving the isolate's arena failed", result);
+    }
   }
 #endif
 }

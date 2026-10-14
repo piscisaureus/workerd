@@ -31,7 +31,8 @@ namespace workerd::jsg {
 // across it. The trampoline that runs `body` in the guest catches everything and records it,
 // together with `body`'s return value, in a heap-allocated turn record that the host side reads
 // back once the guest has returned, re-throwing the exception so that callers observe the same
-// exceptions as without the guest.
+// exceptions as without the guest. The record is written by code running in the guest, so the
+// host treats it as data, not as C++ objects: see GuestTurnOutcome.
 //
 // Host-frame wall (see gk_run_here_user in gk.h): for the length of the call, the caller's stack
 // frames above the guest boundary are read-only to `body`. `body` and everything it calls must
@@ -78,11 +79,38 @@ auto runInGuest(Lock& js,
 namespace _ {  // private
 
 // What `body` did, written in-guest by the trampoline and read host-side after the guest
-// returns. Lives on the heap: see the host-frame wall above.
+// returns. Lives on the heap (see the host-frame wall above), which guest execution can write,
+// so the host trusts nothing in it: the status is checked against the closed set below, and an
+// exception crosses as plain bytes -- its type and a copy of its description in a fixed buffer,
+// the length clamped host-side -- from which the host constructs a new kj::Exception. No
+// kj::String, disposer, context chain or detail array crosses the boundary; the exception's
+// context chain, details, trace and origin file:line are therefore lost, which is accepted.
 struct GuestTurnOutcome {
-  kj::Maybe<kj::Exception> exception;
-  bool jsExceptionThrown = false;
+  enum Status : uint32_t {
+    // The trampoline has not completed; a record read with this status is an error.
+    INCOMPLETE = 0,
+    // `body` returned.
+    RETURNED = 1,
+    // `body` threw JsExceptionThrown; the pending exception stays on the isolate.
+    JS_EXCEPTION_THROWN = 2,
+    // `body` threw something else, carried in `exceptionType` and `description`.
+    EXCEPTION = 3,
+  };
+  static constexpr uint32_t MAX_DESCRIPTION = 4096;
+
+  uint32_t status = INCOMPLETE;
+  uint32_t exceptionType = 0;      // kj::Exception::Type, checked host-side
+  uint32_t descriptionLength = 0;  // bytes of `description` in use, clamped host-side
+  char description[MAX_DESCRIPTION];
+
+  // Records `e` as the turn's outcome (in-guest).
+  void setException(const kj::Exception& e);
 };
+
+// Acts on the outcome a turn reported, host-side: returns if `body` returned, rethrows
+// JsExceptionThrown, or throws a kj::Exception built from the record's bytes. A status outside
+// the closed set is an error of its own.
+void throwIfGuestTurnFailed(const GuestTurnOutcome& outcome);
 
 template <typename Result>
 struct GuestTurnResult {
@@ -108,11 +136,12 @@ struct GuestTurn: public GuestTurnOutcome {
       } else {
         turn.result.value.emplace(turn.body());
       }
+      turn.status = GuestTurnOutcome::RETURNED;
     } catch (const JsExceptionThrown&) {
       // The pending exception stays on the isolate; only the C++ signal must be re-raised.
-      turn.jsExceptionThrown = true;
+      turn.status = GuestTurnOutcome::JS_EXCEPTION_THROWN;
     } catch (...) {
-      turn.exception = kj::getCaughtExceptionAsKj();
+      turn.setException(kj::getCaughtExceptionAsKj());
     }
     return 0;
   }
@@ -135,12 +164,7 @@ auto runInGuest(Lock& js,
     using Turn = _::GuestTurn<kj::Decay<Func>>;
     auto turn = kj::heap<Turn>(body);
     _::runTrampolineInGuest(js, &Turn::trampoline, turn.get(), kj::mv(onFault));
-    if (turn->jsExceptionThrown) {
-      throw JsExceptionThrown();
-    }
-    KJ_IF_SOME(e, turn->exception) {
-      kj::throwFatalException(kj::mv(e));
-    }
+    _::throwIfGuestTurnFailed(*turn);
     if constexpr (!kj::isSameType<typename Turn::Result, void>()) {
       return kj::mv(KJ_ASSERT_NONNULL(turn->result.value));
     } else {

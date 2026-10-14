@@ -318,6 +318,12 @@ struct CaughtJsException {
 // if the phase threw, the exception it threw. Returned out of the phase -- through
 // jsg::runInGuest's heap-allocated turn record when the phase ran in the guest -- for the host
 // to act on.
+//
+// TODO(guest-kernel): when the phase ran in the guest, this is written in-guest and consumed
+//   host-side as a C++ object: the limit error is a kj::Exception (owning strings, a context
+//   chain) and the caught JS exception holds V8 handles, all of which the host then moves,
+//   reports and destroys. Unlike the turn's own outcome (jsg::GuestTurnOutcome), this value is
+//   not yet reduced to plain bytes.
 struct StartupPhaseOutcome {
   ExceptionOrDuration limitErrorOrTime = 0 * kj::NANOSECONDS;
   kj::Maybe<CaughtJsException> thrown;

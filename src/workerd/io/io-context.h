@@ -1439,6 +1439,13 @@ kj::PromiseForResult<Func, Worker::Lock&> IoContext::runSingle(
     // out -- and a non-void result has to be stored somewhere, so neither may live in this frame.
     // Hold both on the C++ heap (a KEEP/RW mapping, outside the wall) and read the result back
     // host-side after the turn returns.
+    //
+    // TODO(guest-kernel): the heap result is written in-guest and consumed host-side as a C++
+    //   object. Every non-void Result in the codebase is a kj::Promise (a heap node with its
+    //   own disposer), a jsg::JsRef, or a bool, so the host takes guest-written ownership words
+    //   when it moves the result out. Closing that channel needs a by-value representation per
+    //   result type and is not done; see jsg::GuestTurnOutcome for the shape it takes for the
+    //   turn's own outcome.
     if constexpr (kj::isSameType<Result, void>()) {
       struct RunnableImpl: public Runnable {
 #ifdef WORKERD_HAS_GUEST_KERNEL

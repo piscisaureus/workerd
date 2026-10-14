@@ -505,22 +505,6 @@ void IoContext::logUncaughtExceptionAsync(
 
   struct RunnableImpl: public Runnable {
     UncaughtExceptionSource source;
-#ifdef WORKERD_HAS_GUEST_KERNEL
-    // Under the guest-kernel host-frame wall (see runJsTurn / gk.h), run() executes at guest
-    // ring 3 and this RunnableImpl, on the caller's stack above the guest boundary, is read-only
-    // for the turn. logUncaughtException() moves the exception out, which writes to the
-    // moved-from object; keep it on the C++ heap (a KEEP/RW mapping, outside the wall) so that
-    // write does not land on the walled stack.
-    kj::Own<kj::Exception> exception;
-
-    RunnableImpl(UncaughtExceptionSource source, kj::Exception&& exception)
-        : source(source),
-          exception(kj::heap<kj::Exception>(kj::mv(exception))) {}
-    void run(Worker::Lock& lock) override {
-      // TODO(soon): Add logUncaughtException to jsg::Lock.
-      lock.logUncaughtException(source, kj::mv(*exception));
-    }
-#else
     kj::Exception exception;
 
     RunnableImpl(UncaughtExceptionSource source, kj::Exception&& exception)
@@ -528,9 +512,17 @@ void IoContext::logUncaughtExceptionAsync(
           exception(kj::mv(exception)) {}
     void run(Worker::Lock& lock) override {
       // TODO(soon): Add logUncaughtException to jsg::Lock.
+#ifdef WORKERD_HAS_GUEST_KERNEL
+      // Under the guest-kernel host-frame wall (see runJsTurn / gk.h), run() executes at guest
+      // ring 3 and this RunnableImpl, on the caller's stack above the guest boundary, is
+      // read-only for the turn. Moving the exception out would write to it, so the turn gets a
+      // copy, which it owns and destroys entirely inside the guest; the original is destroyed
+      // host-side with the ownership words it had before the turn.
+      lock.logUncaughtException(source, exception.clone());
+#else
       lock.logUncaughtException(source, kj::mv(exception));
-    }
 #endif
+    }
   };
 
   // Make sure this is logged even if another exception occurs trying to log it to the devtools inspector,

@@ -14,6 +14,7 @@
 
 #ifdef WORKERD_HAS_GUEST_KERNEL
 #include <workerd/experimental/guest-kernel/gk.h>
+#include <workerd/jsg/guest-run.h>
 
 #include <cppgc/allocation.h>
 #include <cppgc/garbage-collected.h>
@@ -484,6 +485,84 @@ KJ_TEST("each isolate's memory lives in its own guest-kernel arena") {
   // With no lock held the thread is back on the base root, from which neither is reachable.
   probePointerTables(tablesA, false);
   probePointerTables(tablesB, false);
+
+  // Part 4: turns. runInGuest() runs its body at ring 3 and reports what it did through the
+  // heap turn record, which the host reads back as bytes (see GuestTurnOutcome): a return value
+  // comes back, a kj::Exception is rethrown host-side with its type and message intact, an
+  // over-long description is cut at the record's capacity, and JsExceptionThrown is re-raised.
+  a.runInLockScope([&](ArenaIsolate::Lock& lock) {
+    jsg::Lock& js = lock;
+    auto onFault = [](const kj::Exception& e) { KJ_FAIL_ASSERT("turn faulted", e); };
+
+    KJ_EXPECT(runInGuest(js, []() { return 42; }, onFault) == 42);
+
+    auto thrown = kj::runCatchingExceptions([&]() {
+      runInGuest(js,
+          []() { kj::throwFatalException(KJ_EXCEPTION(DISCONNECTED, "from the guest")); }, onFault);
+    });
+    auto& e = KJ_ASSERT_NONNULL(thrown);
+    KJ_EXPECT(e.getType() == kj::Exception::Type::DISCONNECTED);
+    KJ_EXPECT(e.getDescription() == "from the guest", e.getDescription());
+
+    auto longThrown = kj::runCatchingExceptions([&]() {
+      runInGuest(js, []() {
+        auto message = kj::heapArray<char>(2 * _::GuestTurnOutcome::MAX_DESCRIPTION);
+        message.asPtr().fill('y');
+        kj::throwFatalException(KJ_EXCEPTION(FAILED, kj::str(message)));
+      }, onFault);
+    });
+    auto& longE = KJ_ASSERT_NONNULL(longThrown);
+    KJ_EXPECT(longE.getDescription().size() == _::GuestTurnOutcome::MAX_DESCRIPTION);
+    KJ_EXPECT(longE.getDescription().endsWith("yyyy"));
+
+    bool jsThrown = false;
+    try {
+      runInGuest(js, []() { throw JsExceptionThrown(); }, onFault);
+    } catch (const JsExceptionThrown&) {
+      jsThrown = true;
+    }
+    KJ_EXPECT(jsThrown);
+  });
+}
+
+// The host reads the turn record as bytes. A description length past the buffer is clamped to
+// it, a type outside kj::Exception::Type falls back to FAILED, the description is copied by
+// length and not by terminator, and a status outside the closed set is an error of its own.
+KJ_TEST("a guest turn's outcome is read back as bounded bytes") {
+  using Outcome = _::GuestTurnOutcome;
+  auto outcome = kj::heap<Outcome>();
+  auto rethrown = [&]() {
+    return KJ_ASSERT_NONNULL(
+        kj::runCatchingExceptions([&]() { _::throwIfGuestTurnFailed(*outcome); }));
+  };
+
+  outcome->status = Outcome::EXCEPTION;
+  outcome->exceptionType = 0xdeadbeef;
+  outcome->descriptionLength = 0xffffffff;
+  memset(outcome->description, 'x', Outcome::MAX_DESCRIPTION);
+  auto clamped = rethrown();
+  KJ_EXPECT(clamped.getType() == kj::Exception::Type::FAILED);
+  KJ_EXPECT(clamped.getDescription().size() == Outcome::MAX_DESCRIPTION);
+
+  outcome->exceptionType = static_cast<uint32_t>(kj::Exception::Type::OVERLOADED);
+  outcome->descriptionLength = 5;
+  memcpy(outcome->description, "ab\0cdefgh", 9);
+  auto byLength = rethrown();
+  KJ_EXPECT(byLength.getType() == kj::Exception::Type::OVERLOADED);
+  KJ_EXPECT(byLength.getDescription().size() == 5);
+  KJ_EXPECT(byLength.getDescription()[2] == '\0');
+  KJ_EXPECT(byLength.getDescription()[4] == 'd');
+
+  outcome->status = Outcome::RETURNED;
+  KJ_EXPECT(kj::runCatchingExceptions([&]() { _::throwIfGuestTurnFailed(*outcome); }) == kj::none);
+
+  outcome->status = Outcome::INCOMPLETE;
+  auto incomplete = rethrown();
+  KJ_EXPECT(incomplete.getDescription().contains("invalid status"), incomplete.getDescription());
+
+  outcome->status = 1234;
+  auto unknown = rethrown();
+  KJ_EXPECT(unknown.getDescription().contains("invalid status"), unknown.getDescription());
 }
 
 #else
