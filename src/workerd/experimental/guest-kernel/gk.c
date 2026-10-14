@@ -817,8 +817,11 @@ static int s2_ensure(gk_region *rg, uintptr_t hva) {
 // Drop the guest-physical range [gpa, gpa + len) of region `rg` from stage 2:
 // each run of pages that are in goes with one hv_vm_unmap, whose range is then
 // exactly what is mapped. A run the hypervisor will not unmap stays, bits and
-// all.
-static void s2_drop(gk_region *rg, uint64_t gpa, uint64_t len) {
+// all, and the call returns -1: the guest-physical pages still lead to the
+// host pages they were mapped with, so they must not be handed out again.
+// Returns 0 if everything went.
+static int s2_drop(gk_region *rg, uint64_t gpa, uint64_t len) {
+  int r = 0;
   uint64_t b = gpa / GK_HOST_PAGE, end = (gpa + len) / GK_HOST_PAGE;
   while (b < end) {
     if ((b & 63) == 0 && !G->s2_map[b >> 6]) { b += 64; continue; }
@@ -833,6 +836,7 @@ static void s2_drop(gk_region *rg, uint64_t gpa, uint64_t len) {
         db_str(&d, " +"); db_hex(&d, n * GK_HOST_PAGE); db_str(&d, " failed");
         db_flush(&d);
       }
+      r = -1;
     } else {
       for (uint64_t i = b; i < run; i++) G->s2_map[i >> 6] &= ~(1ULL << (i & 63));
       rg->s2_n -= (long)n;
@@ -840,6 +844,7 @@ static void s2_drop(gk_region *rg, uint64_t gpa, uint64_t len) {
     }
     b = run;
   }
+  return r;
 }
 
 // Drop the host pages of [lo, hi), host-page-aligned, from stage 2, so the
@@ -854,9 +859,10 @@ static void s2_unmap(uintptr_t lo, uintptr_t hi) {
   }
 }
 
-// A region is going away (region_remove): its stage-2 pages with it.
-static void s2_release(gk_region *rg) {
-  if (rg->s2_n) s2_drop(rg, rg->gpa, rg->end - rg->start);
+// A region is going away (region_remove): its stage-2 pages with it. Returns
+// -1 if some stayed (see s2_drop).
+static int s2_release(gk_region *rg) {
+  return rg->s2_n ? s2_drop(rg, rg->gpa, rg->end - rg->start) : 0;
 }
 
 // Bring the commpage shadows up to date with the kernel's pages, before a turn.
@@ -1541,7 +1547,9 @@ static int region_add(uintptr_t s, uintptr_t e) {
 // ioctl's result: on failure the region stays.
 static int region_remove(gk_region *n) {
 #if GK_HVF
-  s2_release(n);
+  // The region goes either way (the host memory is going); guest-physical
+  // pages stage 2 still maps are quarantined below rather than reused.
+  int keep_gpa = s2_release(n) < 0;
 #else
   uint64_t gpa = n->start;
 #if defined(__aarch64__)
@@ -1563,7 +1571,11 @@ static int region_remove(gk_region *n) {
 #if defined(__aarch64__)
   // A vCPU still running under a destroyed arena's root (see gk_arena_destroy)
   // may hold translations to this range: it is not handed out again then.
+#if GK_HVF
+  if (!G->gpa_keep && !keep_gpa) {
+#else
   if (!G->gpa_keep) {
+#endif
     uintptr_t wlo = n->start & ~(GK_BACK_WIN - 1);
     uintptr_t whi = (n->end + GK_BACK_WIN - 1) & ~(GK_BACK_WIN - 1);
     gpa_release(n->gpa - (n->start - wlo), whi - wlo);
