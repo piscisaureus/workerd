@@ -19,7 +19,7 @@ verified by disassembly.
 ## Build and run
 
 ```
-make run        # builds and runs all nine milestones
+make run        # builds and runs all ten milestones
 ```
 
 Numbers below were measured on an AMD EPYC 7443P (Zen 3, 24 cores, Ubuntu
@@ -38,6 +38,7 @@ Numbers below were measured on an AMD EPYC 7443P (Zen 3, 24 cores, Ubuntu
 | `m7_syscall.c` | Syscall forwarding. The guest points LSTAR at a trampoline; a `syscall` traps there, hypercalls to the host, which performs the real syscall and resumes. Forwards `write(1, ...)` and `getpid()`. |
 | `m8_guest_enter.c` | Dune-style enter. A real compiled C function runs inside the guest at its actual address, with the process's own memory visible through guest-physical == host-virtual page tables, and its syscalls forwarded. The leap from hand-encoded payloads to running compiled code. |
 | `m9_signal.c` | Asynchronous signal delivery. The guest runs with interrupts enabled; a helper thread fires a timer signal that interrupts the vCPU, and the host injects it as a guest interrupt that an in-guest IDT handler services and returns from with `iretq`. |
+| `m10_ringtrap.c` | Gate 1, the other boundary. Guest ring-3 code traps to an in-guest ring-0 handler and back without leaving the VM, both through `syscall`/`sysretq` and through a #PF on a supervisor-only page returned with `iretq`. KVM's own per-vCPU exit counter proves the measured loop had no VM exit. This prices keeping the runtime's state inside the guest behind the U bit, against milestone 5's price for keeping it on the host. |
 
 ## Results
 
@@ -45,12 +46,24 @@ Numbers below were measured on an AMD EPYC 7443P (Zen 3, 24 cores, Ubuntu
 | --- | --- | --- |
 | CR3 switch (in-guest, incl. code-path TLB refill) | 76 | 217 |
 | VM-exit round trip (port I/O, handled in userspace) | 4660 | 13300 |
+| Ring 3 -> ring 0 -> ring 3 in-guest, `syscall`/`sysretq` (m10, see note) | 24 | 76 |
+| Ring 3 -> ring 0 -> ring 3 in-guest, #PF on a supervisor-only page/`iretq` (m10, see note) | 212 | 677 |
 
 The switch is about 60x cheaper than an exit. The exit is about 13x a native
 `getppid` (347 ns, measured by `../baseline/syscall-cost.c`), inflated by the
 AMD return-thunk and retpoline mitigations that apply to every world switch.
 This is why the design's cost is decided by how many exits remain per request,
 not by the switch.
+
+Note on the m10 rows: they come from a different machine, an AMD EPYC 9255
+(Zen 5, kernel 7.0, NPT on, 3.2 GHz TSC), and their cycles are TSC cycles
+measured in-guest. The same run measured the port-I/O exit there at 4780 ns /
+15300 TSC cycles, so on that machine an explicit `syscall` trap to in-guest
+ring 0 is about 200x cheaper than a VM exit and a fault-driven one about 23x.
+Both figures are for a minimal handler; a real one adds swapgs, a stack switch
+and a register save. That is the cost of keeping the runtime's state in the
+guest but supervisor-only, reached by a privilege transition that never leaves
+the VM, instead of on the host behind an exit.
 
 ## What this does not cover
 

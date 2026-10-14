@@ -6,7 +6,7 @@ CFLAGS ?= -O2 -Wall -Wextra
 M8_CFLAGS = -O2 -Wall -fno-stack-protector -fcf-protection=none
 
 BINS = m1_hypercall m2_longmode m3_isolation m4_fault m5_exitcost \
-       m6_switchcost m7_syscall m8_guest_enter m9_signal
+       m6_switchcost m7_syscall m8_guest_enter m9_signal m10_ringtrap
 
 all: $(BINS)
 
