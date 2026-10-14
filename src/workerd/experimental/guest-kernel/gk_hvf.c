@@ -90,6 +90,42 @@ static int copy_in(void *dst, uintptr_t src, size_t n) {
 static const uintptr_t gk_commpage_addr[GK_COMMPAGE_N] = {0x0000000fffff4000ULL, 0x0000000fffffc000ULL};
 static gk_region *region_succ(uintptr_t s);  // see the MMU layer
 
+// ---- VM setup (see gk_init) --------------------------------------------------
+// The host-frame wall needs no host facts on macOS: the thread descriptor is
+// pthread_self (see stack_wall_bounds).
+static void wall_probe(void) {}
+
+static int vm_create(void) {
+  // The VM, with the largest guest-physical space the framework offers (see
+  // the guest-physical allocator), and the shadow pool (see the HVF section).
+  hv_vm_config_t cfg = hv_vm_config_create();
+  uint32_t ipa = 36;
+  if (!cfg || hv_vm_config_get_max_ipa_size(&ipa) != HV_SUCCESS ||
+      hv_vm_config_set_ipa_size(cfg, ipa) != HV_SUCCESS || hv_vm_create(cfg) != HV_SUCCESS) {
+    G->err = "hv_vm_create (is the binary signed with the hypervisor entitlement?)";
+    return -1;
+  }
+  os_release(cfg);
+  static const int ips_bits[] = {32, 36, 40, 42, 44, 48};
+  for (G->ips = 0; G->ips < 5 && ips_bits[G->ips + 1] <= (int)ipa; G->ips++) {}
+  ipa = (uint32_t)ips_bits[G->ips];
+  G->gpa_next = GK_BACK_WIN;  // guest-physical 0 stays unused
+  G->gpa_limit = 1ULL << ipa;
+  void *pool = mmap(NULL, (size_t)GK_MAX_SHADOWS * GK_HOST_PAGE, PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (pool == MAP_FAILED) { G->err = "mmap shadow pool"; return -1; }
+  G->shadow_pool = (uintptr_t)pool;
+  prot_add(G->shadow_pool, G->shadow_pool + (size_t)GK_MAX_SHADOWS * GK_HOST_PAGE, GK_PROT_REFUSE);
+  size_t map_bytes = HOST_CEIL(G->gpa_limit / GK_HOST_PAGE / 8);  // touched only where used
+  void *map = mmap(NULL, map_bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (map == MAP_FAILED) { G->err = "mmap stage-2 map"; return -1; }
+  G->s2_map = map;
+  prot_add((uintptr_t)map, (uintptr_t)map + map_bytes, GK_PROT_REFUSE);
+  if (G->dbg) fprintf(stderr, "[gk] Hypervisor.framework VM, %u-bit guest-physical space\n", ipa);
+  return 0;
+}
+
 // The s2_map bit of the guest-physical host page holding `gpa`.
 static int s2_test(uint64_t gpa) {
   uint64_t b = gpa / GK_HOST_PAGE;

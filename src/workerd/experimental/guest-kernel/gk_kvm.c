@@ -2,6 +2,14 @@
 #include "gk_internal.h"
 #if !GK_HVF
 
+// /dev/kvm, at the API version gk is written against.
+static int kvm_open(void) {
+  G->kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
+  if (G->kvm < 0) { G->err = "open /dev/kvm"; return -1; }
+  if (ioctl(G->kvm, KVM_GET_API_VERSION, 0) != 12) { G->err = "KVM API != 12"; return -1; }
+  return 0;
+}
+
 // Create memslot `slot` mapping guest-physical `gpa` to the host range [s, e).
 // Runs on the fault path: raw output only (no strerror, it may allocate).
 static int memslot_add(int slot, uint64_t gpa, uintptr_t s, uintptr_t e) {

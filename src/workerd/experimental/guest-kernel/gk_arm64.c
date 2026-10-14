@@ -66,6 +66,35 @@ static int region_clip_holes(uintptr_t *s, uintptr_t *gap_end) {
   return 0;
 }
 
+// ---- VM setup (see gk_init) --------------------------------------------------
+// The host page size: any power of two the windows are multiples of (see the
+// page-sizes section).
+static int page_size_init(void) {
+  long pagesz = sysconf(_SC_PAGESIZE);
+  if (pagesz < 4096 || (pagesz & (pagesz - 1)) || GK_NEIGHBOR_WIN % (unsigned long)pagesz) {
+    G->err = "unsupported host page size";
+    return -1;
+  }
+  G->host_page = (size_t)pagesz;
+  return 0;
+}
+
+static int pt_arena_init(void) {
+  // Table entries hold guest-physical addresses (PTE_TABLE_ENTRY), so the
+  // page-table arena's must be known before the first table is linked in: it
+  // is one region, and one guest-physical range.
+  if (region_ensure(G->pt_base, G->pt_base + G->pt_bytes) < 0) { G->err = "memslot for PT arena"; return -1; }
+  gk_region *ptr = region_find(G->pt_base);
+  if (!ptr || ptr->end < G->pt_base + G->pt_bytes) { G->err = "PT arena memslot split"; return -1; }
+  G->pt_gpa = ptr->gpa + (G->pt_base - ptr->start);
+  return 0;
+}
+
+static int guest_tables_init(void) {
+  if (map_handler_text() < 0) { G->err = "map handler text"; return -1; }
+  return 0;
+}
+
 // ---- page-table entries -----------------------------------------------------
 // The leaf PTE map4k_root installs for `va` (see there for `flags`). The frame
 // is the page's guest-physical address, through the memslot region backing it

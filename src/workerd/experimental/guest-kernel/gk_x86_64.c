@@ -370,6 +370,114 @@ static void flush_stub_select(void) {
     fprintf(stderr, "[gk] TLB flush stub: %s\n",
             G->flush_stub == gk_flush_stub_invpcid ? "invpcid" : "cr4.pge toggle");
 }
+// ---- VM setup (see gk_init) --------------------------------------------------
+// The host facts the host-frame wall needs (see stack_wall_bounds): the size of
+// glibc's static TLS block.
+static void wall_probe(void) {
+  *(void **)&G->tls_static_info = dlsym(RTLD_DEFAULT, "_dl_get_tls_static_info");
+  if (!G->tls_static_info)
+    fprintf(stderr, "[gk] _dl_get_tls_static_info not found: gk_run_here_user builds no "
+                    "host-frame wall on pthread stacks\n");
+}
+
+// The host page size, which on x86-64 must be the guest's (see the page-sizes
+// section).
+static int page_size_init(void) {
+  if (sysconf(_SC_PAGESIZE) != 4096) { G->err = "host page size is not 4KiB"; return -1; }
+  return 0;
+}
+
+static int vm_create(void) {
+  if (kvm_open() < 0) return -1;
+  G->vmfd = ioctl(G->kvm, KVM_CREATE_VM, 0);
+  if (G->vmfd < 0) { G->err = "KVM_CREATE_VM"; return -1; }
+  // Resident vCPUs halt inside KVM_RUN and are woken by an NMI, both of
+  // which need an in-kernel LAPIC: a split irqchip (LAPICs in the kernel,
+  // no PIC or IOAPIC), enabled before any vCPU exists. Without it the
+  // runners return to userspace after every turn as GK_RUNNER=1 does.
+  if (G->resident_mode) {
+    struct kvm_enable_cap cap = {.cap = KVM_CAP_SPLIT_IRQCHIP};
+    cap.args[0] = 24;
+    if (ioctl(G->vmfd, KVM_ENABLE_CAP, &cap) != 0) {
+      fprintf(stderr, "[gk] GK_RUNNER=resident: KVM_CAP_SPLIT_IRQCHIP: %s; runners will return "
+                      "to userspace after every turn\n", strerror(errno));
+      G->resident_mode = 0;
+    }
+  }
+  return 0;
+}
+
+// Guest-physical is host-virtual, so the page-table arena needs nothing before
+// the first table is linked in; its memslots come with guest_tables_init.
+static int pt_arena_init(void) { return 0; }
+
+// The descriptor tables, the page-table arena's memslots, the handler text,
+// and what every vCPU gets from KVM: CPUID, the flush stub, the kvm_run size
+// and the register exchange.
+static int guest_tables_init(void) {
+  uint8_t *tables = mmap(NULL, 0x2000, PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (tables == MAP_FAILED) { G->err = "mmap gdt/idt"; return -1; }
+  G->gdt_va = (uintptr_t)tables;
+  G->idt_va = (uintptr_t)tables + 0x1000;
+  // The GDT and IDT are read by the CPU (a supervisor access) during exception
+  // delivery and ring transitions; ring-3 code has no business touching them.
+  prot_add(G->gdt_va, G->gdt_va + 0x2000, GK_PROT_SUPER);
+  // GDT layout, in the order SYSCALL/SYSRET and the exception frames need:
+  //   0x08 ring-0 code64   (SYSCALL loads CS from STAR[47:32] = 0x08)
+  //   0x10 ring-0 data     (SYSCALL loads SS = 0x08 + 8)
+  //   0x18 unused          (TR's nominal selector; TR uses a cached descriptor)
+  //   0x20 ring-3 data     (SYSRET loads SS = STAR[63:48] + 8 = 0x1b + 8 = 0x23)
+  //   0x28 ring-3 code64   (SYSRET loads CS = STAR[63:48] + 16 = 0x1b + 16 = 0x2b)
+  // STAR[63:48] is 0x1b (RPL 3): SYSRET adds 8/16 and uses the RPL as-is, so
+  // ring 3 runs with SS 0x23 and CS 0x2b. The CPU reloads both from the GDT on
+  // the IRETQ that returns from a ring-3 fault, so the +8/+16 order, RPL and
+  // DPL=3 must all be exact.
+  uint64_t *gdt = (uint64_t *)(uintptr_t)G->gdt_va;
+  gdt[0] = 0;
+  gdt[1] = 0x00AF9A000000FFFFULL;  // ring-0 code64 (DPL 0, L=1)
+  gdt[2] = 0x00CF92000000FFFFULL;  // ring-0 data   (DPL 0)
+  gdt[3] = 0;
+  gdt[4] = 0x00CFF2000000FFFFULL;  // ring-3 data   (DPL 3)
+  gdt[5] = 0x00AFFA000000FFFFULL;  // ring-3 code64 (DPL 3, L=1)
+  uint8_t *idt = (uint8_t *)(uintptr_t)G->idt_va;
+  memset(idt, 0, 0x1000);
+  set_idt_gate(idt, 0, (uintptr_t)&gk_exc_de, 1);
+  // The NMI a halted resident vCPU is kicked with (see the runner section),
+  // on its own stack: it can arrive while an exception handler is on IST1.
+  set_idt_gate(idt, 2, (uintptr_t)&gk_exc_nmi, 2);
+  set_idt_gate(idt, 6, (uintptr_t)&gk_exc_ud, 1);
+  set_idt_gate(idt, 8, (uintptr_t)&gk_exc_df, 1);
+  set_idt_gate(idt, 13, (uintptr_t)&gk_exc_gp, 1);
+  set_idt_gate(idt, 14, (uintptr_t)&gk_exc_pf, 1);
+
+  // The page-table arena is read by the CPU page walker via guest-physical
+  // addresses, so it needs memslots (but no PTEs of its own).
+  if (region_ensure(G->pt_base, G->pt_base + G->pt_bytes) < 0) { G->err = "memslot for PT arena"; return -1; }
+  // GDT/IDT and the handler text must be present before the first fault.
+  if (mmu_map_range(G->gdt_va, G->gdt_va + 0x2000, 1 | 2) < 0) { G->err = "map gdt/idt"; return -1; }
+  if (map_handler_text() < 0) { G->err = "map handler text"; return -1; }
+  // The resolve table is read by the trampoline at ring 0, on the caller's
+  // (ring-3) stack; mapping it now, supervisor r/w, keeps that path free of
+  // demand faults in every root.
+  if (mmu_map_range(GK_RESOLVE_START, GK_RESOLVE_END, 1 | 2) < 0) { G->err = "map resolve table"; return -1; }
+
+  GK_CPUID->nent = GK_CPUID_ENTRIES;
+  if (ioctl(G->kvm, KVM_GET_SUPPORTED_CPUID, GK_CPUID) < 0) { G->err = "GET_SUPPORTED_CPUID"; return -1; }
+  flush_stub_select();
+  G->park_flush_kind = G->flush_stub == gk_flush_stub_invpcid ? 1 : 2;
+  xcr0_select();
+  G->run_size = ioctl(G->kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
+  // Register exchange through kvm_run (see regs_get) when KVM offers it for
+  // both register sets; GK_NO_SYNC_REGS in the environment forces the ioctls.
+  if (!getenv("GK_NO_SYNC_REGS")) {
+    long caps = ioctl(G->kvm, KVM_CHECK_EXTENSION, KVM_CAP_SYNC_REGS);
+    G->sync_regs = caps > 0 && (caps & GK_SYNC_REGS) == GK_SYNC_REGS;
+  }
+  if (G->dbg) fprintf(stderr, "[gk] registers via %s\n", G->sync_regs ? "kvm_run" : "ioctl");
+  return 0;
+}
+
 // ---- vCPU registers ---------------------------------------------------------
 // With KVM_CAP_SYNC_REGS (G->sync_regs) a vCPU's general and special registers
 // are exchanged through its mmap'd kvm_run instead of by ioctl: KVM stores both
