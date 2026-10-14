@@ -102,17 +102,19 @@ static int prot_class(uintptr_t addr) {
 // G->lock.
 static int guest_range_ok(gk_thread *t, uintptr_t addr, uintptr_t len, int write) {
   if (len == 0) return 1;
-  if (addr + len < addr) return 0;  // wrap
-  uintptr_t s = HOST_FLOOR(addr), e = HOST_CEIL(addr + len);
+  uintptr_t last = addr + (len - 1);
+  if (last < addr) return 0;  // wrap
+  uintptr_t p = HOST_FLOOR(addr), end = HOST_FLOOR(last);
   int ok = 1;
   pthread_mutex_lock(&G->lock);
-  for (uintptr_t p = s; p < e; p += GK_HOST_PAGE) {
+  for (;; p += GK_HOST_PAGE) {
     gk_arena *in = arena_containing(p);
     if ((in && in != t->active_arena) || prot_class(p) != GK_PROT_KEEP ||
         (write && p >= t->ro_lo && p < t->ro_hi)) {
       ok = 0;
       break;
     }
+    if (p == end) break;
   }
   pthread_mutex_unlock(&G->lock);
   return ok;
