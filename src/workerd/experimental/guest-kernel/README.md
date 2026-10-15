@@ -258,6 +258,25 @@ decides the overall cost.
   until those accesses become messages. Moving the malloc'd objects into the
   arena needs a per-isolate allocator arena, which means an allocator with
   extent hooks; workerd uses tcmalloc, which has none.
+- **The host acts on data a ring-3 turn can write.** The runtime's heap is in
+  the guest's address space, so every host-side structure the guest can reach
+  is attacker-controlled input to the host, and the dangerous cases are the
+  ones that reach a privileged operation. Those are validated: a host call
+  that names an arena has the pointer checked against gk's own arena pool
+  before anything is read through it, the arena page allocator refuses an
+  address outside the tail it owns before handing it to `mprotect` or
+  `mmap(MAP_FIXED)`, a turn's outcome crosses to the host as bounded plain
+  bytes rather than as a `kj::Exception` the guest wrote, and the guest-turn
+  depth is restored from a value saved in a host frame instead of being
+  decremented, since a rewritten counter would otherwise make the next turn
+  run outside the guest. What validation cannot settle is ownership: a pointer
+  swapped for another live arena's is indistinguishable from a legitimate
+  call, so a turn can still name a different isolate's arena and cost that
+  isolate its memory. Nor does it help with the objects a turn hands back --
+  the non-void results of `IoContext::run`, which are mostly `kj::Promise`,
+  and the `kj::Own` graph the delete queue walks -- which are heap objects
+  carrying their own vtables and disposers. Those become safe when the
+  runtime's mutable memory is out of ring 3's reach, not by marshalling them.
 - **No cross-vCPU TLB shootdown IPIs yet.** Adding mappings needs none (a
   not-present entry has nothing stale to flush), which is why dynamic `mmap`
   and per-thread stacks work across vCPUs. Removing or shrinking a mapping
