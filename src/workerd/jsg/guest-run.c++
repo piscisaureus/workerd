@@ -7,6 +7,7 @@
 #ifdef WORKERD_HAS_GUEST_KERNEL
 #include <workerd/experimental/guest-kernel/gk.h>
 
+#include <kj/async.h>
 #include <kj/debug.h>
 
 #include <atomic>
@@ -59,6 +60,12 @@ void runTrampolineInGuest(
   KJ_DEFER(guestTurnDepth = depth);
   guestTurnArena = arena;
   KJ_DEFER(guestTurnArena = nullptr);
+
+  // What the turn arms (a promise it fulfills, a continuation it attaches to a settled promise)
+  // is linked into this thread's event loop queue next to whatever is queued there, which may
+  // be another isolate's promise node, in memory the turn cannot address. For the turn's
+  // duration the loop's own guards sit between the turn's events and the rest of the queue.
+  kj::EventLoop::GuardedArmScope armGuard;
 
   long result = gk_run_here_user(fn, arg);
   if (result != 0) {

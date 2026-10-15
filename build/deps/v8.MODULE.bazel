@@ -71,6 +71,7 @@ PATCHES = [
     "0046-Make-the-sandbox-size-a-build-time-flag.patch",
     "0047-Per-IsolateGroup-page-allocator-for-out-of-sandbox-memory.patch",
     "0048-Route-pointer-tables-through-the-IsolateGroup-page-allocator.patch",
+    "0049-Run-Intl-builtins-under-an-embedder-shared-allocation-scope.patch",
 ]
 
 http_archive(

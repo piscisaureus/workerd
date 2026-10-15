@@ -3876,6 +3876,10 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::Own<Worker::Actor>> actor,
       bool isTracer,
       kj::Maybe<kj::Own<AccessInfo>> accessInfo) {
+    // A request's entrypoint and IoContext are created by whoever starts the request, which for
+    // a service binding is a turn of the calling isolate, on that isolate's heap arena; they
+    // belong to this worker's request and go in the shared heap instead.
+    jsg::SharedHeapScope sharedHeap;
     auto& channels = KJ_ASSERT_NONNULL(ioChannels.tryGet<LinkedIoChannels>());
 
     kj::Vector<kj::Own<WorkerInterface>> bufferedTailWorkers(channels.tails.size());
@@ -4607,10 +4611,16 @@ class Server::WorkerService final: public Service,
     // stale and the delay will effectively be shortened by that staleness, causing the timer
     // to fire too early. Instead, we compute the target time using a fresh reading from the
     // monotonic clock so the delay is measured from the actual present.
+    //
+    // The timer is the thread's, and its queue holds every isolate's entries: an entry goes in
+    // the shared heap, not in the arena of the isolate whose turn adds it, where another
+    // isolate's turn would fault on it while ordering its own entry.
+    jsg::SharedHeapScope sharedHeap;
     return threadContext.getUnsafeTimer().atTime(monotonicClock.now() + delay);
   }
 
   kj::Promise<void> afterLimitTimeout(kj::Duration t) override {
+    jsg::SharedHeapScope sharedHeap;  // see atTime()
     return threadContext.getUnsafeTimer().afterDelay(t);
   }
 

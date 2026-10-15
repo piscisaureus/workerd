@@ -31,6 +31,7 @@
 #ifdef WORKERD_ICU_DATA_EMBED
 #include "icu-data-file.embed.h"
 
+#include <unicode/uclean.h>
 #include <unicode/udata.h>
 #endif
 
@@ -93,6 +94,26 @@ V8System::V8System(
     v8::platform::NotifyIsolateShutdown(defaultPlatformPtr, isolate);
   }, jitCodeEventTracking);
 }
+
+namespace {
+// ICU's allocator, installed through u_setMemoryFunctions() where per-isolate heap arenas are
+// in use. ICU fills process-wide caches (locale and time zone data, converters, collators)
+// lazily, from whichever thread first needs an item, which may be a turn of one isolate on its
+// heap arena; from there every other isolate's turn would fault on the cached item. So all of
+// ICU's memory goes to the shared heap. Every isolate's ring-3 execution can read it, which for
+// ICU's data (public, and the same for every isolate) concedes nothing.
+void* icuAlloc(const void*, size_t size) {
+  SharedHeapScope sharedHeap;
+  return malloc(size);
+}
+void* icuRealloc(const void*, void* mem, size_t size) {
+  SharedHeapScope sharedHeap;
+  return realloc(mem, size);
+}
+void icuFree(const void*, void* mem) {
+  free(mem);
+}
+}  // namespace
 
 V8System::V8System(v8::Platform& platformParam,
     kj::ArrayPtr<const kj::StringPtr> flags,
@@ -184,6 +205,13 @@ void V8System::init(kj::Own<v8::Platform> platformParam,
 
   if (isPredictableModeForTest() || isGcStressModeForTest() || isAllocGcStressModeForTest()) {
     v8::V8::SetFlagsFromString("--expose-gc");
+  }
+
+  if (heapArenasAvailable()) {
+    // Before ICU's first allocation, which u_setMemoryFunctions() requires.
+    UErrorCode err = U_ZERO_ERROR;
+    u_setMemoryFunctions(nullptr, &icuAlloc, &icuRealloc, &icuFree, &err);
+    KJ_ASSERT(err == U_ZERO_ERROR, "u_setMemoryFunctions() failed", static_cast<int>(err));
   }
 
 #ifdef WORKERD_ICU_DATA_EMBED
@@ -733,34 +761,13 @@ GuestArena::GuestArena(gk_arena* arena): arena(arena) {
 #endif
 }
 
-#ifdef WORKERD_HAS_HEAP_ARENA
-namespace {
-// The arenas of destroyed isolates that held heap arenas, kept for the life of the process (see
-// GuestArena). A retained arena keeps everything a pointer into its memory may still need.
-struct RetainedArena {
-  kj::Own<ArenaPageAllocator> pageAllocator;
-  kj::Own<HeapArena> heapArena;
-};
-kj::MutexGuarded<kj::Vector<RetainedArena>>& retainedArenas() {
-  static kj::MutexGuarded<kj::Vector<RetainedArena>> arenas;
-  return arenas;
-}
-}  // namespace
-#endif
-
 GuestArena::~GuestArena() noexcept(false) {
 #ifdef WORKERD_HAS_GUEST_KERNEL
 #ifdef WORKERD_HAS_HEAP_ARENA
-  KJ_IF_SOME(a, heapArena) {
-    auto lock = retainedArenas().lockExclusive();
-    lock->add(RetainedArena{kj::mv(pageAllocator), kj::mv(a)});
-    heapArena = kj::none;
-    KJ_LOG(WARNING,
-        "guest-kernel: retaining a destroyed isolate's arena, as its heap may still "
-        "be referenced; retained arenas so far",
-        lock->size());
-    return;
-  }
+  // Discards whatever is still allocated in the heap arena. By now that is nothing anyone will
+  // touch again: the isolate is disposed, and what a turn allocates for others lives in the
+  // shared heap (see SharedHeapScope in heap-arena.h).
+  heapArena = kj::none;
 #endif
   // The isolate group that used the tail is gone by now (the arena outlives it), so nothing
   // references the allocator any more.

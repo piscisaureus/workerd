@@ -4,6 +4,7 @@
 
 #include "worker-interface.h"
 
+#include <workerd/jsg/heap-arena.h>
 #include <workerd/util/http-util.h>
 #include <workerd/util/stream-utils.h>
 
@@ -114,8 +115,47 @@ kj::Own<WorkerInterface> newPromisedWorkerInterface(kj::Promise<kj::Own<WorkerIn
   return kj::heap<PromisedWorkerInterface>(kj::mv(promise));
 }
 
+namespace {
+// The HttpClient over a WorkerInterface, with every call made inside a jsg::SharedHeapScope. A
+// call starts the target's handling of the request synchronously, on the calling thread, which
+// holds the calling isolate's lock. When the target is a Worker in this process, everything
+// created for it up to its first suspension -- the copies of the URL and headers, the body pipe
+// and the response object the adapter makes, the entrypoint and its coroutine frame, the new
+// request's IoContext -- is created here, and would otherwise lie in the calling isolate's heap
+// arena, where the target's turns fault on it.
+class SharedHeapHttpClient final: public kj::HttpClient {
+ public:
+  explicit SharedHeapHttpClient(kj::Own<kj::HttpClient> inner): inner(kj::mv(inner)) {}
+
+  Request request(kj::HttpMethod method,
+      kj::StringPtr url,
+      const kj::HttpHeaders& headers,
+      kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
+    jsg::SharedHeapScope sharedHeap;
+    return inner->request(method, url, headers, expectedBodySize);
+  }
+
+  kj::Promise<WebSocketResponse> openWebSocket(
+      kj::StringPtr url, const kj::HttpHeaders& headers) override {
+    jsg::SharedHeapScope sharedHeap;
+    return inner->openWebSocket(url, headers);
+  }
+
+  ConnectRequest connect(kj::StringPtr host,
+      const kj::HttpHeaders& headers,
+      kj::HttpConnectSettings settings) override {
+    jsg::SharedHeapScope sharedHeap;
+    return inner->connect(host, headers, kj::mv(settings));
+  }
+
+ private:
+  kj::Own<kj::HttpClient> inner;
+};
+}  // namespace
+
 kj::Own<kj::HttpClient> asHttpClient(kj::Own<WorkerInterface> workerInterface) {
-  return kj::newHttpClient(*workerInterface).attach(kj::mv(workerInterface));
+  return kj::heap<SharedHeapHttpClient>(
+      kj::newHttpClient(*workerInterface).attach(kj::mv(workerInterface)));
 }
 
 // =======================================================================================

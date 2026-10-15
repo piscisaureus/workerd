@@ -114,6 +114,20 @@ unsigned switchThreadArena(unsigned index) {
   return previous;
 }
 
+// Switches the calling thread back onto arena `index` at the end of a scope, where a failure can
+// only be logged.
+void restoreThreadArena(unsigned index) {
+  auto& mib = threadArenaMib();
+  int err = mallctlbymib(mib.mib, mib.length, nullptr, nullptr, &index, sizeof(index));
+  if (err != 0) {
+    KJ_LOG(ERROR, "guest-kernel: restoring the thread's heap arena failed", index, err);
+  }
+}
+
+// The arena SharedHeapScope switches to. jemalloc creates arena 0 when it initializes and never
+// destroys it.
+constexpr unsigned SHARED_HEAP_ARENA_INDEX = 0;
+
 }  // namespace
 
 // jemalloc hands the registered extent_hooks_t pointer back to every hook; it is the first
@@ -258,14 +272,32 @@ HeapArenaScope::HeapArenaScope(kj::Maybe<HeapArena&> arena) {
 }
 
 HeapArenaScope::~HeapArenaScope() noexcept(false) {
-  if (switched) {
-    auto& mib = threadArenaMib();
-    int err =
-        mallctlbymib(mib.mib, mib.length, nullptr, nullptr, &previousIndex, sizeof(previousIndex));
-    if (err != 0) {
-      KJ_LOG(ERROR, "guest-kernel: restoring the thread's heap arena failed", previousIndex, err);
-    }
-  }
+  if (switched) restoreThreadArena(previousIndex);
+}
+
+SharedHeapScope::SharedHeapScope() {
+  if (!heapArenasAvailable()) return;
+  previousIndex = switchThreadArena(SHARED_HEAP_ARENA_INDEX);
+  switched = true;
+}
+
+SharedHeapScope::~SharedHeapScope() noexcept(false) {
+  if (switched) restoreThreadArena(previousIndex);
+}
+
+// The hooks under which V8 runs its Intl builtins (patches/v8/0049-Run-Intl-builtins-under-an-
+// embedder-shared-allocation-scope.patch): V8 keeps process-wide Intl containers (available-locale
+// sets, calendar, date format and pattern generator caches) that it grows from inside those
+// builtins, which run in a turn, on the isolate's heap arena. V8 declares the pair weak and calls
+// them only when the embedder defines them; no header declares them. They are the SharedHeapScope
+// in two halves, with the arena to return to carried in the token (offset by one so that zero
+// means nothing was switched).
+extern "C" uintptr_t v8_intl_shared_allocation_enter() {
+  if (!heapArenasAvailable()) return 0;
+  return switchThreadArena(SHARED_HEAP_ARENA_INDEX) + 1;
+}
+extern "C" void v8_intl_shared_allocation_leave(uintptr_t token) {
+  if (token != 0) restoreThreadArena(static_cast<unsigned>(token - 1));
 }
 
 unsigned currentHeapArenaIndex() {
@@ -289,6 +321,8 @@ bool isAutomaticHeapArena(unsigned index) {
 
 HeapArenaScope::HeapArenaScope(kj::Maybe<HeapArena&> arena) {}
 HeapArenaScope::~HeapArenaScope() noexcept(false) {}
+SharedHeapScope::SharedHeapScope() {}
+SharedHeapScope::~SharedHeapScope() noexcept(false) {}
 
 #endif  // WORKERD_HAS_HEAP_ARENA
 

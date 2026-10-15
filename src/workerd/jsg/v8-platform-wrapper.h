@@ -4,6 +4,9 @@
 
 #pragma once
 
+#include "heap-arena.h"
+
+#include <libplatform/libplatform.h>
 #include <v8-platform.h>
 
 #include <kj/common.h>
@@ -27,9 +30,14 @@ class V8PlatformWrapper: public v8::Platform {
     return inner.GetForegroundTaskRunner(isolate, priority);
   }
 
+  // The worker-thread task queues are the platform's, shared by every isolate, and an isolate
+  // posts to them from inside its turns (a concurrent compile job, say): the queue entries go
+  // in the shared heap, not in the posting isolate's heap arena, where the next isolate's post
+  // would fault on them.
   void PostTaskOnWorkerThreadImpl(v8::TaskPriority priority,
       std::unique_ptr<v8::Task> task,
       const v8::SourceLocation& location) override {
+    SharedHeapScope sharedHeap;
     inner.PostTaskOnWorkerThreadImpl(priority, kj::mv(task), location);
   }
 
@@ -37,14 +45,20 @@ class V8PlatformWrapper: public v8::Platform {
       std::unique_ptr<v8::Task> task,
       double delay_in_seconds,
       const v8::SourceLocation& location) override {
+    SharedHeapScope sharedHeap;
     inner.PostDelayedTaskOnWorkerThreadImpl(priority, kj::mv(task), delay_in_seconds, location);
   }
 
+  // The job handle is V8's default one, but created over this platform rather than the inner
+  // one, so that the tasks the job posts as its concurrency grows go through
+  // PostTaskOnWorkerThreadImpl() above. The job's own state is shared with the worker threads
+  // that run it, and is allocated in the shared heap for the same reason as the queue entries.
   std::unique_ptr<v8::JobHandle> CreateJobImpl(v8::TaskPriority priority,
       std::unique_ptr<v8::JobTask> job_task,
       const v8::SourceLocation& location) override {
-    return inner.CreateJobImpl(
-        priority, std::make_unique<JobTaskWrapper>(kj::mv(job_task)), location);
+    SharedHeapScope sharedHeap;
+    return v8::platform::NewDefaultJobHandle(this, priority,
+        std::make_unique<JobTaskWrapper>(kj::mv(job_task)), inner.NumberOfWorkerThreads());
   }
 
   bool IdleTasksEnabled(v8::Isolate* isolate) override {

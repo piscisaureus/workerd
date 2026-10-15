@@ -251,30 +251,69 @@ decides the overall cost.
   bookkeeping is shared, so a free from any context touches only shared
   memory, and jemalloc's thread cache is off process-wide, since it would
   recycle one isolate's freed blocks into another's allocations. What stays
-  shared, and readable, is what is allocated with no isolate lock held: the
+  shared, and readable, is what is allocated with no isolate lock held -- the
   isolate object itself and the rest of what V8 allocates while creating it
   (creation also grows process-wide registries, which must not die with one
   isolate), and whatever V8's background threads allocate on an isolate's
-  behalf, since they run on their own arenas.
+  behalf, since they run on their own arenas -- and what is placed in the
+  shared heap on purpose from under a lock, through `jsg::SharedHeapScope`,
+  because a turn allocates it but it is not the isolate's. That covers
+  process-wide state a turn initializes or grows: everything ICU allocates
+  (`u_setMemoryFunctions()` in `jsg/setup.c++`), everything V8's `Intl`
+  builtins allocate (the hooks of `patches/v8/0049-Run-Intl-builtins-under-an-
+  embedder-shared-allocation-scope.patch`, which V8 keeps process-wide caches
+  of locales, calendars and date formats behind), the thread's timer queue
+  entries (`TimerChannel` in `server.c++`), and the V8 platform's worker-thread
+  task queues and job state (`jsg::V8PlatformWrapper`). It also covers what an
+  in-process service binding call hands across: the request objects the caller
+  builds for the callee and the callee's per-request entrypoint and `IoContext`
+  (`asHttpClient()`, `Server::WorkerService::createEntrypoint()`), and the
+  response the callee sends back (`WorkerEntrypoint::ResponseSentTracker`).
+  Each use is a confidentiality concession: subrequest URLs and headers,
+  response headers, a service-binding callee's `IoContext`, and whatever
+  `Intl` formats are readable from every isolate's ring 3.
 
-  Three things do not work under this scheme, all because the per-thread
-  arena switch places everything a turn allocates in the isolate's arena.
-  Objects handed from one isolate's turn to another's fault: an in-process
-  service binding faults the callee's first turn on the request objects the
-  caller built. Process-wide state that is lazily initialized during a turn
-  lands in that isolate's arena: a second worker using `Intl` faults on the
-  ICU data the first one loaded, and V8's wasm type canonicalizer grows its
-  tables on whichever isolate first creates a context. And process-wide
-  mutable containers get nodes and backing arrays from whichever isolate's
-  turn grows them, so another isolate's turn faults when it rebalances or
-  resizes past one: two workers using `setTimeout` concurrently fault each
-  other on the event loop's timer set, and a turn abandoned in the middle of
-  such an update leaves the container inconsistent, after which the whole
-  process stops serving. Workers that share nothing of the kind -- no timers,
-  no `Intl`, no calls between them -- serve concurrently without faults. For
-  the second reason a destroyed isolate's arena is retained for the life of
-  the process rather than unmapped. Confining the remaining shared memory needs the
-  runtime's mutable memory out of ring 3's reach, so that an arena maps only
+  The thread's event loop needs more than placement. Its run queue is an
+  intrusive doubly linked list through the queued events, so arming an event
+  from a turn (fulfilling a promise, attaching a continuation to a settled
+  one) writes the link of the neighbor at the insert point, which may be
+  another isolate's promise node. `kj::EventLoop::GuardedArmScope`
+  (`patches/capnp-cpp/0001-Add-EventLoop-GuardedArmScope.patch`), which
+  `jsg::runInGuest()` enters around every turn, links guard sentinels of the
+  loop's own next to each insert point for the turn's duration, so a turn's
+  events are inserted next to a guard or next to each other. Disarming is not
+  covered: a turn that destroys one of its own events that was queued before
+  the turn began (a timer callback cancelled while already due, a fetch
+  aborted while its response is queued) unlinks it from neighbors that may be
+  another isolate's, and faults.
+
+  With this, two workers using `Intl` with different locales, two using
+  `setTimeout`, and two plain workers serve concurrently under load without
+  faults, and a destroyed isolate's arena is destroyed with it -- heap arena,
+  reservation and page-table slot, which the next isolate reuses
+  (`src/workerd/jsg/guest-arena-test.c++`, part 7). That part is not yet
+  reliable: in one direct run of the test binary out of about twenty, the
+  first ring-3 turn of the isolate created after a destruction faulted and
+  the process then hung until killed. The cause is not known; the missing
+  cross-vCPU shootdown (below) is a candidate, since the slot is reused.
+
+  What does not work is request and response *bodies* across an in-process
+  service binding. The rest of such a call crosses in shared memory, but body
+  bytes travel through a `kj` one-way pipe by pointer, and the copy runs in
+  the reading isolate's turn from the writing isolate's memory: the caller's
+  `r.text()` faults in `kj::AsyncPipe::tryRead` on the callee's heap region,
+  and a body the caller sends faults the callee's read the same way. That
+  needs a copy at the boundary, with the host pumping bodies through shared
+  buffers, which is a protocol change rather than a placement and is future
+  work. Also not covered: process-wide containers that V8 grows from inside a
+  turn without an embedder hook, such as the wasm type canonicalizer, which
+  lands in the arena of the first isolate that compiles a module (and keeps
+  pointing into it once that arena is released); and, untested but by the
+  same reasoning, BoringSSL's lazily allocated per-thread error state, which
+  a `crypto` call in a turn would place on that turn's arena.
+
+  Confining the remaining shared memory needs the runtime's mutable memory
+  out of ring 3's reach, so that an arena maps only
   the isolate's own pages, the runtime's text and read-only data, and a
   per-isolate channel for talking to a host-side runtime. gk already has the
   enforcement primitive for it: `prot_add()` classes a range `GK_PROT_SUPER`

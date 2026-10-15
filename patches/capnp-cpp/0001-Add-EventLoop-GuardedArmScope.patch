@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Wed, 14 Oct 2026 12:00:00 +0000
+Subject: Add EventLoop::GuardedArmScope
+
+The event loop's queue is an intrusive doubly linked list through the
+queued events, so arming an event writes the links of its new
+neighbors: the event queued before the insert point and the one after
+it. An embedder that runs units of work under memory isolation, where
+a unit may address only its own objects, cannot let a unit arm an
+event next to a neighbor another unit queued.
+
+GuardedArmScope links a guard sentinel of the loop's own next to each
+insert point for its lifetime (before the depth-first and breadth-first
+insert points, after the breadth-first one for armLast(), and after
+wouldSleepHead), so that every arm made inside the scope inserts next
+to a guard or next to an event armed inside the scope. head() skips
+the guards like the insert points. Disarming is unchanged, and the
+loop must not run events inside a scope.
+---
+diff --git a/src/kj/async.h b/src/kj/async.h
+--- a/src/kj/async.h
++++ b/src/kj/async.h
+@@ -1498,20 +1498,44 @@
+   };
+ 
+   Id id() const;
++
++  class GuardedArmScope {
++    // While a GuardedArmScope is active on a loop (the calling thread's current loop; a no-op
++    // on a thread without one), arming an event in any mode links it into the queue next to one
++    // of the loop's own sentinels or next to an event armed inside the scope, never next to an
++    // event that was already queued when the scope began. This is for an embedder that runs
++    // units of work under memory isolation, where the code doing the arming may address only its
++    // own objects and the loop itself: the promise nodes other units queued are then never
++    // written by this one. Disarming (destroying a queued event) is not covered: it unlinks the
++    // event from whatever neighbors it has.
++    //
++    // The loop must not run events while a scope is active, and scopes do not nest.
++
++  public:
++    GuardedArmScope();
++    ~GuardedArmScope() noexcept(false);
++    KJ_DISALLOW_COPY_AND_MOVE(GuardedArmScope);
++
++  private:
++    EventLoop* loop;
++  };
+   // Returns the unique identifier of this EventLoop.
+ 
+ private:
+   inline _::Event* head() const {
+     _::Event* event = headSentinel.next;
+-    if (event == &depthFirstInsertPoint) {
+-      event = event->next;
+-    }
+-    if (event == &breadthFirstInsertPoint) {
++    while (isQueueSentinel(*event)) {
+       event = event->next;
+     }
+     return event;
+   }
+ 
++  inline bool isQueueSentinel(const _::Event& event) const {
++    // The insert points and the guards GuardedArmScope links in; never the tail sentinel.
++    return &event == &depthFirstInsertPoint || &event == &breadthFirstInsertPoint ||
++        &event == &depthFirstGuard || &event == &breadthFirstGuard || &event == &lastGuard;
++  }
++
+   class Sentinel final: public _::Event {
+     // Sentinel node for event queues. These nodes are never removed, allowing branchless
+     // list operations on normal event nodes.
+@@ -1557,6 +1581,15 @@
+ 
+   Sentinel wouldSleepTail;
+   Sentinel wouldSleepHead;
++
++  // Linked in by GuardedArmScope: before each insert point, after the breadth-first one (where
++  // armLast() inserts) and after wouldSleepHead, so that every arm mode inserts next to a guard
++  // or next to an event armed inside the scope.
++  Sentinel depthFirstGuard;
++  Sentinel breadthFirstGuard;
++  Sentinel lastGuard;
++  Sentinel wouldSleepGuard;
++  bool guarded = false;
+   // A totally separate list of events to run if we get to the point where we otherwise would
+   // sleep. (See yieldUntilWouldSleep().)
+ 
+diff --git a/src/kj/async.c++ b/src/kj/async.c++
+--- a/src/kj/async.c++
++++ b/src/kj/async.c++
+@@ -1826,6 +1826,7 @@
+ }
+ 
+ bool EventLoop::turn() {
++  KJ_ASSERT(!guarded, "the event loop must not run events inside a GuardedArmScope");
+   _::Event* event = head();
+ 
+   if (event == &tailSentinel) {
+@@ -1885,6 +1886,25 @@
+ 
+ EventLoop::Id EventLoop::Id::current() { return currentEventLoop().id(); }
+ 
++EventLoop::GuardedArmScope::GuardedArmScope(): loop(threadLocalEventLoop) {
++  if (loop == nullptr) return;
++  KJ_REQUIRE(!loop->guarded, "GuardedArmScope does not nest");
++  loop->guarded = true;
++  loop->depthFirstGuard.insertBefore(loop->depthFirstInsertPoint);
++  loop->breadthFirstGuard.insertBefore(loop->breadthFirstInsertPoint);
++  loop->lastGuard.insertAfter(loop->breadthFirstInsertPoint);
++  loop->wouldSleepGuard.insertAfter(loop->wouldSleepHead);
++}
++
++EventLoop::GuardedArmScope::~GuardedArmScope() noexcept(false) {
++  if (loop == nullptr) return;
++  loop->depthFirstGuard.unlink();
++  loop->breadthFirstGuard.unlink();
++  loop->lastGuard.unlink();
++  loop->wouldSleepGuard.unlink();
++  loop->guarded = false;
++}
++
+ void EventLoop::Id::assertCurrentEventLoop() const {
+   EventLoop* loop = threadLocalEventLoop;
+   KJ_ASSERT(loop != nullptr && loop->loopId == id);
