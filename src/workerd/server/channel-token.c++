@@ -38,7 +38,7 @@ bool keyUseMustLeaveTurn(IoChannelFactory::ChannelTokenUsage usage) {
 
 ChannelTokenHandler::ChannelTokenHandler(Resolver& resolver)
     : resolver(resolver),
-      tokenKey(hostOwned<kj::FixedArray<byte, AES_KEY_SIZE>>()) {
+      tokenKey(hostSlot<kj::FixedArray<byte, AES_KEY_SIZE>>()) {
   getEntropy(*tokenKey);
 
   SHA256_CTX ctx{};
@@ -58,6 +58,20 @@ ChannelTokenHandler::ChannelTokenHandler(Resolver& resolver)
     KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: channel token key",
         kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(key))), hostMemory::contains(key));
     hostMemory::setProbeTargetForTest(key);
+    // And where the handle to it lives, with the host-side use of the key the check runs after
+    // a JS turn has overwritten the handle (see hostMemory::setHandleProbeForTest): the same
+    // resolution serializeTokenImpl() and decodeChannelTokenImpl() perform, logged instead of
+    // used.
+    hostMemory::setHandleProbeForTest({.handleStorage = &tokenKey, .useOnHost = [this]() {
+      KJ_IF_SOME(e, kj::runCatchingExceptions([&]() {
+        const void* resolved = tokenKey->begin();
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: host use of the token key resolved it at",
+            kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(resolved))));
+      })) {
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: host use of the token key was refused",
+            e.getDescription());
+      }
+    }});
   }
 }
 

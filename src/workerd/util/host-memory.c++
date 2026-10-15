@@ -8,6 +8,8 @@
 #include <workerd/experimental/guest-kernel/gk.h>
 #endif
 
+#include <kj/mutex.h>
+
 #include <cstring>
 #include <new>
 
@@ -69,7 +71,140 @@ void deallocate(void* ptr, size_t size, size_t alignment) {
 }
 
 namespace {
+
+// The handle table used when the guest kernel is not active: the same shape and the same checks
+// as gk's (see gk_host_slot_alloc in gk.h), over blocks from allocate(). A handle is the slot's
+// index in its low 16 bits and the generation it was allocated with above them; a generation is
+// taken from a counter every allocation advances, so a reused slot never repeats a handle.
+constexpr unsigned SLOT_INDEX_BITS = 16;
+static_assert(SLOT_CAPACITY <= (size_t{1} << SLOT_INDEX_BITS));
+
+struct FallbackSlot {
+  void* ptr = nullptr;
+  size_t size = 0;
+  size_t alignment = 0;
+  uint64_t gen = 0;
+  uint32_t nextFree = 0;  // free-list link, as index + 1; 0 ends the list
+  bool live = false;
+};
+
+struct FallbackTable {
+  FallbackSlot slots[SLOT_CAPACITY];
+  size_t taken = 0;       // slots ever taken
+  uint32_t freeHead = 0;  // free-list head, as index + 1; 0 when empty
+  uint64_t gen = 0;
+
+  FallbackSlot* lookup(SlotHandle handle) {
+    uint64_t idx = handle & ((uint64_t{1} << SLOT_INDEX_BITS) - 1);
+    uint64_t gen = handle >> SLOT_INDEX_BITS;
+    if (idx >= SLOT_CAPACITY) return nullptr;
+    FallbackSlot& slot = slots[idx];
+    if (!slot.live || slot.gen != gen) return nullptr;
+    return &slot;
+  }
+};
+
+kj::MutexGuarded<FallbackTable>& fallbackTable() {
+  static kj::MutexGuarded<FallbackTable> table;
+  return table;
+}
+
+SlotHandle fallbackAllocateSlot(size_t size, size_t alignment) {
+  auto lock = fallbackTable().lockExclusive();
+  uint32_t idx;
+  if (lock->freeHead != 0) {
+    idx = lock->freeHead - 1;
+    lock->freeHead = lock->slots[idx].nextFree;
+  } else {
+    KJ_REQUIRE(lock->taken < SLOT_CAPACITY, "host slot table is full", SLOT_CAPACITY);
+    idx = lock->taken++;
+  }
+  void* ptr;
+  KJ_ON_SCOPE_FAILURE({
+    lock->slots[idx].nextFree = lock->freeHead;
+    lock->freeHead = idx + 1;
+  });
+  ptr = allocate(size, alignment);
+  uint64_t gen = ++lock->gen;
+  lock->slots[idx] = FallbackSlot{
+    .ptr = ptr, .size = size, .alignment = alignment, .gen = gen, .nextFree = 0, .live = true};
+  return (gen << SLOT_INDEX_BITS) | idx;
+}
+
+void* fallbackResolveSlot(SlotHandle handle) {
+  auto lock = fallbackTable().lockExclusive();
+  FallbackSlot* slot = lock->lookup(handle);
+  if (slot == nullptr) {
+    KJ_LOG(ERROR, "host slot handle does not name a live slot; it resolves to nothing", handle);
+    return nullptr;
+  }
+  return slot->ptr;
+}
+
+void fallbackFreeSlot(SlotHandle handle) {
+  auto lock = fallbackTable().lockExclusive();
+  FallbackSlot* slot = lock->lookup(handle);
+  if (slot == nullptr) {
+    KJ_LOG(ERROR, "host slot handle does not name a live slot; nothing is freed", handle);
+    return;
+  }
+  void* ptr = slot->ptr;
+  size_t size = slot->size;
+  size_t alignment = slot->alignment;
+  uint32_t idx = slot - lock->slots;
+  slot->ptr = nullptr;
+  slot->size = 0;
+  slot->alignment = 0;
+  slot->live = false;
+  slot->nextFree = lock->freeHead;
+  lock->freeHead = idx + 1;
+  deallocate(ptr, size, alignment);
+}
+
+}  // namespace
+
+SlotHandle allocateSlot(size_t size, size_t alignment) {
+  KJ_REQUIRE(size > 0);
+  KJ_REQUIRE(alignment <= 4096);
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (guestKernelActive()) {
+    static_assert(SLOT_CAPACITY == GK_HOST_SLOTS, "the fallback table mirrors gk's capacity");
+    SlotHandle handle = gk_host_slot_alloc(gkSize(size, alignment));
+    KJ_REQUIRE(handle != 0, "guest-kernel: out of host slots or host memory", size);
+    return handle;
+  }
+#endif
+  return fallbackAllocateSlot(size, alignment);
+}
+
+void* resolveSlot(SlotHandle handle) {
+  if (handle == 0) return nullptr;
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (guestKernelActive()) {
+    return gk_host_slot_get(handle);
+  }
+#endif
+  return fallbackResolveSlot(handle);
+}
+
+void freeSlot(SlotHandle handle) {
+  if (handle == 0) return;
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (guestKernelActive()) {
+    gk_host_slot_free(handle);
+    return;
+  }
+#endif
+  fallbackFreeSlot(handle);
+}
+
+namespace {
 const void* probeTarget = nullptr;
+
+kj::Maybe<HandleProbeForTest>& handleProbe() {
+  static kj::Maybe<HandleProbeForTest> probe;
+  return probe;
+}
 }  // namespace
 
 void setProbeTargetForTest(const void* target) {
@@ -79,6 +214,14 @@ void setProbeTargetForTest(const void* target) {
 kj::Maybe<const void*> probeTargetForTest() {
   if (probeTarget == nullptr) return kj::none;
   return probeTarget;
+}
+
+void setHandleProbeForTest(HandleProbeForTest probe) {
+  handleProbe() = kj::mv(probe);
+}
+
+kj::Maybe<HandleProbeForTest&> handleProbeForTest() {
+  return handleProbe();
 }
 
 bool contains(const void* ptr) {

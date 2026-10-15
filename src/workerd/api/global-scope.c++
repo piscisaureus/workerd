@@ -43,6 +43,8 @@
 
 #include <kj/encoding.h>
 
+#include <cstring>
+
 namespace workerd::api {
 
 namespace {
@@ -321,6 +323,14 @@ namespace {
 // channel token key) from inside the JS turn. Host memory is mapped into no guest root, so at
 // ring 3 that is the same kind of fault, at the byte's own address; this is how the guest
 // kernel's host-memory-test.sh shows the key is out of a turn's reach. The same two gates apply.
+//
+// With the same variable set, a request whose path is /__gk_corrupt_handle overwrites, from
+// inside the JS turn, the handle through which the tenant's owner reaches it (registered through
+// hostMemory::setHandleProbeForTest()) with the address of a buffer this code chose, which is
+// what a write primitive would leave in place of a pointer; the owner is in the ordinary heap,
+// so the write lands and the turn completes. The host's use of the tenant then runs on the
+// event loop, outside the guest, as the real uses do: it must be refused rather than reach the
+// buffer. The handle is restored afterwards and the use run again.
 void maybeForceGuestFaultForTest(kj::StringPtr url) {
   static const bool faultEnabled =
       jsg::isGuestKernelEnabled() && getenv("WORKERD_GK_TEST_FAULT") != nullptr;
@@ -336,6 +346,25 @@ void maybeForceGuestFaultForTest(kj::StringPtr url) {
           kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(target))));
       volatile byte probed = *static_cast<const volatile byte*>(target);
       (void)probed;
+    }
+  }
+  if (probeEnabled && url.endsWith("/__gk_corrupt_handle")) {
+    KJ_IF_SOME(probe, hostMemory::handleProbeForTest()) {
+      static byte chosenKey[32] = {0x41};
+      hostMemory::SlotHandle saved;
+      memcpy(&saved, probe.handleStorage, sizeof(saved));
+      hostMemory::SlotHandle chosen = reinterpret_cast<uintptr_t>(chosenKey);
+      memcpy(probe.handleStorage, &chosen, sizeof(chosen));
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: overwrote the tenant's handle from inside the JS turn", url,
+          kj::str("0x", kj::hex(saved)), kj::str("0x", kj::hex(chosen)));
+      IoContext::current().addTask(kj::evalLater([&probe, saved]() {
+        probe.useOnHost();
+        memcpy(probe.handleStorage, &saved, sizeof(saved));
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: restored the tenant's handle",
+            kj::str("0x", kj::hex(saved)));
+        probe.useOnHost();
+      }));
     }
   }
 }

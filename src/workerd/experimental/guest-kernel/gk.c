@@ -244,6 +244,23 @@ typedef struct { uintptr_t start, end, bump; } gk_host_region;
 _Static_assert((1UL << GK_HOST_MAX_SHIFT) == GK_HOST_MAX_ALLOC, "gk.h and gk.c disagree");
 _Static_assert(GK_HOST_MAX_ALLOC <= GK_HOST_REGION_BYTES, "a block must fit a region");
 
+// A host slot (see gk_host_slot_alloc in gk.h): one host-memory block, named
+// by a handle. A handle is the slot's index in its low 16 bits and the
+// generation the slot was allocated with above them, so a handle is validated
+// against the table alone: the index bounds-checks against GK_HOST_SLOTS, and
+// the generation must match the slot's. Generations come from one counter
+// that every allocation advances, so a reused slot never repeats a handle.
+#define GK_HOST_SLOT_INDEX_BITS 16
+#define GK_HOST_SLOT_GEN_BITS (64 - GK_HOST_SLOT_INDEX_BITS)
+typedef struct {
+  void *ptr;        // the block, NULL while the slot is free
+  size_t size;      // the size it was allocated with (selects the class on free)
+  uint64_t gen;     // the generation in the slot's current handle; 0 never issued
+  int next_free;    // free-list link, as index + 1; 0 ends the list
+  int live;
+} gk_host_slot;
+_Static_assert(GK_HOST_SLOTS <= (1 << GK_HOST_SLOT_INDEX_BITS), "a slot index must fit a handle");
+
 // The supervisor/refuse registry (see prot_class below). An unregistered page
 // is user-accessible, so the registry must never be too small to hold every
 // range gk wants to protect: prot_add is fatal when it is full. The capacity
@@ -376,6 +393,14 @@ struct gk_ctl {
   int host_region_n;
   void *host_free[GK_HOST_CLASSES];
   long host_blocks;                  // blocks handed out and not yet freed
+
+  // Host slots (see the host-slots section). The table is here, in supervisor
+  // memory, so no ring-3 access reaches an entry. Guarded by G->lock.
+  gk_host_slot host_slots[GK_HOST_SLOTS];
+  int host_slot_n;                   // slots ever taken from the table
+  int host_slot_free;                // free-list head, as index + 1; 0 when empty
+  int host_slot_live;                // slots allocated and not yet freed
+  uint64_t host_slot_gen;            // the generation of the last allocation
 
   // Set at the end of a successful gk_init (see gk_initialized).
   int initialized;
@@ -685,11 +710,10 @@ static gk_host_region *host_region_of(uintptr_t p) {
   return NULL;
 }
 
-void *gk_host_alloc(size_t n) {
-  if (n == 0 || n > GK_HOST_MAX_ALLOC || !G->initialized) return NULL;
+// Caller holds G->lock; `n` is in range.
+static void *host_alloc_locked(size_t n) {
   int k = host_class_of(n);
   size_t sz = (size_t)1 << k, align = sz < 0x1000 ? sz : 0x1000;
-  pthread_mutex_lock(&G->lock);
   void *p = G->host_free[k];
   if (p) {
     G->host_free[k] = *(void **)p;
@@ -705,17 +729,23 @@ void *gk_host_alloc(size_t n) {
     }
   }
   if (p) G->host_blocks++;
+  return p;
+}
+
+void *gk_host_alloc(size_t n) {
+  if (n == 0 || n > GK_HOST_MAX_ALLOC || !G->initialized) return NULL;
+  pthread_mutex_lock(&G->lock);
+  void *p = host_alloc_locked(n);
   pthread_mutex_unlock(&G->lock);
   return p;
 }
 
-void gk_host_free(void *ptr, size_t n) {
-  if (!ptr) return;
-  if (n == 0 || n > GK_HOST_MAX_ALLOC) gk_fatal("gk_host_free with a size no block can have");
+// Caller holds G->lock; `n` is in range. Fatal for a pointer that is not the
+// start of a block of n's class (see gk_host_free).
+static void host_free_locked(void *ptr, size_t n) {
   int k = host_class_of(n);
   size_t sz = (size_t)1 << k, align = sz < 0x1000 ? sz : 0x1000;
   uintptr_t p = (uintptr_t)ptr;
-  pthread_mutex_lock(&G->lock);
   gk_host_region *r = host_region_of(p);
   if (!r || (p & (align - 1)) || p + sz > r->bump)
     gk_fatal("gk_host_free of a pointer that is not a host-memory block of that size");
@@ -726,6 +756,13 @@ void gk_host_free(void *ptr, size_t n) {
   *(void **)ptr = G->host_free[k];
   G->host_free[k] = ptr;
   G->host_blocks--;
+}
+
+void gk_host_free(void *ptr, size_t n) {
+  if (!ptr) return;
+  if (n == 0 || n > GK_HOST_MAX_ALLOC) gk_fatal("gk_host_free with a size no block can have");
+  pthread_mutex_lock(&G->lock);
+  host_free_locked(ptr, n);
   pthread_mutex_unlock(&G->lock);
 }
 
@@ -734,6 +771,91 @@ int gk_host_owns(const void *ptr) {
   int owns = host_region_of((uintptr_t)ptr) != NULL;
   pthread_mutex_unlock(&G->lock);
   return owns;
+}
+
+// ---- host slots ------------------------------------------------------------
+// The handle table for host-memory blocks (see gk_host_slot_alloc in gk.h).
+// Every operation validates the handle against the table and touches nothing
+// the caller supplied: the index selects an entry only after the bounds check,
+// and the entry is used only if it is live with the handle's generation. The
+// table is part of the control block, so it costs no registry entry and no
+// ring-3 access reaches it; the blocks are ordinary host-memory blocks.
+
+// The entry a handle names, or NULL if the handle is not one gk issued for a
+// slot that is still live. Caller holds G->lock.
+static gk_host_slot *host_slot_of_locked(gk_host_handle h) {
+  uint64_t idx = h & ((1ULL << GK_HOST_SLOT_INDEX_BITS) - 1), gen = h >> GK_HOST_SLOT_INDEX_BITS;
+  if (idx >= (uint64_t)GK_HOST_SLOTS) return NULL;
+  gk_host_slot *s = &G->host_slots[idx];
+  if (!s->live || s->gen != gen) return NULL;
+  return s;
+}
+
+gk_host_handle gk_host_slot_alloc(size_t n) {
+  if (n == 0 || n > GK_HOST_MAX_ALLOC || !G->initialized) return 0;
+  pthread_mutex_lock(&G->lock);
+  int idx;
+  if (G->host_slot_free) {
+    idx = G->host_slot_free - 1;
+    G->host_slot_free = G->host_slots[idx].next_free;
+  } else if (G->host_slot_n < GK_HOST_SLOTS) {
+    idx = G->host_slot_n++;
+  } else {
+    pthread_mutex_unlock(&G->lock);
+    return 0;  // the table is full: reported, never fatal
+  }
+  void *p = host_alloc_locked(n);
+  if (!p) {
+    G->host_slots[idx].next_free = G->host_slot_free;
+    G->host_slot_free = idx + 1;
+    pthread_mutex_unlock(&G->lock);
+    return 0;
+  }
+  // A generation is never 0 and never reused: the counter has 48 bits, and a
+  // process does not make 2^48 allocations.
+  uint64_t gen = ++G->host_slot_gen;
+  if (gen >> GK_HOST_SLOT_GEN_BITS) gen = G->host_slot_gen = 1;
+  G->host_slots[idx] = (gk_host_slot){p, n, gen, 0, 1};
+  G->host_slot_live++;
+  pthread_mutex_unlock(&G->lock);
+  return (gen << GK_HOST_SLOT_INDEX_BITS) | (uint64_t)idx;
+}
+
+void *gk_host_slot_get(gk_host_handle h) {
+  if (!h) return NULL;
+  pthread_mutex_lock(&G->lock);
+  gk_host_slot *s = host_slot_of_locked(h);
+  void *p = s ? s->ptr : NULL;
+  pthread_mutex_unlock(&G->lock);
+  if (!p)
+    fprintf(stderr, "[gk] gk_host_slot_get: %#llx is not the handle of a live host slot; it "
+            "resolves to nothing\n", (unsigned long long)h);
+  return p;
+}
+
+void gk_host_slot_free(gk_host_handle h) {
+  if (!h) return;
+  pthread_mutex_lock(&G->lock);
+  gk_host_slot *s = host_slot_of_locked(h);
+  if (!s) {
+    pthread_mutex_unlock(&G->lock);
+    fprintf(stderr, "[gk] gk_host_slot_free: %#llx is not the handle of a live host slot; "
+            "nothing is freed\n", (unsigned long long)h);
+    return;
+  }
+  void *p = s->ptr;
+  size_t n = s->size;
+  int idx = (int)(s - G->host_slots);
+  // The slot is retired before the block goes: its generation stays behind so
+  // the old handle keeps failing validation once the slot is reused.
+  s->ptr = NULL;
+  s->size = 0;
+  s->live = 0;
+  s->next_free = G->host_slot_free;
+  G->host_slot_free = idx + 1;
+  G->host_slot_live--;
+  host_free_locked(p, n);
+  pthread_mutex_unlock(&G->lock);
 }
 
 int gk_initialized(void) { return G->initialized; }
@@ -2273,6 +2395,7 @@ unsigned long gk_debug_ctl_addr(int which) {
     case GK_CTL_PKEYS: return (unsigned long)&G->pkeys[0];
     case GK_CTL_ROOT: return (unsigned long)&G->pml4;
     case GK_CTL_FILTER: return (unsigned long)&G->filter;
+    case GK_CTL_HOST_SLOTS: return (unsigned long)&G->host_slots[0];
     default: return 0;
   }
 }
@@ -3870,6 +3993,7 @@ void gk_get_stats(gk_stats *s) {
   s->flush_invpcid = G->flush_stub == gk_flush_stub_invpcid;
   s->host_regions = G->host_region_n;
   s->host_blocks = G->host_blocks;
+  s->host_slots = G->host_slot_live;
   pthread_mutex_unlock(&G->lock);
 }
 

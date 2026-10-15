@@ -29,9 +29,11 @@ isolate's JS turn at guest ring 3.
   Wasm bounds violation surfaces as a `WebAssembly.RuntimeError` rather than a
   guest fault.
 - `host-memory-test.sh` — end-to-end check against a built workerd that the
-  channel token key lives in host memory and that a JS turn at guest ring 3
-  reading it faults at the key's address, failing only that request and
-  condemning only that isolate.
+  channel token key lives in host memory, that a JS turn overwriting the
+  handle the host reaches it through leaves the host refusing the use rather
+  than reading a key of the turn's choosing, and that a JS turn at guest
+  ring 3 reading the key faults at the key's address, failing only that
+  request and condemning only that isolate.
 
 ## API
 
@@ -50,6 +52,9 @@ int  gk_mapping_syscall_ok(long nr, long a1, ..., long a6); // a filter's range 
 
 void *gk_host_alloc(size_t);                 // host memory: mapped into no guest root
 void  gk_host_free(void*, size_t);
+gk_host_handle gk_host_slot_alloc(size_t);   // a host-memory block named by a handle
+void *gk_host_slot_get(gk_host_handle);      // validated against gk's table; NULL otherwise
+void  gk_host_slot_free(gk_host_handle);
 ```
 
 `gk_run` returns `fn`'s return value, or `GK_EFAULT` if the guest took an
@@ -123,8 +128,37 @@ hardware:
   bytes intact, and runs tens of thousands of allocate/free cycles and
   multi-region bursts without the registry growing past the regions. In
   workerd, `util/host-memory.h` wraps this (`HostOwn<T>`, ordinary heap memory
-  when the guest kernel is off) and the channel token key is its first tenant;
-  `host-memory-test.sh` shows a ring-3 read of the key faulting.
+  when the guest kernel is off).
+- **Host slots.** A block in host memory is out of the guest's reach, but a
+  pointer to it is only as safe as the memory holding it, and an owner in the
+  ordinary heap is memory a write primitive can rewrite, after which the host
+  reads and writes through whatever address it finds. `gk_host_slot_alloc`
+  therefore names a host-memory block by a handle instead: a fixed-capacity
+  table (`GK_HOST_SLOTS`, 4096 entries) in the supervisor control block maps a
+  small integer to the block, and `gk_host_slot_get` validates a handle
+  completely against that table -- index bounds, slot liveness and a
+  generation that every allocation takes fresh from a counter -- before
+  returning the block, reading nothing through the handle's value. A handle
+  gk did not issue, a handle to a freed slot, and the old handle of a slot
+  since recycled all resolve to nothing, reported on stderr; a full table is
+  reported as a failed allocation, never fatal. The test resolves a handle
+  and reads and writes the block from the host, shows ring 3 faulting on
+  both the block and the table, feeds the resolver thirteen handles it did
+  not issue -- including the address of a `PROT_NONE` page, which any read
+  through the value would turn into a crash -- and gets nothing back with the
+  caller's memory untouched, frees and recycles a slot under a new handle
+  while the old one stays dead, fills the table to its bound, has the next
+  allocation refused, and sees the protection registry grow by at most one
+  region rather than per slot. What the table cannot tell apart is a handle
+  rewritten to another live tenant's: that names that tenant's block, the
+  same ownership bound `gk_arena_enter` and `gk_arena_destroy` carry (see
+  Limitations). In workerd, `HostSlot<T>` (`util/host-memory.h`) owns a
+  host-memory object through such a handle, which is its only member, with a
+  table of the same shape on the ordinary heap when the guest kernel is off;
+  the channel token key is held this way. `host-memory-test.sh` shows a
+  handle rewritten from inside a turn resolving to nothing, the host
+  refusing the use instead of reading the turn's buffer, and a ring-3 read
+  of the key faulting.
 - **Threads as vCPUs.** Each host thread that enters the guest gets its own
   vCPU, stack and TLS base, sharing the VM and memory. Four threads run in the
   guest concurrently, and two threads each locked into their own arena run at
@@ -284,15 +318,18 @@ decides the overall cost.
   `util/host-memory.h` places a C++ object there. What is still missing is the
   interface: the C++ bindings reach runtime state through direct pointers, so
   an object moved into host memory faults the turn until the turn's accesses
-  to it become messages. The channel token key is in host memory, and the two
+  to it become messages. The channel token key is in host memory, the two
   functions that read it run on the event loop, outside the guest, when a
-  turn asks for a token; every other object listed above is still in the
-  shared heap, and the pointer *to* a host-memory object (the `HostOwn`) is
-  itself in whatever memory its owner is in, so until the owner moves too, a
-  write primitive can swap it, though not read through it. Moving the
-  malloc'd objects into the arena needs a per-isolate allocator arena, which
-  means an allocator with extent hooks; workerd uses tcmalloc, which has
-  none.
+  turn asks for a token, and the handler reaches the key through a host slot
+  handle (`HostSlot<T>`), so a write primitive that rewrites the handle makes
+  the host refuse the use rather than read a key of the guest's choosing.
+  What a rewritten handle can still do is name another live host slot: the
+  table turns "any address" into "one of the live tenants", and telling a
+  legitimate use from a swapped one is an ownership question the table cannot
+  answer, as with arenas below. Every other object listed above is still in
+  the shared heap. Moving the malloc'd objects into the arena needs a
+  per-isolate allocator arena, which means an allocator with extent hooks;
+  workerd uses tcmalloc, which has none.
 - **The memory classification of runtime objects is applied to few of
   them.** Which side of the boundary each runtime C++ class belongs on is
   written down in `memory-classes.md`, together with the rules that decide
@@ -301,8 +338,9 @@ decides the overall cost.
   for the classes that carry a `WD_MEMORY_CLASS_*` annotation
   (`src/workerd/util/memory-class.h`), which is a handful so far; every other
   class is unchecked. Placement by class exists for H only, as an explicit
-  choice per object (`HostOwn<T>`, `util/host-memory.h`) rather than
-  something the allocator decides, and one object has been placed.
+  choice per object (`HostOwn<T>` and `HostSlot<T>`, `util/host-memory.h`)
+  rather than something the allocator decides, and one object has been
+  placed.
 - **The host acts on data a ring-3 turn can write.** The runtime's heap is in
   the guest's address space, so every host-side structure the guest can reach
   is attacker-controlled input to the host, and the dangerous cases are the
@@ -315,10 +353,14 @@ decides the overall cost.
   turn's outcome crosses to the host as bounded plain bytes rather than as a
   `kj::Exception` the guest wrote, and the guest-turn depth is restored from
   a value saved in a host frame instead of being decremented, since a
-  rewritten counter would otherwise make the next turn run outside the guest.
-  What validation cannot settle is ownership: a pointer swapped for another
-  live arena's is indistinguishable from a legitimate call, so a turn can
-  still name a different isolate's arena and cost that isolate its memory. Nor does it help with the objects a turn hands back --
+  rewritten counter would otherwise make the next turn run outside the guest,
+  and a host-memory object is reached through a host slot handle that gk
+  validates against its own table rather than through a pointer the host
+  loads from the heap. What validation cannot settle is ownership: a pointer
+  swapped for another live arena's, or a handle swapped for another live
+  slot's, is indistinguishable from a legitimate call, so a turn can still
+  name a different isolate's arena and cost that isolate its memory, or name
+  another tenant's host-memory block. Nor does it help with the objects a turn hands back --
   the non-void results of `IoContext::run`, which are mostly `kj::Promise`,
   and the `kj::Own` graph the delete queue walks -- which are heap objects
   carrying their own vtables and disposers. Those become safe when the

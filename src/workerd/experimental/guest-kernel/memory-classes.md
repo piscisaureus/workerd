@@ -39,9 +39,15 @@ fixed-size protection registry is spent per region rather than per object.
 `util/host-memory.h` wraps it for C++: `hostOwned<T>(...)` constructs a `T`
 there and `HostOwn<T>` owns it, as `kj::heap` and `kj::Own` do on the heap,
 and without the guest kernel the same code uses the ordinary heap. May hold
-raw pointers to other H objects. Refers to an I object only as an opaque
-handle together with the arena it belongs to; dereferencing one means
-entering that arena, which only a turn or a ring-0 helper does.
+raw pointers to other H objects. An H object whose owner is not itself in H
+memory is held through a host slot instead (`hostSlot<T>(...)` and
+`HostSlot<T>`): the owner keeps a handle into gk's host slot table, which is
+in the supervisor control block, and every access resolves the handle
+against that table -- bounds, liveness and generation -- so a rewritten
+handle resolves to nothing rather than to an address the guest chose. Refers
+to an I object only as an opaque handle together with the arena it belongs
+to; dereferencing one means entering that arena, which only a turn or a
+ring-0 helper does.
 
 **Boundary (B).** The one region both sides touch, one per isolate. Holds the
 messages the two sides exchange, the handle tables' isolate-visible halves,
@@ -59,7 +65,13 @@ destroyed, the address the page allocator mapped, the turn-depth counter, the
 rule is: a pointer the host dereferences, and any value the host uses to
 decide what to dereference, comes from H memory. An index into an H-owned
 table may come from anywhere, because the host validates it against the
-table; a pointer may not.
+table; a pointer may not. The host slot table (`gk_host_slot_alloc` in
+`gk.h`) is that table for the runtime's H-memory tenants, and it has the
+residual every such table has: validation tells a handle that names nothing
+from one that names a live entry, but not a handle rewritten to another live
+tenant's from the owner's own. That is an ownership bound, the same one
+`gk_arena_enter` and `gk_arena_destroy` carry for a pointer rewritten to
+another live arena.
 
 The first two classes are the whole point: an object is one isolate's or it is
 the runtime's. B is not a third kind of object but the channel, and it exists
@@ -129,8 +141,10 @@ Three layers, each catching what the one before cannot.
 1. **Placement.** The allocator decides the class in practice: an I object has
    to come from the isolate's arena and an H object from memory no arena maps.
    Per-isolate heap arenas are the mechanism for I (`jsg::HeapArena`); for H
-   it is `gk_host_alloc` behind `HostOwn<T>`, chosen per object by the code
-   that owns it rather than by the allocator.
+   it is `gk_host_alloc` behind `HostOwn<T>` for an owner that is itself in
+   H memory and `gk_host_slot_alloc` behind `HostSlot<T>` for one that is
+   not, chosen per object by the code that owns it rather than by the
+   allocator.
 2. **A static check.** The classes are a type-level property, so the
    clang-tidy check `workerd-memory-class` (`tools/clang-tidy/memory-class.c++`)
    makes an H class with an I-class member, or an I class holding a `kj::Own`
@@ -480,7 +494,7 @@ What a turn nevertheless reaches, every path starting at
 |---|---|---|
 | `WorkerService::ioChannels` | `Fetcher::fetch` -> `startSubrequest(channel, ...)` (`server.c++:4269`), `getCache()` (`:4364`), `getActorChannel` (`:4440`), `getRpcChannel` (`:4490`) -- host arrays indexed by a guest-supplied channel number, then dispatched through another service's vtable | H. The `uint channel` a JS `Fetcher` carries (`api/http.h:213`) is already the right shape: an index the host validates. What is wrong is that the validation and dispatch run inside the turn |
 | `Server&` itself | `workerdDebugPortServer` (`server.c++:3466`) -> `getWorkerdDebugPort()` (`:4553`) | H. A worker with that binding reaches the `Server` object by pointer from inside its turn |
-| `ChannelTokenHandler::tokenKey` | a `HostOwn<kj::FixedArray<byte, 32>>` (`channel-token.h`), reached from `getTokenMaybeSync` (`server.c++`) when a `Fetcher` is serialized over JS RPC, in-turn, and from `*FromToken` when one is deserialized | **In H memory; the crossing is interim.** The key bytes are in host memory, so an escaped isolate cannot read the key that mints subrequest-channel tokens. The two functions that read it run on the event loop, outside the guest, when the guest kernel is on: a turn that mints an RPC token gets a `kj::Promise` for the bytes, and one that decodes a token gets a promised channel, both forms the callers already handle. That is a crossing by way of a guest-built promise (violation 5 below), not yet the B message the turn should submit; and the `HostOwn` itself sits in the handler, in the shared heap, so a write primitive can swap the pointer, though not read through it, which the final split removes by moving the handler's host half to H. The IV still comes from the entropy buffer above |
+| `ChannelTokenHandler::tokenKey` | a `HostSlot<kj::FixedArray<byte, 32>>` (`channel-token.h`), reached from `getTokenMaybeSync` (`server.c++`) when a `Fetcher` is serialized over JS RPC, in-turn, and from `*FromToken` when one is deserialized | **In H memory, reached by handle; the crossing is interim.** The key bytes are in host memory, so an escaped isolate cannot read the key that mints subrequest-channel tokens, and the handler, which is in the shared heap, holds only a host slot handle to them: a write primitive that rewrites the handle makes the host's next use resolve to nothing and throw, rather than encrypt or decrypt with a key at an address the guest chose. What it can still do is rewrite the handle to another live host slot's, the ownership residual above; with one tenant there is no other slot to name. The two functions that read the key run on the event loop, outside the guest, when the guest kernel is on: a turn that mints an RPC token gets a `kj::Promise` for the bytes, and one that decodes a token gets a promised channel, both forms the callers already handle. That is a crossing by way of a guest-built promise (violation 5 below), not yet the B message the turn should submit, which the final split removes by moving the handler's host half to H. The IV still comes from the entropy buffer above |
 | `ActorIdFactoryImpl::key`, a SHA-256-sized HMAC key | `actor-id-impl.h:57`, owned by the JS-visible `DurableObjectNamespace` as a `kj::Own` (`api/actor.h:322`); `newUniqueId()` and `idFromName()` HMAC with it in-turn | **Must split.** The JS object is I and holds a namespace handle; the key and `computeMac` are H |
 | `CompatibilityFlags::Reader` | `WorkerdApi::getFeatureFlags()` (`workerd-api.c++:308`), called from nearly every API entry point during a turn; a capnp `Reader` is a pointer into a host-owned message | I only by copying: snapshot the struct into the arena at isolate creation. `jsg::JsgConfig` (`workerd-api.c++:228`) is already such a by-value copy |
 | `EntropySourceImpl` | `IoContext::getEntropySource()` (`io-context.h:926`) from `crypto.getRandomValues` (`api/crypto/crypto.c++:692`) and key generation | H; in-turn callers take bytes through B |
@@ -554,12 +568,15 @@ problem and the event-loop touches together.
 
 ## What is in H memory
 
-H memory exists: `gk_host_alloc` with `HostOwn<T>` over it (see "Host (H)"
-above). Its tenants, and what is waiting on the same facility:
+H memory exists: `gk_host_alloc` with `HostOwn<T>` over it, and the host slot
+table with `HostSlot<T>` over that (see "Host (H)" above). Its tenants, and
+what is waiting on the same facility:
 
 - **In H memory:** `ChannelTokenHandler::tokenKey` (`server/channel-token.h`),
-  with the key's two readers deferred to the event loop under the guest
-  kernel. `host-memory-test.sh` shows a ring-3 read of it faulting.
+  held through a host slot handle, with the key's two readers deferred to the
+  event loop under the guest kernel. `host-memory-test.sh` shows a ring-3
+  read of it faulting, and a handle rewritten from inside a turn resolving to
+  nothing, with the host refusing the use.
 - **Waiting, same remedy:** the provenance violations above, each of which
   needs the host to read a pointer or a descriptor from memory the guest
   cannot write -- the `jsg::Lock` data slot (violation 1), the wasm signal
@@ -568,12 +585,18 @@ above). Its tenants, and what is waiting on the same facility:
   `activeProgressCounter` pointer a signal handler dereferences
   (`thread-scopes.c++:27`), and the host-side entropy buffer (`entropy.c++`).
   Also `ActorIdFactoryImpl::key` (`actor-id-impl.h:57`), the other secret a
-  turn HMACs with today. Each of these is a `HostOwn` plus a crossing for the
-  in-turn reader, and the thread-local ones need the host side to find its
-  record without a thread-local, through gk's per-thread supervisor record.
+  turn HMACs with today. Each of these is a `HostSlot` plus a crossing for
+  the in-turn reader, and the thread-local ones need the host side to find
+  its record without a thread-local, through gk's per-thread supervisor
+  record.
 - **Not addressed by H memory alone:** the pointer to an H object is as safe
   as the memory it sits in. A `HostOwn` in a shared-heap object protects the
   object's bytes and lets the guest kernel refuse a swapped pointer at free
-  time, but the host still dereferences whatever pointer is there; the chain
-  from the event loop down to each H object has to be H all the way, which
-  is what the splits in the inventories above are for.
+  time, but the host still dereferences whatever pointer is there, which is
+  why an owner outside H memory holds a `HostSlot` instead: the host resolves
+  the handle against gk's table on every use, so a rewritten handle names
+  nothing or, at worst, another live tenant, never an address of the guest's
+  choosing. That residual, and the fact that the object's owner is still
+  reachable for rewriting at all, is what the splits in the inventories above
+  are for: the chain from the event loop down to each H object has to be H
+  all the way.

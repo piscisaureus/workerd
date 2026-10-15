@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
-# Checks, against a built workerd, that the channel token key lives in guest-kernel host memory
-# and that a JS turn at guest ring 3 cannot read it: with WORKERD_GK_TEST_PROBE set the server
-# logs the key's address and whether it is in host memory, and a request to /__gk_probe_host
-# reads one byte of it from inside the turn (see maybeForceGuestFaultForTest in
-# src/workerd/api/global-scope.c++). That read must fault at the key's address, failing only that
-# request and condemning only that isolate, while the other worker keeps serving.
+# Checks, against a built workerd, that the channel token key lives in guest-kernel host memory,
+# that the handle through which the host reaches it cannot be redirected from a JS turn, and that
+# a JS turn at guest ring 3 cannot read the key. With WORKERD_GK_TEST_PROBE set the server logs
+# the key's address and whether it is in host memory, and two request paths exercise it from
+# inside the turn (see maybeForceGuestFaultForTest in src/workerd/api/global-scope.c++):
+#
+# /__gk_corrupt_handle overwrites the handler's stored key handle, from inside the turn, with
+# the address of a buffer the turn chose, as a write primitive would a pointer; the write lands,
+# since the handler is in the ordinary heap, and the turn completes. The host then uses the key
+# on the event loop, as the real uses do: that use must be refused -- the guest kernel reports
+# the handle as not naming a live slot and the use throws -- and must not resolve the key at the
+# chosen address. With the handle restored, the use must resolve the key where it was.
+#
+# /__gk_probe_host reads one byte of the key from inside the turn. That read must fault at the
+# key's address, failing only that request and condemning only that isolate, while the other
+# worker keeps serving.
 #
 # Usage: host-memory-test.sh [path/to/workerd]
 #   defaults to bazel-bin/src/workerd/server/workerd in the repo root. Needs /dev/kvm and curl.
@@ -58,8 +68,42 @@ echo "1. token key at $key, in host memory: $inhost"
 [ -n "$key" ] || fail "no key address in: $line"
 [ "$inhost" = true ] || fail "the token key is not in host memory"
 
+# From inside a turn, overwrite the handle with the address of a guest-chosen buffer. The write
+# itself succeeds (the handler is heap memory the turn can write) and the turn completes.
+s=$(status "$victim/__gk_corrupt_handle")
+echo "2. GET $victim/__gk_corrupt_handle -> $s (the in-turn overwrite of the handle must land)"
+[ "$s" = 200 ] || fail "the request that overwrote the handle did not complete"
+over=$(grep -o "overwrote the tenant's handle from inside the JS turn.*" "$log" | head -n1)
+[ -n "$over" ] || fail "the handle was not overwritten"
+oldhandle=$(echo "$over" | grep -o '0x[0-9a-f]*' | sed -n 1p)
+chosen=$(echo "$over" | grep -o '0x[0-9a-f]*' | sed -n 2p)
+echo "   handle $oldhandle overwritten with $chosen (a buffer the turn chose)"
+[ -n "$oldhandle" ] && [ -n "$chosen" ] || fail "no handle values in: $over"
+[ "$chosen" != "$oldhandle" ] || fail "the chosen value equals the handle"
+
+# The host's use runs after the turn, on the event loop; wait for it and the restore.
+for _ in $(seq 1 100); do
+  grep -q "restored the tenant's handle" "$log" && break
+  sleep 0.1
+done
+grep -q "restored the tenant's handle" "$log" || fail "the host-side use of the key did not run"
+refused=$(grep -o "host use of the token key was refused.*" "$log" | head -n1)
+gkline=$(grep -o "gk_host_slot_get: $chosen is not the handle of a live host slot.*" "$log" | head -n1)
+echo "3. host use through the rewritten handle: ${refused:-NOT REFUSED}"
+echo "   guest kernel: ${gkline:-no report}"
+[ -n "$refused" ] || fail "the host used the key through the rewritten handle"
+[ -n "$gkline" ] || fail "the guest kernel did not report the rewritten handle"
+if grep "resolved it at" "$log" | grep -q "$chosen"; then
+  fail "the host resolved the key at the guest-chosen address $chosen"
+fi
+# The first "resolved" line is the use after the restore: the key is back where it was.
+resolved=$(grep -o "resolved it at.*" "$log" | head -n1 | grep -o '0x[0-9a-f]*' | head -n1)
+echo "4. host use after the restore resolved the key at ${resolved:-nothing} (key at $key)"
+[ "$resolved" = "$key" ] || fail "after the restore the key did not resolve where it was"
+[ "$(grep -c 'resolved it at' "$log")" = 1 ] || fail "the key resolved more than once"
+
 s=$(status "$victim/__gk_probe_host")
-echo "2. GET $victim/__gk_probe_host -> $s (the in-turn read of the key must fail the request)"
+echo "5. GET $victim/__gk_probe_host -> $s (the in-turn read of the key must fail the request)"
 [ "$s" != 200 ] || fail "the request that read the key succeeded"
 kill -0 "$pid" 2>/dev/null || fail "workerd died on the guest fault"
 grep -q "reading host memory from inside the JS turn" "$log" || fail "the probe did not run"
@@ -69,17 +113,17 @@ keydec=$((key))
 faultline=$(grep -o 'JS turn faulted inside the guest.*' "$log" | head -n1)
 [ -n "$faultline" ] || fail "no guest fault was reported"
 faultaddr=$(echo "$faultline" | grep -o 'gk_fault_addr() = [0-9]*' | sed 's/.*= //')
-echo "3. guest fault at $(printf '0x%x' "$faultaddr") (key at $key)"
+echo "6. guest fault at $(printf '0x%x' "$faultaddr") (key at $key)"
 [ "$faultaddr" = "$keydec" ] || fail "the fault was not at the key's address: $faultline"
 grep -q "isolate condemned\|has been condemned" "$log" || fail "no condemnation logged"
 
 s=$(status "$victim/")
-echo "4. GET $victim/            -> $s (condemned isolate must not run again)"
+echo "7. GET $victim/            -> $s (condemned isolate must not run again)"
 [ "$s" != 200 ] || fail "the faulted isolate served a request"
 
 s=$(status "$hello/")
-echo "5. GET $hello/             -> $s (other isolate must still serve)"
+echo "8. GET $hello/             -> $s (other isolate must still serve)"
 [ "$s" = 200 ] || fail "the other isolate stopped serving"
 kill -0 "$pid" 2>/dev/null || fail "workerd died after the guest fault"
 
-echo "PASS: the token key is in host memory; a ring-3 read of it faulted at its address, failed one request, condemned one isolate, process kept serving"
+echo "PASS: the token key is in host memory; a handle rewritten from inside a turn resolved to nothing and the host refused the use; a ring-3 read of the key faulted at its address, failed one request, condemned one isolate, process kept serving"

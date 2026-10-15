@@ -10,8 +10,12 @@
 // needs read/write access to /dev/kvm.
 #ifndef GK_H
 #define GK_H
+// A C header: its types are spelled with typedef, which the C++ linter's
+// modernize-use-using would otherwise flag at every C++ include.
+// NOLINTBEGIN(modernize-use-using)
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -127,6 +131,7 @@ enum {
   GK_CTL_PKEYS,        // the protection-key ranges
   GK_CTL_ROOT,         // the base page-table root pointer
   GK_CTL_FILTER,       // the syscall filter
+  GK_CTL_HOST_SLOTS,   // the host slot table
   GK_CTL_COUNT
 };
 unsigned long gk_debug_ctl_addr(int which);
@@ -225,6 +230,7 @@ typedef struct {
   int flush_invpcid;    // the flush stub in use: 1 = INVPCID (one VM exit), 0 = CR4.PGE toggle (three)
   int host_regions;     // host-memory regions mapped (each is one entry in the registry)
   long host_blocks;     // host-memory blocks allocated and not yet freed
+  int host_slots;       // host slots allocated and not yet freed (see gk_host_slot_alloc)
 } gk_stats;
 void gk_get_stats(gk_stats *s);
 
@@ -265,6 +271,61 @@ void gk_host_free(void *ptr, size_t size);
 // Whether `ptr` lies in host memory: in a block gk_host_alloc has handed out
 // or could hand out. For tests and for an embedder's own assertions.
 int gk_host_owns(const void *ptr);
+
+// Host slots: host-memory blocks named by a handle instead of a pointer.
+//
+// A block from gk_host_alloc is out of the guest's reach, but the pointer to
+// it is not: it lives wherever its owner lives, and an owner in the ordinary
+// heap is memory a ring-3 escape with a write primitive can rewrite, after
+// which the host reads and writes through whatever address it was given. The
+// provenance rule in memory-classes.md is that a pointer the host dereferences
+// comes from host memory; an index into a host-owned table may come from
+// anywhere, because the host validates it. Host slots are that table for the
+// runtime's host-memory tenants. A slot owns one block, and the only thing the
+// embedder keeps outside host memory is the handle.
+//
+// The table lives in gk's supervisor control block, so ring 3 can neither read
+// nor write an entry, and it is fixed-size: GK_HOST_SLOTS entries, never more.
+// gk_host_slot_alloc allocates a block of `size` bytes exactly as gk_host_alloc
+// would (same limits, same alignment, zero-filled), places it in a free slot
+// and returns the slot's handle, or 0 when the table or host memory is
+// exhausted, for a zero or oversized `size`, or before gk_init has succeeded;
+// exhaustion is reported this way, never fatal. 0 is never a valid handle.
+//
+// gk_host_slot_get resolves a handle to its block, or to NULL. It validates
+// the handle completely before returning anything: the index is bounds-checked
+// against the table, the slot must be live, and the handle's generation must
+// be the one the slot was allocated with, so a handle to a freed slot resolves
+// to nothing even after the slot has been reused -- every allocation takes a
+// fresh generation from a counter that never repeats within 2^48 allocations.
+// Resolution reads only the table, never anything the caller supplied: a
+// handle that gk did not hand out, whatever its value (a pointer, a stale
+// handle, random bits), resolves to nothing and nothing is read through it.
+// Such a handle is reported on stderr as well, as gk_arena_enter reports a
+// pointer that is not a live arena: a handle that fails validation is never a
+// normal outcome (an owner holds its slot for its lifetime), so it is either an
+// embedder use-after-free or a value the guest rewrote, and both deserve a
+// trace; the only silent case is 0, which names nothing by definition. The
+// returned pointer is for the host's immediate use and is not to be stored
+// outside host memory: resolve the handle again for each use.
+//
+// What no check here can remove: a handle rewritten to the live handle of
+// another tenant names that tenant's block, and the table cannot tell that use
+// from a legitimate one. This is the same ownership bound gk_arena_enter and
+// gk_arena_destroy carry for a pointer rewritten to another live arena; the
+// table turns "any address" into "one of the live tenants", and the rest is a
+// host-side ownership question (see the README's limitations).
+//
+// gk_host_slot_free validates the handle the same way, then scrubs and frees
+// the block (as gk_host_free does), retires the slot's generation and returns
+// the slot to the free list; a handle that fails validation frees nothing and
+// is reported. Both functions are host-side only, like gk_host_alloc: they take
+// gk's lock and are never on the fault or syscall-forward path.
+#define GK_HOST_SLOTS 4096
+typedef uint64_t gk_host_handle;
+gk_host_handle gk_host_slot_alloc(size_t size);
+void *gk_host_slot_get(gk_host_handle handle);
+void gk_host_slot_free(gk_host_handle handle);
 
 // Nonzero once gk_init has succeeded in this process.
 int gk_initialized(void);
@@ -332,4 +393,5 @@ int gk_mapping_syscall_ok(long nr, long a1, long a2, long a3, long a4, long a5,
 }
 #endif
 
+// NOLINTEND(modernize-use-using)
 #endif  // GK_H

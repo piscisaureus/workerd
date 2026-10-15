@@ -1982,6 +1982,153 @@ static int host_memory_check(void) {
   return ok;
 }
 
+// ---- host slots --------------------------------------------------------------
+// A host slot names a host-memory block by a handle that is validated against
+// gk's own table, which lives in the supervisor control block: the handle
+// resolves to its block, which the host reads and writes and ring 3 cannot;
+// a handle gk did not issue -- an index past capacity, the right index with
+// another generation, a pointer-shaped value, the address of an unmapped page,
+// random bits -- resolves to nothing, with nothing read through the value;
+// a freed slot's handle resolves to nothing, also once the slot has been
+// recycled under a new handle; the capacity bound holds, exhaustion is
+// reported as 0 rather than aborting, and filling the table costs the
+// supervisor/refuse registry nothing per slot.
+static int host_slot_check(void) {
+  gk_stats s0, s1, s2, s3, s4, s5, s6;
+  gk_get_stats(&s0);
+  gk_host_handle h = gk_host_slot_alloc(32);
+  if (!h) { printf("host slots: gk_host_slot_alloc failed [FAIL]\n"); return 0; }
+  unsigned char *k = gk_host_slot_get(h);
+  if (!k) { printf("host slots: a fresh handle resolved to nothing [FAIL]\n"); return 0; }
+  gk_get_stats(&s1);
+  int zero = 1;
+  for (int i = 0; i < 32; i++) if (k[i]) zero = 0;
+  for (int i = 0; i < 32; i++) k[i] = (unsigned char)(0xC0 + i);
+  unsigned char *again = gk_host_slot_get(h);
+  int resolves = gk_host_owns(k) && again == k && again[0] == 0xC0 && again[31] == 0xDF &&
+                 s1.host_slots == s0.host_slots + 1 && s1.host_blocks == s0.host_blocks + 1;
+
+  // Ring 3 reaches neither the block (host memory) nor the table (supervisor).
+  long r3 = gk_run_user(read_byte, k + 7);
+  unsigned long f3 = gk_fault_addr();
+  unsigned long table = gk_debug_ctl_addr(GK_CTL_HOST_SLOTS);
+  long w3 = gk_run_user(user_write_here, (void *)table);
+  unsigned long fw3 = gk_fault_addr();
+  int walled = r3 == GK_EFAULT && f3 == (unsigned long)(k + 7) && w3 == GK_EFAULT && fw3 == table;
+
+  // Handles gk did not issue. The PROT_NONE page is the check that resolution
+  // reads nothing through the caller's value: were the handle, or its index or
+  // generation bits, dereferenced, the test would take SIGSEGV here.
+  uint64_t idx = h & 0xffff, gen = h >> 16;
+  unsigned char *none = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  unsigned char *heap = malloc(64);
+  memset(heap, 0xEE, 64);
+  gk_host_handle bad[] = {
+      (gen << 16) | GK_HOST_SLOTS,          // index at capacity
+      (gen << 16) | 0xffff,                 // index past capacity
+      ((gen + 1) << 16) | idx,              // a generation not yet issued, same slot
+      ((gen ^ 0x100000) << 16) | idx,       // a generation never issued, same slot
+      (gen << 16) | (idx ^ 1),              // a slot never taken, with a live generation
+      (gk_host_handle)(uintptr_t)k,         // the block's own address, as a swapped pointer would be
+      (gk_host_handle)(uintptr_t)heap,      // a heap buffer the caller controls
+      (gk_host_handle)(uintptr_t)none,      // an unmapped page
+      (gk_host_handle)(uintptr_t)none | idx,
+      ~(gk_host_handle)0, 1, 0x7fff0000,
+      ((gen << 16) | idx) ^ ((gk_host_handle)1 << 63)};  // the live handle with its top bit flipped
+  int garbage_ok = none != MAP_FAILED;
+  for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++)
+    if (gk_host_slot_get(bad[i]) != NULL) garbage_ok = 0;
+  gk_host_slot_free(bad[2]);  // refused: frees nothing
+  gk_host_slot_free(bad[6]);
+  int heap_intact = 1;
+  for (int i = 0; i < 64; i++) if (heap[i] != 0xEE) heap_intact = 0;
+  free(heap);
+  munmap(none, 4096);
+  int intact = 1;
+  for (int i = 0; i < 32; i++) if (k[i] != (unsigned char)(0xC0 + i)) intact = 0;
+  gk_get_stats(&s2);
+  garbage_ok = garbage_ok && heap_intact && intact && gk_host_slot_get(h) == k &&
+               s2.host_slots == s1.host_slots && s2.host_blocks == s1.host_blocks;
+
+  // Freed: the handle resolves to nothing, the block is scrubbed and returned,
+  // and a second free is refused. Recycled: the next allocation of that class
+  // takes the slot and the block again, under a new handle; the old handle
+  // still resolves to nothing while the new one resolves to the block, zeroed.
+  gk_host_slot_free(h);
+  gk_get_stats(&s3);
+  int freed = gk_host_slot_get(h) == NULL && s3.host_slots == s0.host_slots &&
+              s3.host_blocks == s0.host_blocks;
+  gk_host_slot_free(h);
+  gk_get_stats(&s4);
+  freed = freed && s4.host_slots == s3.host_slots && s4.host_blocks == s3.host_blocks;
+  gk_host_handle h2 = gk_host_slot_alloc(32);
+  unsigned char *k2 = gk_host_slot_get(h2);
+  int recycled = h2 != 0 && (h2 & 0xffff) == idx && h2 != h && k2 == k &&
+                 gk_host_slot_get(h) == NULL;
+  for (int i = 0; i < 32; i++) if (k2 && k2[i]) recycled = 0;
+  gk_host_slot_free(h2);
+
+  // Capacity: the table fills to GK_HOST_SLOTS exactly, the next allocation
+  // reports 0, every handle names its own block (each block is tagged with its
+  // slot's position and read back through the handle), and the registry grew
+  // by at most the one region the blocks may have needed, not per slot. Freed
+  // in an order that scrambles the free list, the table empties again.
+  static gk_host_handle all[GK_HOST_SLOTS + 1];
+  gk_get_stats(&s4);
+  int n = 0;
+  for (; n <= GK_HOST_SLOTS; n++) {
+    all[n] = gk_host_slot_alloc(16);
+    if (!all[n]) break;
+  }
+  gk_host_handle over = n <= GK_HOST_SLOTS ? all[n] : gk_host_slot_alloc(16);
+  gk_get_stats(&s5);
+  int distinct = 1;
+  for (int i = 0; i < n; i++) {
+    int *p = gk_host_slot_get(all[i]);
+    if (!p) { distinct = 0; break; }
+    *p = i;
+  }
+  for (int i = 0; i < n && distinct; i++) {
+    int *p = gk_host_slot_get(all[i]);
+    if (!p || *p != i) distinct = 0;
+  }
+  for (int i = 0; i < n; i += 2) gk_host_slot_free(all[i]);
+  for (int i = (n - 1) | 1; i >= 1; i -= 2) if (i < n) gk_host_slot_free(all[i]);
+  gk_get_stats(&s6);
+  int capacity_ok = n == GK_HOST_SLOTS - s4.host_slots && over == 0 &&
+                    s5.host_slots == GK_HOST_SLOTS && distinct &&
+                    s5.prot_ranges - s4.prot_ranges == s5.host_regions - s4.host_regions &&
+                    s5.prot_ranges - s4.prot_ranges <= 1 && s6.host_slots == s4.host_slots &&
+                    s6.host_blocks == s4.host_blocks && s6.prot_ranges == s5.prot_ranges &&
+                    gk_host_slot_get(all[0]) == NULL && gk_host_slot_get(all[n - 1]) == NULL;
+  // The table is reusable after that: an allocation succeeds and the handle
+  // is fresh (a generation past every one issued above).
+  gk_host_handle h3 = gk_host_slot_alloc(16);
+  int fresh = h3 != 0 && (h3 >> 16) > (all[n - 1] >> 16) && gk_host_slot_get(h3) != NULL;
+  gk_host_slot_free(h3);
+  long cpl = gk_run_user(user_cpl, NULL);  // the process survived the faults above
+
+  int ok = zero && resolves && walled && garbage_ok && freed && recycled && capacity_ok &&
+           fresh && cpl == 3;
+  printf("host slots: handle %#llx -> block @%p (zero-filled %s, host r/w %s); ring-3 read of "
+         "the block -> %s (fault %#lx == %p), ring-3 write to the table -> %s (fault %#lx == "
+         "%#lx); %zu garbage handles -> nothing (%s, caller's memory untouched %s, block intact "
+         "%s); freed -> nothing %s; recycled as %#llx (same slot %s, same block %s, old handle "
+         "-> nothing %s, zeroed %s); capacity %d: filled %d, next -> %#llx, all distinct %s, "
+         "registry +%d for +%d region(s), emptied %s; reusable %s; ring 3 at CPL %ld [%s]\n",
+         (unsigned long long)h, (void *)k, zero ? "yes" : "NO", resolves ? "ok" : "BROKEN",
+         r3 == GK_EFAULT ? "FAULT" : "READ", f3, (void *)(k + 7),
+         w3 == GK_EFAULT ? "FAULT" : "WROTE", fw3, table, sizeof bad / sizeof bad[0],
+         garbage_ok ? "yes" : "NO", heap_intact ? "yes" : "NO", intact ? "yes" : "NO",
+         freed ? "yes" : "NO", (unsigned long long)h2, (h2 & 0xffff) == idx ? "yes" : "no",
+         k2 == k ? "yes" : "no", gk_host_slot_get(h) == NULL ? "yes" : "NO",
+         recycled ? "yes" : "NO", GK_HOST_SLOTS, n, (unsigned long long)over,
+         distinct ? "yes" : "NO", s5.prot_ranges - s4.prot_ranges,
+         s5.host_regions - s4.host_regions, s6.host_slots == s4.host_slots ? "yes" : "NO",
+         fresh ? "yes" : "NO", cpl, ok ? "OK" : "FAIL");
+  return ok;
+}
+
 // ---- AVX-512 state in the guest ----------------------------------------------
 // The guest CPUID is the host's, so glibc's ifunc resolvers and any JIT pick
 // AVX-512 code paths on a CPU that has them; the guest's XCR0 must then have
@@ -2571,7 +2718,8 @@ int main(void) {
     static const char *const names[GK_CTL_COUNT] = {
         "scratch word", "arena registry", "arena structs", "supervisor/refuse registry",
         "memslot tree root", "memslot node pool", "page-table allocator", "thread records",
-        "vCPU pool", "protection-key ranges", "base root pointer", "syscall filter"};
+        "vCPU pool", "protection-key ranges", "base root pointer", "syscall filter",
+        "host slot table"};
     int faulted = 0;
     for (int i = 0; i < GK_CTL_COUNT; i++) {
       unsigned long a = gk_debug_ctl_addr(i);
@@ -2741,9 +2889,16 @@ int main(void) {
   // without growing the supervisor/refuse registry (see host_memory_check).
   int ok28 = host_memory_check() == 1;
 
+  // ---- host slots -------------------------------------------------------------
+  // A handle from gk's host slot table resolves to its block only while the
+  // slot is live under that generation; anything else resolves to nothing with
+  // nothing read through it, and the table's capacity bound holds (see
+  // host_slot_check).
+  int ok29 = host_slot_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
-            ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28;
+            ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28 && ok29;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

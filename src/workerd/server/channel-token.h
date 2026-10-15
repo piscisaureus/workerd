@@ -135,12 +135,16 @@ class ChannelTokenHandler {
 
   // The AES-256-GCM key that encrypts and authenticates RPC tokens. It lives in host memory
   // (util/host-memory.h), which no guest page-table root maps, so a JS turn at guest ring 3 --
-  // or an escape from one with a read primitive -- cannot read it. The two places that use it,
-  // serializeTokenImpl() and decodeChannelTokenImpl(), are reached from inside JS turns (a stub
-  // serialized or deserialized over JS RPC); with the guest kernel enabled they therefore run on
-  // the event loop, outside the guest, see finishToken() and decodeToken(). The key id is the
-  // public 16-byte prefix of the key's SHA-256 and goes into every token header in the clear.
-  HostOwn<kj::FixedArray<byte, AES_KEY_SIZE>> tokenKey;
+  // or an escape from one with a read primitive -- cannot read it. The handler itself is in the
+  // ordinary heap, which such an escape can write, so the key is owned through a host slot
+  // handle rather than a pointer: an access resolves the handle through the guest kernel's own
+  // table, and a rewritten handle resolves to nothing instead of pointing the host at a key of
+  // the guest's choosing. The two places that use it, serializeTokenImpl() and
+  // decodeChannelTokenImpl(), are reached from inside JS turns (a stub serialized or deserialized
+  // over JS RPC); with the guest kernel enabled they therefore run on the event loop, outside
+  // the guest, see finishToken() and decodeToken(). The key id is the public 16-byte prefix of
+  // the key's SHA-256 and goes into every token header in the clear.
+  HostSlot<kj::FixedArray<byte, AES_KEY_SIZE>> tokenKey;
   byte keyId[KEY_ID_SIZE];
 
   struct TokenHeader {
