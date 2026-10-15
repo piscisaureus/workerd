@@ -67,6 +67,7 @@ struct Entry {
 enum Index : unsigned {
   ACTOR_ID = 1,     // keyed operations on an actor-id namespace key (server/actor-id-impl.h)
   WASM_SIGNAL = 2,  // register or unregister a Wasm signal field (io/tracked-wasm-instance.h)
+  VFS_ROOT = 3,     // set or clear the turn directory for a SQLite VFS's root (util/sqlite.h)
 };
 
 // Calls `entry`'s handler on `frame` and returns its result: a negative errno-style value from

@@ -64,6 +64,13 @@ isolate's JS turn at guest ring 3.
   an error raised inside a SQLite turn -- caught in JS, uncaught, or one the
   runtime logs inside the turn with its stack trace, which would run the
   symbolizer -- fails only its request rather than faulting the guest.
+- `vfs-root-test.sh` — end-to-end check against a built workerd that a JS turn
+  rewriting the directory descriptor SQLite's native VFS uses for its path
+  syscalls (a thread-local the turn can write) does not redirect where a
+  Durable Object's database lands: the open is refused under the turn
+  directory and nothing appears in the directory of the turn's choosing,
+  while with the confinement switched off (a test-only switch) the same
+  rewrite puts the database there.
 
 ## API
 
@@ -344,18 +351,32 @@ hardware:
   `RESOLVE_NO_MAGICLINKS` and its `newfstatat`/`statx` as an `O_PATH` open
   under the same rules, so an absolute path, a `..` or a symbolic link that
   would leave the directory, and a `/proc` magic link are refused by the
-  kernel atomically with the lookup; every other path syscall, and `fchdir`,
-  is refused, and a thread with no directory refuses them all. The descriptor
-  is checked by device and inode on every use, so one the guest closed and
-  reused names nothing. This is the remedy for SQLite's `currentVfsRoot`
-  (`util/sqlite.c++`), the dirfd of its forwarded `openat`, which a turn could
-  otherwise rewrite to redirect a file operation; wiring the VFS to set the
-  turn directory is pending (see memory-classes.md R7). `gk_test.c`'s
-  `turn_dir_check` opens and stats beneath the directory, sees a wrong dirfd,
-  an absolute path, a `..`, a symlink out, a reused descriptor and the rest
-  refused, and times a confined open; its negative build removes the
-  confinement and the case fails with the file landing at a guest-chosen
-  directory.
+  kernel atomically with the lookup. `unlinkat`, `mkdirat`, `readlinkat`,
+  `faccessat` and `faccessat2`, which act on a name rather than opening it,
+  are split: the path is copied into host memory once, its parent is opened
+  beneath the directory under the same rules, and the syscall runs against
+  that descriptor with the final component alone, never followed. Every other
+  path syscall, and `fchdir`, is refused, and a thread with no directory
+  refuses them all. The descriptor is checked by device and inode on every
+  use, so one the guest closed and reused names nothing. In workerd this
+  bounds SQLite's `currentVfsRoot` (`util/sqlite.c++`), the dirfd of the path
+  syscalls its native VFS issues from inside a turn and a thread-local the
+  turn can write: each native VFS call that may name a file has the VFS's
+  root made the turn directory through the VFS root hostcall, whose handler
+  takes the descriptor from a host slot, so a rewritten `currentVfsRoot`
+  makes that call fail rather than land elsewhere (`vfs-root-test.sh`; see
+  memory-classes.md R7). `gk_test.c`'s `turn_dir_check` opens, stats,
+  unlinks, makes and removes a directory, reads a link and checks access
+  beneath the directory, sees a wrong dirfd, an absolute path, a `..`, a
+  symlink out, a reused descriptor and the rest refused, and times a
+  confined open; its negative build removes the confinement and the case
+  fails with the file landing at a guest-chosen directory. The cost falls on
+  the calls that name files: opening a Durable Object's database made 26
+  hostcall pairs on the test machine, while a steady-state `/get` or `/put`
+  on an open database makes none (its commit runs on the host side, and the
+  turn's own syscalls are two `fcntl` locks), so the request p50 was the same
+  with the turn directory on and off (about 1.7 ms for a read and 1.9 ms for
+  a write under the guest kernel, oha, one connection, 10 s samples).
 - **Threads as vCPUs.** Each host thread that enters the guest gets its own
   vCPU, stack and TLS base, sharing the VM and memory. Four threads run in the
   guest concurrently, and two threads each locked into their own arena run at
@@ -617,10 +638,17 @@ rare enough to pay for an exit each time.
   from gk's own record in supervisor memory, so ring 3 cannot change what the
   check compares against. An `mmap` the kernel places is not range-checked,
   since it can only land in free space and the process allocator grows during
-  a turn. What that leaves open: `openat`, `read`, `write`, `socket`,
-  `connect`, `bind`, `accept4`, `sendto`, `recvfrom` and the rest of the
-  socket set are on the allowlist, so an escaped isolate can open any file
-  the process can and reach the network, as the process. The range check
+  a turn. The path syscalls on the allowlist (`openat`, `newfstatat`,
+  `statx`, `unlinkat`, `faccessat2`) are bounded by the turn directory (see
+  "Turn directory" above): a turn has one only for the length of a native
+  SQLite VFS call that names a file, beneath that VFS's root, and none
+  otherwise, so an escaped isolate cannot open a file by path except a
+  Durable Object's own database files during such a call. What that leaves
+  open: `read`, `write`, `fcntl`, `mmap` and `close` take a descriptor by
+  number, so an escaped isolate can still act on any file the process has
+  open, and `socket`, `connect`, `bind`, `accept4`, `sendto`, `recvfrom` and
+  the rest of the socket set are on the allowlist, so it can reach the
+  network, as the process. The range check
   covers only the sets above: the heap, glibc's data, other threads' stacks
   and any object `dlopen`ed after `gk_init` can still be remapped or
   unmapped by a turn, as they can be written by it directly (see the first

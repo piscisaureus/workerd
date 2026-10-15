@@ -19,6 +19,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 // ---- x86-64 paging and control-register bits -------------------------------
@@ -3172,15 +3173,22 @@ int gk_thread_words_get(unsigned first, unsigned n, uint64_t *values) {
 // dirfd must be that descriptor, and the descriptor must still name the
 // directory it named when it was set (its device and inode are compared on
 // every use, so a descriptor the guest closed and reused for something else
-// is refused). The path itself is never parsed here: openat becomes openat2
-// with RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS, so the kernel refuses an
-// absolute path, a ".." that would leave the directory, a symbolic link that
-// would, and a /proc magic link, atomically with the lookup; a stat becomes
-// an O_PATH open under the same rules followed by fstat or statx on the
-// result. Every other syscall gk knows to take a path is refused, as is
-// fchdir, which would move the process's working directory. The policy is
-// applied after the embedder's filter, which still decides what is forwarded
-// at all; it never allocates.
+// is refused). The lookup is the kernel's: openat becomes openat2 with
+// RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS, so the kernel refuses an absolute
+// path, a ".." that would leave the directory, a symbolic link that would,
+// and a /proc magic link, atomically with the lookup; a stat becomes an
+// O_PATH open under the same rules followed by fstat or statx on the result.
+// A syscall that acts on a name rather than opening it -- unlinkat, mkdirat,
+// readlinkat, faccessat and faccessat2 -- has no beneath-only form, so it is
+// split: its parent directory is opened beneath the turn directory under the
+// same rules and the syscall is issued against that descriptor with the final
+// component alone, which cannot traverse and is never followed. The split
+// reads the guest's path into host memory once (confined_parent), since the
+// bytes the kernel acts on must be the bytes the policy checked. Every other
+// syscall gk knows to take a path is refused, as is fchdir, which would move
+// the process's working directory. The policy is applied after the
+// embedder's filter, which still decides what is forwarded at all; it never
+// allocates.
 #define GK_SYS_openat2 437
 #define GK_SYS_faccessat2 439
 #define GK_SYS_fchmodat2 452
@@ -3189,6 +3197,9 @@ int gk_thread_words_get(unsigned first, unsigned n, uint64_t *values) {
 #define GK_O_PATH 010000000
 #define GK_AT_EMPTY_PATH 0x1000
 #define GK_AT_SYMLINK_NOFOLLOW 0x100
+#define GK_AT_EACCESS 0x200
+#define GK_PATH_MAX 4096
+#define GK_NAME_MAX 255
 struct gk_open_how { uint64_t flags, mode, resolve; };
 
 void gk_confine_paths(int on) { G->confine_paths = on != 0; }
@@ -3226,11 +3237,11 @@ static int path_syscall_refused(long nr) {
     case SYS_pivot_root: case SYS_setxattr: case SYS_lsetxattr: case SYS_getxattr:
     case SYS_lgetxattr: case SYS_listxattr: case SYS_llistxattr: case SYS_removexattr:
     case SYS_lremovexattr: case SYS_quotactl: case SYS_inotify_add_watch:
-    case SYS_fanotify_mark: case SYS_mkdirat: case SYS_mknodat: case SYS_fchownat:
-    case SYS_futimesat: case SYS_unlinkat: case SYS_renameat: case SYS_linkat:
-    case SYS_symlinkat: case SYS_readlinkat: case SYS_fchmodat: case SYS_faccessat:
+    case SYS_fanotify_mark: case SYS_mknodat: case SYS_fchownat:
+    case SYS_futimesat: case SYS_renameat: case SYS_linkat:
+    case SYS_symlinkat: case SYS_fchmodat:
     case SYS_utimensat: case SYS_name_to_handle_at: case SYS_renameat2: case SYS_execveat:
-    case GK_SYS_openat2: case GK_SYS_faccessat2: case GK_SYS_fchmodat2:
+    case GK_SYS_openat2: case GK_SYS_fchmodat2:
     case 428: case 429: case 430: case 433: case 442:  // open_tree, move_mount, fsopen, fspick, mount_setattr
       return 1;
     default:
@@ -3266,6 +3277,39 @@ static long open_beneath(int dir, long path, uint64_t flags, uint64_t mode) {
   return r;
 }
 
+// The parent directory of the path at `path` in guest memory, opened beneath
+// `dir` as an O_PATH descriptor, with the path's final component copied into
+// `name` (GK_NAME_MAX + 1 bytes of host memory). The guest's string is memory
+// another guest thread can rewrite under the call, so the path is read into
+// host memory once -- with process_vm_readv, which answers EFAULT for an
+// address the guest cannot read where a plain load would fault the host --
+// and split there, and the kernel acts on the copy. A final component of ".."
+// is refused with -EPERM (a syscall on it would act in the parent's parent,
+// which for the turn directory itself lies outside); "." is allowed, naming
+// the parent. Returns the parent descriptor, or a negative errno: the kernel's
+// answer for the parent (EXDEV for one that would leave the directory), or
+// -EPERM for the refused name.
+static int confined_parent(int dir, long path, char *name) {
+  char buf[GK_PATH_MAX];
+  struct iovec local = {buf, sizeof buf}, remote = {(void *)path, sizeof buf};
+  long n = host_syscall(SYS_process_vm_readv, getpid(), (long)&local, 1, (long)&remote, 1, 0);
+  if (n < 0) return (int)n;
+  if (n == 0) return -EFAULT;
+  size_t len = strnlen(buf, (size_t)n);
+  if (len == (size_t)n) return n == (long)sizeof buf ? -ENAMETOOLONG : -EFAULT;
+  char *slash = strrchr(buf, '/');
+  const char *parent, *base;
+  if (!slash) { parent = "."; base = buf; }
+  else if (slash == buf) { parent = "/"; base = buf + 1; }  // absolute: refused beneath
+  else { *slash = '\0'; parent = buf; base = slash + 1; }
+  size_t base_len = strlen(base);
+  if (base_len == 0) return -ENOENT;
+  if (base_len > GK_NAME_MAX) return -ENAMETOOLONG;
+  if (base[0] == '.' && base[1] == '.' && base[2] == '\0') return -EPERM;
+  memcpy(name, base, base_len + 1);
+  return (int)open_beneath(dir, (long)parent, GK_O_PATH | O_DIRECTORY | O_CLOEXEC, 0);
+}
+
 // Applies the policy to one forwarded syscall of a confined thread. Returns 1
 // with *ret the result (a refusal or the rewritten syscall's result) when the
 // policy decided the syscall, 0 when the syscall is not a path syscall and
@@ -3274,6 +3318,7 @@ static int confined_path_syscall(gk_thread *t, long nr, long a1, long a2, long a
                                  long a5, long *ret) {
   long err;
   int dir;
+  char name[GK_NAME_MAX + 1];
   switch (nr) {
     case SYS_openat: {
       dir = turn_dir_for(t, a1, &err);
@@ -3311,6 +3356,38 @@ static int confined_path_syscall(gk_thread *t, long nr, long a1, long a2, long a
       if (fd < 0) { *ret = fd; return 1; }
       *ret = host_syscall(SYS_statx, fd, (long)empty, sync | GK_AT_EMPTY_PATH, a4, a5, 0);
       host_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+      return 1;
+    }
+    case SYS_unlinkat:
+    case SYS_mkdirat:
+    case SYS_readlinkat:
+    case SYS_faccessat:
+    case GK_SYS_faccessat2: {
+      dir = turn_dir_for(t, a1, &err);
+      if (dir < 0) break;
+      int pfd = confined_parent(dir, a2, name);
+      if (pfd == -EPERM) { err = -GK_EPERM; break; }
+      if (pfd < 0) { *ret = pfd; return 1; }
+      switch (nr) {
+        case SYS_unlinkat:
+          *ret = host_syscall(SYS_unlinkat, pfd, (long)name, a3, 0, 0, 0);
+          break;
+        case SYS_mkdirat:
+          *ret = host_syscall(SYS_mkdirat, pfd, (long)name, a3, 0, 0, 0);
+          break;
+        case SYS_readlinkat:
+          *ret = host_syscall(SYS_readlinkat, pfd, (long)name, a3, a4, 0, 0);
+          break;
+        default: {
+          // Both forms become faccessat2 with the final component unfollowed: a
+          // symbolic link there is examined as itself rather than through its
+          // target, which could lie outside the directory.
+          long flags = (nr == GK_SYS_faccessat2 ? a4 & GK_AT_EACCESS : 0) | GK_AT_SYMLINK_NOFOLLOW;
+          *ret = host_syscall(GK_SYS_faccessat2, pfd, (long)name, a3, flags, 0, 0);
+          break;
+        }
+      }
+      host_syscall(SYS_close, pfd, 0, 0, 0, 0, 0);
       return 1;
     }
     default:
@@ -4205,8 +4282,14 @@ static long run_vcpu(gk_thread *t) {
           if (r.rax == GK_EXIT_SYSCALL) return (long)r.rdi;
           // A hostcall (see the hostcalls section) is answered here, never
           // forwarded and never shown to the filter.
-          if (r.rax == GK_HOSTCALL_SYSCALL) r.rax = (uint64_t)hostcall_dispatch(t, r.rdi);
-          else r.rax = (uint64_t)forward_syscall(t, &r);
+          if (r.rax == GK_HOSTCALL_SYSCALL) {
+            r.rax = (uint64_t)hostcall_dispatch(t, r.rdi);
+            if (G->dbg)
+              fprintf(stderr, "[gk] vcpu %d hostcall %lu -> %ld\n", t->id, (unsigned long)r.rdi,
+                      (long)r.rax);
+          } else {
+            r.rax = (uint64_t)forward_syscall(t, &r);
+          }
           // A ring-3 guest's syscall trampoline ran in ring 0; return it to
           // ring 3 with SYSRET rather than the ring-0 jmp. forward_syscall left
           // RCX/R11 (the SYSCALL-saved return RIP and flags) intact and may

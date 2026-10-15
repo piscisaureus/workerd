@@ -581,7 +581,7 @@ int gk_in_guest_hint(void);
 // land. With the policy on (gk_confine_paths(1), process-wide, host-side),
 // every thread starts each guest entry with no directory, and a forwarded
 // syscall that names a file by path is refused with -EPERM unless the thread
-// has one, the syscall is openat, newfstatat or statx, and its dirfd is that
+// has one, the syscall is one of the eight below, and its dirfd is that
 // directory; the lookup then runs beneath it. The directory is set host-side
 // by gk_turn_dir_set -- from a hostcall handler, in the runtime, so that the
 // value comes from a table the host validates (a host slot) and never from
@@ -592,29 +592,38 @@ int gk_in_guest_hint(void);
 // copy of the descriptor, wherever it keeps it, is untrusted bookkeeping: a
 // rewritten copy makes its syscalls fail, nothing else.
 //
-// The path is never parsed by gk. openat is forwarded as openat2 with
+// The lookup is the kernel's. openat is forwarded as openat2 with
 // RESOLVE_BENEATH and RESOLVE_NO_MAGICLINKS, so the kernel refuses, atomically
 // with the lookup, an absolute path (EXDEV), a ".." that would leave the
 // directory, a symbolic link that would, and a /proc magic link; the mode is
 // passed only with O_CREAT or O_TMPFILE, as openat2 requires. newfstatat and
 // statx become an O_PATH open under the same rules (O_NOFOLLOW for
 // AT_SYMLINK_NOFOLLOW) followed by fstat or statx on the descriptor, which is
-// then closed; with AT_EMPTY_PATH they stat the directory itself. Every other
+// then closed; with AT_EMPTY_PATH they stat the directory itself. unlinkat,
+// mkdirat, readlinkat, faccessat and faccessat2 act on a name rather than
+// opening it and have no beneath-only form, so each is split: the path is
+// read into host memory once (a guest thread could rewrite it under the
+// call), its parent is opened beneath the directory under the rules above,
+// and the syscall is issued against that descriptor with the final component
+// alone, which cannot traverse and is never followed -- the two access
+// forms become faccessat2 with AT_SYMLINK_NOFOLLOW, so a symbolic link is
+// examined as itself. A final component of ".." is refused. Every other
 // syscall gk knows to name a path -- open, access, stat, readlink, rename,
-// unlink, mkdir, the *at family other than the three above, openat2 itself,
-// execve, mount and the rest -- is refused, and so is fchdir, which would
-// move the process's working directory. A thread the guest creates is
-// confined like any other and starts with no directory. The policy is
-// applied after the embedder's filter, which still decides what is forwarded
-// at all; refusals are counted in gk_stats.path_refusals. It costs one fstat
-// per path syscall, and an extra open and close per stat.
+// unlink, mkdir, the rest of the *at family, openat2 itself, execve, mount
+// and so on -- is refused, and so is fchdir, which would move the process's
+// working directory. A thread the guest creates is confined like any other
+// and starts with no directory. The policy is applied after the embedder's
+// filter, which still decides what is forwarded at all; refusals are counted
+// in gk_stats.path_refusals. It costs one fstat per path syscall, and an
+// extra open and close per stat and per name-acting syscall.
 //
 // What it does not bound: the descriptors the turn already holds or can
 // guess. read, pwrite, fcntl, mmap and close take a descriptor by number and
 // are not path syscalls, so a turn can still act on any file the process has
 // open, as the process; confining that needs a per-turn descriptor table,
 // which this is not. Nor does it hide the directory's contents from the turn:
-// what the turn may open beneath its directory, it may read and write.
+// what the turn may open beneath its directory, it may read, write, create
+// and unlink.
 #define GK_TURN_DIR_NONE (-1)
 void gk_confine_paths(int on);
 int gk_turn_dir_set(int dirfd);

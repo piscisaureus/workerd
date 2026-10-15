@@ -2934,13 +2934,15 @@ static int thread_word_check(void) {
 // With gk_confine_paths on, a ring-3 turn's path syscalls resolve beneath the
 // directory a hostcall handler set for it, or are refused (see
 // gk_confine_paths in gk.h). Checks: with no directory everything is refused;
-// with one, openat and newfstatat under it work and files land there, while a
+// with one, openat and newfstatat under it work and files land there, and
+// unlinkat, mkdirat, readlinkat and faccessat2 act on a name under it, while a
 // dirfd for another directory, AT_FDCWD, an absolute path, a "..", a symbolic
-// link out, a direct openat2, unlinkat, mkdirat, access and fchdir are each
-// refused; the directory's descriptor closed and reused for another directory
-// is refused by identity; a second entry starts with no directory; a turn
-// cannot set the directory itself; the policy off forwards as before; the
-// cost of a confined open is measured.
+// link out (opened, unlinked, made a directory under, or access-checked
+// through), a direct openat2, access and fchdir are each refused; the
+// directory's descriptor closed and reused for another directory is refused
+// by identity; a second entry starts with no directory; a turn cannot set the
+// directory itself; the policy off forwards as before; the cost of a confined
+// open is measured.
 
 enum { TD_IDX = 11, TD_SET_A = 1, TD_SET_B = 2, TD_SET_NONE = 3, TD_N = 20000 };
 
@@ -2970,8 +2972,11 @@ static long td_handler(void *ctx, gk_hostcall_frame *f) {
 struct td_probe {
   int a, b;
   long before, open_a, open_b, cwd, abs, dotdot, link, stat_a, stat_b, stat_dir, statx_a,
-      access, unlink, mkdir, openat2, fchdir, swapped, open_b2, none, self_set;
+      access, unlink, unlink_b, unlink_link, unlink_dotdot, unlink_abs, mkdir, mkdir_link, rmdir,
+      readlink, readlink_b, faccess, faccess_link, faccess_through, faccess_dotdot, openat2,
+      fchdir, swapped, open_b2, none, self_set;
   long st_size, st_isdir, stx_size;
+  char target[16];
 };
 
 static long td_hostcall(unsigned op) {
@@ -3006,8 +3011,26 @@ static long td_guest(void *arg) {
   p->statx_a = td_raw(SYS_statx, p->a, (long)"f1", 0, 0x7ff, (long)&stx);
   memcpy(&p->stx_size, stx.raw + 40, 8);  // stx_size
   p->access = td_raw(SYS_access, (long)"/etc/passwd", R_OK, 0, 0, 0);
-  p->unlink = td_raw(SYS_unlinkat, p->a, (long)"f1", 0, 0, 0);
+  // The name-acting syscalls: under the directory they work on the final
+  // component through its parent; elsewhere, through a symbolic link or a
+  // "..", or on ".." itself, they are refused.
+  long u = td_sys_open(p->a, "u1", O_CREAT | O_WRONLY);
+  if (u >= 0) td_raw(SYS_close, u, 0, 0, 0, 0);
+  p->unlink = td_raw(SYS_unlinkat, p->a, (long)"u1", 0, 0, 0);
+  p->unlink_b = td_raw(SYS_unlinkat, p->b, (long)"f2", 0, 0, 0);
+  p->unlink_link = td_raw(SYS_unlinkat, p->a, (long)"out/passwd", 0, 0, 0);
+  p->unlink_dotdot = td_raw(SYS_unlinkat, p->a, (long)"../escape", 0, 0, 0);
+  p->unlink_abs = td_raw(SYS_unlinkat, p->a, (long)"/etc/passwd", 0, 0, 0);
   p->mkdir = td_raw(SYS_mkdirat, p->a, (long)"d", 0755, 0, 0);
+  p->mkdir_link = td_raw(SYS_mkdirat, p->a, (long)"out/gk-td-escape", 0755, 0, 0);
+  p->rmdir = td_raw(SYS_unlinkat, p->a, (long)"d", AT_REMOVEDIR, 0, 0);
+  memset(p->target, 0, sizeof p->target);
+  p->readlink = td_raw(SYS_readlinkat, p->a, (long)"out", (long)p->target, sizeof p->target - 1, 0);
+  p->readlink_b = td_raw(SYS_readlinkat, p->b, (long)"out", (long)p->target, sizeof p->target - 1, 0);
+  p->faccess = td_raw(439, p->a, (long)"f1", R_OK, 0, 0);  // faccessat2
+  p->faccess_link = td_raw(SYS_faccessat, p->a, (long)"out", R_OK, 0, 0);
+  p->faccess_through = td_raw(439, p->a, (long)"out/passwd", R_OK, 0, 0);
+  p->faccess_dotdot = td_raw(439, p->a, (long)"..", R_OK, 0, 0);
   struct { uint64_t flags, mode, resolve; } how = {O_RDONLY, 0, 0};
   p->openat2 = td_raw(437, p->a, (long)"f1", (long)&how, sizeof how, 0);
   p->fchdir = td_raw(SYS_fchdir, p->a, 0, 0, 0, 0);
@@ -3094,8 +3117,19 @@ static int turn_dir_check(void) {
   int refused = p->open_b == -EPERM && !exists_in(tb, "f2") && p->cwd == -EPERM &&
                 p->abs == -EXDEV && p->dotdot == -EXDEV && !exists_in(tb, "escape") &&
                 p->link == -EXDEV && p->stat_b == -EPERM && p->access == -EPERM &&
-                p->unlink == -EPERM && exists_in(ta, "f1") && p->mkdir == -EPERM &&
-                !exists_in(ta, "d") && p->openat2 == -EPERM && p->fchdir == -EPERM;
+                p->openat2 == -EPERM && p->fchdir == -EPERM;
+  // The name-acting syscalls: unlink, mkdir, rmdir, readlink and access beneath
+  // the directory work; the same through another dirfd are refused, through
+  // the symbolic link or a ".." fail to resolve beneath, and ".." itself is
+  // refused. The link is read as itself (its target text), not followed.
+  int names_ok = p->unlink == 0 && !exists_in(ta, "u1") && p->unlink_b == -EPERM &&
+                 exists_in(tb, "f2") == 0 && p->unlink_link == -EXDEV && exists_in("/etc", "passwd") &&
+                 p->unlink_dotdot == -EXDEV && p->unlink_abs == -EXDEV && p->mkdir == 0 &&
+                 p->rmdir == 0 && !exists_in(ta, "d") && p->mkdir_link == -EXDEV &&
+                 !exists_in("/etc", "gk-td-escape") && p->readlink == 4 &&
+                 strcmp(p->target, "/etc") == 0 && p->readlink_b == -EPERM && p->faccess == 0 &&
+                 p->faccess_link == 0 && p->faccess_through == -EXDEV &&
+                 p->faccess_dotdot == -EPERM;
   int swapped_ok = p->swapped == -EPERM && !exists_in(tb, "f3") && !exists_in(ta, "f3");
   int other_ok = p->open_b2 >= 0 && exists_in(tb, "g1") && p->none == -EPERM &&
                  !exists_in(tb, "g2");
@@ -3122,22 +3156,27 @@ static int turn_dir_check(void) {
   if (p->before >= 0) close(p->before);
   gk_hostcall_unregister(TD_IDX);
 
-  int ok = set_bad && r == 0 && before_ok && open_ok && refused && swapped_ok && other_ok &&
-           again_ok && self_ok && refusals == 11 && bench_ok && off_ok;
+  int ok = set_bad && r == 0 && before_ok && open_ok && refused && names_ok && swapped_ok &&
+           other_ok && again_ok && self_ok && refusals == 12 && bench_ok && off_ok;
   if (!ok)
     printf("turn directory: set_bad %d r %ld before %d open %d (isdir %ld stx_size %ld) refused %d "
-           "swapped %d other %d again %d self %d bench %d (%ld %ld) off %d\n", set_bad, r,
-           before_ok, open_ok, p->st_isdir, p->stx_size, refused, swapped_ok, other_ok, again_ok,
-           self_ok, bench_ok, nb, nu, off_ok);
+           "names %d swapped %d other %d again %d self %d refusals %ld bench %d (%ld %ld) off %d\n",
+           set_bad, r, before_ok, open_ok, p->st_isdir, p->stx_size, refused, names_ok, swapped_ok,
+           other_ok, again_ok, self_ok, refusals, bench_ok, nb, nu, off_ok);
   printf("turn directory: bad descriptors refused %s; no directory -> %ld; under it: open %s stat "
          "%ld (size %ld) dir %ld statx %ld; other dirfd %ld, AT_FDCWD %ld, absolute %ld, .. %ld, "
-         "symlink out %ld, stat other %ld, access %ld, unlinkat %ld, mkdirat %ld, openat2 %ld, "
-         "fchdir %ld; descriptor reused for another directory %ld; handler-chosen other dir %s, "
-         "none %ld; next entry %ld; set from ring 3 -> %ld; %ld refusals counted; confined open "
-         "%.2f us vs %.2f us; policy off %s [%s]\n",
+         "symlink out %ld, stat other %ld, access %ld, openat2 %ld, fchdir %ld; by name under it: "
+         "unlinkat %ld mkdirat %ld rmdir %ld readlinkat %ld (\"%s\") faccessat2 %ld, on the link "
+         "itself %ld; other dirfd: unlinkat %ld readlinkat %ld; through the link: unlinkat %ld "
+         "mkdirat %ld faccessat2 %ld; .. %ld, absolute %ld, on .. itself %ld; descriptor reused "
+         "for another directory %ld; handler-chosen other dir %s, none %ld; next entry %ld; set "
+         "from ring 3 -> %ld; %ld refusals counted; confined open %.2f us vs %.2f us; policy off "
+         "%s [%s]\n",
          set_bad ? "yes" : "NO", first_before, p->open_a >= 0 ? "ok" : "NO", p->stat_a, p->st_size,
          p->stat_dir, p->statx_a, p->open_b, p->cwd, p->abs, p->dotdot, p->link, p->stat_b,
-         p->access, p->unlink, p->mkdir, p->openat2, p->fchdir, p->swapped,
+         p->access, p->openat2, p->fchdir, p->unlink, p->mkdir, p->rmdir, p->readlink, p->target,
+         p->faccess, p->faccess_link, p->unlink_b, p->readlink_b, p->unlink_link, p->mkdir_link,
+         p->faccess_through, p->unlink_dotdot, p->unlink_abs, p->faccess_dotdot, p->swapped,
          p->open_b2 >= 0 ? "ok" : "NO", p->none, again_ok ? -EPERM : 0L, r3, refusals,
          per_c / 1000, per_u / 1000, off_ok ? "forwards" : "NO", ok ? "OK" : "FAIL");
   return ok;

@@ -21,6 +21,7 @@
 #include <workerd/server/workerd.capnp.h>
 #include <workerd/util/autogate.h>
 #include <workerd/util/entropy.h>
+#include <workerd/util/sqlite.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -114,7 +115,8 @@ namespace {
 // (util/sqlite.c++), which is what the file syscalls here are for: pread64,
 // pwrite64, fsync, fdatasync, ftruncate and fcntl on the descriptors it holds,
 // geteuid for its root check, and openat, newfstatat, unlinkat and faccessat2
-// by path.
+// by path; the turn directory (gk_confine_paths in gk.h) decides where the
+// path ones may land.
 //
 // Adapted from Deno Deploy's V8 seccomp allowlist (x86_64 set).
 // TODO: see if this can be tightened further.
@@ -1692,6 +1694,16 @@ int main(int argc, char* argv[]) {
     // The hostcalls a turn makes (util/hostcall.h), registered before any turn can run.
     workerd::server::ActorIdFactoryImpl::installHostcall();
     workerd::TrackedWasmInstanceList::installHostcall();
+    workerd::SqliteDatabase::Vfs::installHostcall();
+    // A turn's path syscalls land beneath the turn directory its VFS root hostcall set, or
+    // nowhere (gk_confine_paths in gk.h). The test-only switch leaves them unconfined, so that
+    // vfs-root-test.sh can show what the confinement prevents.
+    if (getenv("WORKERD_GK_TEST_PROBE") != nullptr &&
+        getenv("WORKERD_GK_TEST_UNCONFINED") != nullptr) {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_UNCONFINED: a turn's path syscalls are not confined");
+    } else {
+      gk_confine_paths(1);
+    }
     KJ_LOG(WARNING, "guest-kernel isolation enabled (experimental)");
   }
 #endif

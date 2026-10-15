@@ -539,6 +539,25 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
           kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(cur))), verdict);
     }));
   }
+  if (probeEnabled && url.endsWith("/__gk_vfs_rewrite")) {
+    // SQLite's native VFS keeps the directory descriptor for its path syscalls in a thread-local
+    // a turn can write (currentVfsRoot in util/sqlite.c++); the guest kernel's turn directory is
+    // what keeps a rewritten descriptor from redirecting the files. The rewrite is armed on the
+    // event loop (the directory it names must be opened on the host, which a confined turn
+    // cannot do) and applies to every native VFS call after that; /__gk_vfs_restore lifts it.
+    IoContext::current().addTask(kj::evalLater([]() {
+      KJ_IF_SOME(rewrite, hostMemory::hostUseForTest("vfs-root-rewrite")) {
+        rewrite();
+      }
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_vfs_restore")) {
+    IoContext::current().addTask(kj::evalLater([]() {
+      KJ_IF_SOME(restore, hostMemory::hostUseForTest("vfs-root-restore")) {
+        restore();
+      }
+    }));
+  }
   if (probeEnabled && url.endsWith("/__gk_corrupt_handle")) {
     KJ_IF_SOME(probe, hostMemory::handleProbeForTest()) {
       static byte chosenKey[32] = {0x41};
