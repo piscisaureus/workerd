@@ -77,6 +77,7 @@ wd_cc_library(
         "async-context.c++",
         "dom-exception.c++",
         "guest-run.c++",
+        "heap-arena.c++",
         "jsg.c++",
         "jsvalue.c++",
         "modules.c++",
@@ -95,6 +96,7 @@ wd_cc_library(
         "fast-api.h",
         "function.h",
         "guest-run.h",
+        "heap-arena.h",
         "jsg.h",
         "jsvalue.h",
         "jsvalue-defs.h",
@@ -110,6 +112,10 @@ wd_cc_library(
         "web-idl.h",
         "wrappable.h",
     ],
+    defines = select({
+        "//src/workerd/server:really_use_jemalloc": ["WORKERD_HAS_JEMALLOC=1"],
+        "//conditions:default": [],
+    }),
     # Some JSG headers can't be compiled on their own
     features = ["-parse_headers"],
     implementation_deps = [
@@ -146,6 +152,12 @@ wd_cc_library(
         "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
             "//src/workerd/experimental/guest-kernel",
         ],
+        "//conditions:default": [],
+    }) + select({
+        # Per-isolate heap arenas (heap-arena.h) use jemalloc's arena controls;
+        # the dep and the WORKERD_HAS_JEMALLOC define exist only when jemalloc
+        # is the build's allocator.
+        "//src/workerd/server:really_use_jemalloc": ["@jemalloc"],
         "//conditions:default": [],
     }),
 )
@@ -335,9 +347,16 @@ wd_cc_library(
 
 # Proves that per-isolate guest-kernel arenas make one isolate's sandbox unaddressable from
 # another's guest execution. The test body is compiled only where gk is (x86-64 Linux); there it
-# also skips itself when gk cannot initialize (no /dev/kvm).
+# also skips itself when gk cannot initialize (no /dev/kvm). The environment configures the
+# process allocator as a workerd run with guest-kernel isolation has it (see
+# heapArenasAvailable() in heap-arena.h): the test binary links jemalloc as a shared library,
+# where only MALLOC_CONF reaches it in time. MALLOC_CONF is ignored by the other allocators.
 kj_test(
     src = "guest-arena-test.c++",
+    env = {
+        "MALLOC_CONF": "tcache:false",
+        "WORKERD_EXPERIMENTAL_GUEST_KERNEL": "1",
+    },
     local_defines = ["JSG_IMPLEMENTATION"],
     deps = [":jsg"] + select({
         "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [

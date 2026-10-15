@@ -1692,6 +1692,9 @@ int main(int argc, char* argv[]) {
           gk_last_error() != nullptr ? gk_last_error() : "unknown"));
     }
     gk_set_syscall_filter(&workerd::server::guestKernelSyscallFilter);
+    // Per-isolate C++ heap arenas need the allocator set up for them (jsg/heap-arena.h);
+    // without that the isolates' heap objects stay in the shared heap.
+    workerd::jsg::checkHeapArenaSupport();
     // The hostcalls a turn makes (util/hostcall.h), registered before any turn can run.
     workerd::server::ActorIdFactoryImpl::installHostcall();
     workerd::TrackedWasmInstanceList::installHostcall();

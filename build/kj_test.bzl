@@ -9,6 +9,7 @@ def kj_test(
         tags = [],
         size = "medium",
         target_compatible_with = [],
+        env = {},
         **kwargs):
     test_name = src.removesuffix(".c++")
     binary_name = test_name + "_binary"
@@ -51,6 +52,7 @@ def kj_test(
         srcs = ["//build/fixtures:kj_test.sh"],
         args = ["$(location {})".format(cross_alias)],
         data = data + [cross_alias],
+        env = env,
         tags = tags,
         size = size,
         target_compatible_with = target_compatible_with,
@@ -61,7 +63,7 @@ def kj_test(
         srcs = ["//build/fixtures:kj_test.sh"],
         args = ["$(location {})".format(cross_alias)],
         data = data + [cross_alias],
-        env = {"WORKERD_ALL_AUTOGATES": "1"},
+        env = dict(env, WORKERD_ALL_AUTOGATES = "1"),
         # Tag with no-coverage to reduce coverage CI time
         tags = tags + ["no-coverage"],
         size = size,

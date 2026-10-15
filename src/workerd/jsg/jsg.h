@@ -7,6 +7,7 @@
 //
 // Any files declaring an API to export to JavaScript will need to include this header.
 
+#include "heap-arena.h"
 #include "util.h"
 #include "wrappable.h"
 
@@ -2707,9 +2708,14 @@ class MemoryProtectionKeyScope final {
 // address this isolate's V8 sandbox and no other isolate's. A no-op when the isolate has no
 // arena, which is always the case unless guest-kernel isolation is enabled (see setup.h).
 //
+// The scope also switches the thread onto the isolate's C++ heap arena (HeapArenaScope in
+// heap-arena.h), where there is one, so that what the thread allocates while it holds the lock
+// -- on the host side of the lock as much as in the guest turn -- lives in the isolate's arena.
+//
 // The scope records nothing that selects a page-table root: the arena to return to is kept by
 // gk itself, per thread, in its supervisor memory (gk_arena_leave in gk.h). A jsg::Lock, and so
-// this scope, may live on the heap, which guest execution can write; a flag is all it holds.
+// this scope, may live on the heap, which guest execution can write; it holds a flag and the
+// heap arena to return to, which selects no root either (see HeapArenaScope).
 class GuestArenaScope final {
  public:
   explicit GuestArenaScope(v8::Isolate* isolate);
@@ -2717,6 +2723,7 @@ class GuestArenaScope final {
   KJ_DISALLOW_COPY_AND_MOVE(GuestArenaScope);
 
  private:
+  HeapArenaScope heapArenaScope;
   bool entered = false;
 };
 
