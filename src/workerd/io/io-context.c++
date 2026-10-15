@@ -1429,7 +1429,7 @@ void IoContext::runInContextScope(Worker::LockType lockType,
         auto l = deleteQueue.queue->crossThreadDeleteQueue.lockExclusive();
         auto& state = KJ_ASSERT_NONNULL(*l);
         for (auto handle: state.queue) {
-          DeleteQueue::unlinkOwned(handle);
+          OwnedObjectList::release(handle, DestroyOwnedObject::YES);
         }
         state.queue.clear();
       }
@@ -1451,8 +1451,9 @@ void runJsTurn(IoContext& context, Worker::Lock& workerLock, Func&& body) {
   // bookkeeping; the outermost turn's restore runs last.
   auto threadLocals = GuestTurnThreadLocals::save();
   KJ_DEFER(threadLocals.restore());
-  // The turn's IoOwn registrations, reserved before it and committed after it (host-memory.h).
-  hostMemory::ResolveTurn resolveTurn;
+  // The turn's IoOwn registrations, reserved before it and committed after it (host-memory.h),
+  // with the owned list's hooks building the nodes host-side (io-own.h).
+  hostMemory::ResolveTurn resolveTurn(OwnedObjectList::TURN_HOOKS);
   jsg::runInGuest(workerLock, body, [&](const kj::Exception& e) {
     // The turn faulted inside the guest. Condemn the isolate so no further JS turn is run on it
     // -- while this thread still holds the isolate lock (`workerLock`), so a thread waiting for

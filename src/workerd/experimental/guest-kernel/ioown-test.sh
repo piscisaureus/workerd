@@ -18,6 +18,17 @@
 # before entering the guest: the host must refuse the handle rather than unlink through the
 # chosen address.
 #
+# /__gk_ioown_node_corrupt, on the node worker, aims at the record behind the handle instead: the
+# owned-list node in host memory, whose links the host's walk follows and whose disposer the host
+# calls. The turn creates an IoOwn; the host, on the event loop, finds the node behind its handle
+# and announces its address; a later turn writes a slot and a disposer of its choosing into the
+# node's link and disposer fields, as a write primitive would. The write must fault at the node --
+# the turn is abandoned and its isolate condemned -- and the context's teardown, host-side, must
+# then dispose of the object through the disposer the node recorded, never calling the one the
+# turn chose. (Where the write lands, as in the WORKERD_GK_NEG_IOOWN_NODE build, the holder is
+# destroyed on the event loop and the next turn's host-side drain follows the rewritten node:
+# the chosen disposer logs that the host called it, and this script fails.)
+#
 # /__gk_ioown_announce, on the other worker, creates an IoOwn and publishes its handle; the
 # worker's JS keeps that request open for three seconds, so its context, which owns the object
 # and retires the entry when it ends, outlives the next step. /__gk_ioown_steal, on the victim,
@@ -29,8 +40,8 @@
 #
 # Usage: ioown-test.sh [path/to/workerd]
 #   defaults to bazel-bin/src/workerd/server/workerd in the repo root. Needs /dev/kvm and curl.
-#   GK_IOOWN_TEST_HELLO_PORT / GK_IOOWN_TEST_VICTIM_PORT / GK_IOOWN_TEST_OTHER_PORT override the
-#   ports (8885 / 8884 / 8883).
+#   GK_IOOWN_TEST_HELLO_PORT / GK_IOOWN_TEST_VICTIM_PORT / GK_IOOWN_TEST_OTHER_PORT /
+#   GK_IOOWN_TEST_NODE_PORT override the ports (8885 / 8884 / 8883 / 8882).
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -39,9 +50,11 @@ workerd=${1:-$root/bazel-bin/src/workerd/server/workerd}
 hello_port=${GK_IOOWN_TEST_HELLO_PORT:-8885}
 victim_port=${GK_IOOWN_TEST_VICTIM_PORT:-8884}
 other_port=${GK_IOOWN_TEST_OTHER_PORT:-8883}
+node_port=${GK_IOOWN_TEST_NODE_PORT:-8882}
 hello=http://127.0.0.1:$hello_port
 victim=http://127.0.0.1:$victim_port
 other=http://127.0.0.1:$other_port
+node=http://127.0.0.1:$node_port
 log=$(mktemp)
 chosen_magic=badbadbadbadbad0
 other_magic=e7e70e7e70e7e70
@@ -71,18 +84,18 @@ wait_for() {  # $1 pattern
 WORKERD_EXPERIMENTAL_GUEST_KERNEL=1 WORKERD_GK_TEST_PROBE=1 \
   "$workerd" serve "$here/ioown-test.capnp" \
   --socket-addr "hello=127.0.0.1:$hello_port" --socket-addr "victim=127.0.0.1:$victim_port" \
-  --socket-addr "other=127.0.0.1:$other_port" \
+  --socket-addr "other=127.0.0.1:$other_port" --socket-addr "node=127.0.0.1:$node_port" \
   >"$log" 2>&1 &
 pid=$!
 trap cleanup EXIT
 
 for _ in $(seq 1 100); do
   [ "$(status "$hello/")" = 200 ] && [ "$(status "$victim/")" = 200 ] &&
-    [ "$(status "$other/")" = 200 ] && break
+    [ "$(status "$other/")" = 200 ] && [ "$(status "$node/")" = 200 ] && break
   kill -0 "$pid" 2>/dev/null || fail "workerd exited during startup"
   sleep 0.1
 done
-echo "workerd pid $pid serving hello on $hello, victim on $victim, other on $other"
+echo "workerd pid $pid serving hello on $hello, victim on $victim, other on $other, node on $node"
 
 s=$(status "$victim/__gk_ioown_corrupt")
 echo "1. GET $victim/__gk_ioown_corrupt -> $s (the in-turn overwrite of the handle must land)"
@@ -110,7 +123,7 @@ echo "$use" | grep -q "$chosen_magic" && fail "the use read the magic at the add
 echo "$use" | grep -q "does not name a live owned object" || fail "the refusal is not the handle check: $use"
 
 wait_for "the turn after the holder's destruction ran" || fail "the holder was not destroyed and drained"
-drain=$(grep -o "IoOwn handle does not name a live owned object; nothing is unlinked.*" "$log" | head -n1)
+drain=$(grep -o "IoOwn handle does not name a live owned object; nothing is released.*" "$log" | head -n1)
 echo "3. host-side drain of the destroyed holder's handle: ${drain:-NOT REFUSED}"
 [ -n "$drain" ] || fail "the host did not refuse the handle when draining the delete queue"
 echo "$drain" | grep -qi "${chosen#0x}" || fail "the refused handle is not the chosen value: $drain"
@@ -159,4 +172,40 @@ echo "10. GET $hello/            -> $s (other isolates must still serve)"
 [ "$s" = 200 ] || fail "hello stopped serving"
 kill -0 "$pid" 2>/dev/null || fail "workerd died"
 
-echo "PASS: an IoOwn handle rewritten from inside a turn to an address the turn chose was refused by the next turn's dereference and by the host's drain of the delete queue, reaching neither the chosen buffer nor its magic; the isolate kept serving; a handle rewritten to another isolate's live handle named that isolate's object (the ownership residual, not closed by the handle check) and was refused once that isolate's context had ended"
+s=$(status "$node/__gk_ioown_node_corrupt")
+echo "11. GET $node/__gk_ioown_node_corrupt -> $s (creates an IoOwn whose node a later turn rewrites)"
+[ "$s" = 200 ] || fail "the node probe request did not complete"
+wait_for "the owned node behind the IoOwn, found host-side" || fail "the host did not find the node"
+found=$(grep -o "the owned node behind the IoOwn, found host-side.*" "$log" | head -n1)
+node_handle=$(echo "$found" | grep -o '0x[0-9a-f]*' | sed -n 1p)
+node_addr=$(echo "$found" | grep -o '0x[0-9a-f]*' | sed -n 2p)
+[ -n "$node_addr" ] && [ "$node_addr" != "0x0" ] || fail "no node address in: $found"
+echo "    the node behind handle $node_handle is at $node_addr, found host-side through the entry's companion"
+wait_for "rewriting the owned node from inside the JS turn" || fail "the later turn did not attempt the rewrite"
+rewrite=$(grep -o "rewriting the owned node from inside the JS turn.*" "$log" | head -n1)
+chosen_slot=$(echo "$rewrite" | grep -o '0x[0-9a-f]*' | sed -n 2p)
+chosen_disposer=$(echo "$rewrite" | grep -o '0x[0-9a-f]*' | sed -n 3p)
+echo "    the turn writes link = $chosen_slot and disposer = $chosen_disposer into the node at $node_addr"
+wait_for "isolate condemned" || fail "the in-turn write to the node did not fault"
+condemned=$(grep -o "isolate condemned.*" "$log" | head -n1)
+echo "$condemned" | grep -q "JS turn faulted inside the guest" || fail "the isolate was condemned for another reason: $condemned"
+fault_dec=$(echo "$condemned" | grep -o "gk_fault_addr() = [0-9]*" | grep -o "[0-9]*$")
+[ -n "$fault_dec" ] || fail "no fault address in: $condemned"
+fault_addr=$(printf '0x%x' "$fault_dec")
+node_dec=$((node_addr))
+# The write lands on the node's link field, inside the node.
+[ "$fault_dec" -ge "$node_dec" ] && [ "$fault_dec" -lt $((node_dec + 64)) ] ||
+  fail "the fault is not at the node ($node_addr): $condemned"
+echo "12. the write faulted at $fault_addr, inside the node at $node_addr (offset $((fault_dec - node_dec))): ${condemned%%;*}"
+grep -q "the owned node was rewritten from inside the JS turn; the write landed" "$log" && fail "the write to the node landed"
+wait_for "disposed of through its own disposer; .*0xde0de0de0de0de0" || fail "the context's teardown did not dispose of the node probe's object"
+echo "13. the context's teardown, host-side, walked the list and disposed of the object through the disposer the node recorded"
+grep -q "the chosen disposer was called by the host" "$log" && fail "the host called the disposer the turn chose: $(grep -o 'the chosen disposer was called by the host.*' "$log" | head -n1)"
+echo "    the chosen disposer was never called"
+
+s=$(status "$hello/")
+echo "14. GET $hello/            -> $s (other isolates must still serve)"
+[ "$s" = 200 ] || fail "hello stopped serving after the node fault"
+kill -0 "$pid" 2>/dev/null || fail "workerd died"
+
+echo "PASS: an IoOwn handle rewritten from inside a turn to an address the turn chose was refused by the next turn's dereference and by the host's drain of the delete queue, reaching neither the chosen buffer nor its magic; the isolate kept serving; a handle rewritten to another isolate's live handle named that isolate's object (the ownership residual, not closed by the handle check) and was refused once that isolate's context had ended; a turn's write into the owned node behind a handle faulted at the node, and the host's teardown walk disposed of the object through the node's own disposer, never the chosen one"

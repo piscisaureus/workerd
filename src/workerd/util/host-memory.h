@@ -91,14 +91,69 @@ void freeSlot(SlotHandle handle);
 // cannot tell from a legitimate use (the ownership residual the host slot table carries too).
 // unregisterResolve() refuses a handle that does not name a live entry, with a report, and
 // retires nothing.
+//
+// A registration may carry RESOLVE_AUX_WORDS words of the registrant's own beside the pointer.
+// Inside a turn they are journaled with it and handed, host-side, to the turn's committed hook
+// (ResolveTurnHooks below) once the table has taken the pointer; outside a turn there is no
+// hook, and the caller acts on them itself. The table never interprets them.
 using ResolveHandle = uint64_t;
 constexpr size_t RESOLVE_CAPACITY = size_t{1} << 20;
+constexpr size_t RESOLVE_AUX_WORDS = 4;
 ResolveHandle registerResolve(void* ptr);
+ResolveHandle registerResolve(void* ptr, const uint64_t (&aux)[RESOLVE_AUX_WORDS]);
 void* resolve(ResolveHandle handle);
 void unregisterResolve(ResolveHandle handle);
 
+// Retires a live entry through the table directly, for host code that runs while a turn's
+// journal is active on the thread -- a hostcall handler -- where unregisterResolve() would
+// journal the release for the turn instead. Refuses a handle that names nothing, with a report.
+void retireResolve(ResolveHandle handle);
+
 // Entries registered or reserved and not yet unregistered, for tests and diagnostics.
 size_t liveResolveEntries();
+
+// Companions: one host-only record per live entry, in host memory, for what the host keeps
+// about the object an entry names and the turn must never reach -- the owned-list node behind
+// an IoOwn's entry (io/io-own.h), say, while the entry itself holds the object pointer the turn
+// resolves. A companion is set and read host-side only, and is validated like a resolve: the
+// handle must name a live committed entry, and the record is found by the entry's index in a
+// table the host owns, never through the handle's value. The record's address is stable for as
+// long as the entry is live, so host state may point into it. Unregistering the entry clears
+// its companion. Without the guest kernel the table is on the ordinary heap, like the entries.
+struct ResolveCompanion {
+  uint64_t kind;  // the owner's tag for what `ptr` is; 0 when the entry has no companion
+  void* ptr;
+};
+bool setResolveCompanion(ResolveHandle handle, ResolveCompanion companion);
+kj::Maybe<ResolveCompanion&> resolveCompanion(ResolveHandle handle);
+
+// Whether a turn is running on this thread, as the turn's own bookkeeping says. Outside a turn
+// the answer is the host's, since the host resets that bookkeeping when the turn returns; inside
+// one a turn that lies takes the host's path at ring 3 and faults on the memory it reaches.
+bool inTurn();
+
+// In a turn: visits, in registration order, the entries this turn has registered and not yet
+// released, and releases those for which `fn` returns true -- as unregisterResolve() would, with
+// nothing committed for them after the turn. For a holder that is torn down inside the turn
+// that created some of its objects.
+void releaseJournaled(
+    kj::FunctionParam<bool(ResolveHandle handle, void* ptr, const uint64_t* aux)> fn);
+
+// In a turn: retires, through one hostcall, the committed entries this turn has released so
+// far, with their released hook run, as the end of the turn would. For a holder that is about
+// to walk its host-side state through a hostcall and must not find what it has already released.
+void flushReleasedInTurn();
+
+// What the host does, after a turn, with the entries the turn registered and released. Both
+// run host-side, with the table already updated for the entry: committed() once the table has
+// taken a registration's pointer, with the words the registration carried, and may refuse it,
+// after which the entry is retired and resolves to nothing; released() for a committed entry
+// the turn released, before the entry is retired. released() may also run inside a hostcall
+// (a turn that outruns its retire list), so it must not take the process heap.
+struct ResolveTurnHooks {
+  bool (*committed)(ResolveHandle handle, void* ptr, const uint64_t* aux);
+  void (*released)(ResolveHandle handle);
+};
 
 // A JS turn's registrations, batched. The table is written only by the host, and the objects
 // an IoOwn names are created inside turns, at guest ring 3, where the table cannot be written
@@ -107,25 +162,27 @@ size_t liveResolveEntries();
 // a ResolveTurn on the host frame around a turn (io/io-context.c++, runJsTurn) tops the thread's
 // pool of reserved entries up, hands the turn a journal with their handles, and once the guest
 // has returned commits each handle the turn used with the pointer the turn journaled for it,
-// retires the ones the turn released, and keeps the rest for the next turn. Inside the turn,
-// registerResolve() takes the next reserved handle and journals the pointer, resolve() falls
-// back to the journal for a handle the table does not yet hold, and unregisterResolve() marks
-// a journaled entry released or lists a committed one for retirement at the end; a turn that
-// outruns its reserved entries, or its retire list, refills or flushes through one hostcall.
-// Nested in a turn, a ResolveTurn does nothing: the outermost frame commits.
+// runs the hooks, retires the ones the turn released, and keeps the rest for the next turn.
+// Inside the turn, registerResolve() takes the next reserved handle and journals the pointer
+// and words, resolve() falls back to the journal for a handle the table does not yet hold, and
+// unregisterResolve() marks a journaled entry released or lists a committed one for retirement
+// at the end; a turn that outruns its reserved entries, or its retire list, refills or flushes
+// through one hostcall. Nested in a turn, a ResolveTurn does nothing: the outermost frame
+// commits.
 //
-// What the host trusts. The pool -- which handles it reserved for this thread -- is in host
-// memory and found through the guest kernel's per-thread words, never through anything a turn
-// can write; the journal is ordinary memory the turn writes, and the host reads it by position,
-// bounded by its own counts, taking from it only the pointers, which the table validates on
-// commit (gk_resolve_commit: ordinary user memory, outside gk's protected ranges and every
-// arena). A turn can therefore commit pointers only into the entries reserved for it, and only
-// pointers to memory it could already write directly; it cannot commit into another tenant's
-// entry, which is committed once, nor send the host into memory it cannot reach itself. A
-// turn's lies about its own journal cost only that turn its registrations.
+// What the host trusts. The pool -- which handles it reserved for this thread, and the hooks --
+// is in host memory and found through the guest kernel's per-thread words, never through
+// anything a turn can write; the journal is ordinary memory the turn writes, and the host reads
+// it by position, bounded by its own counts, taking from it only the pointers, which the table
+// validates on commit (gk_resolve_commit: ordinary user memory, outside gk's protected ranges
+// and every arena), and the words, which the hook validates. A turn can therefore commit
+// pointers only into the entries reserved for it, and only pointers to memory it could already
+// write directly; it cannot commit into another tenant's entry, which is committed once, nor
+// send the host into memory it cannot reach itself. A turn's lies about its own journal cost
+// only that turn its registrations.
 class ResolveTurn {
  public:
-  ResolveTurn();
+  explicit ResolveTurn(ResolveTurnHooks hooks);
   ~ResolveTurn() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(ResolveTurn);
 

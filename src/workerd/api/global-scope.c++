@@ -633,6 +633,13 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   // The IoOwn handle (see the comment above and io/io-own.h): the probe object is a T an IoOwn
   // owns, held in a heap holder that stands in for the JS wrapper's C++ object a turn can write.
   struct IoOwnProbe {
+    IoOwnProbe(uint64_t magic): magic(magic) {}
+    ~IoOwnProbe() noexcept(false) {
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: an IoOwn probe object was disposed of through its "
+          "own disposer",
+          kj::str("0x", kj::hex(magic)));
+    }
     uint64_t magic;
   };
   struct IoOwnProbeHolder {
@@ -641,9 +648,11 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   constexpr uint64_t IOOWN_GOOD_MAGIC = 0x600d600d600d600d;
   constexpr uint64_t IOOWN_CHOSEN_MAGIC = 0xbadbadbadbadbad0;
   constexpr uint64_t IOOWN_OTHER_MAGIC = 0x0e7e70e7e70e7e70;
-  // The handle is the IoOwn's second word, after the delete queue reference; a write primitive
-  // aiming at it writes exactly there.
-  static_assert(sizeof(IoOwn<IoOwnProbe>) == sizeof(kj::Arc<DeleteQueue>) + sizeof(uint64_t));
+  constexpr uint64_t IOOWN_NODE_MAGIC = 0x0de0de0de0de0de0;
+  // The handle is the IoOwn's second word, after the delete queue reference and before the
+  // disposal record; a write primitive aiming at it writes exactly there.
+  static_assert(sizeof(IoOwn<IoOwnProbe>) ==
+      sizeof(kj::Arc<DeleteQueue>) + sizeof(uint64_t) + sizeof(OwnedDisposal));
   constexpr size_t IOOWN_HANDLE_OFFSET = sizeof(kj::Arc<DeleteQueue>);
   auto ioOwnHandle = [](IoOwnProbeHolder& holder) {
     uint64_t handle;
@@ -674,12 +683,9 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
         IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_GOOD_MAGIC))});
     IoOwnProbeHolder& h = *holder;
     uint64_t handle = ioOwnHandle(h);
-    // The buffer the turn chose: an object laid out as the one the handle named, whose T carries
-    // a magic of its own, so a host that dereferences the address reads it.
-    static auto* chosen =
-        new SpecificOwnedObject<IoOwnProbe>(kj::heap<IoOwnProbe>(IOOWN_CHOSEN_MAGIC));
-    static kj::Maybe<kj::Own<OwnedObject>> chosenSlot;
-    chosen->prev = &chosenSlot;
+    // The buffer the turn chose: an object as the one the handle names, carrying a magic of its
+    // own, so a host that dereferences the address reads it.
+    static auto* chosen = new IoOwnProbe(IOOWN_CHOSEN_MAGIC);
     KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: created an IoOwn inside the JS turn", url,
         kj::str("0x", kj::hex(handle)), addr(h.own.operator->()));
     // A later turn first uses the IoOwn as it is (the control: the handle committed at the end
@@ -695,7 +701,7 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
         setIoOwnHandle(h, reinterpret_cast<uintptr_t>(chosen));
         KJ_LOG(WARNING,
             "WORKERD_GK_TEST_PROBE: overwrote the IoOwn's handle from inside the JS turn", url,
-            kj::str("0x", kj::hex(handle)), addr(chosen), addr(chosen->ptr.get()));
+            kj::str("0x", kj::hex(handle)), addr(chosen), addr(chosen));
       });
     })
             .then(
@@ -760,6 +766,78 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
     setIoOwnHandle(h, announcedIoOwnHandle);
     thief2 = kj::mv(holder);
     context.addWaitUntil(useIoOwnLater(context, "cross-isolate-after-release", h));
+  }
+  // The owned node (see OwnedObjectList in io/io-own.h): the record the host keeps about the
+  // object behind an IoOwn's handle, in host memory. The turn creates an IoOwn; after the turn
+  // the host, on the event loop, finds the node behind its handle and announces its address; a
+  // later turn rewrites the node's link and disposer to a slot and a disposer the turn chose,
+  // as a write primitive would. Under the guest kernel the write faults at the node, the isolate
+  // is condemned and the request's context is torn down host-side, where the walk disposes of
+  // the object through the disposer the node recorded. Where the write lands (no guest kernel,
+  // or the WORKERD_GK_NEG_IOOWN_NODE build), the holder is destroyed on the event loop and the
+  // next turn's drain follows the rewritten node: it writes the chosen slot and calls the chosen
+  // disposer, which logs that it was reached.
+  struct ChosenDisposer final: public kj::Disposer {
+    void disposeImpl(void* pointer) const override {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the chosen disposer was called by the host",
+          kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(pointer))));
+    }
+  };
+  static const ChosenDisposer chosenDisposer;
+  static void* chosenSlot = nullptr;
+  if (probeEnabled && url.endsWith("/__gk_ioown_node_corrupt")) {
+    auto& context = IoContext::current();
+    static kj::Maybe<kj::Own<IoOwnProbeHolder>> nodeHolder;
+    // The node's fields, found host-side and kept for the turn: the lookup itself reads host
+    // state a turn cannot.
+    static OwnedObjectList::NodeForTest probedNode = {nullptr, nullptr, nullptr};
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_NODE_MAGIC))});
+    uint64_t handle = ioOwnHandle(*holder);
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: created an IoOwn for the node probe inside the JS turn",
+        url, kj::str("0x", kj::hex(handle)), addr(holder->own.operator->()));
+    nodeHolder = kj::mv(holder);
+    context.addWaitUntil(kj::evalLater([&context, handle, addr, url = kj::str(url)]() mutable {
+      // On the event loop, after the turn: the node exists in host memory now.
+      probedNode = OwnedObjectList::nodeForTest(handle);
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the owned node behind the IoOwn, found host-side",
+          kj::str("0x", kj::hex(handle)), addr(probedNode.node), addr(probedNode.prev),
+          addr(probedNode.disposer));
+      return context
+          .run([addr, url = kj::mv(url)](Worker::Lock&) {
+        auto node = probedNode;
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: rewriting the owned node from inside the JS turn",
+            url, addr(node.node), addr(&chosenSlot), addr(&chosenDisposer));
+        // The write: under the guest kernel this faults at the node and nothing below runs.
+        *node.prev = &chosenSlot;
+        *node.disposer = &chosenDisposer;
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: the owned node was rewritten from inside the JS turn; the "
+            "write landed",
+            addr(node.node));
+      })
+          .then([]() {
+        return kj::evalLater([]() {
+          KJ_LOG(WARNING,
+              "WORKERD_GK_TEST_PROBE: destroying the node probe's holder on the event loop");
+          nodeHolder = kj::none;
+        });
+      }).then([&context, addr]() {
+        return context.run([addr](Worker::Lock&) {
+          KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the turn after the node holder's destruction ran",
+              addr(chosenSlot));
+        });
+      });
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_ioown_counts")) {
+    // The owned-node and resolve-entry counts, for a leak check across a load: read on the
+    // event loop, since the entry count is the guest kernel's, which a turn cannot read.
+    IoContext::current().addTask(kj::evalLater([]() {
+      auto stats = OwnedObjectList::statsForTest();
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: owned-node counts", stats.nodesAllocated,
+          stats.nodesFreed, hostMemory::liveResolveEntries());
+    }));
   }
   if (probeEnabled && url.endsWith("/__gk_corrupt_handle")) {
     KJ_IF_SOME(probe, hostMemory::handleProbeForTest()) {

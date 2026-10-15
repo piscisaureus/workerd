@@ -336,6 +336,9 @@ size_t fallbackLiveResolveEntries() {
 // The table operations, routed to gk's table when the guest kernel is active and to the
 // fallback otherwise. Host-side: inside a turn they are reached only through the journal
 // below.
+void* tableResolve(ResolveHandle handle);
+void clearCompanion(ResolveHandle handle);
+
 ResolveHandle tableRegister(void* ptr) {
 #ifdef WORKERD_HAS_GUEST_KERNEL
   if (guestKernelActive()) return gk_resolve_register(ptr);
@@ -364,6 +367,9 @@ void* tableResolve(ResolveHandle handle) {
   return fallbackResolve(handle);
 }
 void tableUnregister(ResolveHandle handle) {
+  // The companion goes first, while the entry is still this handle's: once the entry is free a
+  // later registration may take its index.
+  clearCompanion(handle);
 #ifdef WORKERD_HAS_GUEST_KERNEL
   if (guestKernelActive()) {
     gk_resolve_unregister(handle);
@@ -371,6 +377,66 @@ void tableUnregister(ResolveHandle handle) {
   }
 #endif
   fallbackUnregisterResolve(handle);
+}
+
+// Companions (see host-memory.h): a table of RESOLVE_CAPACITY records indexed like the resolve
+// table, in host memory, in chunks mapped as entries come into use. The chunk directory is a
+// host-memory block reached through a host slot handle kept in a function-local static: the
+// handle is the one word of this facility outside host memory, and a rewritten one resolves to
+// nothing, so the host refuses the use rather than reading a directory of the guest's choosing.
+// A chunk pointer is published once, so readers take no lock; the directory's own lock covers
+// mapping a chunk.
+constexpr unsigned COMPANION_CHUNK_BITS = 10;
+constexpr size_t COMPANION_CHUNK_ENTRIES = size_t{1} << COMPANION_CHUNK_BITS;
+constexpr size_t COMPANION_CHUNKS = RESOLVE_CAPACITY / COMPANION_CHUNK_ENTRIES;
+static_assert(RESOLVE_CAPACITY % COMPANION_CHUNK_ENTRIES == 0);
+
+struct CompanionChunk {
+  ResolveCompanion entries[COMPANION_CHUNK_ENTRIES];
+};
+static_assert(sizeof(CompanionChunk) <= 16384, "a chunk is one host-memory block");
+
+struct CompanionDirectory {
+  kj::MutexGuarded<int> mapLock;  // held while mapping a chunk; the value is unused
+  std::atomic<CompanionChunk*> chunks[COMPANION_CHUNKS];
+};
+
+CompanionDirectory* companionDirectory() {
+  // Never freed: entries are retired from threads that may outlive static destruction.
+  static HostSlot<CompanionDirectory>* slot =
+      new HostSlot<CompanionDirectory>(hostSlot<CompanionDirectory>());
+  return slot->get();  // null if the slot handle no longer resolves
+}
+
+// The companion record of a live committed entry, or none: the handle is validated against the
+// table, and the record found by the entry's index. With `map`, a chunk not yet mapped is
+// mapped first (host-side allocation, never from a hostcall handler).
+kj::Maybe<ResolveCompanion&> companionOf(ResolveHandle handle, bool map) {
+  if (tableResolve(handle) == nullptr) return kj::none;
+  CompanionDirectory* dir = companionDirectory();
+  if (dir == nullptr) {
+    KJ_LOG(ERROR, "the resolve companion directory does not resolve; the use is refused");
+    return kj::none;
+  }
+  size_t idx = handle & (RESOLVE_CAPACITY - 1);
+  auto& slot = dir->chunks[idx >> COMPANION_CHUNK_BITS];
+  CompanionChunk* chunk = slot.load(std::memory_order_acquire);
+  if (chunk == nullptr) {
+    if (!map) return kj::none;
+    auto lock = dir->mapLock.lockExclusive();
+    chunk = slot.load(std::memory_order_acquire);
+    if (chunk == nullptr) {
+      chunk = new (allocate(sizeof(CompanionChunk), alignof(CompanionChunk))) CompanionChunk();
+      slot.store(chunk, std::memory_order_release);
+    }
+  }
+  return chunk->entries[idx & (COMPANION_CHUNK_ENTRIES - 1)];
+}
+
+void clearCompanion(ResolveHandle handle) {
+  KJ_IF_SOME(c, companionOf(handle, false)) {
+    c = ResolveCompanion{.kind = 0, .ptr = nullptr};
+  }
 }
 
 // Turn-batched registration (see ResolveTurn in host-memory.h). A thread's pool is the host's
@@ -385,8 +451,9 @@ constexpr uint32_t RETIRE_CAPACITY = 256;  // committed entries a turn retires b
 
 struct TurnJournal {
   enum State : uint8_t { UNUSED = 0, USED = 1, RETIRED = 2 };
-  ResolveHandle handles[POOL_CAPACITY];  // the turn's copy of the pool, to hand out
-  void* ptr[POOL_CAPACITY];              // the pointer each handed-out position names
+  ResolveHandle handles[POOL_CAPACITY];            // the turn's copy of the pool, to hand out
+  void* ptr[POOL_CAPACITY];                        // the pointer each handed-out position names
+  uint64_t aux[POOL_CAPACITY][RESOLVE_AUX_WORDS];  // the words each registration carried
   State state[POOL_CAPACITY];
   uint32_t count = 0;                     // positions available (the pool's count, copied)
   uint32_t next = 0;                      // positions handed out
@@ -399,6 +466,7 @@ struct ThreadPool {
   ResolveHandle handles[POOL_CAPACITY];
   uint32_t count = 0;
   kj::Own<TurnJournal> journal;
+  ResolveTurnHooks hooks = {nullptr, nullptr};  // the current turn's, written by the host at entry
 };
 
 // The turn's way to its journal. Guest-writable, and a lie costs only the liar: the host
@@ -471,11 +539,15 @@ ThreadPool& ensurePoolOfThread() {
   return *pool;
 }
 
-// Retires the journal's committed-entry retire list. Host-side; bounded by the list's capacity
-// whatever the journal says.
-void flushRetired(TurnJournal& journal) {
+// Retires the journal's committed-entry retire list, running the released hook for each entry
+// first. Host-side; bounded by the list's capacity whatever the journal says.
+void flushRetired(TurnJournal& journal, const ResolveTurnHooks& hooks) {
   uint32_t n = kj::min(journal.retireCount, RETIRE_CAPACITY);
-  for (uint32_t i = 0; i < n; i++) tableUnregister(journal.retire[i]);
+  for (uint32_t i = 0; i < n; i++) {
+    ResolveHandle handle = journal.retire[i];
+    if (hooks.released != nullptr && tableResolve(handle) != nullptr) hooks.released(handle);
+    tableUnregister(handle);
+  }
   journal.retireCount = 0;
 }
 
@@ -491,7 +563,7 @@ long resolveHostcall(hostcall::Frame& frame) {
     case ResolveOp::REFILL:
       return static_cast<long>(refillPool(*pool));
     case ResolveOp::RETIRE:
-      flushRetired(*pool->journal);
+      flushRetired(*pool->journal, pool->hooks);
       return 0;
   }
   return -EINVAL;
@@ -515,26 +587,12 @@ TurnJournal* activeJournal() {
 
 }  // namespace
 
-// WORKERD_GK_NEG_IOOWN is a negative-test build, never shipped: the handle is the pointer itself
-// and nothing validates it, which is the state before IoOwn held a handle. The guest kernel's
-// ioown-test.sh must then fail, with the host reading through the address a turn chose; this is
-// the check that the test tests the protection.
-#ifdef WORKERD_GK_NEG_IOOWN
 ResolveHandle registerResolve(void* ptr) {
-  return reinterpret_cast<uintptr_t>(ptr);
+  uint64_t aux[RESOLVE_AUX_WORDS] = {};
+  return registerResolve(ptr, aux);
 }
-void* resolve(ResolveHandle handle) {
-  return reinterpret_cast<void*>(static_cast<uintptr_t>(handle));
-}
-void unregisterResolve(ResolveHandle) {}
-size_t liveResolveEntries() {
-  return 0;
-}
-ResolveTurn::ResolveTurn(): pool(nullptr) {}
-ResolveTurn::~ResolveTurn() noexcept(false) {}
-void installResolveHostcall() {}
-#else
-ResolveHandle registerResolve(void* ptr) {
+
+ResolveHandle registerResolve(void* ptr, const uint64_t (&aux)[RESOLVE_AUX_WORDS]) {
   KJ_REQUIRE(ptr != nullptr);
   if (TurnJournal* journal = activeJournal()) {
     if (journal->next >= journal->count) {
@@ -546,6 +604,7 @@ ResolveHandle registerResolve(void* ptr) {
     }
     uint32_t i = journal->next++;
     journal->ptr[i] = ptr;
+    for (size_t w = 0; w < RESOLVE_AUX_WORDS; w++) journal->aux[i][w] = aux[w];
     journal->state[i] = TurnJournal::USED;
     return journal->handles[i];
   }
@@ -566,7 +625,15 @@ void* resolve(ResolveHandle handle) {
       }
     }
   }
+#ifdef WORKERD_GK_NEG_IOOWN
+  // WORKERD_GK_NEG_IOOWN is a negative-test build, never shipped: a handle the table does not
+  // validate is taken as the pointer itself, which is what a holder's raw pointer was before it
+  // held a handle. The guest kernel's ioown-test.sh must then fail, with the host reading through
+  // the address a turn chose; this is the check that the test tests the validation.
+  return reinterpret_cast<void*>(static_cast<uintptr_t>(handle));
+#else
   return nullptr;
+#endif
 }
 
 void unregisterResolve(ResolveHandle handle) {
@@ -591,6 +658,17 @@ void unregisterResolve(ResolveHandle handle) {
   tableUnregister(handle);
 }
 
+void retireResolve(ResolveHandle handle) {
+  if (handle == 0) return;
+  tableUnregister(handle);
+}
+
+void flushReleasedInTurn() {
+  TurnJournal* journal = activeJournal();
+  if (journal == nullptr || journal->retireCount == 0) return;
+  callResolveHostcall(ResolveOp::RETIRE);
+}
+
 size_t liveResolveEntries() {
 #ifdef WORKERD_HAS_GUEST_KERNEL
   if (guestKernelActive()) {
@@ -602,11 +680,30 @@ size_t liveResolveEntries() {
   return fallbackLiveResolveEntries();
 }
 
-ResolveTurn::ResolveTurn(): pool(nullptr) {
+bool inTurn() {
+  return activeJournal() != nullptr;
+}
+
+void releaseJournaled(
+    kj::FunctionParam<bool(ResolveHandle handle, void* ptr, const uint64_t* aux)> fn) {
+  TurnJournal* journal = activeJournal();
+  if (journal == nullptr) return;
+  uint32_t next = kj::min(journal->next, journal->count);
+  for (uint32_t i = 0; i < next; i++) {
+    if (journal->state[i] != TurnJournal::USED) continue;
+    if (!fn(journal->handles[i], journal->ptr[i], journal->aux[i])) continue;
+    journal->state[i] = TurnJournal::RETIRED;
+    journal->ptr[i] = nullptr;
+    for (size_t w = 0; w < RESOLVE_AUX_WORDS; w++) journal->aux[i][w] = 0;
+  }
+}
+
+ResolveTurn::ResolveTurn(ResolveTurnHooks hooks): pool(nullptr) {
   // Nested in a turn: this frame is inside the guest, and the outermost frame commits.
   if (activeJournal() != nullptr) return;
   ThreadPool& threadPool = ensurePoolOfThread();
   if (threadPool.count < POOL_LOW) refillPool(threadPool);
+  threadPool.hooks = hooks;
   TurnJournal& journal = *threadPool.journal;
   for (uint32_t i = 0; i < threadPool.count; i++) {
     journal.handles[i] = threadPool.handles[i];
@@ -626,23 +723,32 @@ ResolveTurn::~ResolveTurn() noexcept(false) {
   // host wrote at entry; nothing the turn left in the thread-local decides what is committed.
   ThreadPool& threadPool = *static_cast<ThreadPool*>(pool);
   TurnJournal& journal = *threadPool.journal;
+  const ResolveTurnHooks hooks = threadPool.hooks;
   uint32_t next = kj::min(journal.next, threadPool.count);
   for (uint32_t i = 0; i < next; i++) {
     ResolveHandle handle = threadPool.handles[i];
     if (journal.state[i] == TurnJournal::USED) {
-      if (tableCommit(handle, journal.ptr[i])) continue;
-      KJ_LOG(ERROR, "a turn's resolve entry could not be committed; it resolves to nothing",
-          kj::hex(handle), journal.ptr[i]);
+      if (tableCommit(handle, journal.ptr[i])) {
+        if (hooks.committed == nullptr || hooks.committed(handle, journal.ptr[i], journal.aux[i])) {
+          continue;
+        }
+        KJ_LOG(ERROR, "a turn's resolve entry was refused by the commit hook; it is retired",
+            kj::hex(handle), journal.ptr[i]);
+      } else {
+        KJ_LOG(ERROR, "a turn's resolve entry could not be committed; it resolves to nothing",
+            kj::hex(handle), journal.ptr[i]);
+      }
     }
-    // Retired by the turn, never used, or refused by the table: the entry resolves to nothing
-    // from now on, and so does any IoOwn holding it.
+    // Retired by the turn, never used, or refused: the entry resolves to nothing from now on,
+    // and so does any holder of it.
     tableUnregister(handle);
   }
   for (uint32_t i = next; i < threadPool.count; i++) {
     threadPool.handles[i - next] = threadPool.handles[i];
   }
   threadPool.count -= next;
-  flushRetired(journal);
+  flushRetired(journal, hooks);
+  threadPool.hooks = {nullptr, nullptr};
   journal.active = false;
   journal.next = 0;
   journal.count = 0;
@@ -652,7 +758,23 @@ ResolveTurn::~ResolveTurn() noexcept(false) {
 void installResolveHostcall() {
   hostcall::install(RESOLVE_HOSTCALL);
 }
-#endif  // WORKERD_GK_NEG_IOOWN
+
+bool setResolveCompanion(ResolveHandle handle, ResolveCompanion companion) {
+  KJ_IF_SOME(c, companionOf(handle, true)) {
+    c = companion;
+    return true;
+  }
+  KJ_LOG(ERROR, "resolve handle does not name a live committed entry; no companion is set",
+      kj::hex(handle));
+  return false;
+}
+
+kj::Maybe<ResolveCompanion&> resolveCompanion(ResolveHandle handle) {
+  KJ_IF_SOME(c, companionOf(handle, false)) {
+    if (c.kind != 0) return c;
+  }
+  return kj::none;
+}
 
 namespace {
 

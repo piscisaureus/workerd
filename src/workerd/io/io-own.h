@@ -1,6 +1,8 @@
 #pragma once
 
 #include <workerd/util/host-memory.h>
+#include <workerd/util/hostcall.h>
+#include <workerd/util/strong-bool.h>
 
 #include <kj/async.h>
 #include <kj/common.h>
@@ -63,34 +65,112 @@ constexpr bool isIoOwn() {
 template <typename T>
 using RemoveIoOwn = RemoveIoOwn_<T>::Type;
 
-struct OwnedObject {
-  kj::Maybe<kj::Own<OwnedObject>> next;
-  kj::Maybe<kj::Own<OwnedObject>>* prev;
-  // The resolve entry naming this object (hostMemory::registerResolve), through which the
-  // IoOwn that owns it reaches it; 0 for an object a ReverseIoOwn owns, which holds a pointer.
-  // Retired by OwnedObjectList::unlink.
-  hostMemory::ResolveHandle handle = 0;
-};
+WD_STRONG_BOOL(DestroyOwnedObject);
 
+// How a holder disposes of its object inside a turn, where the context's record of the object
+// (OwnedObjectList) cannot be reached: the disposer recorded when the object was registered,
+// and the call to it for the object's type, bound at registration, where the type is complete,
+// so that a holder of an incomplete type can be destroyed.
+struct OwnedDisposal {
+  const kj::Disposer* disposer;
+  void (*dispose)(void* object, const kj::Disposer& disposer);
+};
 template <typename T>
-struct SpecificOwnedObject: public OwnedObject {
-  SpecificOwnedObject(kj::Own<T> ptr): ptr(kj::mv(ptr)) {}
-  kj::Own<T> ptr;
-};
+void disposeOwnedAs(void* object, const kj::Disposer& disposer) {
+  disposer.dispose(static_cast<T*>(object));
+}
 
+// The objects a context owns on behalf of the IoOwns and ReverseIoOwns that name them, each
+// registered in the ring-0 resolve table (hostMemory::registerResolve) under a handle its holder
+// keeps. The table's entry holds the object pointer, which a turn resolves on every dereference;
+// what the host keeps about the object beyond that -- its place in this list, and how to dispose
+// of it -- is a node in host memory, reached from the entry's companion (hostMemory::
+// resolveCompanion), so that nothing the host follows when it walks the list or disposes of an
+// object is in memory a turn can write. The list's own head is the companion of an entry of its
+// own, registered when the first object is added; a node names its list by that handle, and a
+// handle is the only thing about the list that lives in the context, in guest memory.
+//
+// Objects are added inside turns, where host memory cannot be written: the registration is
+// journaled by the turn with the disposer and the list's handle as its words
+// (hostMemory::RESOLVE_AUX_WORDS), and the host builds and links the node after the turn, from
+// its committed hook (TURN_HOOKS); the holder uses its handle in the meantime, resolved through
+// the journal. An object released inside a turn by its holder is disposed of by the turn, through
+// the disposer the holder recorded beside its handle, and the entry's release is journaled, so the
+// host unlinks and frees the node afterwards without touching the object. Released host-side --
+// a holder dropped on the event loop, the delete-queue drain, the context's teardown -- the host
+// disposes of the object through the node's own copy of the disposer. A list torn down inside a
+// turn (a context destroyed by another context's turn) releases what the turn itself registered
+// from the journal, and drains the rest through the OWNED_LIST hostcall, which hands the turn
+// each object with its disposer and frees the nodes host-side.
+//
+// What this protects is the node: the links the host's walk follows and the disposer it calls
+// are in host memory and were written by the host. What it does not protect is the object: the
+// T is in the shared heap, placed by ordinary runtime code, so the host's disposal of it runs a
+// destructor over memory a turn can write; and the disposer the node records is the one the
+// turn journaled when it registered the object, which the commit admits unvalidated -- a turn
+// that lies about the disposer of its own object sends the host's disposal of that object to a
+// function of its choosing, the same exposure the object's own vtable and members carry. A
+// turn's words can also name another context's live list, which links the turn's own object
+// into that context's list (the ownership residual the table cannot close).
 class OwnedObjectList {
  public:
   OwnedObjectList() = default;
   KJ_DISALLOW_COPY_AND_MOVE(OwnedObjectList);
   ~OwnedObjectList() noexcept(false);
 
-  void link(kj::Own<OwnedObject> object);
+  // Registers `object` as owned by this list and returns the handle naming it, or throws if the
+  // table is full. `object` is the pointer the holder resolves (a T*); `disposal` the pointer
+  // its disposer takes (kj::castToVoid of it).
+  hostMemory::ResolveHandle add(void* object, void* disposal, const kj::Disposer& disposer);
 
-  // Removes the object from its list, destroying it, and retires its resolve entry if it has one.
-  static void unlink(OwnedObject& object);
+  // Host-side: releases the object `handle` names from its list, disposing of it when asked,
+  // and retires the entry. Reports and does nothing if the handle does not name an owned
+  // object.
+  static void release(hostMemory::ResolveHandle handle, DestroyOwnedObject destroy);
+
+  // Host-side: takes the object `handle` names out of its list without disposing of it, retires
+  // the entry, and returns the disposer the object is to be disposed of with. Throws if the
+  // handle does not name an owned object.
+  static const kj::Disposer& take(hostMemory::ResolveHandle handle);
+
+  // Inside a turn: releases the entry `handle` names, which the turn is disposing of itself.
+  static void releaseInTurn(hostMemory::ResolveHandle handle);
+
+  // Drops the object `handle` names on the thread of the context that owns it: inside a turn,
+  // through `disposal` and releaseInTurn(); outside one, host-side through the list.
+  static void drop(hostMemory::ResolveHandle handle, const OwnedDisposal& disposal);
+
+  // The hooks a ResolveTurn runs host-side for the entries a turn registered and released.
+  static const hostMemory::ResolveTurnHooks TURN_HOOKS;
+
+  // Registers the OWNED_LIST hostcall. Called once, host-side, before any turn runs.
+  static void installHostcall();
+
+  // Nodes allocated and freed since the process started, for tests and diagnostics.
+  struct Stats {
+    size_t nodesAllocated;
+    size_t nodesFreed;
+  };
+  static Stats statsForTest();
+
+  // The node behind `handle`, for a test that corrupts it from inside a turn: the node's
+  // address, and its link and disposer fields; null if the handle names no owned object.
+  struct NodeForTest {
+    void* node;
+    void** prev;
+    const kj::Disposer** disposer;
+  };
+  static NodeForTest nodeForTest(hostMemory::ResolveHandle handle);
 
  private:
-  kj::Maybe<kj::Own<OwnedObject>> head;
+  hostMemory::ResolveHandle handle = 0;  // the list's entry, 0 until the first object is added
+
+  hostMemory::ResolveHandle ensureRegistered();
+
+  static bool committed(hostMemory::ResolveHandle handle, void* ptr, const uint64_t* aux);
+  static void released(hostMemory::ResolveHandle handle);
+  static long hostcallHandler(hostcall::Frame& frame);
+  static const hostcall::Entry HOSTCALL;
 };
 
 // Object which receives possibly-cross-thread deletions of owned objects.
@@ -98,10 +178,12 @@ class DeleteQueue: public kj::AtomicRefcounted {
  public:
   DeleteQueue(): crossThreadDeleteQueue(State{kj::Vector<hostMemory::ResolveHandle>()}) {}
 
-  // Deletes the object the handle names: at once if the owning IoContext is current on this
-  // thread, otherwise when that context next runs. A handle that names nothing (never normal:
-  // an IoOwn holds a live entry for its lifetime) is reported and deletes nothing.
-  void scheduleDeletion(hostMemory::ResolveHandle handle) const;
+  // Drops the object the handle names, which the holder of `handle` and `disposal` is giving
+  // up: at once if the owning IoContext is current on this thread -- inside a turn, by the
+  // holder's own disposal; otherwise host-side through the owned list -- and otherwise when
+  // that context next runs. A handle that names nothing (never normal: a holder keeps a live
+  // entry for its lifetime) is reported and deletes nothing.
+  void scheduleDeletion(hostMemory::ResolveHandle handle, const OwnedDisposal& disposal) const;
 
   // Schedules the given action to run in the IoContext that owns this queue, the next time
   // that context drains its queue (in its own thread, under the isolate lock). If the owning
@@ -122,8 +204,8 @@ class DeleteQueue: public kj::AtomicRefcounted {
   bool isDefunct() const;
 
   struct State {
-    // Handles of objects whose IoOwns were dropped in other threads, resolved when the owning
-    // IoContext drains the queue (see unlinkOwned).
+    // Handles of objects whose holders were dropped in other threads, released host-side when
+    // the owning IoContext drains the queue (see OwnedObjectList::release).
     kj::Vector<hostMemory::ResolveHandle> queue;
     // Actions that some other IoContext has requested be executed in this IoContext. When
     // adding an action to this list, crossThreadFulfiller should be fulfilled, signaling the
@@ -140,7 +222,7 @@ class DeleteQueue: public kj::AtomicRefcounted {
 
   // Handles from IoOwns that were dropped in other threads, and therefore should be deleted
   // whenever the IoContext gets around to it. The maybe is changed to kj::none when the
-  // IoContext goes away, at which point all OwnedObjects have already been deleted so
+  // IoContext goes away, at which point all owned objects have already been deleted so
   // cross-thread deletions can just be ignored.
   kj::MutexGuarded<kj::Maybe<State>> crossThreadDeleteQueue;
 
@@ -154,19 +236,22 @@ class DeleteQueue: public kj::AtomicRefcounted {
 
   static void checkFarGet(const DeleteQueue& deleteQueue, const std::type_info& type);
 
-  // The object a live IoOwn's handle names, resolved against the table (hostMemory::resolve)
-  // for this one use. Throws if the handle names nothing: the IoOwn registered a live entry
-  // and holds it until it is unlinked, so a handle that fails to resolve was rewritten, or
+  // The object a live holder's handle names, resolved against the table (hostMemory::resolve)
+  // for this one use. Throws if the handle names nothing: the holder registered a live entry
+  // and keeps it until it releases it, so a handle that fails to resolve was rewritten, or
   // names an object already released, and is reported as such.
-  static OwnedObject& resolveOwned(hostMemory::ResolveHandle handle, const std::type_info& type);
+  static void* resolveOwned(hostMemory::ResolveHandle handle, const std::type_info& type);
 
-  // Unlinks the object `handle` names, or reports and does nothing if it names nothing.
-  static void unlinkOwned(hostMemory::ResolveHandle handle);
+  // Adds the object to the owned list and returns the handle naming it with the disposer the
+  // holder records; on a full table, disposes of the object and throws.
+  struct OwnedRegistration {
+    hostMemory::ResolveHandle handle;
+    OwnedDisposal disposal;
+  };
+  template <typename T>
+  static OwnedRegistration registerOwned(kj::Own<T> obj, OwnedObjectList& ownedObjects);
 
  private:
-  template <typename T>
-  SpecificOwnedObject<T>* addObjectImpl(kj::Own<T> obj, OwnedObjectList& ownedObjects) const;
-
   kj::Promise<void> resetCrossThreadSignal() const;
 
   friend class IoContext;
@@ -205,41 +290,29 @@ class IoCrossContextExecutor {
 };
 
 template <typename T>
-inline SpecificOwnedObject<T>* DeleteQueue::addObjectImpl(
-    kj::Own<T> obj, OwnedObjectList& ownedObjects) const {
-  // HACK: We need an Own<OwnedObject>, but we actually need to allocate it as the subclass
-  //   SpecificOwnedObject<T>. OwnedObject is not polymorphic, which means kj::Own will refuse
-  //   to upcast kj::Own<SpecificOwnedObject<T>> to kj::Own<OwnedObject> since it can't guarantee
-  //   the disposers are compatible. However, since we're only using single inheritance here, the
-  //   disposers *are* compatible (the numeric value of pointers to SpecificOwnedObject<T> and
-  //   its parent OwnedObject are equal). So, instead of forcing OwnedObject to be polymorphic
-  //   (which would have forced a bunch of useless vtables and vtable pointers)... I'm manually
-  //   constructing the kj::Own<> using a disposer that I know is compatible.
-  // TODO(cleanup): Can KJ be made to support this use case?
-  kj::Own<OwnedObject> ownedObject(new SpecificOwnedObject<T>(kj::mv(obj)),
-      kj::_::HeapDisposer<SpecificOwnedObject<T>>::instance);
-
-  auto result = static_cast<SpecificOwnedObject<T>*>(ownedObject.get());
-  ownedObjects.link(kj::mv(ownedObject));
-  return result;
+inline DeleteQueue::OwnedRegistration DeleteQueue::registerOwned(
+    kj::Own<T> obj, OwnedObjectList& ownedObjects) {
+  const kj::Disposer& disposer = obj.getDisposer();
+  // The disposer is told the object's address as it was allocated (kj::castToVoid, which is
+  // what kj::Own hands it), which for a polymorphic T need not be the T* the holder resolves.
+  T* object = obj.get();
+  // Throws if the table is full, with `obj` still owning the object.
+  hostMemory::ResolveHandle handle = ownedObjects.add(object, kj::_::castToVoid(object), disposer);
+  obj.disown(&disposer);
+  return {handle, {&disposer, &disposeOwnedAs<T>}};
 }
 
 template <typename T>
 inline IoOwn<T> DeleteQueue::addObject(kj::Own<T> obj, OwnedObjectList& ownedObjects) const {
-  auto* item = addObjectImpl(kj::mv(obj), ownedObjects);
-  item->handle = hostMemory::registerResolve(item);
-  if (item->handle == 0) {
-    OwnedObjectList::unlink(*item);
-    KJ_FAIL_REQUIRE("the resolve table is full; cannot create another I/O object",
-        hostMemory::RESOLVE_CAPACITY);
-  }
-  return IoOwn<T>(addRefToThis(), item->handle);
+  auto registration = registerOwned(kj::mv(obj), ownedObjects);
+  return IoOwn<T>(addRefToThis(), registration.handle, registration.disposal);
 }
 
 template <typename T>
 inline ReverseIoOwn<T> DeleteQueue::addObjectReverse(
     kj::Arc<ReverseIoOwnValidity> validity, kj::Own<T> obj, OwnedObjectList& ownedObjects) const {
-  return ReverseIoOwn<T>(kj::mv(validity), addObjectImpl(kj::mv(obj), ownedObjects));
+  auto registration = registerOwned(kj::mv(obj), ownedObjects);
+  return ReverseIoOwn<T>(kj::mv(validity), registration.handle, registration.disposal);
 }
 
 // When the IoContext is destroyed, we need to null out the DeleteQueue. Complicating
@@ -277,14 +350,18 @@ class DeleteQueuePtr {
 // rewritten it. The handle is resolved against a table the guest cannot write on every use --
 // in a turn through a trap into ring 0 inside the guest, on the host directly -- and a handle
 // that no longer names a live entry fails the use rather than reaching whatever it was changed
-// to. The resolve protects the handle, not the object: the object itself is still in the shared
-// heap, and a handle rewritten to another live entry's names that entry's object.
+// to. Beside the handle the IoOwn records how to dispose of the object (OwnedDisposal), which
+// only the turn uses: an IoOwn dropped inside a turn disposes of its object there, since the
+// context's record of the object (OwnedObjectList) is in host memory, which the turn cannot
+// reach; the host never reads this copy, and disposes of the object through the record's own.
+// The object itself is still in the shared heap, and a handle rewritten to another live entry's
+// names that entry's object.
 template <typename T>
 class IoOwn {
 
  public:
   IoOwn(IoOwn&& other) noexcept;
-  IoOwn(decltype(nullptr)): handle(0) {}
+  IoOwn(decltype(nullptr)): handle(0), disposal{nullptr, nullptr} {}
   ~IoOwn() noexcept(false);
   KJ_DISALLOW_COPY(IoOwn);
 
@@ -316,25 +393,32 @@ class IoOwn {
 
   kj::Arc<DeleteQueue> deleteQueue;
   hostMemory::ResolveHandle handle;
+  OwnedDisposal disposal;
 
-  IoOwn(kj::Arc<DeleteQueue> deleteQueue, hostMemory::ResolveHandle handle)
+  IoOwn(kj::Arc<DeleteQueue> deleteQueue, hostMemory::ResolveHandle handle, OwnedDisposal disposal)
       : deleteQueue(kj::mv(deleteQueue)),
-        handle(handle) {}
+        handle(handle),
+        disposal(disposal) {}
 
   // The owned object, resolved for this one use after checkFarGet.
-  SpecificOwnedObject<T>& item() {
+  T* object() {
     DeleteQueue::checkFarGet(*deleteQueue, typeid(T));
-    return static_cast<SpecificOwnedObject<T>&>(DeleteQueue::resolveOwned(handle, typeid(T)));
+    return static_cast<T*>(DeleteQueue::resolveOwned(handle, typeid(T)));
   }
 };
 
 // Reference held by a V8 heap object, pointing to a KJ event loop object. Cannot be
 // dereferenced unless the isolate is executing on the appropriate event loop thread.
+//
+// Like an IoOwn, the IoPtr names its object by a resolve handle rather than a pointer, with an
+// entry of its own that lives as long as the IoPtr does; it owns nothing, so there is no node
+// behind the entry.
 template <typename T>
 class IoPtr {
  public:
-  IoPtr(const IoPtr& other): deleteQueue(other.deleteQueue.addRef()), ptr(other.ptr) {}
-  IoPtr(IoPtr&& other) = default;
+  IoPtr(const IoPtr& other);
+  IoPtr(IoPtr&& other) noexcept;
+  ~IoPtr() noexcept(false);
 
   T* operator->();
   T& operator*() {
@@ -347,9 +431,9 @@ class IoPtr {
   friend class DeleteQueue;
 
   kj::Arc<DeleteQueue> deleteQueue;
-  T* ptr;
+  hostMemory::ResolveHandle handle;
 
-  IoPtr(kj::Arc<DeleteQueue> deleteQueue, T* ptr): deleteQueue(kj::mv(deleteQueue)), ptr(ptr) {}
+  IoPtr(kj::Arc<DeleteQueue> deleteQueue, T* ptr);
 };
 
 // Owned pointer held by a KJ I/O object living in the same thread as an IoContext. The underlying
@@ -362,11 +446,15 @@ class IoPtr {
 // outlive the isolate they point into. But if the holder could outlive the IoContext, then it
 // could also outlive the isolate. In that case, the handles should be wrapped in an object held
 // using `ReverseIoOwn`.
+//
+// The object is named by a resolve handle with its disposal recorded beside it, as an IoOwn's
+// is: a ReverseIoOwn's holder lives in the shared heap, and the ReverseIoOwn is dereferenced
+// and dropped inside turns as well as outside them.
 template <typename T>
 class ReverseIoOwn {
  public:
   ReverseIoOwn(ReverseIoOwn&& other) noexcept;
-  ReverseIoOwn(decltype(nullptr)): validity(nullptr), item(nullptr) {}
+  ReverseIoOwn(decltype(nullptr)): validity(nullptr), handle(0), disposal{nullptr, nullptr} {}
   ~ReverseIoOwn() noexcept(false);
   KJ_DISALLOW_COPY(ReverseIoOwn);
 
@@ -382,8 +470,9 @@ class ReverseIoOwn {
   // Returns kj::none if the IoContext has been destroyed or if this is null.
   // This is a safe alternative to operator->() that won't throw or crash.
   kj::Maybe<T&> tryGet() {
-    if (item != nullptr && validity != nullptr && validity->isValid()) {
-      return *item->ptr.get();
+    if (handle != 0 && validity != nullptr && validity->isValid()) {
+      T* object = static_cast<T*>(hostMemory::resolve(handle));
+      if (object != nullptr) return *object;
     }
     return kj::none;
   }
@@ -393,34 +482,43 @@ class ReverseIoOwn {
   friend class DeleteQueue;
 
   kj::Arc<ReverseIoOwnValidity> validity;
-  SpecificOwnedObject<T>* item;
+  hostMemory::ResolveHandle handle;
+  OwnedDisposal disposal;
 
-  ReverseIoOwn(kj::Arc<ReverseIoOwnValidity> validity, SpecificOwnedObject<T>* item)
+  ReverseIoOwn(kj::Arc<ReverseIoOwnValidity> validity,
+      hostMemory::ResolveHandle handle,
+      OwnedDisposal disposal)
       : validity(kj::mv(validity)),
-        item(item) {}
+        handle(handle),
+        disposal(disposal) {}
+
+  // Drops the object, if the context still owns it.
+  void drop();
 };
 
 template <typename T>
 IoOwn<T>::IoOwn(IoOwn&& other) noexcept
     : deleteQueue(kj::mv(other.deleteQueue)),
-      handle(other.handle) {
+      handle(other.handle),
+      disposal(other.disposal) {
   other.handle = 0;
 }
 
 template <typename T>
 IoOwn<T>::~IoOwn() noexcept(false) {
   if (handle != 0) {
-    deleteQueue->scheduleDeletion(handle);
+    deleteQueue->scheduleDeletion(handle, disposal);
   }
 }
 
 template <typename T>
 IoOwn<T>& IoOwn<T>::operator=(IoOwn<T>&& other) {
   if (handle != 0) {
-    deleteQueue->scheduleDeletion(handle);
+    deleteQueue->scheduleDeletion(handle, disposal);
   }
   deleteQueue = kj::mv(other.deleteQueue);
   handle = other.handle;
+  disposal = other.disposal;
   other.handle = 0;
   return *this;
 }
@@ -428,10 +526,11 @@ IoOwn<T>& IoOwn<T>::operator=(IoOwn<T>&& other) {
 template <typename T>
 IoOwn<T>& IoOwn<T>::operator=(decltype(nullptr)) {
   if (handle != 0) {
-    deleteQueue->scheduleDeletion(handle);
+    deleteQueue->scheduleDeletion(handle, disposal);
   }
   deleteQueue = nullptr;
   handle = 0;
+  disposal = {nullptr, nullptr};
   return *this;
 }
 
@@ -439,88 +538,135 @@ template <typename T>
 void IoOwn<T>::deferGcToContext() && {
   // Turns out, if we simply *don't* enqueue the item for deletion, we get the behavior we want.
   // So we can just forget the handle here; the context's OwnedObjectList still owns the object
-  // and its entry, and retires both when it is torn down.
+  // and its entry, and releases both when it is torn down.
   handle = 0;
+  disposal = {nullptr, nullptr};
   deleteQueue = nullptr;
-}
-
-template <typename T>
-IoPtr<T>& IoPtr<T>::operator=(decltype(nullptr)) {
-  deleteQueue = nullptr;
-  ptr = nullptr;
-  return *this;
 }
 
 template <typename T>
 inline T* IoOwn<T>::operator->() {
-  return item().ptr;
+  return object();
 }
 
 template <typename T>
 inline IoOwn<T>::operator kj::Own<T>() && {
-  auto& owned = item();
-  auto result = kj::mv(owned.ptr);
-  OwnedObjectList::unlink(owned);
+  T* result = object();
+  const kj::Disposer* d;
+  if (hostMemory::inTurn()) {
+    d = disposal.disposer;
+    OwnedObjectList::releaseInTurn(handle);
+  } else {
+    d = &OwnedObjectList::take(handle);
+  }
   handle = 0;
+  disposal = {nullptr, nullptr};
   deleteQueue = nullptr;  // not needed anymore, might as well drop the refcount
-  return result;
+  return kj::Own<T>(result, *d);
+}
+
+template <typename T>
+inline IoPtr<T>::IoPtr(kj::Arc<DeleteQueue> deleteQueue, T* ptr)
+    : deleteQueue(kj::mv(deleteQueue)),
+      handle(hostMemory::registerResolve(ptr)) {
+  KJ_REQUIRE(handle != 0, "the resolve table is full; cannot create another I/O reference",
+      hostMemory::RESOLVE_CAPACITY);
+}
+
+template <typename T>
+inline IoPtr<T>::IoPtr(const IoPtr& other): deleteQueue(other.deleteQueue.addRef()),
+                                            handle(0) {
+  // A copy names the same object under an entry of its own; one whose handle no longer
+  // resolves is a copy that resolves to nothing, like its original.
+  void* object = hostMemory::resolve(other.handle);
+  if (object != nullptr) handle = hostMemory::registerResolve(object);
+}
+
+template <typename T>
+inline IoPtr<T>::IoPtr(IoPtr&& other) noexcept
+    : deleteQueue(kj::mv(other.deleteQueue)),
+      handle(other.handle) {
+  other.handle = 0;
+}
+
+template <typename T>
+inline IoPtr<T>::~IoPtr() noexcept(false) {
+  if (handle != 0) hostMemory::unregisterResolve(handle);
+}
+
+template <typename T>
+IoPtr<T>& IoPtr<T>::operator=(decltype(nullptr)) {
+  if (handle != 0) hostMemory::unregisterResolve(handle);
+  deleteQueue = nullptr;
+  handle = 0;
+  return *this;
 }
 
 template <typename T>
 inline T* IoPtr<T>::operator->() {
   DeleteQueue::checkFarGet(*deleteQueue, typeid(T));
-  return ptr;
+  return static_cast<T*>(DeleteQueue::resolveOwned(handle, typeid(T)));
 }
 
 template <typename T>
 ReverseIoOwn<T>::ReverseIoOwn(ReverseIoOwn&& other) noexcept
     : validity(kj::mv(other.validity)),
-      item(other.item) {
-  other.item = nullptr;
+      handle(other.handle),
+      disposal(other.disposal) {
+  other.handle = 0;
+}
+
+template <typename T>
+void ReverseIoOwn<T>::drop() {
+  if (handle == 0 || !validity->isValid()) return;
+  OwnedObjectList::drop(handle, disposal);
 }
 
 template <typename T>
 ReverseIoOwn<T>::~ReverseIoOwn() noexcept(false) {
-  if (item != nullptr && validity->isValid()) {
-    OwnedObjectList::unlink(*item);
-  }
+  drop();
 }
 
 template <typename T>
 ReverseIoOwn<T>& ReverseIoOwn<T>::operator=(ReverseIoOwn<T>&& other) {
-  if (item != nullptr && validity->isValid()) {
-    OwnedObjectList::unlink(*item);
-  }
+  drop();
   validity = kj::mv(other.validity);
-  item = other.item;
-  other.item = nullptr;
+  handle = other.handle;
+  disposal = other.disposal;
+  other.handle = 0;
   return *this;
 }
 
 template <typename T>
 ReverseIoOwn<T>& ReverseIoOwn<T>::operator=(decltype(nullptr)) {
-  if (item != nullptr && validity->isValid()) {
-    OwnedObjectList::unlink(*item);
-  }
+  drop();
   validity = nullptr;
-  item = nullptr;
+  handle = 0;
+  disposal = {nullptr, nullptr};
   return *this;
 }
 
 template <typename T>
 inline T* ReverseIoOwn<T>::operator->() {
   validity->checkValid();
-  return item->ptr;
+  return static_cast<T*>(DeleteQueue::resolveOwned(handle, typeid(T)));
 }
 
 template <typename T>
 inline ReverseIoOwn<T>::operator kj::Own<T>() && {
   validity->checkValid();
-  auto result = kj::mv(item->ptr);
-  OwnedObjectList::unlink(*item);
-  item = nullptr;
+  T* result = static_cast<T*>(DeleteQueue::resolveOwned(handle, typeid(T)));
+  const kj::Disposer* d;
+  if (hostMemory::inTurn()) {
+    d = disposal.disposer;
+    OwnedObjectList::releaseInTurn(handle);
+  } else {
+    d = &OwnedObjectList::take(handle);
+  }
+  handle = 0;
+  disposal = {nullptr, nullptr};
   validity = nullptr;  // not needed anymore, might as well drop the refcount
-  return result;
+  return kj::Own<T>(result, *d);
 }
 
 }  // namespace workerd

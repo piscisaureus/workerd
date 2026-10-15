@@ -81,12 +81,17 @@ isolate's JS turn at guest ring 3.
   rewrite puts the database there.
 - `ioown-test.sh` / `ioown-test.capnp` — end-to-end check against a built
   workerd that an `IoOwn` (`io/io-own.h`) names its object by a handle the
-  host validates: a JS turn that rewrites the handle inside its own object,
-  to the address of a buffer the turn chose, leaves the next turn's
-  dereference and the host's drain of the delete queue refusing the handle
-  rather than reaching the buffer, with the isolate still serving; and that a
-  handle rewritten to another isolate's live handle names that isolate's
-  object, the ownership residual the table cannot close, stated as such.
+  host validates, and that the record behind the handle is out of a turn's
+  reach: a JS turn that rewrites the handle inside its own object, to the
+  address of a buffer the turn chose, leaves the next turn's dereference and
+  the host's drain of the delete queue refusing the handle rather than
+  reaching the buffer, with the isolate still serving; a handle rewritten to
+  another isolate's live handle names that isolate's object, the ownership
+  residual the table cannot close, stated as such; and a turn's write into
+  the owned-list node behind a handle -- the links the host's walk follows
+  and the disposer it calls, in host memory -- faults at the node, after
+  which the context's teardown, host-side, disposes of the object through
+  the disposer the node recorded and never the one the turn chose.
 
 ## API
 
@@ -334,13 +339,20 @@ hardware:
   pointer-first and retires it generation-first, so a pointer seen between
   two matching reads was the entry's under that generation. Exhaustion is a
   registration refused with 0, never fatal. The tenant is `IoOwn`
-  (`io/io-own.h`): the handle it holds names the object the context owns,
-  and every dereference, destruction and unlink resolves it. Its objects are
-  created inside turns, where the table cannot be written, so the host
-  reserves entries for the thread before each turn and commits them after it
-  from the turn's journal (`gk_resolve_reserve`, `gk_resolve_commit`;
-  `ResolveTurn` in `util/host-memory.h`): a commit takes once, only into a
-  reserved entry, and only a pointer to ordinary user memory -- outside gk's
+  (`io/io-own.h`), with `ReverseIoOwn` and `IoPtr` beside it: the handle a
+  holder keeps names the object, and every dereference, destruction and
+  release resolves it. The entry holds the object's pointer, which the turn
+  resolves; what the host keeps about the object -- its node in the
+  context's owned list, with the links the host's walk follows and the
+  disposer the host calls -- is in host memory, found through the entry's
+  companion (`hostMemory::resolveCompanion`), a host-side record per entry
+  that the host alone writes. The objects are created inside turns, where
+  neither the table nor host memory can be written, so the host reserves
+  entries for the thread before each turn and commits them after it from
+  the turn's journal (`gk_resolve_reserve`, `gk_resolve_commit`;
+  `ResolveTurn` in `util/host-memory.h`), building each node from the
+  journal's words as it commits: a commit takes once, only into a reserved
+  entry, and only a pointer to ordinary user memory -- outside gk's
   supervisor and refused ranges and outside every arena -- so a turn can
   launder nothing into the table that it could not already write directly,
   and cannot aim the host at gk's state, host memory or another arena. The
@@ -378,9 +390,8 @@ hardware:
   in guest memory but does not make safe to reach from there -- the object's
   own placement does that -- and a handle rewritten to another live entry's
   names that entry, the ownership residual the arena and host slot facilities
-  carry too. Nothing in workerd uses it yet; `IoOwn` is the intended first
-  user (see `memory-classes.md`, Cost, for what a turn's dereference count
-  implies).
+  carry too (see `memory-classes.md`, Cost, for what a turn's dereference
+  count implies).
 - **Signal fields.** A runtime that tells a Wasm module its CPU budget is
   nearly spent does so by writing a constant into the module's linear memory
   from the handler of a per-thread CPU timer, while the turn runs. The
@@ -668,8 +679,13 @@ so a crossing a turn makes on every dereference belongs on that path.
   I/O object, the largest family of pointers the host loaded from guest
   memory -- names its object by a handle into the ring-0 resolve table (see
   "Ring-0 resolve" above), resolved on every use, so a rewritten one fails
-  the use rather than redirecting it; the object it names is still in the
-  shared heap, as is the delete-queue reference beside the handle.
+  the use rather than redirecting it, and the context's record of the
+  object -- the owned-list node whose links the host follows at teardown
+  and on the delete-queue drain, and whose disposer the host calls -- is in
+  host memory, written by the host; the object it names is still in the
+  shared heap, as is the delete-queue reference beside the handle, and the
+  disposer the node records is the one the turn journaled when it created
+  the object.
   What a rewritten handle can still do is name another live host slot, or
   another isolate's live resolve entry: the
   table turns "any address" into "one of the live tenants", and telling a
@@ -687,9 +703,10 @@ so a crossing a turn makes on every dereference belongs on that path.
   (`src/workerd/util/memory-class.h`), which is a handful so far; every other
   class is unchecked. Placement by class exists for H only, as an explicit
   choice per object (`HostOwn<T>` and `HostSlot<T>`, `util/host-memory.h`)
-  rather than something the allocator decides, and four objects have been
-  placed: the channel token key, the host entropy buffer, the actor-id
-  namespace key and the Wasm signal descriptors.
+  rather than something the allocator decides, and five kinds of object have
+  been placed: the channel token key, the host entropy buffer, the actor-id
+  namespace key, the Wasm signal descriptors and the owned-list nodes
+  behind `IoOwn` handles.
 - **The host acts on data a ring-3 turn can write.** The runtime's heap is in
   the guest's address space, so every host-side structure the guest can reach
   is attacker-controlled input to the host, and the dangerous cases are the
@@ -707,7 +724,8 @@ so a crossing a turn makes on every dereference belongs on that path.
   validates against its own table rather than through a pointer the host
   loads from the heap, an `IoOwn`'s object is reached through a resolve
   handle the same way, with the pointer behind it admitted to the table only
-  if it is ordinary user memory the turn could write anyway, a hostcall's handler is selected by an index gk
+  if it is ordinary user memory the turn could write anyway, and the list
+  the host walks to release such objects is in host memory, a hostcall's handler is selected by an index gk
   checks against its table and sees a host-memory copy of the arguments,
   never the guest's memory, the Wasm signal handler writes through a
   descriptor gk validated against the thread's arena and keeps in its own

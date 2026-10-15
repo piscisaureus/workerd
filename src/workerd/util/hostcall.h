@@ -70,6 +70,8 @@ enum Index : unsigned {
   VFS_ROOT = 3,     // set or clear the turn directory for a SQLite VFS's root (util/sqlite.h)
   RESOLVE = 4,      // refill a turn's reserved resolve entries or flush its retire list
                     // (util/host-memory.h, ResolveTurn)
+  OWNED_LIST = 5,   // drain a context's owned-object list torn down inside a turn
+                    // (io/io-own.h, OwnedObjectList)
 };
 
 // Calls `entry`'s handler on `frame` and returns its result: a negative errno-style value from
