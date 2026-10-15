@@ -1,0 +1,1016 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Wed, 14 Oct 2026 12:00:00 +0000
+Subject: Run Intl builtins under an embedder shared-allocation scope
+
+The Intl implementation keeps process-wide containers that it fills
+lazily from whichever isolate first needs an entry: the available-locale
+sets, the calendar, date format and pattern generator caches, the unit
+factory and the currency list, all allocated with the process allocator
+from inside the builtin that needed them. An embedder that gives each
+isolate its own allocation arena, unaddressable from every other
+isolate, then finds those entries in the arena of whichever isolate
+first used Intl, where the next isolate's Intl call faults on them.
+
+Let such an embedder define a pair of weak hook functions, under which
+every Intl builtin and runtime function runs, so that it can switch the
+calling thread's allocation onto memory every isolate shares for the
+duration. Without the hooks nothing changes.
+---
+diff --git a/src/builtins/builtins-intl.cc b/src/builtins/builtins-intl.cc
+--- a/src/builtins/builtins-intl.cc
++++ b/src/builtins/builtins-intl.cc
+@@ -37,11 +37,68 @@
+ #include "src/objects/smi.h"
+ #include "unicode/brkiter.h"
+ 
++// Process-wide Intl state and the embedder's allocator. The Intl implementation
++// keeps process-wide containers that it fills lazily from whichever isolate
++// first needs an entry: the available-locale sets, the calendar, date format
++// and pattern generator caches, the unit factory, the currency list. An
++// embedder that gives each isolate its own allocation arena, unaddressable
++// from other isolates, needs those entries placed elsewhere: it defines the
++// two functions below (both or neither), and every Intl builtin and runtime
++// function then runs between an enter and the matching leave, so that all
++// of its allocations go where the embedder puts memory shared by every
++// isolate. The token the enter returns is handed back to the leave.
++#if defined(__GNUC__) || defined(__clang__)
++extern "C" {
++uintptr_t v8_intl_shared_allocation_enter() __attribute__((weak));
++void v8_intl_shared_allocation_leave(uintptr_t token) __attribute__((weak));
++}
++#define V8_HAS_INTL_SHARED_ALLOCATION_HOOKS 1
++#endif
++
+ namespace v8 {
+ namespace internal {
+ 
++namespace {
++// Enters the embedder's shared-allocation state for the lifetime of the
++// scope, when the embedder provides it (see the hooks above).
++class IntlSharedAllocationScope final {
++ public:
++  IntlSharedAllocationScope() {
++#ifdef V8_HAS_INTL_SHARED_ALLOCATION_HOOKS
++    if (v8_intl_shared_allocation_enter != nullptr) {
++      token_ = v8_intl_shared_allocation_enter();
++      active_ = true;
++    }
++#endif
++  }
++  ~IntlSharedAllocationScope() {
++#ifdef V8_HAS_INTL_SHARED_ALLOCATION_HOOKS
++    if (active_) v8_intl_shared_allocation_leave(token_);
++#endif
++  }
++  IntlSharedAllocationScope(const IntlSharedAllocationScope&) = delete;
++  IntlSharedAllocationScope& operator=(const IntlSharedAllocationScope&) =
++      delete;
++
++ private:
++  uintptr_t token_ = 0;
++  bool active_ = false;
++};
++}  // namespace
++
++// A builtin whose body runs inside an IntlSharedAllocationScope.
++#define INTL_BUILTIN(name)                                                 \
++  V8_WARN_UNUSED_RESULT static Tagged<Object> Builtin_IntlBody_##name(     \
++      BuiltinArguments args, Isolate* isolate);                            \
++  BUILTIN(name) {                                                          \
++    IntlSharedAllocationScope shared_allocation;                           \
++    return Builtin_IntlBody_##name(args, isolate);                         \
++  }                                                                        \
++  V8_WARN_UNUSED_RESULT static Tagged<Object> Builtin_IntlBody_##name(     \
++      BuiltinArguments args, Isolate* isolate)
++
+ // https://tc39.es/ecma262/#sec-string.prototype.touppercase
+-BUILTIN(StringPrototypeToUpperCaseIntl) {
++INTL_BUILTIN(StringPrototypeToUpperCaseIntl) {
+   HandleScope scope(isolate);
+   TO_THIS_STRING(string, "String.prototype.toUpperCase");
+   string = String::Flatten(isolate, string);
+@@ -49,7 +106,7 @@
+ }
+ 
+ // https://tc39.es/ecma262/#sec-string.prototype.normalize
+-BUILTIN(StringPrototypeNormalizeIntl) {
++INTL_BUILTIN(StringPrototypeNormalizeIntl) {
+   HandleScope handle_scope(isolate);
+   isolate->CountUsage(v8::Isolate::UseCounterFeature::kStringNormalize);
+   TO_THIS_STRING(string, "String.prototype.normalize");
+@@ -64,7 +121,7 @@
+ // https://tc39.es/ecma402/section 19.1.1.
+ //   String.prototype.localeCompare ( that [ , locales [ , options ] ] )
+ // This implementation supersedes the definition provided in ES6.
+-BUILTIN(StringPrototypeLocaleCompareIntl) {
++INTL_BUILTIN(StringPrototypeLocaleCompareIntl) {
+   HandleScope handle_scope(isolate);
+ 
+   isolate->CountUsage(v8::Isolate::UseCounterFeature::kStringLocaleCompare);
+@@ -88,7 +145,7 @@
+   return Smi::FromInt(result.value());
+ }
+ 
+-BUILTIN(V8BreakIteratorSupportedLocalesOf) {
++INTL_BUILTIN(V8BreakIteratorSupportedLocalesOf) {
+   HandleScope scope(isolate);
+   DirectHandle<Object> locales = args.atOrUndefined(isolate, 1);
+   DirectHandle<Object> options = args.atOrUndefined(isolate, 2);
+@@ -100,7 +157,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.numberformat.supportedlocalesof
+-BUILTIN(NumberFormatSupportedLocalesOf) {
++INTL_BUILTIN(NumberFormatSupportedLocalesOf) {
+   HandleScope scope(isolate);
+   DirectHandle<Object> locales = args.atOrUndefined(isolate, 1);
+   DirectHandle<Object> options = args.atOrUndefined(isolate, 2);
+@@ -112,7 +169,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.numberformat.prototype.formattoparts
+-BUILTIN(NumberFormatPrototypeFormatToParts) {
++INTL_BUILTIN(NumberFormatPrototypeFormatToParts) {
+   const char* const method_name = "Intl.NumberFormat.prototype.formatToParts";
+   HandleScope handle_scope(isolate);
+   CHECK_RECEIVER(JSNumberFormat, number_format, method_name);
+@@ -129,7 +186,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.datetimeformat.prototype.resolvedoptions
+-BUILTIN(DateTimeFormatPrototypeResolvedOptions) {
++INTL_BUILTIN(DateTimeFormatPrototypeResolvedOptions) {
+   const char* const method_name =
+       "Intl.DateTimeFormat.prototype.resolvedOptions";
+   HandleScope scope(isolate);
+@@ -146,7 +203,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.datetimeformat.supportedlocalesof
+-BUILTIN(DateTimeFormatSupportedLocalesOf) {
++INTL_BUILTIN(DateTimeFormatSupportedLocalesOf) {
+   HandleScope scope(isolate);
+   DirectHandle<Object> locales = args.atOrUndefined(isolate, 1);
+   DirectHandle<Object> options = args.atOrUndefined(isolate, 2);
+@@ -158,7 +215,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.datetimeformat.prototype.formattoparts
+-BUILTIN(DateTimeFormatPrototypeFormatToParts) {
++INTL_BUILTIN(DateTimeFormatPrototypeFormatToParts) {
+   const char* const method_name = "Intl.DateTimeFormat.prototype.formatToParts";
+   HandleScope handle_scope(isolate);
+   CHECK_RECEIVER(JSObject, date_format_holder, method_name);
+@@ -205,7 +262,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.datetimeformat.prototype.formatrange
+-BUILTIN(DateTimeFormatPrototypeFormatRange) {
++INTL_BUILTIN(DateTimeFormatPrototypeFormatRange) {
+   const char* const method_name = "Intl.DateTimeFormat.prototype.formatRange";
+   HandleScope handle_scope(isolate);
+   return DateTimeFormatRange<String, JSDateTimeFormat::FormatRange>(
+@@ -213,7 +270,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.datetimeformat.prototype.formatrangetoparts
+-BUILTIN(DateTimeFormatPrototypeFormatRangeToParts) {
++INTL_BUILTIN(DateTimeFormatPrototypeFormatRangeToParts) {
+   const char* const method_name =
+       "Intl.DateTimeFormat.prototype.formatRangeToParts";
+   HandleScope handle_scope(isolate);
+@@ -388,7 +445,7 @@
+ // Intl.DisplayNames
+ 
+ // https://tc39.es/ecma402/#sec-Intl.DisplayNames
+-BUILTIN(DisplayNamesConstructor) {
++INTL_BUILTIN(DisplayNamesConstructor) {
+   HandleScope scope(isolate);
+ 
+   return DisallowCallConstructor<JSDisplayNames>(
+@@ -397,7 +454,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.DisplayNames.prototype.resolvedOptions
+-BUILTIN(DisplayNamesPrototypeResolvedOptions) {
++INTL_BUILTIN(DisplayNamesPrototypeResolvedOptions) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSDisplayNames, holder,
+                  "Intl.DisplayNames.prototype.resolvedOptions");
+@@ -405,7 +462,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.DisplayNames.supportedLocalesOf
+-BUILTIN(DisplayNamesSupportedLocalesOf) {
++INTL_BUILTIN(DisplayNamesSupportedLocalesOf) {
+   HandleScope scope(isolate);
+   DirectHandle<Object> locales = args.atOrUndefined(isolate, 1);
+   DirectHandle<Object> options = args.atOrUndefined(isolate, 2);
+@@ -417,7 +474,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.DisplayNames.prototype.of
+-BUILTIN(DisplayNamesPrototypeOf) {
++INTL_BUILTIN(DisplayNamesPrototypeOf) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSDisplayNames, holder, "Intl.DisplayNames.prototype.of");
+   Handle<Object> code_obj = args.atOrUndefined(isolate, 1);
+@@ -431,7 +488,7 @@
+ //
+ 
+ // https://tc39.es/ecma402/#sec-intl-durationformat-constructor
+-BUILTIN(DurationFormatConstructor) {
++INTL_BUILTIN(DurationFormatConstructor) {
+   HandleScope scope(isolate);
+ 
+   return DisallowCallConstructor<JSDurationFormat>(
+@@ -440,7 +497,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.DurationFormat.prototype.resolvedOptions
+-BUILTIN(DurationFormatPrototypeResolvedOptions) {
++INTL_BUILTIN(DurationFormatPrototypeResolvedOptions) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSDurationFormat, holder,
+                  "Intl.DurationFormat.prototype.resolvedOptions");
+@@ -448,7 +505,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.DurationFormat.supportedLocalesOf
+-BUILTIN(DurationFormatSupportedLocalesOf) {
++INTL_BUILTIN(DurationFormatSupportedLocalesOf) {
+   HandleScope scope(isolate);
+   DirectHandle<Object> locales = args.atOrUndefined(isolate, 1);
+   DirectHandle<Object> options = args.atOrUndefined(isolate, 2);
+@@ -460,7 +517,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.DurationFormat.prototype.format
+-BUILTIN(DurationFormatPrototypeFormat) {
++INTL_BUILTIN(DurationFormatPrototypeFormat) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSDurationFormat, holder,
+                  "Intl.DurationFormat.prototype.format");
+@@ -470,7 +527,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.DurationFormat.prototype.formatToParts
+-BUILTIN(DurationFormatPrototypeFormatToParts) {
++INTL_BUILTIN(DurationFormatPrototypeFormatToParts) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSDurationFormat, holder,
+                  "Intl.DurationFormat.prototype.formatToParts");
+@@ -484,7 +541,7 @@
+ //
+ 
+ // https://tc39.es/ecma402/#sec-intl.numberformat
+-BUILTIN(NumberFormatConstructor) {
++INTL_BUILTIN(NumberFormatConstructor) {
+   HandleScope scope(isolate);
+ 
+   return LegacyFormatConstructor<JSNumberFormat>(
+@@ -493,7 +550,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.numberformat.prototype.resolvedoptions
+-BUILTIN(NumberFormatPrototypeResolvedOptions) {
++INTL_BUILTIN(NumberFormatPrototypeResolvedOptions) {
+   HandleScope scope(isolate);
+   const char* const method_name = "Intl.NumberFormat.prototype.resolvedOptions";
+ 
+@@ -511,7 +568,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.numberformat.prototype.format
+-BUILTIN(NumberFormatPrototypeFormatNumber) {
++INTL_BUILTIN(NumberFormatPrototypeFormatNumber) {
+   const char* const method_name = "get Intl.NumberFormat.prototype.format";
+   HandleScope scope(isolate);
+ 
+@@ -545,7 +602,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-number-format-functions
+-BUILTIN(NumberFormatInternalFormatNumber) {
++INTL_BUILTIN(NumberFormatInternalFormatNumber) {
+   HandleScope scope(isolate);
+ 
+   DirectHandle<Context> context(isolate->context(), isolate);
+@@ -596,7 +653,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.numberformat.prototype.formatrange
+-BUILTIN(NumberFormatPrototypeFormatRange) {
++INTL_BUILTIN(NumberFormatPrototypeFormatRange) {
+   const char* const method_name = "Intl.NumberFormat.prototype.formatRange";
+   HandleScope handle_scope(isolate);
+   return NumberFormatRange<String, JSNumberFormat::FormatNumericRange>(
+@@ -604,7 +661,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.numberformat.prototype.formatrangetoparts
+-BUILTIN(NumberFormatPrototypeFormatRangeToParts) {
++INTL_BUILTIN(NumberFormatPrototypeFormatRangeToParts) {
+   const char* const method_name =
+       "Intl.NumberFormat.prototype.formatRangeToParts";
+   HandleScope handle_scope(isolate);
+@@ -613,7 +670,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.datetimeformat
+-BUILTIN(DateTimeFormatConstructor) {
++INTL_BUILTIN(DateTimeFormatConstructor) {
+   HandleScope scope(isolate);
+ 
+   return LegacyFormatConstructor<JSDateTimeFormat>(
+@@ -622,7 +679,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.datetimeformat.prototype.format
+-BUILTIN(DateTimeFormatPrototypeFormat) {
++INTL_BUILTIN(DateTimeFormatPrototypeFormat) {
+   const char* const method_name = "get Intl.DateTimeFormat.prototype.format";
+   HandleScope scope(isolate);
+ 
+@@ -657,7 +714,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-datetime-format-functions
+-BUILTIN(DateTimeFormatInternalFormat) {
++INTL_BUILTIN(DateTimeFormatInternalFormat) {
+   HandleScope scope(isolate);
+   DirectHandle<Context> context(isolate->context(), isolate);
+ 
+@@ -677,7 +734,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.getcanonicallocales
+-BUILTIN(IntlGetCanonicalLocales) {
++INTL_BUILTIN(IntlGetCanonicalLocales) {
+   HandleScope scope(isolate);
+   DirectHandle<Object> locales = args.atOrUndefined(isolate, 1);
+ 
+@@ -686,7 +743,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.supportedvaluesof
+-BUILTIN(IntlSupportedValuesOf) {
++INTL_BUILTIN(IntlSupportedValuesOf) {
+   HandleScope scope(isolate);
+   DirectHandle<Object> locales = args.atOrUndefined(isolate, 1);
+ 
+@@ -694,7 +751,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl-listformat-constructor
+-BUILTIN(ListFormatConstructor) {
++INTL_BUILTIN(ListFormatConstructor) {
+   HandleScope scope(isolate);
+ 
+   return DisallowCallConstructor<JSListFormat>(
+@@ -703,7 +760,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.listformat.prototype.resolvedoptions
+-BUILTIN(ListFormatPrototypeResolvedOptions) {
++INTL_BUILTIN(ListFormatPrototypeResolvedOptions) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSListFormat, format_holder,
+                  "Intl.ListFormat.prototype.resolvedOptions");
+@@ -711,7 +768,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.ListFormat.supportedlocalesof
+-BUILTIN(ListFormatSupportedLocalesOf) {
++INTL_BUILTIN(ListFormatSupportedLocalesOf) {
+   HandleScope scope(isolate);
+   DirectHandle<Object> locales = args.atOrUndefined(isolate, 1);
+   DirectHandle<Object> options = args.atOrUndefined(isolate, 2);
+@@ -727,7 +784,7 @@
+ //
+ 
+ // https://tc39.es/ecma402/#sec-intl-locale-constructor
+-BUILTIN(LocaleConstructor) {
++INTL_BUILTIN(LocaleConstructor) {
+   HandleScope scope(isolate);
+ 
+   isolate->CountUsage(v8::Isolate::UseCounterFeature::kLocale);
+@@ -781,21 +838,21 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.maximize
+-BUILTIN(LocalePrototypeMaximize) {
++INTL_BUILTIN(LocalePrototypeMaximize) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.maximize");
+   RETURN_RESULT_OR_FAILURE(isolate, JSLocale::Maximize(isolate, locale));
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.minimize
+-BUILTIN(LocalePrototypeMinimize) {
++INTL_BUILTIN(LocalePrototypeMinimize) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.minimize");
+   RETURN_RESULT_OR_FAILURE(isolate, JSLocale::Minimize(isolate, locale));
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.getCalendars
+-BUILTIN(LocalePrototypeGetCalendars) {
++INTL_BUILTIN(LocalePrototypeGetCalendars) {
+   HandleScope scope(isolate);
+   isolate->CountUsage(v8::Isolate::UseCounterFeature::kLocaleInfoFunctions);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.getCalendars");
+@@ -803,7 +860,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.getCollations
+-BUILTIN(LocalePrototypeGetCollations) {
++INTL_BUILTIN(LocalePrototypeGetCollations) {
+   HandleScope scope(isolate);
+   isolate->CountUsage(v8::Isolate::UseCounterFeature::kLocaleInfoFunctions);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.getCollations");
+@@ -811,7 +868,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.getHourCycles
+-BUILTIN(LocalePrototypeGetHourCycles) {
++INTL_BUILTIN(LocalePrototypeGetHourCycles) {
+   HandleScope scope(isolate);
+   isolate->CountUsage(v8::Isolate::UseCounterFeature::kLocaleInfoFunctions);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.getHourCycles");
+@@ -819,7 +876,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.getNumberingSystems
+-BUILTIN(LocalePrototypeGetNumberingSystems) {
++INTL_BUILTIN(LocalePrototypeGetNumberingSystems) {
+   HandleScope scope(isolate);
+   isolate->CountUsage(v8::Isolate::UseCounterFeature::kLocaleInfoFunctions);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.getNumberingSystems");
+@@ -828,7 +885,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.getTextInfo
+-BUILTIN(LocalePrototypeGetTextInfo) {
++INTL_BUILTIN(LocalePrototypeGetTextInfo) {
+   HandleScope scope(isolate);
+   isolate->CountUsage(v8::Isolate::UseCounterFeature::kLocaleInfoFunctions);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.getTextInfo");
+@@ -836,7 +893,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.getTimeZones
+-BUILTIN(LocalePrototypeGetTimeZones) {
++INTL_BUILTIN(LocalePrototypeGetTimeZones) {
+   HandleScope scope(isolate);
+   isolate->CountUsage(v8::Isolate::UseCounterFeature::kLocaleInfoFunctions);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.getTimeZones");
+@@ -844,7 +901,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.getWeekInfo
+-BUILTIN(LocalePrototypeGetWeekInfo) {
++INTL_BUILTIN(LocalePrototypeGetWeekInfo) {
+   HandleScope scope(isolate);
+   isolate->CountUsage(v8::Isolate::UseCounterFeature::kLocaleInfoFunctions);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.getWeekInfo");
+@@ -852,7 +909,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.RelativeTimeFormat.supportedlocalesof
+-BUILTIN(RelativeTimeFormatSupportedLocalesOf) {
++INTL_BUILTIN(RelativeTimeFormatSupportedLocalesOf) {
+   HandleScope scope(isolate);
+   DirectHandle<Object> locales = args.atOrUndefined(isolate, 1);
+   DirectHandle<Object> options = args.atOrUndefined(isolate, 2);
+@@ -865,7 +922,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.RelativeTimeFormat.prototype.format
+-BUILTIN(RelativeTimeFormatPrototypeFormat) {
++INTL_BUILTIN(RelativeTimeFormatPrototypeFormat) {
+   HandleScope scope(isolate);
+   // 1. Let relativeTimeFormat be the this value.
+   // 2. If Type(relativeTimeFormat) is not Object or relativeTimeFormat does not
+@@ -882,7 +939,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.RelativeTimeFormat.prototype.formatToParts
+-BUILTIN(RelativeTimeFormatPrototypeFormatToParts) {
++INTL_BUILTIN(RelativeTimeFormatPrototypeFormatToParts) {
+   HandleScope scope(isolate);
+   // 1. Let relativeTimeFormat be the this value.
+   // 2. If Type(relativeTimeFormat) is not Object or relativeTimeFormat does not
+@@ -898,7 +955,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.language
+-BUILTIN(LocalePrototypeLanguage) {
++INTL_BUILTIN(LocalePrototypeLanguage) {
+   HandleScope scope(isolate);
+   // CHECK_RECEIVER will case locale_holder to JSLocale.
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.language");
+@@ -907,7 +964,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.script
+-BUILTIN(LocalePrototypeScript) {
++INTL_BUILTIN(LocalePrototypeScript) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.script");
+ 
+@@ -915,7 +972,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.region
+-BUILTIN(LocalePrototypeRegion) {
++INTL_BUILTIN(LocalePrototypeRegion) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.region");
+ 
+@@ -923,7 +980,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.variants
+-BUILTIN(LocalePrototypeVariants) {
++INTL_BUILTIN(LocalePrototypeVariants) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.variants");
+ 
+@@ -931,7 +988,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.baseName
+-BUILTIN(LocalePrototypeBaseName) {
++INTL_BUILTIN(LocalePrototypeBaseName) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.baseName");
+ 
+@@ -939,7 +996,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.calendar
+-BUILTIN(LocalePrototypeCalendar) {
++INTL_BUILTIN(LocalePrototypeCalendar) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.calendar");
+ 
+@@ -947,7 +1004,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.caseFirst
+-BUILTIN(LocalePrototypeCaseFirst) {
++INTL_BUILTIN(LocalePrototypeCaseFirst) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.caseFirst");
+ 
+@@ -955,7 +1012,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.collation
+-BUILTIN(LocalePrototypeCollation) {
++INTL_BUILTIN(LocalePrototypeCollation) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.collation");
+ 
+@@ -963,7 +1020,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.firstDayOfWeek
+-BUILTIN(LocalePrototypeFirstDayOfWeek) {
++INTL_BUILTIN(LocalePrototypeFirstDayOfWeek) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.firstDayOfWeek");
+ 
+@@ -971,7 +1028,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.hourCycle
+-BUILTIN(LocalePrototypeHourCycle) {
++INTL_BUILTIN(LocalePrototypeHourCycle) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.hourCycle");
+ 
+@@ -979,7 +1036,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.numeric
+-BUILTIN(LocalePrototypeNumeric) {
++INTL_BUILTIN(LocalePrototypeNumeric) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.numeric");
+ 
+@@ -987,7 +1044,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.numberingSystem
+-BUILTIN(LocalePrototypeNumberingSystem) {
++INTL_BUILTIN(LocalePrototypeNumberingSystem) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.numberingSystem");
+ 
+@@ -995,7 +1052,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-Intl.Locale.prototype.toString
+-BUILTIN(LocalePrototypeToString) {
++INTL_BUILTIN(LocalePrototypeToString) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSLocale, locale, "Intl.Locale.prototype.toString");
+ 
+@@ -1003,7 +1060,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.RelativeTimeFormat.constructor
+-BUILTIN(RelativeTimeFormatConstructor) {
++INTL_BUILTIN(RelativeTimeFormatConstructor) {
+   HandleScope scope(isolate);
+ 
+   return DisallowCallConstructor<JSRelativeTimeFormat>(
+@@ -1012,7 +1069,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.RelativeTimeFormat.prototype.resolvedOptions
+-BUILTIN(RelativeTimeFormatPrototypeResolvedOptions) {
++INTL_BUILTIN(RelativeTimeFormatPrototypeResolvedOptions) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSRelativeTimeFormat, format_holder,
+                  "Intl.RelativeTimeFormat.prototype.resolvedOptions");
+@@ -1042,7 +1099,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sup-string.prototype.tolocaleuppercase
+-BUILTIN(StringPrototypeToLocaleUpperCase) {
++INTL_BUILTIN(StringPrototypeToLocaleUpperCase) {
+   HandleScope scope(isolate);
+   DirectHandle<Object> maybe_locale = args.atOrUndefined(isolate, 1);
+   TO_THIS_STRING(string, "String.prototype.toLocaleUpperCase");
+@@ -1056,7 +1113,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.pluralrules
+-BUILTIN(PluralRulesConstructor) {
++INTL_BUILTIN(PluralRulesConstructor) {
+   HandleScope scope(isolate);
+ 
+   return DisallowCallConstructor<JSPluralRules>(
+@@ -1065,7 +1122,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.pluralrules.prototype.resolvedoptions
+-BUILTIN(PluralRulesPrototypeResolvedOptions) {
++INTL_BUILTIN(PluralRulesPrototypeResolvedOptions) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSPluralRules, plural_rules_holder,
+                  "Intl.PluralRules.prototype.resolvedOptions");
+@@ -1073,7 +1130,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.pluralrules.prototype.select
+-BUILTIN(PluralRulesPrototypeSelect) {
++INTL_BUILTIN(PluralRulesPrototypeSelect) {
+   HandleScope scope(isolate);
+ 
+   // 1. 1. Let pr be the this value.
+@@ -1093,7 +1150,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.pluralrules.prototype.selectrange
+-BUILTIN(PluralRulesPrototypeSelectRange) {
++INTL_BUILTIN(PluralRulesPrototypeSelectRange) {
+   HandleScope scope(isolate);
+ 
+   // 1. Let pr be the this value.
+@@ -1144,7 +1201,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.pluralrules.supportedlocalesof
+-BUILTIN(PluralRulesSupportedLocalesOf) {
++INTL_BUILTIN(PluralRulesSupportedLocalesOf) {
+   HandleScope scope(isolate);
+   DirectHandle<Object> locales = args.atOrUndefined(isolate, 1);
+   DirectHandle<Object> options = args.atOrUndefined(isolate, 2);
+@@ -1156,7 +1213,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.collator
+-BUILTIN(CollatorConstructor) {
++INTL_BUILTIN(CollatorConstructor) {
+   HandleScope scope(isolate);
+ 
+   isolate->CountUsage(v8::Isolate::UseCounterFeature::kCollator);
+@@ -1165,7 +1222,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.collator.prototype.resolvedoptions
+-BUILTIN(CollatorPrototypeResolvedOptions) {
++INTL_BUILTIN(CollatorPrototypeResolvedOptions) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSCollator, collator_holder,
+                  "Intl.Collator.prototype.resolvedOptions");
+@@ -1173,7 +1230,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.collator.supportedlocalesof
+-BUILTIN(CollatorSupportedLocalesOf) {
++INTL_BUILTIN(CollatorSupportedLocalesOf) {
+   HandleScope scope(isolate);
+   DirectHandle<Object> locales = args.atOrUndefined(isolate, 1);
+   DirectHandle<Object> options = args.atOrUndefined(isolate, 2);
+@@ -1185,7 +1242,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.collator.prototype.compare
+-BUILTIN(CollatorPrototypeCompare) {
++INTL_BUILTIN(CollatorPrototypeCompare) {
+   const char* const method_name = "get Intl.Collator.prototype.compare";
+   HandleScope scope(isolate);
+ 
+@@ -1214,7 +1271,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-collator-compare-functions
+-BUILTIN(CollatorInternalCompare) {
++INTL_BUILTIN(CollatorInternalCompare) {
+   HandleScope scope(isolate);
+   DirectHandle<Context> context(isolate->context(), isolate);
+ 
+@@ -1252,7 +1309,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-%segmentiteratorprototype%.next
+-BUILTIN(SegmentIteratorPrototypeNext) {
++INTL_BUILTIN(SegmentIteratorPrototypeNext) {
+   const char* const method_name = "%SegmentIterator.prototype%.next";
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSSegmentIterator, segment_iterator, method_name);
+@@ -1262,7 +1319,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.segmenter
+-BUILTIN(SegmenterConstructor) {
++INTL_BUILTIN(SegmenterConstructor) {
+   HandleScope scope(isolate);
+ 
+   return DisallowCallConstructor<JSSegmenter>(
+@@ -1271,7 +1328,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.segmenter.supportedlocalesof
+-BUILTIN(SegmenterSupportedLocalesOf) {
++INTL_BUILTIN(SegmenterSupportedLocalesOf) {
+   HandleScope scope(isolate);
+   DirectHandle<Object> locales = args.atOrUndefined(isolate, 1);
+   DirectHandle<Object> options = args.atOrUndefined(isolate, 2);
+@@ -1283,7 +1340,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.segmenter.prototype.resolvedoptions
+-BUILTIN(SegmenterPrototypeResolvedOptions) {
++INTL_BUILTIN(SegmenterPrototypeResolvedOptions) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSSegmenter, segmenter,
+                  "Intl.Segmenter.prototype.resolvedOptions");
+@@ -1291,7 +1348,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-intl.segmenter.prototype.segment
+-BUILTIN(SegmenterPrototypeSegment) {
++INTL_BUILTIN(SegmenterPrototypeSegment) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSSegmenter, segmenter, "Intl.Segmenter.prototype.segment");
+   Handle<Object> input_text = args.atOrUndefined(isolate, 1);
+@@ -1306,7 +1363,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-%segmentsprototype%.containing
+-BUILTIN(SegmentsPrototypeContaining) {
++INTL_BUILTIN(SegmentsPrototypeContaining) {
+   const char* const method_name = "%Segments.prototype%.containing";
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSSegments, segments, method_name);
+@@ -1322,7 +1379,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-%segmentsprototype%-@@iterator
+-BUILTIN(SegmentsPrototypeIterator) {
++INTL_BUILTIN(SegmentsPrototypeIterator) {
+   const char* const method_name = "%SegmentIsPrototype%[@@iterator]";
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSSegments, segments, method_name);
+@@ -1336,21 +1393,21 @@
+                    *iterator_with_text->iterator(), segments->granularity()));
+ }
+ 
+-BUILTIN(V8BreakIteratorConstructor) {
++INTL_BUILTIN(V8BreakIteratorConstructor) {
+   HandleScope scope(isolate);
+ 
+   return CallOrConstructConstructor<JSV8BreakIterator>(args, isolate,
+                                                        "Intl.v8BreakIterator");
+ }
+ 
+-BUILTIN(V8BreakIteratorPrototypeResolvedOptions) {
++INTL_BUILTIN(V8BreakIteratorPrototypeResolvedOptions) {
+   HandleScope scope(isolate);
+   CHECK_RECEIVER(JSV8BreakIterator, break_iterator,
+                  "Intl.v8BreakIterator.prototype.resolvedOptions");
+   return *JSV8BreakIterator::ResolvedOptions(isolate, break_iterator);
+ }
+ 
+-BUILTIN(V8BreakIteratorPrototypeAdoptText) {
++INTL_BUILTIN(V8BreakIteratorPrototypeAdoptText) {
+   const char* const method_name =
+       "get Intl.v8BreakIterator.prototype.adoptText";
+   HandleScope scope(isolate);
+@@ -1370,7 +1427,7 @@
+   return *new_bound_adopt_text_function;
+ }
+ 
+-BUILTIN(V8BreakIteratorInternalAdoptText) {
++INTL_BUILTIN(V8BreakIteratorInternalAdoptText) {
+   HandleScope scope(isolate);
+   DirectHandle<Context> context(isolate->context(), isolate);
+ 
+@@ -1388,7 +1445,7 @@
+   return ReadOnlyRoots(isolate).undefined_value();
+ }
+ 
+-BUILTIN(V8BreakIteratorPrototypeFirst) {
++INTL_BUILTIN(V8BreakIteratorPrototypeFirst) {
+   const char* const method_name = "get Intl.v8BreakIterator.prototype.first";
+   HandleScope scope(isolate);
+ 
+@@ -1406,7 +1463,7 @@
+   return *new_bound_first_function;
+ }
+ 
+-BUILTIN(V8BreakIteratorInternalFirst) {
++INTL_BUILTIN(V8BreakIteratorInternalFirst) {
+   HandleScope scope(isolate);
+   DirectHandle<Context> context(isolate->context(), isolate);
+ 
+@@ -1418,7 +1475,7 @@
+   return *JSV8BreakIterator::First(isolate, break_iterator);
+ }
+ 
+-BUILTIN(V8BreakIteratorPrototypeNext) {
++INTL_BUILTIN(V8BreakIteratorPrototypeNext) {
+   const char* const method_name = "get Intl.v8BreakIterator.prototype.next";
+   HandleScope scope(isolate);
+ 
+@@ -1436,7 +1493,7 @@
+   return *new_bound_next_function;
+ }
+ 
+-BUILTIN(V8BreakIteratorInternalNext) {
++INTL_BUILTIN(V8BreakIteratorInternalNext) {
+   HandleScope scope(isolate);
+   DirectHandle<Context> context(isolate->context(), isolate);
+ 
+@@ -1447,7 +1504,7 @@
+   return *JSV8BreakIterator::Next(isolate, break_iterator);
+ }
+ 
+-BUILTIN(V8BreakIteratorPrototypeCurrent) {
++INTL_BUILTIN(V8BreakIteratorPrototypeCurrent) {
+   const char* const method_name = "get Intl.v8BreakIterator.prototype.current";
+   HandleScope scope(isolate);
+ 
+@@ -1465,7 +1522,7 @@
+   return *new_bound_current_function;
+ }
+ 
+-BUILTIN(V8BreakIteratorInternalCurrent) {
++INTL_BUILTIN(V8BreakIteratorInternalCurrent) {
+   HandleScope scope(isolate);
+   DirectHandle<Context> context(isolate->context(), isolate);
+ 
+@@ -1476,7 +1533,7 @@
+   return *JSV8BreakIterator::Current(isolate, break_iterator);
+ }
+ 
+-BUILTIN(V8BreakIteratorPrototypeBreakType) {
++INTL_BUILTIN(V8BreakIteratorPrototypeBreakType) {
+   const char* const method_name =
+       "get Intl.v8BreakIterator.prototype.breakType";
+   HandleScope scope(isolate);
+@@ -1496,7 +1553,7 @@
+   return *new_bound_break_type_function;
+ }
+ 
+-BUILTIN(V8BreakIteratorInternalBreakType) {
++INTL_BUILTIN(V8BreakIteratorInternalBreakType) {
+   HandleScope scope(isolate);
+   DirectHandle<Context> context(isolate->context(), isolate);
+ 
+diff --git a/src/runtime/runtime-intl.cc b/src/runtime/runtime-intl.cc
+--- a/src/runtime/runtime-intl.cc
++++ b/src/runtime/runtime-intl.cc
+@@ -19,11 +19,68 @@
+ #include "src/objects/js-plural-rules-inl.h"
+ #include "src/runtime/runtime-utils.h"
+ 
++// Process-wide Intl state and the embedder's allocator. The Intl implementation
++// keeps process-wide containers that it fills lazily from whichever isolate
++// first needs an entry: the available-locale sets, the calendar, date format
++// and pattern generator caches, the unit factory, the currency list. An
++// embedder that gives each isolate its own allocation arena, unaddressable
++// from other isolates, needs those entries placed elsewhere: it defines the
++// two functions below (both or neither), and every Intl builtin and runtime
++// function then runs between an enter and the matching leave, so that all
++// of its allocations go where the embedder puts memory shared by every
++// isolate. The token the enter returns is handed back to the leave.
++#if defined(__GNUC__) || defined(__clang__)
++extern "C" {
++uintptr_t v8_intl_shared_allocation_enter() __attribute__((weak));
++void v8_intl_shared_allocation_leave(uintptr_t token) __attribute__((weak));
++}
++#define V8_HAS_INTL_SHARED_ALLOCATION_HOOKS 1
++#endif
++
+ namespace v8 {
+ namespace internal {
+ 
++namespace {
++// Enters the embedder's shared-allocation state for the lifetime of the
++// scope, when the embedder provides it (see the hooks above).
++class IntlSharedAllocationScope final {
++ public:
++  IntlSharedAllocationScope() {
++#ifdef V8_HAS_INTL_SHARED_ALLOCATION_HOOKS
++    if (v8_intl_shared_allocation_enter != nullptr) {
++      token_ = v8_intl_shared_allocation_enter();
++      active_ = true;
++    }
++#endif
++  }
++  ~IntlSharedAllocationScope() {
++#ifdef V8_HAS_INTL_SHARED_ALLOCATION_HOOKS
++    if (active_) v8_intl_shared_allocation_leave(token_);
++#endif
++  }
++  IntlSharedAllocationScope(const IntlSharedAllocationScope&) = delete;
++  IntlSharedAllocationScope& operator=(const IntlSharedAllocationScope&) =
++      delete;
++
++ private:
++  uintptr_t token_ = 0;
++  bool active_ = false;
++};
++}  // namespace
++
++// A runtime function whose body runs inside an IntlSharedAllocationScope.
++#define INTL_RUNTIME_FUNCTION(Name)                                        \
++  static Tagged<Object> RuntimeIntlBody_##Name(RuntimeArguments args,      \
++                                               Isolate* isolate);          \
++  RUNTIME_FUNCTION(Name) {                                                 \
++    IntlSharedAllocationScope shared_allocation;                           \
++    return RuntimeIntlBody_##Name(args, isolate);                          \
++  }                                                                        \
++  static Tagged<Object> RuntimeIntlBody_##Name(RuntimeArguments args,      \
++                                               Isolate* isolate)
++
+ // https://tc39.es/ecma402/#sec-formatlist
+-RUNTIME_FUNCTION(Runtime_FormatList) {
++INTL_RUNTIME_FUNCTION(Runtime_FormatList) {
+   HandleScope scope(isolate);
+   DCHECK_EQ(2, args.length());
+   DirectHandle<JSListFormat> list_format = args.at<JSListFormat>(0);
+@@ -33,7 +90,7 @@
+ }
+ 
+ // https://tc39.es/ecma402/#sec-formatlisttoparts
+-RUNTIME_FUNCTION(Runtime_FormatListToParts) {
++INTL_RUNTIME_FUNCTION(Runtime_FormatListToParts) {
+   HandleScope scope(isolate);
+   DCHECK_EQ(2, args.length());
+   DirectHandle<JSListFormat> list_format = args.at<JSListFormat>(0);
+@@ -42,7 +99,7 @@
+       isolate, JSListFormat::FormatListToParts(isolate, list_format, list));
+ }
+ 
+-RUNTIME_FUNCTION(Runtime_StringToLowerCaseIntl) {
++INTL_RUNTIME_FUNCTION(Runtime_StringToLowerCaseIntl) {
+   HandleScope scope(isolate);
+   DCHECK_EQ(args.length(), 1);
+   Handle<String> s = args.at<String>(0);
+@@ -50,7 +107,7 @@
+   RETURN_RESULT_OR_FAILURE(isolate, Intl::ConvertToLower(isolate, s));
+ }
+ 
+-RUNTIME_FUNCTION(Runtime_StringToUpperCaseIntl) {
++INTL_RUNTIME_FUNCTION(Runtime_StringToUpperCaseIntl) {
+   HandleScope scope(isolate);
+   DCHECK_EQ(args.length(), 1);
+   Handle<String> s = args.at<String>(0);
+@@ -58,7 +115,7 @@
+   RETURN_RESULT_OR_FAILURE(isolate, Intl::ConvertToUpper(isolate, s));
+ }
+ 
+-RUNTIME_FUNCTION(Runtime_StringToLocaleLowerCase) {
++INTL_RUNTIME_FUNCTION(Runtime_StringToLocaleLowerCase) {
+   HandleScope scope(isolate);
+   DCHECK_EQ(args.length(), 2);
+   DirectHandle<String> s = args.at<String>(0);

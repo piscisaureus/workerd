@@ -182,12 +182,18 @@ class WorkerEntrypoint::ResponseSentTracker final: public kj::HttpService::Respo
         "workerd", "WorkerEntrypoint::ResponseSentTracker::send()", "statusCode", statusCode);
     sent = true;
     httpResponseStatus = statusCode;
+    // The response is sent from this worker's turn, on its heap arena, to a response object the
+    // caller owns; what sending creates -- the copy of the headers, the body stream -- the caller
+    // reads, which for a service binding is another isolate's turn, so it goes in the shared
+    // heap.
+    jsg::SharedHeapScope sharedHeap;
     return inner.send(statusCode, statusText, headers, expectedBodySize);
   }
 
   kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
     TRACE_EVENT("workerd", "WorkerEntrypoint::ResponseSentTracker::acceptWebSocket()");
     sent = true;
+    jsg::SharedHeapScope sharedHeap;  // see send()
     return inner.acceptWebSocket(headers);
   }
 

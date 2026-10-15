@@ -196,13 +196,13 @@ class ArenaPageAllocator final: public v8::PageAllocator {
 // arena releases the reservation. The page allocator lives as long as the arena, as
 // v8::IsolateGroup::CreateParams::page_allocator requires.
 //
-// An arena that held a heap arena is never released: destroying a GuestArena then retains the
-// reservation, the page allocators and the jemalloc arena for the life of the process, mapped
-// to the host and addressable from no later isolate's guest execution. Objects allocated under
-// the isolate's lock can outlive the isolate -- a cached string, a promise node, and in
-// particular the storage of process-wide registries that the thread happened to grow while on
-// the isolate's arena (V8's wasm type canonicalizer, for one) -- and the process keeps reading
-// and eventually freeing them, which needs the memory mapped and the jemalloc arena alive.
+// Destroying the arena destroys its heap arena first, which discards whatever is still
+// allocated there, and then releases the reservation and its page-table slot for later arenas.
+// Nothing may refer to memory allocated under the isolate's lock by then: the isolate's own
+// objects die with it, and what a turn allocates for the process or for other isolates goes to
+// the shared heap (see SharedHeapScope in heap-arena.h and its uses). A process-wide registry
+// that V8 grows from under the lock without such a scope (its wasm type canonicalizer, for one)
+// is not covered, and keeps pointing into the released arena.
 class WD_MEMORY_CLASS_HOST GuestArena final {
  public:
   // Takes ownership of `arena`, which must have been created by gk_arena_create().

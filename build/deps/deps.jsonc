@@ -45,7 +45,8 @@
       "extra_strip_prefix": "/c++",
       "patches": [
         "//:patches/capnp-cpp/0001-Start-the-symbolizer-subprocess-without-throwing.patch",
-        "//:patches/capnp-cpp/0002-Expose-the-disposer-of-an-Own.patch"
+        "//:patches/capnp-cpp/0002-Expose-the-disposer-of-an-Own.patch",
+        "//:patches/capnp-cpp/0003-Add-EventLoop-GuardedArmScope.patch"
       ]
     },
     // We want to avoid version skew with v8, so we use identical versions. Keep this
