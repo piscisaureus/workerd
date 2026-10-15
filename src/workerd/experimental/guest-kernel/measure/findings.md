@@ -23,6 +23,15 @@ below is from an optimized build (`bazel build -c opt
 //src/workerd/server:workerd`) of the current tree. Build configuration turns
 out to matter a great deal; the last section says why.
 
+The CPU's speculative-execution mitigations were all at their defaults, which
+on this machine means the VMSCAPE mitigation is **on**
+(`/sys/devices/system/cpu/vulnerabilities/vmscape`). That one matters to any
+comparison involving the guest kernel, because its cost falls on guest-host
+transitions, which is the side of the ledger the guest kernel pays. Check that
+file before trusting a repeat of these numbers: a run with the mitigation
+disabled flatters the guest kernel for a reason no deployment can rely on, and
+the figures here would not be comparable to it.
+
 ## Method
 
 A tenant is one worker with its own V8 isolate. The arrangements are:
