@@ -12,6 +12,7 @@
 #include <workerd/jsg/observer.h>
 #include <workerd/jsg/util.h>
 #include <workerd/util/batch-queue.h>
+#include <workerd/util/memory-class.h>
 #include <workerd/util/strong-bool.h>
 
 #include <v8-platform.h>
@@ -50,7 +51,7 @@ kj::Own<v8::Platform> defaultPlatform(uint backgroundThreadCount);
 // In order to use any part of the JSG API, you must first construct a V8System. You can only
 // construct one of these per process. This performs process-wide initialization of the V8
 // library.
-class V8System {
+class WD_MEMORY_CLASS_HOST V8System {
   using PumpMsgLoopType = kj::Function<bool(v8::Isolate*)>;
   using ShutdownIsolateType = kj::Function<void(v8::Isolate*)>;
 
@@ -191,7 +192,7 @@ class ArenaPageAllocator final: public v8::PageAllocator {
 // group's sandbox and, on teardown, decommits inside it but never unmaps it; destroying the
 // arena releases the reservation. The page allocator lives as long as the arena, as
 // v8::IsolateGroup::CreateParams::page_allocator requires.
-class GuestArena final {
+class WD_MEMORY_CLASS_HOST GuestArena final {
  public:
   // Takes ownership of `arena`, which must have been created by gk_arena_create().
   explicit GuestArena(gk_arena* arena);

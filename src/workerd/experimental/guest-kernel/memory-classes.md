@@ -122,12 +122,36 @@ Three layers, each catching what the one before cannot.
 1. **Placement.** The allocator decides the class in practice: an I object has
    to come from the isolate's arena and an H object from memory no arena maps.
    Per-isolate heap arenas are the mechanism (`jsg::HeapArena`).
-2. **A static check.** The classes are a type-level property, so an H class
-   with an I-class member, or an I class holding a `kj::Own` of an H class, is
-   a compile-time error rather than a fault in production. workerd already
-   carries custom clang-tidy checks of this shape in `tools/clang-tidy`
-   (`jsg-visit-for-gc`, `workerd-unsafe-continuation-capture`), so the
-   infrastructure for one more exists.
+2. **A static check.** The classes are a type-level property, so the
+   clang-tidy check `workerd-memory-class` (`tools/clang-tidy/memory-class.c++`)
+   makes an H class with an I-class member, or an I class holding a `kj::Own`
+   of an H class, a lint error rather than a fault in production. A class opts
+   in by carrying one of `WD_MEMORY_CLASS_HOST`, `WD_MEMORY_CLASS_ISOLATE` or
+   `WD_MEMORY_CLASS_BOUNDARY` (`src/workerd/util/memory-class.h`) between the
+   class-key and its name, as in `class WD_MEMORY_CLASS_HOST V8System`; the
+   annotation compiles to nothing. For an annotated class the check examines
+   every non-static data member and base class, through typedefs, references
+   and the `kj::Own`, `kj::Arc`, `kj::Rc`, `kj::Maybe`, `kj::Array`,
+   `kj::Vector` and `kj::OneOf` wrappers, and rejects:
+   - in an H class, an I class by value, pointer or reference, or any of the
+     R2 handle types `v8::Global`, `v8::TracedReference`, `jsg::Data`,
+     `jsg::V8Ref`, `jsg::Value`, `jsg::JsRef`, `jsg::Ref`, `jsg::Promise`,
+     `jsg::Function` and `jsg::JsContext`;
+   - in an I class, an H class by value, pointer, reference or ownership, or
+     any of the R3 primitives `kj::Promise`, `kj::ForkedPromise`,
+     `kj::TaskSet`, `kj::PromiseFulfiller`, `kj::Canceler`, `kj::MutexGuarded`
+     and `kj::Executor`;
+   - in a B class, anything but integers, enums, bools, floating-point values,
+     arrays of those and other B classes: no pointer, reference, vtable or
+     non-trivial destructor, and the B class itself is not polymorphic.
+
+   Unannotated classes are not examined, so adoption is per class: a class is
+   annotated once it passes, and a class that needs a split (see the
+   inventories below) stays unannotated until it is split. The check decides
+   by type alone. It does not see provenance, a pointer laundered through an
+   integer, a static data member (which lives in process memory whatever its
+   class says), or a crossing made through a method rather than a member;
+   those are what measurement is for.
 3. **Measurement.** `GK_TRACE_FOREIGN` (on the `guest-kernel-trace` branch)
    records every ring-3 access to memory outside the arena, with the faulting
    RIP. Any access to an address in H memory is a violation of the

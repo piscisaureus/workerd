@@ -5,6 +5,7 @@
 
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/setup.h>
+#include <workerd/util/memory-class.h>
 
 #include <kj/function.h>
 
@@ -85,7 +86,7 @@ namespace _ {  // private
 // the length clamped host-side -- from which the host constructs a new kj::Exception. No
 // kj::String, disposer, context chain or detail array crosses the boundary; the exception's
 // context chain, details, trace and origin file:line are therefore lost, which is accepted.
-struct GuestTurnOutcome {
+struct WD_MEMORY_CLASS_BOUNDARY GuestTurnOutcome {
   enum Status : uint32_t {
     // The trampoline has not completed; a record read with this status is an error.
     INCOMPLETE = 0,

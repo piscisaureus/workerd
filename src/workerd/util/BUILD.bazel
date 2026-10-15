@@ -133,6 +133,12 @@ wd_cc_library(
 )
 
 wd_cc_library(
+    name = "memory-class",
+    hdrs = ["memory-class.h"],
+    visibility = ["//visibility:public"],
+)
+
+wd_cc_library(
     name = "checked-queue",
     hdrs = ["checked-queue.h"],
     visibility = ["//visibility:public"],

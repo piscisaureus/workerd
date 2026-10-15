@@ -4,13 +4,15 @@
 
 #pragma once
 
+#include <workerd/util/memory-class.h>
+
 #include <v8-platform.h>
 
 #include <kj/common.h>
 
 namespace workerd::jsg {
 
-class V8PlatformWrapper: public v8::Platform {
+class WD_MEMORY_CLASS_HOST V8PlatformWrapper: public v8::Platform {
  public:
   explicit V8PlatformWrapper(v8::Platform& inner): inner(inner) {}
 

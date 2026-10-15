@@ -262,12 +262,14 @@ decides the overall cost.
   until those accesses become messages. Moving the malloc'd objects into the
   arena needs a per-isolate allocator arena, which means an allocator with
   extent hooks; workerd uses tcmalloc, which has none.
-- **No memory classification for runtime objects yet.** Which side of the
-  boundary each runtime C++ class belongs on is written down in
-  `memory-classes.md`, together with the rules that decide it, the splits the
-  classes that straddle need, and the places the code violates it today. The
-  classification is not enforced: nothing in the build checks it, and the
-  allocator does not yet place objects by it.
+- **The memory classification of runtime objects is applied to few of
+  them.** Which side of the boundary each runtime C++ class belongs on is
+  written down in `memory-classes.md`, together with the rules that decide
+  it, the splits the classes that straddle need, and the places the code
+  violates it today. The clang-tidy check `workerd-memory-class` enforces it
+  for the classes that carry a `WD_MEMORY_CLASS_*` annotation
+  (`src/workerd/util/memory-class.h`), which is a handful so far; every other
+  class is unchecked, and the allocator does not yet place objects by class.
 - **The host acts on data a ring-3 turn can write.** The runtime's heap is in
   the guest's address space, so every host-side structure the guest can reach
   is attacker-controlled input to the host, and the dangerous cases are the
