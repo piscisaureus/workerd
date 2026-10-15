@@ -44,6 +44,12 @@ isolate's JS turn at guest ring 3.
   for one longer than a hostcall frame), address working Durable Objects, and
   that a forged id is refused and a ring-3 read of the key faults at the
   address read.
+- `wasm-signal-test.sh` / `wasm-signal-test.capnp` / `wasm-signal-test.js` /
+  `signal.wasm` — end-to-end check against a built workerd that the Wasm
+  shutdown signal, written from a CPU-time timer's signal handler, reaches a
+  module whose JS turn runs at guest ring 3, and that a turn overwriting the
+  module's heap descriptor with a buffer of its choosing leaves the signal
+  landing in the module's real memory and the chosen buffer untouched.
 
 ## API
 
@@ -69,6 +75,11 @@ void  gk_host_slot_free(gk_host_handle);
 int   gk_hostcall_register(unsigned idx, gk_hostcall_fn, void *ctx); // a host handler the guest may call
 gk_hostcall_frame *gk_hostcall_region(void); // the thread's exchange frame: args in, result out
 long  gk_hostcall(unsigned idx);             // call handler idx synchronously (one VM exit)
+
+int   gk_signal_field_register(uintptr_t off, size_t len, uint32_t field, unsigned kind,
+                               gk_signal_handle *h); // a word in the thread's arena a signal handler may write
+int   gk_signal_field_unregister(gk_signal_handle);
+long  gk_signal_field_write(unsigned kind, uint32_t value); // from a signal handler: no lock, no allocation
 ```
 
 `gk_run` returns `fn`'s return value, or `GK_EFAULT` if the guest took an
@@ -240,6 +251,55 @@ hardware:
   every handler is an attack surface that validates its own inputs, and a
   handle swapped for another live tenant's is one it cannot tell from the
   owner's own.
+- **Signal fields.** A runtime that tells a Wasm module its CPU budget is
+  nearly spent does so by writing a constant into the module's linear memory
+  from the handler of a per-thread CPU timer, while the turn runs. The
+  handler can take no lock and allocate nothing, and a descriptor it reads
+  from the ordinary heap -- a pointer and a size the isolate can rewrite --
+  makes it an arbitrary write of a known constant, triggered by burning CPU.
+  `gk_signal_field_register` keeps the descriptor in a fixed table
+  (`GK_SIGNAL_FIELDS`, 8192 entries) in the supervisor control block instead:
+  it is called host-side (from a hostcall handler, in workerd) for the
+  calling thread's active arena, which it takes from gk's record of the
+  thread and never from the caller, with the buffer named by its offset
+  within that arena and its length and the field by its offset within the
+  buffer, and it refuses, with nothing recorded, a buffer outside the arena,
+  a field outside the buffer, any sum that overflows, a bad kind, a thread
+  with no arena and a full table. What it keeps is the field's absolute
+  address, its arena and its kind, under a handle validated like a host
+  slot's, which `gk_signal_field_unregister` accepts only from a thread whose
+  active arena is the field's. `gk_signal_field_write` is the signal-handler
+  side: it finds the thread's record by kernel tid (the thread-local index
+  is a hint it verifies and otherwise ignores), takes the arena from the
+  record, walks that arena's entries without a lock, bounds-checks each
+  address against the arena again and writes the value, reading nothing the
+  guest can write and allocating nothing; the entries are published with
+  their gate flag stored last and retired with it cleared first, so a walk
+  that interrupts a registration or an unregistration on the same thread --
+  the only thread that mutates that arena's entries, since it holds the
+  isolate's lock -- sees either the complete entry or none. Destroying an
+  arena drops its fields. The test registers a field from ring 3 through a
+  hostcall handler and writes it from the host and from a `SIGUSR1` handler
+  the guest raises at itself mid-turn, feeds the handler a buffer past the
+  arena, one past its end, a field at the buffer's end and three bytes short
+  of it, a length that wraps, a buffer too short and a kind past the limit
+  and sees each refused with the count unchanged, sees an unregister refused
+  from another arena, from no arena and for garbage handles, fills the table
+  and empties it, sees a destroyed arena drop its field, shows a ring-3 read
+  and write of the table faulting, times the write -- **about 60 ns** with
+  eight fields registered, 50 with one, on the test machine, most of it the
+  `gettid` that validates the thread record -- and runs 20000
+  register/read/unregister rounds from ring 3 and 20000 from the host under a
+  100 us CPU-time timer whose handler writes the fields, with every read
+  consistent. The guard build runs the write path with allocation forbidden.
+  In workerd, `TrackedWasmInstanceList` (`io/tracked-wasm-instance.h`)
+  registers each module's fields through the `WASM_SIGNAL` hostcall from the
+  turn that instantiates it, and its signal-handler entry points call
+  `gk_signal_field_write` when `gk_initialized()` says the guest kernel is on
+  -- a word in supervisor memory, not a heap flag a turn could flip to send
+  the writer back to the heap list, which is what the writers walk without
+  the guest kernel. `wasm-signal-test.sh` shows the signal reaching a module
+  at ring 3 and not reaching a buffer the turn aimed the heap entry at.
 - **Threads as vCPUs.** Each host thread that enters the guest gets its own
   vCPU, stack and TLS base, sharing the VM and memory. Four threads run in the
   guest concurrently, and two threads each locked into their own arena run at
@@ -412,7 +472,11 @@ rare enough to pay for an exit each time.
   readers, which are synchronous to JS, reach it through a hostcall (see
   "Hostcalls" above): the HMAC runs host-side inside the turn, on a key the
   turn cannot read, with the random half of a unique id drawn from the
-  host-memory buffer in the same call.
+  host-memory buffer in the same call. The descriptor the Wasm shutdown
+  signal's handler writes through is in gk's signal field table (see
+  "Signal fields" above), registered through a hostcall and found through
+  gk's record of the thread rather than through the heap entry or a
+  thread-local.
   What a rewritten handle can still do is name another live host slot: the
   table turns "any address" into "one of the live tenants", and telling a
   legitimate use from a swapped one is an ownership question the table cannot
@@ -429,9 +493,9 @@ rare enough to pay for an exit each time.
   (`src/workerd/util/memory-class.h`), which is a handful so far; every other
   class is unchecked. Placement by class exists for H only, as an explicit
   choice per object (`HostOwn<T>` and `HostSlot<T>`, `util/host-memory.h`)
-  rather than something the allocator decides, and three objects have been
-  placed: the channel token key, the host entropy buffer and the actor-id
-  namespace key.
+  rather than something the allocator decides, and four objects have been
+  placed: the channel token key, the host entropy buffer, the actor-id
+  namespace key and the Wasm signal descriptors.
 - **The host acts on data a ring-3 turn can write.** The runtime's heap is in
   the guest's address space, so every host-side structure the guest can reach
   is attacker-controlled input to the host, and the dangerous cases are the
@@ -447,9 +511,11 @@ rare enough to pay for an exit each time.
   rewritten counter would otherwise make the next turn run outside the guest,
   a host-memory object is reached through a host slot handle that gk
   validates against its own table rather than through a pointer the host
-  loads from the heap, and a hostcall's handler is selected by an index gk
+  loads from the heap, a hostcall's handler is selected by an index gk
   checks against its table and sees a host-memory copy of the arguments,
-  never the guest's memory. What validation cannot settle is ownership: a pointer
+  never the guest's memory, and the Wasm signal handler writes through a
+  descriptor gk validated against the thread's arena and keeps in its own
+  table. What validation cannot settle is ownership: a pointer
   swapped for another live arena's, or a handle swapped for another live
   slot's, is indistinguishable from a legitimate call, so a turn can still
   name a different isolate's arena and cost that isolate its memory, or name

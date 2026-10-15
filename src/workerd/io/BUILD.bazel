@@ -347,10 +347,19 @@ wd_cc_library(
         "limit-enforcer.h",
         "tracked-wasm-instance.h",
     ],
+    implementation_deps = select({
+        # Experimental guest-kernel isolation is x86-64 Linux only; the dep and
+        # its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         ":outcome_capnp",
         "//src/workerd/jsg",
+        "//src/workerd/util:hostcall",
     ],
 )
 

@@ -140,8 +140,11 @@ owns and snapshots into H memory before the handler runs, and the handler
 validates every field it reads, because the turn calls it whenever and with
 whatever it likes. `ActorIdFactoryImpl` (`server/actor-id-impl.h`) is the
 pattern: the key is H, reached by a host slot handle the frame carries, and
-the HMAC runs in the handler. A hostcall costs a VM exit, so it is for the
-rare operation, not the bulk of a turn's crossings (see Cost).
+the HMAC runs in the handler. The Wasm signal descriptor
+(`io/tracked-wasm-instance.h`) is the other user: the turn submits a
+buffer by offset and length and the handler has gk validate it against the
+arena gk records the thread as running in. A hostcall costs a VM exit, so it
+is for the rare operation, not the bulk of a turn's crossings (see Cost).
 
 **Binary data becomes a descriptor.** An `ArrayBuffer` backing store or a body
 chunk crosses as `{handle, offset, length}` against a buffer the host owns,
@@ -270,11 +273,11 @@ The splits, with the half each member goes to:
 | `InputGate`/`OutputGate` (`io/io-gate.h:34`, `:250`) | H only; `Lock` and `CriticalSection` become handles, and `blockConcurrencyWhile` sends `startCriticalSection(parent handle)` |
 | `Frankenvalue` (`io/frankenvalue.h:19`) | Bytes plus a cap table; `IoChannelCapTableEntry` (`io-channels.h:627`) is already `{type, channel}`, which is the right form |
 | `modules::ModuleRegistry` (`jsg/modules-new.h:692`) | H: the builder, bundle ownership, the mutex taken on every lookup (`:801`). I: the per-isolate compiled-module table, plus the bundles mapped read-only into the arena since they are immutable after `finish()` |
-| `TrackedWasmInstanceList` (`io/tracked-wasm-instance.h:178`) | H keeps the signal-safe list of validated `{arena, buffer, offsets}`; I keeps `instanceRef` and the GC filter. See violation 2 |
+| `TrackedWasmInstanceList` (`io/tracked-wasm-instance.h`) | **Split, done.** H is gk's signal field table of validated `{arena, address, kind}` entries, keyed by arena; the heap entry keeps the memory pin, `instanceRef`, the GC filter and the handles for unregistering. See violation 2 |
 | `AsyncContextFrame::StorageKey` (`jsg/async-context.h:73`) | Identity is `this` (`:101`) and H holds it for identity only (`worker.h:605`, `setup.h:669`); replace with a 64-bit key the host mints |
 | `V8PlatformWrapper::JobTaskWrapper` (`jsg/v8-platform-wrapper.h:86`) | H, but it needs a per-job `gk_arena_enter`, and the job must carry the arena id -- which V8's `JobTask` does not currently expose |
 
-### Two violations that are full escapes
+### Two violations that are full escapes, the second closed
 
 **1. The host installs a guest-chosen pointer as the isolate's `jsg::Lock`.**
 `jsg::Lock` is heap-allocated (`server/workerd-api.c++:305`), so its
@@ -296,21 +299,45 @@ be made safe by validating at the call site; host-side code has to obtain a
 `Lock&` from an H source instead, which means `jsg::Lock` must be reachable
 from H memory and `Lock::from` has to go.
 
-**2. A signal handler writes through a guest-supplied buffer descriptor.**
-`TrackedWasmInstance` (`io/tracked-wasm-instance.h:38`) holds a
-`kj::Array<kj::byte> memory` and a `signalByteOffset`, and
-`writeShutdownSignal` -- which runs in a signal handler, deliberately without
-a lock -- does
-`signal.memory.asPtr().slice(offset, offset + 4).copyFrom(...)`
-(`tracked-wasm-instance.c++:54-62`). The descriptor is bounds-checked when the
-instance registers (`:20-26`), but it then lives in guest-writable memory --
-the list is a member of the isolate's limit enforcer (`server.c++:3374`),
-which is an ordinary heap object. Checking the offset against the array's own
-size proves nothing once both the pointer and the size come from there, so the
-result is an arbitrary 4-byte write of a known constant, triggerable by
-burning CPU until the limit signal fires. The remedy is the
-H-side copy in the split above: the host validates the descriptor once, keeps
-it where the guest cannot reach it, and the signal handler uses that copy.
+**2. The Wasm signal descriptor, closed.** `TrackedWasmInstanceList::writeShutdownSignal`
+(`io/tracked-wasm-instance.c++`) runs in a signal handler, deliberately
+without a lock, and writes four bytes into a Wasm module's linear memory to
+tell it its CPU budget is nearly spent. The entry describing the module is a
+node of a list in the isolate's limit enforcer (`server.c++`), an ordinary
+heap object, so with the guest kernel on it is memory a ring-3 escape can
+write; a descriptor read from there -- a pointer and a size, checked against
+each other -- is an arbitrary write of a known constant, triggered by burning
+CPU. So with the guest kernel on the signal handler reads nothing from the
+entry. Registration runs inside the turn that instantiates the module, so it
+is a hostcall (`hostcall::WASM_SIGNAL`): the turn submits the linear memory
+by its offset within the isolate's arena and its length, and the field by its
+offset within the memory, never a pointer, and the handler has gk validate
+all of it against gk's own record of the arena the calling thread is running
+in -- the arena is never taken from the turn -- and keep the field's absolute
+address, arena and kind in gk's signal field table, which lives in the
+supervisor control block beside the host slot table (`gk_signal_field_register`
+in `gk.h`). The signal handler calls `gk_signal_field_write`, which finds the
+calling thread's record by its kernel tid rather than through a thread-local,
+takes the arena from that record, walks the arena's entries without a lock
+and allocating nothing, and bounds-checks each address against the arena
+again before writing. Mutation of an arena's entries happens only under the
+isolate lock on the thread that has the arena active, which is the thread the
+signal interrupts, and the entries are published and retired in an order a
+walk interrupting the mutation sees as consistent. The heap entry keeps what
+only the turn needs: the memory pin, the weak instance handle, and the
+handles gk issued, which the GC filter and teardown use to unregister, and
+which gk validates like host slot handles and accepts only from the owning
+arena's thread. Whether the writer takes this path is decided by
+`gk_initialized()`, a word in supervisor memory, not by a flag in the heap a
+turn could flip to send the writer back to the list. What remains: the
+write lands at the address the memory had when it was registered, so a
+memory the isolate has since grown by relocation gets it at the old address
+-- still inside that isolate's own arena, so the isolate at worst mislays its
+own signal -- and a page the isolate has decommitted since faults the host's
+write, a crash the isolate could cause by other means. `wasm-signal-test.sh`
+shows a module at ring 3 observing the signal, and the signal landing in the
+module's memory rather than in a buffer the turn pointed the heap descriptor
+at.
 
 ### Other violations
 
@@ -592,7 +619,8 @@ H memory exists: `gk_host_alloc` with `HostOwn<T>` over it, and the host slot
 table with `HostSlot<T>` over that (see "Host (H)" above). Its tenants, and
 what is waiting on the same facility:
 
-- **In H memory:** `ChannelTokenHandler::tokenKey` (`server/channel-token.h`),
+- **In H memory, or in gk's supervisor control block beside the host slot
+  table:** `ChannelTokenHandler::tokenKey` (`server/channel-token.h`),
   held through a host slot handle, with the key's two readers deferred to the
   event loop under the guest kernel; the host entropy buffer
   (`util/host-entropy.c++`), one block holding the unconsumed system-generator
@@ -608,23 +636,25 @@ what is waiting on the same facility:
   `getEntropy()` draw but not a token's nonce; `actor-id-test.sh` shows a
   ring-3 read of the key faulting while the ids turns mint through the
   hostcall are distinct, derive from the configured key and address working
-  Durable Objects.
+  Durable Objects. The Wasm signal descriptors (`io/tracked-wasm-instance.h`)
+  are gk's signal field table, keyed by arena, filled through the
+  `WASM_SIGNAL` hostcall and read by the signal handler through gk's record
+  of the calling thread (see "The Wasm signal descriptor, closed" above);
+  `wasm-signal-test.sh` shows the signal reaching a module at ring 3 and not
+  reaching a buffer the turn aimed the heap entry at. This is the first
+  host-side table a signal handler reads, and the pattern the thread-local
+  cases below need: the handler finds its state through gk's per-thread
+  supervisor record -- the thread's record by kernel tid, the arena from the
+  record -- and never through a thread-local.
 - **Waiting, same remedy:** the provenance violations above, each of which
   needs the host to read a pointer or a descriptor from memory the guest
-  cannot write -- the `jsg::Lock` data slot (violation 1), the wasm signal
-  descriptor (violation 2), the guest-writable thread-locals
-  `threadLocalRequest`, `currentApi` and `guestTurnArena` (violation 3), the
-  `activeProgressCounter` pointer a signal handler dereferences
-  (`thread-scopes.c++:27`). Each of these is a `HostSlot` plus a crossing for
-  the in-turn reader, and the thread-local ones need the host side to find
-  its record without a thread-local, through gk's per-thread supervisor
-  record. The wasm descriptor's registration is synchronous to the turn
-  (`registerTrackedWasmInstance` runs inside `shimWebAssemblyInstantiate`),
-  so its crossing is a hostcall: the turn submits `{arena, buffer offset
-  within the arena, signal offset, length}` and the handler validates the
-  buffer against the arena's bounds host-side and keeps the validated copy in
-  H memory, where the signal handler reads it; the pointer-plus-size pair in
-  the shared heap that the signal handler trusts today goes away with it.
+  cannot write -- the `jsg::Lock` data slot (violation 1), the guest-writable
+  thread-locals `threadLocalRequest`, `currentApi` and `guestTurnArena`
+  (violation 3), the `activeProgressCounter` pointer a signal handler
+  dereferences (`thread-scopes.c++:27`). Each of these is a `HostSlot` plus a
+  crossing for the in-turn reader, and the thread-local ones need the host
+  side to find its record without a thread-local, through gk's per-thread
+  supervisor record, as the signal field write does.
 - **Not addressed by H memory alone:** the pointer to an H object is as safe
   as the memory it sits in. A `HostOwn` in a shared-heap object protects the
   object's bytes and lets the guest kernel refuse a swapped pointer at free

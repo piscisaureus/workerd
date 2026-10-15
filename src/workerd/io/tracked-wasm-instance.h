@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <workerd/util/hostcall.h>
+
 #include <v8-forward.h>
 #include <v8-persistent-handle.h>
 
@@ -35,11 +37,21 @@ constexpr size_t WASM_SIGNAL_FIELD_BYTES = sizeof(uint32_t);
 // Cleanup of entries relies on a weak reference to the WASM instance (instanceRef): when V8
 // garbage-collects the instance, the handle becomes empty and the GC prologue filter removes
 // the entry, releasing the strong reference to linear memory.
+//
+// Where the signal writers find the fields depends on whether the guest kernel is active
+// (experimental/guest-kernel/gk.h). This entry is an ordinary heap object: with the guest kernel
+// on, a JS turn at ring 3 can write every byte of it, so the writers, which run in a signal
+// handler, read nothing from it. The validated descriptor of each field lives in gk's signal
+// field table, in its supervisor memory, keyed by the isolate's arena; what this entry keeps of
+// it is the handle gk issued, which only the unregistration uses, and which gk validates
+// against its table like a host slot handle. Without the guest kernel the writers use `memory`
+// and the offsets here, as there is no memory the isolate cannot reach anyway.
 struct TrackedWasmInstance {
   // Owns a reference to the WASM module's linear memory. The underlying v8::BackingStore is kept
   // alive via kj::Array's attach() mechanism, preventing V8 from garbage-collecting the memory
-  // while we still need to read/write signal addresses. This gets cleaned up in a V8 GC prologue
-  // hook where we atomically remove the entry from the signal list before releasing the memory.
+  // while a signal field registered in it may still be written. This gets cleaned up in a V8 GC
+  // prologue hook where we atomically remove the entry from the signal list before releasing the
+  // memory.
   //
   // TODO: If a user were to grow a 64 bit linear memory >16GB, relocation will happen and this
   // array will point to stale (but not free'd) memory. The impact is that the user will see a
@@ -58,14 +70,19 @@ struct TrackedWasmInstance {
   // When kj::none, the module did not export __instance_terminated.
   kj::Maybe<uint32_t> terminatedByteOffset;
 
+  // With the guest kernel active, the handles of the signal fields registered in gk's table for
+  // the two offsets above (0 when the offset is kj::none, or without the guest kernel). Used
+  // only to unregister the fields when the entry is removed; never by the signal writers.
+  uint64_t signalFieldHandle = 0;
+  uint64_t terminatedFieldHandle = 0;
+
   // Weak handle to the WASM instance. Set to weak via SetWeak() at registration time. When V8
   // collects the instance, the handle becomes empty (IsEmpty() returns true). Checked in the GC
   // prologue filter to clean up entries whose instance has been garbage-collected. Always set at
   // registration time, so IsEmpty() unambiguously means the instance was collected.
   //
-  // This field is never accessed from signal handlers — signal handlers only touch `memory` and
-  // `signalByteOffset`. The Global's destructor is safe to call during filter() (under isolate
-  // lock) or clear() (during isolate teardown with V8 still alive).
+  // This field is never accessed from signal handlers. The Global's destructor is safe to call
+  // during filter() (under isolate lock) or clear() (during isolate teardown with V8 still alive).
   v8::Global<v8::Object> instanceRef;
 
   // Returns true if the entry should be kept in the list, false if it should be removed.
@@ -168,13 +185,29 @@ class SignalSafeList {
 };
 
 // Encapsulates a SignalSafeList<TrackedWasmInstance> with operations that require the isolate
-// lock for mutation, and a read-only accessor for signal-handler use.
+// lock for mutation, and the signal-handler entry points that write the fields.
 //
 // The mutation methods are const and accept a jsg::Lock& to prove the caller holds the isolate
 // lock. Internally they const_cast the list, which is safe because the lock provides the
 // required synchronization. This design allows IsolateLimitEnforcer (whose methods are const
 // per KJ convention) to return a const reference without exposing mutable access to code that
 // does not hold the lock.
+//
+// With the guest kernel active, the fields are registered through a hostcall (util/hostcall.h,
+// WASM_SIGNAL): registerSignal() runs inside the turn that instantiates the module, so it submits
+// each field as {offset of the linear memory within the isolate's arena, its length, the field's
+// offset within it, its kind}, never a pointer, and the handler -- host-side, in a different
+// privilege domain from the turn -- has gk validate that against the arena gk records the
+// calling thread as running in, and keep the result in gk's table. The writers
+// (writeShutdownSignal() and the others, called from the CPU limiter's signal handler on the
+// thread whose turn is running) then call gk_signal_field_write, which finds the thread's arena
+// through gk's record of the thread and writes that arena's fields, taking no lock and
+// allocating nothing; the list here is not read. Whether the writers take that path is decided
+// by gk_initialized(), a word in gk's supervisor memory, not by anything in the heap: a turn
+// that could flip the decision could send the writers back to a descriptor it controls.
+// A module's fields are registered in one hostcall and unregistered in one, a VM exit each,
+// about 6 us. Without the guest kernel the writers walk the list, which is then the only
+// descriptor there is.
 class TrackedWasmInstanceList {
  public:
   // Registers a WASM module for receiving the "shut down" signal and/or terminated notification.
@@ -183,7 +216,9 @@ class TrackedWasmInstanceList {
   // terminatedOffset is kj::none, the module will not receive the terminated notification.
   // Cleanup always relies on the weak instanceRef becoming empty when V8 GCs the instance.
   //
-  // Silently skips registration if any provided offset falls outside the module's linear memory.
+  // Silently skips registration if any provided offset falls outside the module's linear memory,
+  // or if the guest kernel refuses the field (a memory outside the isolate's arena, or a full
+  // table).
   //
   // Returns a reference to the registered entry on success, or kj::none if registration was
   // skipped. The caller uses the returned reference to set up the weak instance handle.
@@ -192,29 +227,71 @@ class TrackedWasmInstanceList {
       kj::Maybe<uint32_t> signalOffset,
       kj::Maybe<uint32_t> terminatedOffset) const;
 
-  // Filters out entries where the instance has been garbage-collected (instanceRef is empty).
-  // Call from a GC prologue hook to allow linear memory to be reclaimed.
+  // Filters out entries where the instance has been garbage-collected (instanceRef is empty),
+  // unregistering their fields. Call from a GC prologue hook to allow linear memory to be
+  // reclaimed.
   void filter(jsg::Lock&) const;
 
-  // Removes all entries unconditionally. Call before the V8 isolate is disposed, since each
-  // entry holds a shared_ptr<v8::BackingStore> (via the memory array) and a v8::Global whose
-  // destructors may access V8 state.
+  // Removes all entries unconditionally, unregistering their fields. Call before the V8 isolate
+  // is disposed, since each entry holds a shared_ptr<v8::BackingStore> (via the memory array) and
+  // a v8::Global whose destructors may access V8 state.
   void clear(jsg::Lock&) const;
 
+  // The signal-handler entry points: each writes one value to every registered field of one
+  // kind for the isolate whose turn the calling thread is in. Signal-safe: no lock, no
+  // allocation.
   void writeShutdownSignal() const;
-
   void clearShutdownSignal() const;
-
   void writeTerminatedSignal() const;
 
-  // Returns the underlying signal-safe list for use by signal handlers and the CPU time limiter.
-  // The returned reference is const; signal-handler free functions use const_cast internally.
+  // Returns the underlying signal-safe list for the CPU time limiter and for tests. The returned
+  // reference is const; the writers above const_cast internally.
   const SignalSafeList<TrackedWasmInstance>& signals() const {
     return list;
   }
 
+  // The hostcall that registers and unregisters fields with the guest kernel. workerd's main
+  // installs it (hostcall::install) once gk_init() has run.
+  static const hostcall::Entry HOSTCALL;
+  static void installHostcall();
+
+  // The kinds of field, as registered with the guest kernel (GK_SIGNAL_KINDS bounds them).
+  enum class FieldKind : unsigned {
+    SIGNAL = 0,      // __instance_signal: written SIGXCPU by writeShutdownSignal()
+    TERMINATED = 1,  // __instance_terminated: written 1 by writeTerminatedSignal()
+  };
+
+  // Operations of the hostcall, in args[0]. Both act on a module's two fields at once, so that
+  // an instantiation and a collection cost one exit each.
+  enum class Op : uint64_t {
+    // in: args[1] the linear memory's offset within the arena, args[2] its length, args[3] the
+    // signal field's offset within it in the low 32 bits and the terminated field's in the high
+    // 32, each NO_FIELD when absent; out: the two 8-byte handles, 0 for an absent field. Either
+    // both present fields are registered or neither is.
+    REGISTER = 1,
+    // in: args[1] the signal field's handle, args[2] the terminated field's, 0 for none; out:
+    // nothing.
+    UNREGISTER = 2,
+  };
+  // An absent field in REGISTER's args[3]: no 4-byte field can start there.
+  static constexpr uint32_t NO_FIELD = 0xffffffff;
+
  private:
   SignalSafeList<TrackedWasmInstance> list;
+
+  static long hostcallHandler(hostcall::Frame& frame);
+
+  // Unregisters an entry's fields with the guest kernel, if it has any.
+  static void unregisterFields(TrackedWasmInstance& entry);
+
+  // Registers the fields present in `signalOffset` and `terminatedOffset` through the hostcall,
+  // filling the handles. False, with nothing registered, if the guest kernel refused.
+  static bool registerFields(uintptr_t memoryOffset,
+      size_t memoryLength,
+      kj::Maybe<uint32_t> signalOffset,
+      kj::Maybe<uint32_t> terminatedOffset,
+      uint64_t& signalHandle,
+      uint64_t& terminatedHandle);
 };
 
 // The value written to the signal address when CPU time is nearly exhausted.

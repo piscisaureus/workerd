@@ -65,7 +65,8 @@ struct Entry {
 // Index assignments. The guest kernel's table has GK_HOSTCALLS entries; every index in use is
 // listed here.
 enum Index : unsigned {
-  ACTOR_ID = 1,  // keyed operations on an actor-id namespace key (server/actor-id-impl.h)
+  ACTOR_ID = 1,     // keyed operations on an actor-id namespace key (server/actor-id-impl.h)
+  WASM_SIGNAL = 2,  // register or unregister a Wasm signal field (io/tracked-wasm-instance.h)
 };
 
 // Calls `entry`'s handler on `frame` and returns its result: a negative errno-style value from

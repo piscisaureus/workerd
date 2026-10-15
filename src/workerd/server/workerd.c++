@@ -11,6 +11,7 @@
 #include <workerd/io/compatibility-date.capnp.h>
 #include <workerd/io/compatibility-date.h>
 #include <workerd/io/release-version.embed.h>
+#include <workerd/io/tracked-wasm-instance.h>
 #include <workerd/jsg/setup.h>
 #include <workerd/server/actor-id-impl.h>
 #include <workerd/server/cpp-capnp-schema.embed.h>
@@ -1673,6 +1674,7 @@ int main(int argc, char* argv[]) {
     gk_set_syscall_filter(&workerd::server::guestKernelSyscallFilter);
     // The hostcalls a turn makes (util/hostcall.h), registered before any turn can run.
     workerd::server::ActorIdFactoryImpl::installHostcall();
+    workerd::TrackedWasmInstanceList::installHostcall();
     KJ_LOG(WARNING, "guest-kernel isolation enabled (experimental)");
   }
 #endif

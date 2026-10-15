@@ -42,6 +42,13 @@
 
 #include <v8-microtask-queue.h>
 
+#ifdef __linux__
+#include <signal.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+#endif
+
 #include <kj/encoding.h>
 
 #include <cstring>
@@ -311,6 +318,91 @@ kj::Promise<void> ServiceWorkerGlobalScope::connectUdp(kj::String host,
 
 namespace {
 
+#ifdef __linux__
+// Test-only stand-in for the CPU limiter's signal (see maybeForceGuestFaultForTest below).
+constexpr long WASM_SIGNAL_PROBE_MS = 20;
+const TrackedWasmInstanceList* wasmSignalProbeList = nullptr;
+timer_t wasmSignalProbeTimer;
+bool wasmSignalProbeTimerArmed = false;
+
+void wasmSignalProbeHandler(int) {
+  if (wasmSignalProbeList != nullptr) wasmSignalProbeList->writeShutdownSignal();
+}
+
+// Host-side, on the event loop: installs the SIGXCPU handler once and arms the thread's timer.
+void armWasmSignalTimerForTest(const TrackedWasmInstanceList& list) {
+  static const bool installed = []() {
+    struct sigaction sa {};
+    sa.sa_handler = &wasmSignalProbeHandler;
+    sa.sa_flags = SA_RESTART;
+    return sigaction(SIGXCPU, &sa, nullptr) == 0;
+  }();
+  KJ_REQUIRE(installed);
+  wasmSignalProbeList = &list;
+  if (wasmSignalProbeTimerArmed) timer_delete(wasmSignalProbeTimer);
+  struct sigevent sev {};
+  sev.sigev_notify = SIGEV_THREAD_ID;
+  sev.sigev_signo = SIGXCPU;
+  sev._sigev_un._tid = static_cast<int>(syscall(SYS_gettid));
+  KJ_SYSCALL(timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &wasmSignalProbeTimer));
+  wasmSignalProbeTimerArmed = true;
+  struct itimerspec its {};
+  its.it_value.tv_nsec = WASM_SIGNAL_PROBE_MS * 1000000;
+  KJ_SYSCALL(timer_settime(wasmSignalProbeTimer, 0, &its, nullptr));
+  KJ_LOG(WARNING,
+      "WORKERD_GK_TEST_PROBE: armed a CPU-time timer on this thread whose signal handler writes "
+      "the Wasm shutdown signal",
+      WASM_SIGNAL_PROBE_MS);
+}
+
+// The buffer a write primitive would aim the old descriptor at, and the descriptors as they
+// were, for the restore.
+byte chosenWasmBuffer[64] = {};
+struct SavedWasmDescriptor {
+  TrackedWasmInstance* entry;
+  byte memory[sizeof(kj::Array<byte>)];
+  kj::Maybe<uint32_t> signalByteOffset;
+};
+kj::Vector<SavedWasmDescriptor> savedWasmDescriptors;
+
+// In-turn: rewrites each entry's `memory` (a kj::Array: pointer, size, disposer) to name the
+// chosen buffer, and its signal offset to 0, as a write primitive with the old layout in mind
+// would.
+void corruptWasmDescriptorsForTest(const TrackedWasmInstanceList& list, kj::StringPtr url) {
+  auto& entries = const_cast<SignalSafeList<TrackedWasmInstance>&>(list.signals());
+  entries.iterate([&](TrackedWasmInstance& entry) {
+    SavedWasmDescriptor saved{.entry = &entry, .signalByteOffset = entry.signalByteOffset};
+    memcpy(saved.memory, &entry.memory, sizeof(saved.memory));
+    savedWasmDescriptors.add(kj::mv(saved));
+    uintptr_t words[2] = {reinterpret_cast<uintptr_t>(chosenWasmBuffer), sizeof(chosenWasmBuffer)};
+    uintptr_t oldWords[2];
+    memcpy(oldWords, &entry.memory, sizeof(oldWords));
+    memcpy(&entry.memory, words, sizeof(words));
+    entry.signalByteOffset = static_cast<uint32_t>(0);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: overwrote a Wasm signal descriptor in the heap from inside the "
+        "JS turn",
+        url, kj::str("0x", kj::hex(oldWords[0])), oldWords[1], kj::str("0x", kj::hex(words[0])),
+        words[1]);
+  });
+}
+
+// In-turn: reports what the chosen buffer holds and puts the descriptors back.
+void checkWasmDescriptorsForTest(kj::StringPtr url) {
+  uint32_t word = 0;
+  memcpy(&word, chosenWasmBuffer, sizeof(word));
+  KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the chosen buffer's first word after the signal", url,
+      word, kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(chosenWasmBuffer))));
+  for (auto& saved: savedWasmDescriptors) {
+    memcpy(&saved.entry->memory, saved.memory, sizeof(saved.memory));
+    saved.entry->signalByteOffset = saved.signalByteOffset;
+  }
+  KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: restored the Wasm signal descriptors",
+      savedWasmDescriptors.size());
+  savedWasmDescriptors.clear();
+}
+#endif  // __linux__
+
 // Test-only hooks for the experimental guest kernel's fault path. With the guest kernel enabled
 // and WORKERD_GK_TEST_FAULT set, a request whose path is /__gk_fault dereferences a null pointer
 // from inside the JS turn. At guest ring 3 that is a page fault the guest cannot service, so
@@ -342,7 +434,20 @@ namespace {
 // so the write lands and the turn completes. The host's use of the tenant then runs on the
 // event loop, outside the guest, as the real uses do: it must be refused rather than reach the
 // buffer. The handle is restored afterwards and the use run again.
-void maybeForceGuestFaultForTest(kj::StringPtr url) {
+//
+// With the same variable set, three request paths exercise the Wasm shutdown signal, whose
+// descriptors the guest kernel keeps in its own table (see TrackedWasmInstanceList). The signal
+// has no source in workerd itself, so /__gk_wasm_arm stands in for the CPU limiter: on the event
+// loop after the turn, it arms a one-shot CPU-time timer of WASM_SIGNAL_PROBE_MS on this thread,
+// whose SIGXCPU handler calls writeShutdownSignal() on the isolate's list, as a limiter would
+// from its own signal handler; a following request that burns CPU reading a registered module's
+// field sees the value land. /__gk_wasm_corrupt first overwrites, from inside the turn, the heap
+// entry of every registered module -- the pointer and size of its linear memory, and the signal
+// offset -- with a buffer this code chose, which is what a write primitive aiming the old
+// descriptor would do, then arms the timer the same way; the signal must still reach the
+// module's real memory and the chosen buffer must stay untouched, which /__gk_wasm_check reads
+// out and logs before restoring the entries.
+void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   static const bool faultEnabled =
       jsg::isGuestKernelEnabled() && getenv("WORKERD_GK_TEST_FAULT") != nullptr;
   if (faultEnabled && url.endsWith("/__gk_fault")) {
@@ -385,6 +490,20 @@ void maybeForceGuestFaultForTest(kj::StringPtr url) {
       discardEntropyBufferForTest();
     }));
   }
+#ifdef __linux__
+  if (probeEnabled && url.endsWith("/__gk_wasm_arm")) {
+    auto& list = lock.getWorker().getIsolate().getLimitEnforcer().getTrackedWasmInstances();
+    IoContext::current().addTask(kj::evalLater([&list]() { armWasmSignalTimerForTest(list); }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_wasm_corrupt")) {
+    auto& list = lock.getWorker().getIsolate().getLimitEnforcer().getTrackedWasmInstances();
+    corruptWasmDescriptorsForTest(list, url);
+    IoContext::current().addTask(kj::evalLater([&list]() { armWasmSignalTimerForTest(list); }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_wasm_check")) {
+    checkWasmDescriptorsForTest(url);
+  }
+#endif
   if (probeEnabled && url.endsWith("/__gk_corrupt_handle")) {
     KJ_IF_SOME(probe, hostMemory::handleProbeForTest()) {
       static byte chosenKey[32] = {0x41};
@@ -418,7 +537,7 @@ kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(kj::HttpMetho
     kj::Maybe<ExportedHandler&> exportedHandler,
     kj::Maybe<jsg::Ref<AbortSignal>> abortSignal) {
   TRACE_EVENT("workerd", "ServiceWorkerGlobalScope::request()");
-  maybeForceGuestFaultForTest(url);
+  maybeForceGuestFaultForTest(url, lock);
   // To construct a ReadableStream object, we're supposed to pass in an Own<AsyncInputStream>, so
   // that it can drop the reference whenever it gets GC'ed. But in this case the stream's lifetime
   // is not under our control -- it's attached to the request. So, we wrap it in a

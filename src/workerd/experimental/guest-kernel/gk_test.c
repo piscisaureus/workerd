@@ -6,6 +6,7 @@
 
 #include <errno.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2379,6 +2380,370 @@ static int hostcall_check(void) {
   return ok;
 }
 
+// ---- signal fields -----------------------------------------------------------
+// A signal field is a 4-byte word in an arena that the host writes from a
+// signal handler, through a descriptor the host validated and keeps in
+// supervisor memory (see gk_signal_field_register in gk.h). Checks: a field a
+// ring-3 turn registers through a hostcall handler is found and written by
+// gk_signal_field_write, including from a real signal handler that interrupts
+// the turn; a buffer outside the arena, a field past the buffer, a length
+// that overflows, and a bad kind are each refused host-side with nothing
+// recorded; an unregister from another arena, from no arena, or with a
+// garbage handle is refused; destroying an arena drops its fields; the table
+// is unreachable from ring 3; the write path survives a CPU-timer signal
+// landing inside registrations and unregistrations; the write is timed and,
+// under the guard build, shown to allocate nothing.
+
+enum { SF_IDX = 9, SF_REGISTER = 1, SF_UNREGISTER = 2, SF_KIND = 2, SF_N = 200000, SF_STRESS = 20000 };
+
+// The hostcall handler a runtime would register: validates nothing itself,
+// since gk validates against the thread's arena. Allocates nothing.
+static long sf_handler(void *ctx, gk_hostcall_frame *f) {
+  (void)ctx;
+  if (f->args[0] == SF_REGISTER) {
+    gk_signal_handle h = 0;
+    int r = gk_signal_field_register((uintptr_t)f->args[1], (size_t)f->args[2],
+                                     (uint32_t)f->args[3], (unsigned)(f->args[3] >> 32), &h);
+    memcpy(f->buf, &h, sizeof h);
+    f->out_len = sizeof h;
+    return r;
+  }
+  if (f->args[0] == SF_UNREGISTER) return gk_signal_field_unregister(f->args[1]);
+  return -EINVAL;
+}
+
+struct sf_call { uint64_t offset, len, field, kind; long r; gk_signal_handle h; };
+
+// Runs in the guest (ring 3): one registration hostcall per entry of `arg`.
+static long sf_guest_register(void *arg) {
+  struct sf_call *c = arg;
+  gk_hostcall_frame *r = gk_hostcall_region();
+  if (!r) return -1;
+  for (; c->kind != ~0ULL; c++) {
+    r->args[0] = SF_REGISTER; r->args[1] = c->offset; r->args[2] = c->len;
+    r->args[3] = c->field | (c->kind << 32);
+    r->in_len = 0;
+    c->r = gk_hostcall(SF_IDX);
+    c->h = 0;
+    if (r->out_len == sizeof c->h) memcpy(&c->h, r->buf, sizeof c->h);
+  }
+  return 0;
+}
+
+static long sf_guest_unregister(void *arg) {
+  gk_hostcall_frame *r = gk_hostcall_region();
+  r->args[0] = SF_UNREGISTER; r->args[1] = *(gk_signal_handle *)arg; r->in_len = 0;
+  return gk_hostcall(SF_IDX);
+}
+
+static volatile long sf_signals;  // handler runs, and the total of fields written
+static volatile long sf_written;
+static void sf_sigaction(int sig, siginfo_t *si, void *uc) {
+  (void)sig; (void)si; (void)uc;
+  long n = gk_signal_field_write(SF_KIND, 24);
+  sf_signals++;
+  if (n > 0) sf_written += n;
+}
+
+// Runs in the guest (ring 3): raises the signal at itself (a forwarded
+// tgkill: the handler runs host-side when the syscall returns) and then reads
+// the field, which the handler must have written by then. Returns what it
+// read.
+struct sf_raise { volatile uint32_t *field; long before, after; };
+static long sf_guest_raise(void *arg) {
+  struct sf_raise *p = arg;
+  p->before = *p->field;
+  syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGUSR1);
+  p->after = *p->field;
+  return p->after;
+}
+
+// Runs in the guest (ring 3) under a CPU-time timer whose handler writes the
+// fields: per round, registers two fields through the hostcall, zeroes them,
+// reads them for a while and unregisters them. A field reads 0 or the value
+// the handler writes, never anything else; every hostcall succeeds. Returns
+// the number of rounds that saw otherwise.
+struct sf_stress { unsigned char *buf; uint64_t offset, len; long rounds; };
+static long sf_guest_stress(void *arg) {
+  struct sf_stress *p = arg;
+  gk_hostcall_frame *r = gk_hostcall_region();
+  volatile uint32_t *w = (volatile uint32_t *)p->buf;
+  long bad = 0;
+  for (long i = 0; i < p->rounds; i++) {
+    gk_signal_handle h[2];
+    for (int k = 0; k < 2; k++) {
+      r->args[0] = SF_REGISTER; r->args[1] = p->offset; r->args[2] = p->len;
+      r->args[3] = (uint64_t)(4 * k) | ((uint64_t)SF_KIND << 32);
+      r->in_len = 0;
+      if (gk_hostcall(SF_IDX) != 0 || r->out_len != sizeof h[k]) { bad++; return bad; }
+      memcpy(&h[k], r->buf, sizeof h[k]);
+    }
+    w[0] = 0; w[1] = 0;
+    for (int n = 0; n < 64; n++) {
+      uint32_t a = w[0], b = w[1];
+      if ((a != 0 && a != 24) || (b != 0 && b != 24)) bad++;
+    }
+    for (int k = 1; k >= 0; k--) {
+      r->args[0] = SF_UNREGISTER; r->args[1] = h[k]; r->in_len = 0;
+      if (gk_hostcall(SF_IDX) != 0) bad++;
+    }
+  }
+  return bad;
+}
+
+static int signal_field_check(void) {
+  gk_stats s0, s1, s2, s3, s4;
+  gk_get_stats(&s0);
+  gk_arena *a = gk_arena_create(1UL << 20), *b = gk_arena_create(4096);
+  if (!a || !b || gk_hostcall_register(SF_IDX, sf_handler, NULL) != 0) {
+    printf("signal fields: setup failed [FAIL]\n");
+    return 0;
+  }
+  unsigned char *base = gk_arena_base(a);
+  size_t span = ((size_t)gk_arena_size(a) + (1UL << 39) - 1) & ~((1UL << 39) - 1);  // the reservation
+  unsigned char *buf = base + 3 * 4096;  // a 4 KiB buffer in the arena
+  enum { BUF = 4096, FIELD = 100 };      // the field at an unaligned offset
+  if (mprotect(buf, BUF, PROT_READ | PROT_WRITE) != 0) { printf("signal fields: mprotect [FAIL]\n"); return 0; }
+  memset(buf, 0, BUF);
+  struct sigaction sa = {0}, old;
+  sa.sa_sigaction = sf_sigaction;
+  sa.sa_flags = SA_SIGINFO | SA_RESTART;
+  sigaction(SIGUSR1, &sa, &old);
+
+  // 1. Registered from ring 3 through the handler, for the thread's arena,
+  //    then written from the host: the word in the arena carries the value,
+  //    the count is one, and a second kind writes nothing.
+  gk_arena_enter(a);
+  struct sf_call *reg = calloc(2, sizeof *reg);
+  reg[0] = (struct sf_call){(uint64_t)(buf - base), BUF, FIELD, SF_KIND, 0, 0};
+  reg[1].kind = ~0ULL;
+  long rr = gk_run_here_user(sf_guest_register, reg);
+  gk_get_stats(&s1);
+  uint32_t word = 0;
+  memcpy(&word, buf + FIELD, 4);
+  long w1 = gk_signal_field_write(SF_KIND, 24);
+  uint32_t w1v = 0;
+  memcpy(&w1v, buf + FIELD, 4);
+  long w2 = gk_signal_field_write(SF_KIND + 1, 99);
+  uint32_t w2v = 0;
+  memcpy(&w2v, buf + FIELD, 4);
+  int untouched = 1;
+  for (int i = 0; i < BUF; i++) if (i < FIELD || i >= FIELD + 4) if (buf[i]) untouched = 0;
+  int reg_ok = rr == 0 && reg[0].r == 0 && reg[0].h != 0 && s1.signal_fields == s0.signal_fields + 1 &&
+               word == 0 && w1 == 1 && w1v == 24 && w2 == 0 && w2v == 24 && untouched;
+
+  // 2. From a real signal handler interrupting the ring-3 turn: the guest
+  //    raises SIGUSR1 at itself and reads the field on return.
+  uint32_t zero = 0;
+  memcpy(buf + FIELD, &zero, 4);
+  sf_signals = sf_written = 0;
+  struct sf_raise *rs = calloc(1, sizeof *rs);
+  rs->field = (volatile uint32_t *)(buf + FIELD);
+  long raised = gk_run_here_user(sf_guest_raise, rs);
+  long raise_signals = sf_signals, raise_written = sf_written;
+  int sig_ok = raised == 24 && rs->before == 0 && rs->after == 24 && raise_signals == 1 &&
+               raise_written == 1;
+
+  // 3. Refused host-side, with nothing recorded: a buffer past the arena's
+  //    reservation, one that reaches past its end, a field past the buffer,
+  //    a field whose end overflows the buffer, a length that wraps the
+  //    address space, a buffer too short for a field, a kind at the limit.
+  struct sf_call *bad = calloc(8, sizeof *bad);
+  bad[0] = (struct sf_call){span, BUF, 0, SF_KIND, 0, 0};                    // outside the arena
+  bad[1] = (struct sf_call){span - 4096, 8192, 0, SF_KIND, 0, 0};            // past its end
+  bad[2] = (struct sf_call){(uint64_t)(buf - base), BUF, BUF, SF_KIND, 0, 0};  // field at the end
+  bad[3] = (struct sf_call){(uint64_t)(buf - base), BUF, BUF - 3, SF_KIND, 0, 0};  // 3 bytes left
+  bad[4] = (struct sf_call){(uint64_t)(buf - base), ~0ULL, 0, SF_KIND, 0, 0};  // length wraps
+  bad[5] = (struct sf_call){(uint64_t)(buf - base), 3, 0, SF_KIND, 0, 0};      // too short
+  bad[6] = (struct sf_call){(uint64_t)(buf - base), BUF, 0, GK_SIGNAL_KINDS, 0, 0};  // kind
+  bad[7].kind = ~0ULL;
+  long rb = gk_run_here_user(sf_guest_register, bad);
+  gk_get_stats(&s2);
+  int refused = rb == 0 && s2.signal_fields == s1.signal_fields;
+  for (int i = 0; i < 7; i++) if (bad[i].r != -EINVAL || bad[i].h != 0) refused = 0;
+
+  // 4. Unregister: refused from another arena (b) and from no arena, and for
+  //    handles gk did not issue; accepted from the owner, after which the
+  //    write finds nothing and a second unregister is refused.
+  gk_signal_handle h = reg[0].h;
+  gk_arena_enter(b);
+  long u_other = gk_run_here_user(sf_guest_unregister, &h);
+  gk_arena_leave();
+  gk_arena_enter(NULL);
+  long u_none = gk_signal_field_unregister(h);
+  gk_arena_enter(a);
+  gk_signal_handle garbage[] = {h ^ 1, h + (1ULL << 16), (gk_signal_handle)(uintptr_t)buf, ~0ULL, 0,
+                                (h & 0xffff) | ((uint64_t)GK_SIGNAL_FIELDS << 16)};
+  int u_garbage = 1;
+  for (size_t i = 0; i < sizeof garbage / sizeof garbage[0]; i++)
+    if (gk_run_here_user(sf_guest_unregister, &garbage[i]) != -EINVAL) u_garbage = 0;
+  gk_get_stats(&s3);
+  memcpy(buf + FIELD, &zero, 4);
+  long u_own = gk_run_here_user(sf_guest_unregister, &h);
+  long w3 = gk_signal_field_write(SF_KIND, 24);
+  uint32_t w3v = 0;
+  memcpy(&w3v, buf + FIELD, 4);
+  long u_again = gk_run_here_user(sf_guest_unregister, &h);
+  gk_get_stats(&s4);
+  int unreg_ok = u_other == -EINVAL && u_none == -ESRCH && u_garbage &&
+                 s3.signal_fields == s1.signal_fields && u_own == 0 && w3 == 0 && w3v == 0 &&
+                 u_again == -EINVAL && s4.signal_fields == s0.signal_fields;
+
+  // 5. No active arena, bad kind: nothing written, an error returned.
+  gk_arena_enter(NULL);
+  long w_none = gk_signal_field_write(SF_KIND, 24);
+  gk_arena_enter(a);
+  long w_kind = gk_signal_field_write(GK_SIGNAL_KINDS, 24);
+  int errs_ok = w_none == -ESRCH && w_kind == -EINVAL;
+
+  // 6. The table is supervisor memory: a ring-3 read and write both fault.
+  unsigned long table = gk_debug_ctl_addr(GK_CTL_SIGNAL_FIELDS);
+  long r3 = gk_run_user(read_byte, (void *)table);
+  unsigned long fr3 = gk_fault_addr();
+  long w3t = gk_run_user(user_write_here, (void *)table);
+  unsigned long fw3 = gk_fault_addr();
+  int walled = r3 == GK_EFAULT && fr3 == table && w3t == GK_EFAULT && fw3 == table;
+
+  // 7. Capacity: the table fills to GK_SIGNAL_FIELDS, the next is refused
+  //    with -ENOMEM, every handle unregisters, and the count returns.
+  static struct sf_call all[GK_SIGNAL_FIELDS + 2];
+  int n = GK_SIGNAL_FIELDS - s4.signal_fields + 1;
+  for (int i = 0; i < n; i++) all[i] = (struct sf_call){(uint64_t)(buf - base), BUF, 0, SF_KIND, 0, 0};
+  all[n].kind = ~0ULL;
+  gk_run_here_user(sf_guest_register, all);
+  gk_stats s5;
+  gk_get_stats(&s5);
+  long wall = gk_signal_field_write(SF_KIND, 7);
+  int cap_ok = s5.signal_fields == GK_SIGNAL_FIELDS && all[n - 1].r == -ENOMEM && all[n - 1].h == 0 &&
+               wall == n - 1;
+  for (int i = 0; i < n - 1; i++) {
+    if (all[i].r != 0 || all[i].h == 0) cap_ok = 0;
+    if (gk_run_here_user(sf_guest_unregister, &all[i].h) != 0) cap_ok = 0;
+  }
+  gk_stats s6;
+  gk_get_stats(&s6);
+  cap_ok = cap_ok && s6.signal_fields == s4.signal_fields;
+
+  // 8. A destroyed arena takes its fields with it.
+  struct sf_call *db = calloc(2, sizeof *db);
+  db[0] = (struct sf_call){(uint64_t)(buf - base), BUF, 8, SF_KIND, 0, 0};
+  db[1].kind = ~0ULL;
+  gk_run_here_user(sf_guest_register, db);
+  gk_stats s7;
+  gk_get_stats(&s7);
+  gk_arena_enter(NULL);
+  gk_arena_destroy(a);
+  gk_stats s8;
+  gk_get_stats(&s8);
+  int destroy_ok = db[0].r == 0 && s7.signal_fields == s6.signal_fields + 1 &&
+                   s8.signal_fields == s6.signal_fields;
+
+  // 9. Cost, and a signal landing inside the mutations. A fresh arena with
+  //    eight fields registered: SF_N writes from the host, timed. Then a
+  //    CPU-time timer fires SIGUSR1 at this thread every 100 us while the
+  //    thread registers two fields, writes them and unregisters them,
+  //    SF_STRESS times: the handler's write runs inside gk's lock at random
+  //    points of those mutations and must find a consistent list each time.
+  a = gk_arena_create(1UL << 20);
+  base = gk_arena_base(a);
+  buf = base + 4096;
+  mprotect(buf, BUF, PROT_READ | PROT_WRITE);
+  memset(buf, 0, BUF);
+  gk_arena_enter(a);
+  struct sf_call *eight = calloc(9, sizeof *eight);
+  for (int i = 0; i < 8; i++) eight[i] = (struct sf_call){(uint64_t)(buf - base), BUF, 16 * i, SF_KIND, 0, 0};
+  eight[8].kind = ~0ULL;
+  gk_run_here_user(sf_guest_register, eight);
+  double t0 = now_ns();
+  long acc = 0;
+  for (int i = 0; i < SF_N; i++) acc += gk_signal_field_write(SF_KIND, (uint32_t)i);
+  double t1 = now_ns();
+  double per_write = (t1 - t0) / SF_N;
+  for (int i = 0; i < 8; i++) gk_run_here_user(sf_guest_unregister, &eight[i].h);
+  gk_signal_handle one;
+  gk_signal_field_register((uintptr_t)(buf - base), BUF, 0, SF_KIND, &one);
+  t0 = now_ns();
+  for (int i = 0; i < SF_N; i++) acc += gk_signal_field_write(SF_KIND, (uint32_t)i);
+  t1 = now_ns();
+  double per_write1 = (t1 - t0) / SF_N;
+  gk_signal_field_unregister(one);
+  int bench_ok = acc == 8L * SF_N + SF_N;
+
+  timer_t timer;
+  struct sigevent sev = {0};
+  sev.sigev_notify = SIGEV_THREAD_ID;
+  sev.sigev_signo = SIGUSR1;
+  sev._sigev_un._tid = (int)syscall(SYS_gettid);
+  struct itimerspec its = {{0, 100000}, {0, 100000}};
+  sf_signals = sf_written = 0;
+  int timer_ok = timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &timer) == 0 &&
+                 timer_settime(timer, 0, &its, NULL) == 0;
+  int stress_ok = timer_ok;
+  struct sf_stress *st = calloc(1, sizeof *st);
+  st->buf = buf; st->offset = (uint64_t)(buf - base); st->len = BUF; st->rounds = SF_STRESS;
+  long guest_bad = gk_run_here_user(sf_guest_stress, st);
+  long guest_signals = sf_signals;
+  if (guest_bad != 0) stress_ok = 0;
+  sf_signals = 0;
+  for (int i = 0; i < SF_STRESS && stress_ok; i++) {
+    gk_signal_handle h1 = 0, h2 = 0;
+    if (gk_signal_field_register((uintptr_t)(buf - base), BUF, 0, SF_KIND, &h1) != 0) stress_ok = 0;
+    if (gk_signal_field_register((uintptr_t)(buf - base), BUF, 4, SF_KIND, &h2) != 0) stress_ok = 0;
+    uint32_t v = 0;
+    memcpy(buf, &v, 4); memcpy(buf + 4, &v, 4);
+    long k = gk_signal_field_write(SF_KIND, 24);
+    uint32_t v1, v2;
+    memcpy(&v1, buf, 4); memcpy(&v2, buf + 4, 4);
+    if (k != 2 || v1 != 24 || v2 != 24) stress_ok = 0;
+    if (gk_signal_field_unregister(h2) != 0 || gk_signal_field_unregister(h1) != 0) stress_ok = 0;
+  }
+  if (timer_ok) timer_delete(timer);
+  long stress_signals = sf_signals;
+  gk_stats s9;
+  gk_get_stats(&s9);
+  stress_ok = stress_ok && guest_signals > 0 && stress_signals > 0 &&
+              s9.signal_fields == s6.signal_fields;
+  gk_arena_enter(NULL);
+  gk_arena_destroy(a);
+  gk_arena_destroy(b);
+  gk_hostcall_unregister(SF_IDX);
+  sigaction(SIGUSR1, &old, NULL);
+  long cpl = gk_run_user(user_cpl, NULL);
+
+  int ok = reg_ok && sig_ok && refused && unreg_ok && errs_ok && walled && cap_ok && destroy_ok &&
+           bench_ok && stress_ok && cpl == 3;
+  printf("signal fields: registered from ring 3 -> handle %#llx (field at %p, arena offset %#lx+%d), "
+         "host write -> %ld field(s), word %u (want 24), other kind -> %ld, rest of buffer intact "
+         "%s [%s]; from a signal handler interrupting the turn: before %ld, after %ld, %ld "
+         "signal(s) wrote %ld [%s]; refused host-side: outside arena %ld, past its end %ld, field "
+         "at end %ld, 3 bytes left %ld, length wraps %ld, too short %ld, kind %ld (want all %d; "
+         "count unchanged %s) [%s]; unregister from other arena %ld, from no arena %ld, %zu "
+         "garbage handles refused %s, by owner %ld then write -> %ld word %u, again %ld [%s]; "
+         "write with no arena %ld, bad kind %ld [%s]; ring-3 read of the table -> %s (fault "
+         "%#lx == %#lx), write -> %s (fault %#lx) [%s]; capacity %d: filled, next -> %ld, write "
+         "hit %ld, emptied %s [%s]; destroyed arena dropped its field %s [%s]; %.0f ns per write "
+         "with 8 fields, %.0f with 1 (%d writes each) [%s]; under a 100 us CPU timer, %d "
+         "register/read/unregister rounds from ring 3 through the hostcall: %ld signals landed, "
+         "%ld inconsistent reads, and %d rounds from the host: %ld signals landed, consistent %s "
+         "[%s]; CPL %ld [%s]\n",
+         (unsigned long long)reg[0].h, (void *)(buf + FIELD), (unsigned long)(buf - base), FIELD,
+         w1, w1v, w2, untouched ? "yes" : "NO", reg_ok ? "ok" : "FAIL", rs->before, rs->after,
+         raise_signals, raise_written, sig_ok ? "ok" : "FAIL", bad[0].r, bad[1].r, bad[2].r,
+         bad[3].r, bad[4].r, bad[5].r, bad[6].r, -EINVAL,
+         s2.signal_fields == s1.signal_fields ? "yes" : "NO", refused ? "ok" : "FAIL", u_other,
+         u_none, sizeof garbage / sizeof garbage[0], u_garbage ? "yes" : "NO", u_own, w3, w3v,
+         u_again, unreg_ok ? "ok" : "FAIL", w_none, w_kind, errs_ok ? "ok" : "FAIL",
+         r3 == GK_EFAULT ? "FAULT" : "READ", fr3, table, w3t == GK_EFAULT ? "FAULT" : "WROTE", fw3,
+         walled ? "ok" : "FAIL", GK_SIGNAL_FIELDS, all[n - 1].r, wall,
+         s6.signal_fields == s4.signal_fields ? "yes" : "NO", cap_ok ? "ok" : "FAIL",
+         s8.signal_fields == s6.signal_fields ? "yes" : "NO", destroy_ok ? "ok" : "FAIL",
+         per_write, per_write1, SF_N, bench_ok ? "ok" : "FAIL", SF_STRESS, guest_signals,
+         guest_bad, SF_STRESS, stress_signals, stress_ok ? "yes" : "NO", stress_ok ? "ok" : "FAIL",
+         cpl, ok ? "OK" : "FAIL");
+  free(reg); free(rs); free(bad); free(db); free(eight); free(st);
+  return ok;
+}
+
 // ---- AVX-512 state in the guest ----------------------------------------------
 // The guest CPUID is the host's, so glibc's ifunc resolvers and any JIT pick
 // AVX-512 code paths on a CPU that has them; the guest's XCR0 must then have
@@ -3153,9 +3518,17 @@ int main(void) {
   // never as a pointer the handler dereferences (see hostcall_check).
   int ok30 = hostcall_check() == 1;
 
+  // ---- signal fields ----------------------------------------------------------
+  // A 4-byte word in an arena that a ring-3 turn registers through a hostcall
+  // is written from the host, and from a signal handler interrupting the
+  // turn, through a descriptor validated host-side and kept in supervisor
+  // memory; bad descriptors are refused with nothing recorded, and the write
+  // path takes no lock and allocates nothing (see signal_field_check).
+  int ok31 = signal_field_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
-            ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28 && ok29 && ok30;
+            ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28 && ok29 && ok30 && ok31;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

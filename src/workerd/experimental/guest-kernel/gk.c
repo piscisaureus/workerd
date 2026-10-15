@@ -110,6 +110,7 @@
 // Guarded by G->lock.
 #define GK_MAX_VCPUS 4096
 #define GK_EPERM 1
+#define GK_ESRCH 3
 #define GK_E2BIG 7
 #define GK_ENOMEM 12
 #define GK_EBUSY 16
@@ -246,6 +247,11 @@ struct gk_arena {
   // G->pml4_gen as of the last arena_sync_root of this root (see sync_cr3).
   // Written under G->lock, read without it.
   unsigned synced_gen;
+  // The arena's signal fields (see the signal-fields section): the index + 1
+  // of the first entry in G->signal_fields, 0 for none; the entries link on
+  // from there. Written under G->lock by the thread that has the arena
+  // active, read without it by that thread's signal handler.
+  int field_head;
   gk_arena *next_free;        // free-list link while the struct is unused
 };
 
@@ -289,6 +295,25 @@ typedef struct { gk_hostcall_fn fn; void *ctx; } gk_hostcall_entry;
 #define GK_HOSTCALL_AREA_BYTES ((size_t)GK_MAX_VCPUS * GK_HOSTCALL_REGION_BYTES)
 _Static_assert(sizeof(gk_hostcall_frame) <= GK_HOSTCALL_REGION_BYTES, "a frame must fit its region");
 _Static_assert(sizeof(gk_hostcall_frame) <= GK_HOST_MAX_ALLOC, "a frame must fit a host block");
+
+// A signal field (see gk_signal_field_register in gk.h): one 4-byte word in
+// an arena that the host writes from a signal handler. Its handle has the
+// same shape as a host slot's (index in the low 16 bits, generation above).
+// `live` is the reader's gate: stored last with release when the entry is
+// published, cleared first when it is retired, so a lock-free walk that sees
+// it set sees the rest of the entry. `next` links the arena's list and is
+// left in place when the entry is retired, so a walk standing on a retired
+// entry still finds the rest of the list; `next_free` links the free list.
+typedef struct {
+  uintptr_t addr;    // absolute address of the field
+  gk_arena *arena;   // the arena it lies in
+  uint64_t gen;      // the generation in the entry's current handle
+  uint32_t kind;
+  int live;
+  int next;          // per-arena list link, as index + 1; 0 ends the list
+  int next_free;     // free-list link, as index + 1; 0 ends the list
+} gk_signal_field;
+_Static_assert(GK_SIGNAL_FIELDS <= (1 << GK_HOST_SLOT_INDEX_BITS), "a field index must fit a handle");
 
 // The supervisor/refuse registry (see prot_class below). An unregistered page
 // is user-accessible, so the registry must never be too small to hold every
@@ -438,6 +463,15 @@ struct gk_ctl {
   int hostcall_n;                    // entries with a handler
   atomic_long hostcall_calls;        // calls that reached a handler
   uintptr_t hostcall_area;           // GK_HOSTCALL_AREA_BYTES, PROT_NONE until a region is committed
+
+  // Signal fields (see the signal-fields section). The table is here, in
+  // supervisor memory, so no ring-3 access reaches an entry. Mutated under
+  // G->lock; walked without it by gk_signal_field_write (see there).
+  gk_signal_field signal_fields[GK_SIGNAL_FIELDS];
+  int signal_field_n;                // entries ever taken from the table
+  int signal_field_free;             // free-list head, as index + 1; 0 when empty
+  int signal_field_live;             // fields registered and not yet unregistered
+  uint64_t signal_field_gen;         // the generation of the last registration
 
   // Set at the end of a successful gk_init (see gk_initialized).
   int initialized;
@@ -2487,6 +2521,7 @@ unsigned long gk_debug_ctl_addr(int which) {
     case GK_CTL_FILTER: return (unsigned long)&G->filter;
     case GK_CTL_HOST_SLOTS: return (unsigned long)&G->host_slots[0];
     case GK_CTL_HOSTCALLS: return (unsigned long)&G->hostcalls[0];
+    case GK_CTL_SIGNAL_FIELDS: return (unsigned long)&G->signal_fields[0];
     default: return 0;
   }
 }
@@ -2888,6 +2923,164 @@ long gk_hostcall(unsigned idx) {
   gk_thread *t = thread_get();
   if (!t) return -GK_ENOMEM;
   return hostcall_dispatch(t, idx);
+}
+
+// ---- signal fields -----------------------------------------------------------
+// The table of 4-byte words in arenas that the host writes from a signal
+// handler (see gk_signal_field_register in gk.h). Registration and
+// unregistration are host-side and take G->lock; the write path takes no
+// lock and allocates nothing, and is placed here, beside the hostcall
+// dispatch, because it runs under the allocation guard too. The arena of
+// every operation is the calling thread's active arena, from the thread's
+// record: never a value the caller supplies.
+
+// The calling thread's record for the lock-free path, or NULL. The thread-
+// local index is a hint, accepted only if the record it names carries the
+// calling thread's kernel tid; otherwise the records are scanned for the tid.
+// Neither outcome is fatal: a signal handler has no caller to report to, and
+// a rewritten hint must cost the writer nothing but the scan.
+static gk_thread *thread_cur_lockfree(void) {
+  long tid = gettid_raw();
+  int i = tls_rec;
+  if (i >= 1 && i <= GK_MAX_VCPUS && __atomic_load_n(&G->threads[i - 1].tid, __ATOMIC_RELAXED) == tid)
+    return &G->threads[i - 1];
+  int n = __atomic_load_n(&G->thread_n, __ATOMIC_ACQUIRE);
+  if (n > GK_MAX_VCPUS) n = GK_MAX_VCPUS;
+  for (int j = 0; j < n; j++)
+    if (__atomic_load_n(&G->threads[j].tid, __ATOMIC_RELAXED) == tid) return &G->threads[j];
+  return NULL;
+}
+
+// The entry a handle names, or NULL if the handle is not one gk issued for a
+// field that is still registered. Caller holds G->lock.
+static gk_signal_field *signal_field_of_locked(gk_signal_handle h) {
+  uint64_t idx = h & ((1ULL << GK_HOST_SLOT_INDEX_BITS) - 1), gen = h >> GK_HOST_SLOT_INDEX_BITS;
+  if (idx >= (uint64_t)GK_SIGNAL_FIELDS) return NULL;
+  gk_signal_field *f = &G->signal_fields[idx];
+  if (!f->live || f->gen != gen) return NULL;
+  return f;
+}
+
+// Retires entry `f` of arena `a`: clears its gate, unlinks it from the
+// arena's list (the link it carries stays, see gk_signal_field), and returns
+// it to the free list. Caller holds G->lock.
+static void signal_field_retire_locked(gk_arena *a, gk_signal_field *f) {
+  int idx = (int)(f - G->signal_fields);
+  __atomic_store_n(&f->live, 0, __ATOMIC_RELEASE);
+  int *prev = &a->field_head;
+  for (int cur = *prev; cur; cur = *prev) {
+    if (cur == idx + 1) { __atomic_store_n(prev, f->next, __ATOMIC_RELEASE); break; }
+    prev = &G->signal_fields[cur - 1].next;
+  }
+  f->next_free = G->signal_field_free;
+  G->signal_field_free = idx + 1;
+  G->signal_field_live--;
+}
+
+// Unregisters every field of an arena being destroyed. Caller holds G->lock.
+static void signal_fields_drop_locked(gk_arena *a) {
+  while (a->field_head) {
+    gk_signal_field *f = &G->signal_fields[a->field_head - 1];
+    if (f->arena != a || !f->live) { a->field_head = 0; break; }  // cannot happen; be safe
+    signal_field_retire_locked(a, f);
+  }
+}
+
+int gk_signal_field_register(uintptr_t buffer_offset, size_t buffer_len, uint32_t field_offset,
+                             unsigned kind, gk_signal_handle *handle) {
+  if (handle) *handle = 0;
+  if (!handle || kind >= GK_SIGNAL_KINDS || !G->initialized) return -GK_EINVAL;
+  gk_thread *t = thread_cur();
+  gk_arena *a = t ? t->active_arena : NULL;
+  if (!a) return -GK_ESRCH;
+  pthread_mutex_lock(&G->lock);
+  // The buffer within the reservation, the field within the buffer, each
+  // bound checked by subtraction so no sum can wrap.
+  size_t span = a->end - a->base;
+  if (buffer_offset > span || buffer_len > span - buffer_offset ||
+      buffer_len < GK_SIGNAL_FIELD_BYTES || field_offset > buffer_len - GK_SIGNAL_FIELD_BYTES) {
+    pthread_mutex_unlock(&G->lock);
+    return -GK_EINVAL;
+  }
+  int idx;
+  if (G->signal_field_free) {
+    idx = G->signal_field_free - 1;
+    G->signal_field_free = G->signal_fields[idx].next_free;
+  } else if (G->signal_field_n < GK_SIGNAL_FIELDS) {
+    idx = G->signal_field_n++;
+  } else {
+    pthread_mutex_unlock(&G->lock);
+    return -GK_ENOMEM;  // the table is full: reported, never fatal
+  }
+  uint64_t gen = ++G->signal_field_gen;
+  if (gen >> GK_HOST_SLOT_GEN_BITS) gen = G->signal_field_gen = 1;
+  gk_signal_field *f = &G->signal_fields[idx];
+  f->addr = a->base + buffer_offset + field_offset;
+  f->arena = a;
+  f->kind = kind;
+  f->gen = gen;
+  f->next = a->field_head;
+  f->next_free = 0;
+  // Published in this order: the entry is complete before its gate opens,
+  // and reachable from the arena's list only after that.
+  __atomic_store_n(&f->live, 1, __ATOMIC_RELEASE);
+  __atomic_store_n(&a->field_head, idx + 1, __ATOMIC_RELEASE);
+  G->signal_field_live++;
+  pthread_mutex_unlock(&G->lock);
+  *handle = (gen << GK_HOST_SLOT_INDEX_BITS) | (uint64_t)idx;
+  return 0;
+}
+
+int gk_signal_field_unregister(gk_signal_handle handle) {
+  if (!G->initialized) return -GK_EINVAL;
+  gk_thread *t = thread_cur();
+  gk_arena *a = t ? t->active_arena : NULL;
+  if (!a) return -GK_ESRCH;
+  pthread_mutex_lock(&G->lock);
+  gk_signal_field *f = signal_field_of_locked(handle);
+  if (!f || f->arena != a) {
+    pthread_mutex_unlock(&G->lock);
+    fprintf(stderr, "[gk] gk_signal_field_unregister: %#llx is not the handle of a signal field "
+            "of the calling thread's arena; nothing is unregistered\n", (unsigned long long)handle);
+    return -GK_EINVAL;
+  }
+  signal_field_retire_locked(a, f);
+  pthread_mutex_unlock(&G->lock);
+  return 0;
+}
+
+long gk_signal_field_write(unsigned kind, uint32_t value) {
+  if (kind >= GK_SIGNAL_KINDS) return -GK_EINVAL;
+  if (!G->initialized) return -GK_ESRCH;
+#ifdef GK_GUARD_HANDLER_ALLOC
+  int was_in_handler = g_in_handler;  // the signal may have interrupted a handler
+#endif
+  GK_HANDLER_ENTER();
+  long n = -GK_ESRCH;
+  gk_thread *t = thread_cur_lockfree();
+  gk_arena *a = t ? __atomic_load_n(&t->active_arena, __ATOMIC_ACQUIRE) : NULL;
+  if (a) {
+    uintptr_t base = a->base, end = a->end;
+    n = 0;
+    int i = __atomic_load_n(&a->field_head, __ATOMIC_ACQUIRE);
+    for (int steps = 0; i >= 1 && i <= GK_SIGNAL_FIELDS && steps < GK_SIGNAL_FIELDS; steps++) {
+      gk_signal_field *f = &G->signal_fields[i - 1];
+      int live = __atomic_load_n(&f->live, __ATOMIC_ACQUIRE);
+      uintptr_t addr = __atomic_load_n(&f->addr, __ATOMIC_RELAXED);
+      if (live && f->arena == a && f->kind == kind && addr >= base &&
+          addr <= end - GK_SIGNAL_FIELD_BYTES) {
+        memcpy((void *)addr, &value, sizeof value);  // the field need not be aligned
+        n++;
+      }
+      i = __atomic_load_n(&f->next, __ATOMIC_ACQUIRE);
+    }
+  }
+#ifdef GK_GUARD_HANDLER_ALLOC
+  g_in_handler = was_in_handler;
+#else
+  GK_HANDLER_LEAVE();
+#endif
+  return n;
 }
 
 // ---- syscall forwarding ----------------------------------------------------
@@ -4130,6 +4323,7 @@ void gk_arena_destroy(gk_arena *a) {
   }
   if (pkey_set_range(a->base, a->end, 0) < 0 && G->dbg)
     fprintf(stderr, "[gk] pkey table full; destroyed arena keeps stale keys\n");
+  signal_fields_drop_locked(a);
   int in_use = __atomic_load_n(&a->active_threads, __ATOMIC_SEQ_CST);
   if (in_use > 0) {
     fprintf(stderr, "[gk] gk_arena_destroy: arena [%#lx,%#lx) is still active on %d thread(s); "
@@ -4181,6 +4375,7 @@ void gk_get_stats(gk_stats *s) {
   s->host_slots = G->host_slot_live;
   s->hostcall_handlers = G->hostcall_n;
   s->hostcalls = atomic_load_explicit(&G->hostcall_calls, memory_order_relaxed);
+  s->signal_fields = G->signal_field_live;
   pthread_mutex_unlock(&G->lock);
 }
 

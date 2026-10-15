@@ -133,6 +133,7 @@ enum {
   GK_CTL_FILTER,       // the syscall filter
   GK_CTL_HOST_SLOTS,   // the host slot table
   GK_CTL_HOSTCALLS,    // the hostcall handler table
+  GK_CTL_SIGNAL_FIELDS,  // the signal field table
   GK_CTL_COUNT
 };
 unsigned long gk_debug_ctl_addr(int which);
@@ -234,6 +235,7 @@ typedef struct {
   int host_slots;       // host slots allocated and not yet freed (see gk_host_slot_alloc)
   int hostcall_handlers;  // hostcall indices with a handler registered (see gk_hostcall_register)
   long hostcalls;       // hostcalls that reached a handler, from either side
+  int signal_fields;    // signal fields registered and not yet unregistered (see gk_signal_field_register)
 } gk_stats;
 void gk_get_stats(gk_stats *s);
 
@@ -447,6 +449,83 @@ gk_hostcall_frame *gk_hostcall_region(void);
 // its result, or gk's refusal (-ENOSYS, -E2BIG, -EINVAL). One VM exit from
 // inside the guest; a direct call on the host side.
 long gk_hostcall(unsigned idx);
+
+// Signal fields: 4-byte words inside an arena that the host writes from a
+// signal handler, found through a table in gk's supervisor memory rather than
+// through anything the guest can write.
+//
+// The case this serves: a runtime that signals an isolate whose turn is using
+// up its CPU budget by writing a constant into the isolate's own memory (a
+// Wasm module's linear memory, say), from the handler of a per-thread CPU
+// timer, while the turn is running. The handler cannot take a lock and
+// cannot allocate, and it must not trust a descriptor kept in the ordinary
+// heap: a pointer and a size the isolate can rewrite turn the handler into
+// an arbitrary write of a known constant, triggered by burning CPU. So the
+// descriptor is validated once, host-side, and kept here.
+//
+// Registration is host-side (a hostcall handler, or any host code) and is
+// for the calling thread's active arena, taken from gk's record of the
+// thread, never from the caller: a turn can register fields only in the
+// arena it is running in. gk_signal_field_register names a buffer by its
+// offset within that arena and its length, and the field by its offset
+// within the buffer, and refuses -- with nothing recorded -- a buffer that
+// does not lie wholly within the arena's reservation, a field that does not
+// lie wholly within the buffer (including by overflow of any sum), a kind at
+// or past GK_SIGNAL_KINDS, a calling thread with no active arena (-ESRCH),
+// and a full table (-ENOMEM, never fatal). What the table keeps is the
+// field's absolute address, the arena and the kind. The handle it returns is
+// validated like a host slot handle (index, liveness, generation; see
+// gk_host_slot_get), and gk_signal_field_unregister accepts it only from a
+// thread whose active arena is the field's, so a turn cannot unregister
+// another arena's fields with a handle it guessed; a handle that fails
+// validation is -EINVAL with nothing changed. Destroying an arena
+// unregisters whatever fields it still has.
+//
+// gk_signal_field_write writes `value` to every registered field of kind
+// `kind` in the calling thread's active arena, and returns how many it
+// wrote, or a negative value with nothing written: -ESRCH when the thread has
+// no record or no active arena, -EINVAL for a bad kind. It is for use from a
+// signal handler on the thread whose turn is running: it takes no lock,
+// allocates nothing, makes at most one syscall (gettid, to validate the
+// thread's record), and reads only the control block -- the thread record is
+// found by validating the thread-local hint against the record's tid and,
+// failing that, by scanning the records for the tid, so a rewritten hint
+// changes nothing; the arena is the record's; the fields are the arena's
+// list, walked without a lock. It is correct against a signal that arrives
+// in the middle of a registration or unregistration: the only mutations of
+// an arena's list come from the threads that have that arena active (a
+// registration is for the caller's own active arena, an unregistration is
+// refused for any other), which in the runtime is the one thread holding the
+// isolate's lock -- the thread the signal interrupts. The interrupted
+// mutation holds gk's lock, which the walk never takes, and the walk sees the
+// mutation's stores in program order: a field is published by storing its
+// `live` flag last, with release semantics, after its address, arena and
+// kind, and retired by clearing `live` first, with its address left in place
+// until the entry is recycled, so a walk that observes `live` observes a
+// complete descriptor, and the link it reads from a retired entry still
+// leads to the rest of the list. Each address is checked against the
+// arena's bounds again before the write, so a torn or recycled entry (which
+// the ordering above rules out, but which costs nothing to check) cannot
+// aim the write outside the arena. Under the GK_GUARD_HANDLER_ALLOC build
+// the walk runs under the allocation guard.
+//
+// What this does not do: the write lands wherever the field is, at the
+// address the buffer had when it was registered. A buffer the isolate has
+// since freed or moved (a Wasm memory that grew by relocation) gets the
+// write at its old address, which is still inside that isolate's own arena,
+// so the isolate can at worst mislay its own signal; an owner that moves a
+// buffer unregisters and re-registers the field. A field in a page the
+// isolate has decommitted since faults the host's write: a crash the
+// isolate could cause by other means, not a write anywhere else.
+#define GK_SIGNAL_FIELDS 8192
+#define GK_SIGNAL_KINDS 4
+#define GK_SIGNAL_FIELD_BYTES 4
+typedef uint64_t gk_signal_handle;
+int gk_signal_field_register(uintptr_t buffer_offset, size_t buffer_len,
+                             uint32_t field_offset, unsigned kind,
+                             gk_signal_handle *handle);
+int gk_signal_field_unregister(gk_signal_handle handle);
+long gk_signal_field_write(unsigned kind, uint32_t value);
 
 // Nonzero once gk_init has succeeded in this process.
 int gk_initialized(void);

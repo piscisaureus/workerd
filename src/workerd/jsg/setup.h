@@ -202,9 +202,18 @@ class WD_MEMORY_CLASS_HOST GuestArena final {
   gk_arena* get() const {
     return arena;
   }
-  // The sandbox part of the arena's reservation, [base(), base() + size()).
-  void* base() const;
-  size_t size() const;
+  // The sandbox part of the arena's reservation, [base(), base() + size()). Both are copies
+  // taken when the arena is adopted: gk's own record of the arena is in its supervisor memory,
+  // which a JS turn at ring 3 cannot read, and a turn needs these to describe a buffer of its
+  // own to the host by its offset within the arena (see TrackedWasmInstanceList). The copies
+  // live in this ordinary heap object, so they are the turn's to misreport, and what they feed
+  // is validated host-side against gk's record.
+  void* base() const {
+    return reinterpret_cast<void*>(sandboxBase);
+  }
+  size_t size() const {
+    return sandboxSize;
+  }
 
 #ifdef WORKERD_HAS_GUEST_KERNEL
   // The allocator over the arena's tail, [base() + size(), end of the reservation).
@@ -215,6 +224,8 @@ class WD_MEMORY_CLASS_HOST GuestArena final {
 
  private:
   gk_arena* arena;
+  uintptr_t sandboxBase = 0;
+  size_t sandboxSize = 0;
 #ifdef WORKERD_HAS_GUEST_KERNEL
   kj::Own<ArenaPageAllocator> pageAllocator;
 #endif

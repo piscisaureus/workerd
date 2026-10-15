@@ -693,6 +693,8 @@ GuestArena::GuestArena(gk_arena* arena): arena(arena) {
 #ifdef WORKERD_HAS_GUEST_KERNEL
   auto base = reinterpret_cast<uintptr_t>(gk_arena_base(arena));
   size_t size = gk_arena_size(arena);
+  sandboxBase = base;
+  sandboxSize = size;
   // gk does not report the reservation's full extent; it follows from the slot layout, which
   // the alignment check pins.
   KJ_REQUIRE(base % GUEST_ARENA_SLOT_SIZE == 0, "guest-kernel arena is not slot-aligned", base);
@@ -715,22 +717,6 @@ GuestArena::~GuestArena() noexcept(false) {
   // references the allocator any more.
   pageAllocator = nullptr;
   gk_arena_destroy(arena);
-#endif
-}
-
-void* GuestArena::base() const {
-#ifdef WORKERD_HAS_GUEST_KERNEL
-  return gk_arena_base(arena);
-#else
-  return nullptr;
-#endif
-}
-
-size_t GuestArena::size() const {
-#ifdef WORKERD_HAS_GUEST_KERNEL
-  return gk_arena_size(arena);
-#else
-  return 0;
 #endif
 }
 
