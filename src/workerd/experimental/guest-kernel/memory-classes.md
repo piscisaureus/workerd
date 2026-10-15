@@ -1,0 +1,519 @@
+# Memory classes for runtime C++ objects
+
+Guest-kernel isolation (see `README.md`) maps each isolate's memory into a
+private page-table arena, so another isolate's arena is unmapped during a
+turn and a stray access faults. The enforcement exists; what is missing is a
+decision, for every runtime object, about which side of the boundary it lives
+on. Without that decision the arena covers whatever the allocator happens to
+place in it, which is how shared state ends up inside one isolate's arena and
+faults every other isolate that reads it.
+
+This file is that decision procedure, and the inventory of where the code
+stands against it.
+
+## The classes
+
+**Isolate (I).** Lives in the isolate's arena. Mapped only while that
+isolate's turn runs, so no other isolate and no host-side code can address it.
+The host does not read or write an I object: what the host needs from one is
+serialized out of the arena first, as a Cap'n Proto message in the boundary
+region. An I object may hold raw pointers to other I objects in the same
+arena, and to read-only runtime text and rodata. Everything else it refers to
+is either an opaque handle naming a host object, or a bounds- and
+owner-checked descriptor for a binary buffer. In particular an I object holds
+no `kj::Own` whose disposer lives outside the arena, and no vtable that the
+host will later call through.
+
+**Host (H).** Lives outside every arena, in memory no arena maps, so ring 3
+can neither read nor write it. Which of gk's two protected classes it takes
+follows from who serves the crossing: state a ring-0 helper inside the guest
+has to reach is `GK_PROT_SUPER` (mapped, `PTE_U` clear, so ring 0 reaches it
+and ring 3 faults), and state only the host proper touches is
+`GK_PROT_REFUSE`, never mapped into any guest root at all. Both are how gk
+already protects its own control state; see `prot_add` in `gk.c`. Preferring
+REFUSE is the safer default, since a SUPER range is reachable by any ring-0
+code the guest can get to run. May hold raw pointers to other H objects. Refers to an I object only
+as an opaque handle together with the arena it belongs to; dereferencing one
+means entering that arena, which only a turn or a ring-0 helper does.
+
+**Boundary (B).** The one region both sides touch, one per isolate. Holds the
+messages the two sides exchange, the handle tables' isolate-visible halves,
+and buffer descriptors. Contains no pointers, only offsets, lengths and
+handles. Everything the host reads from it is untrusted input and is validated
+on every read, with no assumption that a value read twice is the same value.
+
+**Provenance.** A class is not safe merely because its own memory is on the
+right side. What matters as much is where the host got the pointer it used to
+reach the object: a pointer the host loads out of I or B memory names whatever
+the guest put there. Every host-side flaw found in this codebase so far has
+this shape -- the page-table root the host installed, the arena the host
+destroyed, the address the page allocator mapped, the turn-depth counter, the
+`jsg::Lock` the host re-installs, the buffer a signal handler writes. So the
+rule is: a pointer the host dereferences, and any value the host uses to
+decide what to dereference, comes from H memory. An index into an H-owned
+table may come from anywhere, because the host validates it against the
+table; a pointer may not.
+
+The first two classes are the whole point: an object is one isolate's or it is
+the runtime's. B is not a third kind of object but the channel, and it exists
+because without a region both sides can touch there is nothing to carry a
+message. Keeping it a named class with its own rules is what stops it growing
+into "shared memory" by accident.
+
+## Deciding a class
+
+For a given class, in order. The first question that answers decides it.
+
+1. Is its lifetime owned by a JS object -- a `jsg::Ref`, a `JSG_RESOURCE_TYPE`
+   wrapper, a cppgc-traced object -- and does nothing outside the isolate hold
+   a reference to it? **I.**
+2. Is it reached from the KJ event loop, a timer, an I/O completion, a
+   background thread, or more than one isolate? **H.**
+3. Does it exist once per process or once per thread rather than once per
+   isolate? **H.** A singleton, a registry, a file-scope cache and the
+   allocator's own metadata are all H, and an I object may not own storage
+   that one of them will later read.
+4. Is it a leaf utility with no state of its own beyond what its owner gives
+   it -- a string view, a parser, a small value type? It takes the class of
+   whatever owns it, and needs no annotation.
+5. Otherwise it is used from both sides, and it does not have a class: it has
+   a **split**. Naming the split is the answer -- which members go to which
+   side, and whether the interface between the halves is a message, a checked
+   buffer, or a handle.
+
+A class that fails rule 1 only because something outside the isolate holds a
+reference to it is usually a split, not an H class. The reference is the thing
+to replace, with a handle.
+
+## What replaces the patterns that cross today
+
+**`kj::Own` across the boundary becomes a handle.** An I object that needs a
+host resource holds an integer handle into a table that lives in H memory. The
+host owns the resource and the table entry; the entry carries a generation
+counter, and the host validates index and generation on every use, so a
+rewritten handle names nothing or names a dead entry rather than an object of
+the attacker's choosing. Isolate teardown walks the table host-side instead of
+running disposers inside the arena.
+
+This is what `IoOwn` and `DeleteQueue` (`src/workerd/io/io-own.h`) already do
+in spirit -- make a JS-heap reference to a KJ I/O object safe across context
+teardown -- with the ownership and the validity check moved to the side the
+guest cannot write.
+
+**A returned object becomes a message.** A turn that produces a value for the
+host writes it into the boundary region in a form with no pointers and no
+disposers. This is why the non-void results of `IoContext::run` cannot be
+fixed by marshalling the out-parameter: 25 of its 27 non-void call sites
+return a `kj::Promise`, whose node is built in the arena and carries a vtable
+the host would call through. The promise has to be created host-side and the
+turn has to resolve it through the channel.
+
+**Binary data becomes a descriptor.** An `ArrayBuffer` backing store or a body
+chunk crosses as `{handle, offset, length}` against a buffer the host owns,
+checked on every use, rather than as a pointer the host dereferences. This is
+the one case where the boundary carries bulk data rather than a message, and
+the reason the rubric permits it is that the content is opaque bytes: nothing
+the host does with it depends on its value.
+
+## Enforcing it
+
+Three layers, each catching what the one before cannot.
+
+1. **Placement.** The allocator decides the class in practice: an I object has
+   to come from the isolate's arena and an H object from memory no arena maps.
+   Per-isolate heap arenas are the mechanism (`jsg::HeapArena`).
+2. **A static check.** The classes are a type-level property, so an H class
+   with an I-class member, or an I class holding a `kj::Own` of an H class, is
+   a compile-time error rather than a fault in production. workerd already
+   carries custom clang-tidy checks of this shape in `tools/clang-tidy`
+   (`jsg-visit-for-gc`, `workerd-unsafe-continuation-capture`), so the
+   infrastructure for one more exists.
+3. **Measurement.** `GK_TRACE_FOREIGN` (on the `guest-kernel-trace` branch)
+   records every ring-3 access to memory outside the arena, with the faulting
+   RIP. Any access to an address in H memory is a violation of the
+   classification, found by running the test suite rather than by reading
+   code. A hello-world turn currently makes about 43 such accesses, across
+   about 32 distinct pages.
+
+The order matters: the static check is what makes the classification hold as
+the code changes, and the measurement is what finds the places the static
+check cannot see, such as a write through a pointer that was laundered
+through an integer.
+
+## Cost
+
+The classification implies a crossing wherever a turn reaches H state today.
+The crossing is a ring 3 to ring 0 transition inside the guest, not a VM exit:
+**22 ns, measured, 212 times cheaper than the 4.75 us of an exit** (see
+`m10_ringtrap` in the benchmark suite). At the ~43 crossings a hello turn
+takes that is about 1 us, roughly 1% of the request. The explicit trap is 9.5
+times cheaper than servicing a demand fault, so the interface should be a call
+into ring 0 rather than fault-and-service.
+
+Most of the foreign accesses a hello turn makes -- roughly seven in ten of
+the recorded hits -- are to the allocator's global state, which per-isolate
+heap arenas remove rather than convert into crossings, so the crossing count
+is an upper bound that the placement work reduces first.
+
+## Inventory: rules that classify the bulk
+
+Each rule has a test that can be applied without reading the class body.
+
+| Rule | Test | Class |
+|---|---|---|
+| R1 | Declares `JSG_RESOURCE_TYPE(`, equivalently derives from `jsg::Object` | **I**. `jsg::Object` inherits `Wrappable` (`jsg/jsg.h:1384`); the only allocation path is `Lock::alloc` -> `kj::refcounted<T>` (`jsg.h:2753`); lifetime is GC-driven through the `v8::TracedReference` wrapper (`wrappable.h:309`). Its vtable is only ever called by the heap tracer and the memory tracker, both under the lock |
+| R2 | Has a member of type `v8::Global`, `v8::TracedReference`, `jsg::Data`, `V8Ref`, `JsRef`, `Ref`, `WeakRef`, `jsg::Promise`, `Resolver`, `jsg::Function`, `JsContext` | **I**, or a split site if the enclosing class is otherwise H. All of them bottom out in `v8::Global<v8::Data>` (`jsg.h:969`) or a `kj::Own` of a `Wrappable` (`jsg.h:1594`) |
+| R3 | Has a member of, or implements, `kj::Promise`, `ForkedPromise`, `TaskSet`, `PromiseFulfiller`, `Canceler`, `kj::Timer&`, `AsyncInputStream`/`AsyncIoStream`, `HttpClient`/`HttpService`, `capnp::*::Client`/`Server`, `kj::Executor`, `EventLoopLocal`, `MutexGuarded` | **H**. The codebase already enforces this split at the type level in the other direction: `jsg::Promise<kj::Promise<T>>` is a `static_assert` failure naming `IoOwn` as the bridge (`jsg/promise.h:470`), and `PromiseWrapper` deletes `kj::Promise<v8::Global<T>>` (`io/promise-wrapper.h:464`) |
+| R4 | Abstract class of embedder hooks whose implementation lives outside `io/` and `jsg/` (the `observer.h` convention) | **H**, and every in-turn call through its vtable is a message site. Covers `RequestObserver` (`io/observer.h:93`), `LimitEnforcer` (`io/limit-enforcer.h:221`), `IoChannelFactory` and its channels (`io/io-channels.h:119`), `TimerChannel` (`:69`), `CacheClient` (`:44`), `ActorIdFactory` (`io/actor-id.h:41`), the gate hooks (`io/io-gate.h:44`), `jsg::IsolateObserver` (`jsg/observer.h:25`), `Serializer::ExternalHandler` (`jsg/ser.h:73`) |
+| R5 | No path from a `Wrappable` except through `IoOwn`/`IoPtr`/`ReverseIoOwn` or a `kj::Function` captured into a KJ promise | **H**. Promise nodes, `TaskSet` entries, timer tasks, HTTP client objects, `WorkerInterface` instances, capnp RPC state |
+| R6 | Every member is an integer, enum, `bool`, `kj::Date`, `kj::Duration`, or a `kj::String`/`kj::Array<byte>`/`kj::Vector` of the same | Side-neutral; crosses by copying into B. `IoContext::Id` (`io-context.h:521`), `TimeoutId` (`io/io-timers.h:17`), `tracing::SpanId`/`TraceId` (`io/trace.h:45`, `:128`), every event struct in `io/trace.h:373-985`, `Trace` (`:989`, which already has capnp `copyTo`/`mergeFrom` at `:1049`), `jsg::GuestTurnOutcome`. Caveat: a `kj::String` carries an `ArrayDisposer*`, so it crosses as bytes plus length and is re-owned on arrival, never moved as a `kj::String` |
+| R7 | `thread_local`, or a function-local `static` with mutable state | Reachable by the guest; must move to H memory or be re-derived host-side after each turn. `threadLocalRequest` (`io-context.c++:29`), `currentApi` (`worker.c++:557`), `tmpDirStorageScope` (`worker-fs.c++:53`), `inCppgcShimDestructor` (`wrappable.c++:29`), `guestTurnArena` (`guest-run.c++:29`), `CompileCache::get()`'s static (`jsg/compile-cache.h:47`), `AsyncLockQueue::threadCurrentWaiter` (`io/async-lock-scheduler.h:159`) |
+| R8 | Every public method takes `jsg::Lock&` and the class has no R3 member | **I**. `jsg::Serializer`/`Deserializer` (`jsg/ser.h:60`), `MemoryTracker` (`jsg/memory.h:176`), `jsg::Url` and friends, the `TypeWrapper`/`ResourceWrapper` machinery (`jsg/type-wrapper.h:635`), `ModuleRegistryImpl` (`jsg/modules.h:280`), `AsyncContextFrame` (`jsg/async-context.h:70`) |
+| R9 | Process-wide singleton of the V8 embedding | **H**. `V8System` (`jsg/setup.h:53`), `V8PlatformWrapper` (`jsg/v8-platform-wrapper.h:13`), `GuestArena` (`setup.h:194`). `ArenaPageAllocator` (`setup.h:121`) is the exception: V8 calls it from in-arena threads, so its code runs in the guest and its range checks are not a host-side guarantee -- the enforcement for it is the syscall filter's `gk_mapping_syscall_ok` |
+
+## Inventory: `io/` and `jsg/`
+
+This is where almost every split lives. The turn lambda
+(`io-context.c++:1476-1623`) touches host state before any API code runs:
+`registerPendingEvent()` (`:1483`), `limitEnforcer->enterJs` (`:1486`),
+`js.pumpMsgLoop()` (`:1541`), `getLimitsExceeded()` (`:1543`),
+`runnable.run(workerLock)` through a vtable on a host-stack object (`:1582`),
+`abortException` (`:1593`), `logUncaughtException` (`:1616`). Then every API
+call reaches `IoContext::current()`, `addObject`/`IoOwn`, `awaitIo`,
+`getSubrequest*`, `getIoChannelFactory()`, `makeTraceSpan`, the actor cache,
+the input gate and the timeout manager -- all by direct pointer today.
+
+The splits, with the half each member goes to:
+
+| Class | Split |
+|---|---|
+| `IoContext` (`io-context.h:277`) | H keeps the event-loop state: `tasks`/`waitUntilTasks` (`:1235`, `:1245`), `abortFulfiller`/`abortPromise` (`:1210`), `canceler` (`:1250`), `ownedObjects` (`:1221`), `localCapSet` (`:1187`), `thread` (`:1172`), `limitEnforcer` (`:1180`). I gets a mirror: the `Id`, the JsRefs (`:1269`), the invocation span context, the policy constants, and the handle tables. `IoContext::current()` becomes a read of the mirror through a slot the host writes before each turn |
+| `IoContext::Runnable`/`RunnableImpl` (`:1272`, `:1450`) | Becomes a B message `{closure handle, input descriptors, result slot}`. This is where the non-void result problem lives |
+| `IoOwn`/`IoPtr`/`ReverseIoOwn` (`io-own.h:245`, `:290`, `:322`) | I side becomes `{context slot, object index}`; `operator->` is deleted for an H `T`, so every use becomes a message keyed by the handle. H keeps `OwnedObjectList`, split by `T`: it owns H objects outright and holds an arena handle for I ones (the functors from `addFunctor`, the `SpanBuilder` tuple at `:629`) |
+| `DeleteQueue` (`io-own.h:89`) | `State::queue`/`actions` become a B ring of `{release handle}` and `{closure handle}` records, so `~IoOwn` stops taking a host mutex from inside the arena during GC (`io-own.c++:15`). The cross-thread wakeup stays H |
+| `jsg::Lock` (`jsg.h:2746`) | H: the `v8::Locker`, `GuestArenaScope`, and the data-slot save/restore. I: `v8Isolate`, `isolateScope`, `warningsLogged` and the wrap/alloc methods. See violation 1 -- this one is not optional |
+| `jsg::IsolateBase` (`setup.h:244`) | I: `ptr`, the behaviour flags, `typeHandlerRegistry`, the V8 global templates, `heapTracer`. H: `v8System`, `observer`, the external-memory target. B: the deferred-destruction queue becomes a ring of `{kind, handle}` records rather than `kj::OneOf<GlobalToDelete, RefToDelete, kj::Own<void>>` (`setup.h:584`), and `codeMap` (`:739`) becomes a B array of `{start, size, name offset}` the host signal handler bounds-checks |
+| `Worker` / `Script` / `Isolate` / `Actor` (`worker.h:104`, `:246`, `:333`, `:887`) | Each splits along `X` versus `X::Impl`: the `Impl`s are I (contexts, `env`, `ctxExports`, `namedHandlers` of `jsg::Function`, `classInstance`, `transient`), the outer objects keep scheduling, metrics, limits, the inspector transport, condemnation, the actor cache and the gates |
+| `Worker::Lock` (`worker.h:732`) | The object is on the host stack but `impl` is heap (`worker.c++:2508`) and `~Lock` calls `checkInWithLimitEnforcer` through it (`:2512`). H keeps the lock record and the limit check-in; in-turn users move to the I mirror |
+| `TimeoutManager` (`io/io-timers.h:66`, `io-context.c++:45`) | H: `{id -> when, fulfiller, repeat}` and the timer task. I: `{id -> jsg::Function}`. Messages `schedule(id, delayMs, repeat)`, `clear(id)`, and `fire(id)` as a turn request |
+| Trace types (`io/trace.h:1185`, `:1123`) | H: `Span`, the `SpanObserver` chain, the tracer. I: `SpanBuilder`/`SpanParent`/`TraceContext` become `{span handle}` plus a tag buffer, with messages `spanOpen`/`spanSetTag`/`spanAddLog`/`spanClose`. `trace.capnp` already serializes the payloads |
+| `IoChannelFactory` and the `WorkerInterface`/`kj::HttpService` plumbing (`io-channels.h:119`, `io/worker-interface.h:36`) | H only. The `uint channel` the I side holds is already the handle. A subrequest becomes a message in the http-over-capnp shape plus B ring buffers for bodies; the host is the only side that touches sockets |
+| `ActorCache` and storage (`io/actor-cache.h:345`, `io/actor-sqlite.h:16`) | H only; messages for get/put/delete/list/transaction, with a cache hit returning a checked buffer immediately and a miss returning a promise handle |
+| `InputGate`/`OutputGate` (`io/io-gate.h:34`, `:250`) | H only; `Lock` and `CriticalSection` become handles, and `blockConcurrencyWhile` sends `startCriticalSection(parent handle)` |
+| `Frankenvalue` (`io/frankenvalue.h:19`) | Bytes plus a cap table; `IoChannelCapTableEntry` (`io-channels.h:627`) is already `{type, channel}`, which is the right form |
+| `modules::ModuleRegistry` (`jsg/modules-new.h:692`) | H: the builder, bundle ownership, the mutex taken on every lookup (`:801`). I: the per-isolate compiled-module table, plus the bundles mapped read-only into the arena since they are immutable after `finish()` |
+| `TrackedWasmInstanceList` (`io/tracked-wasm-instance.h:178`) | H keeps the signal-safe list of validated `{arena, buffer, offsets}`; I keeps `instanceRef` and the GC filter. See violation 2 |
+| `AsyncContextFrame::StorageKey` (`jsg/async-context.h:73`) | Identity is `this` (`:101`) and H holds it for identity only (`worker.h:605`, `setup.h:669`); replace with a 64-bit key the host mints |
+| `V8PlatformWrapper::JobTaskWrapper` (`jsg/v8-platform-wrapper.h:86`) | H, but it needs a per-job `gk_arena_enter`, and the job must carry the arena id -- which V8's `JobTask` does not currently expose |
+
+### Two violations that are full escapes
+
+**1. The host installs a guest-chosen pointer as the isolate's `jsg::Lock`.**
+`jsg::Lock` is heap-allocated (`server/workerd-api.c++:305`), so its
+`previousData` member (`jsg.h:3365`) is guest-writable. `Lock::~Lock()` does
+`v8Isolate->SetData(SET_DATA_LOCK, previousData)` (`jsg.c++:193`), and
+`Lock::from()` does `*reinterpret_cast<Lock*>(v8Isolate->GetData(...))`
+(`jsg.h:2789`) with no validation. `jsg::Lock` is polymorphic, so the host
+then calls virtuals through a vtable pointer read from memory the guest chose.
+This is on the normal path: every lock teardown restores the word.
+
+Fixing `previousData` alone is not enough, and this is the clearest
+illustration of the provenance rule. The V8 data slots live in the isolate's
+own memory, which is I, so `GetData(SET_DATA_LOCK)` reads a pointer out of
+guest-writable memory however it got there. `Lock::from` cannot be made safe
+by validation at the call site; host-side code must obtain a `Lock&` from an H
+source instead, which means `jsg::Lock` has to be reachable from H memory and
+`Lock::from` has to go.
+
+**2. A signal handler writes through a guest-supplied buffer descriptor.**
+`TrackedWasmInstance` (`io/tracked-wasm-instance.h:38`) holds a
+`kj::Array<kj::byte> memory` and a `signalByteOffset`, and
+`writeShutdownSignal` -- which runs in a signal handler, deliberately without
+a lock -- does
+`signal.memory.asPtr().slice(offset, offset + 4).copyFrom(...)`
+(`tracked-wasm-instance.c++:54-62`). The descriptor is bounds-checked when the
+instance registers (`:20-26`), but it then lives in guest-writable memory --
+the list is a member of the isolate's limit enforcer (`server.c++:3374`),
+which is an ordinary heap object. Checking the offset against the array's own
+size proves nothing once both the pointer and the size come from there, so the
+result is an arbitrary 4-byte write of a known constant, triggerable by
+burning CPU until the limit signal fires. The remedy is the
+H-side copy in the split above: the host validates the descriptor once, keeps
+it where the guest cannot reach it, and the signal handler uses that copy.
+
+### Other violations
+
+3. **Guest-writable thread-locals the host trusts after the turn.**
+   `threadLocalRequest` (`io-context.c++:29`) is read by `IoContext::current()`
+   from host-side destructors (`io-own.c++:10`); `currentApi`
+   (`worker.c++:557`) backs `Worker::Api::current()`; `guestTurnArena`
+   (`guest-run.c++:29`) decides whether a nested turn is in the same arena.
+4. **Guest code takes host mutexes**, so corrupting a `kj::Mutex` word
+   deadlocks the next host locker: `DeleteQueue::crossThreadDeleteQueue` from
+   `~IoOwn` during in-arena GC (`io-own.c++:15`), `IsolateBase::queue` from
+   `Data::destroy` (`setup.h:755`), the module registry on every lookup
+   (`modules-new.h:801`), `CompileCache` (`compile-cache.h:54`), the actor
+   cache LRU (`actor-cache.h:1084`).
+5. **Guest-built KJ objects with vtables are consumed by the event loop.**
+   `awaitIoImpl` builds promise nodes in-turn and hands them to `addTask`
+   (`io-context.h:1600`); `IoContext::abort` stores a guest-built
+   `kj::Exception` that the host later clones and throws
+   (`io-context.c++:542`).
+6. **Guest-written strings are freed by the host**: `Trace::logs`/`exceptions`
+   (`worker.c++:262`, `:2436`), `Span::tags` (`trace.h:1250`),
+   `warningOnceDescriptions` (`worker.c++:619`).
+7. **H objects hold V8 handles and `jsg::Ref`s**: `IoContext`'s JsRefs
+   (`io-context.h:1269`), `Worker::Actor::Impl` (`worker.c++:3797`),
+   `TimeoutState::params.function` (`io-timers.h:79`),
+   `HibernatableWebSocket::websocket` (`io/legacy-hibernation-manager.h:110`).
+8. **The guest calls through host enforcement vtables**, and can swap the
+   `limitEnforcer` `kj::Own` in `IoContext` (`io-context.h:1180`) for a stub.
+   The CPU timer is host-driven, so this is a confinement gap rather than an
+   escape, but `newSubrequest` and `getBufferingLimit` are enforced nowhere
+   else.
+9. **`jsg::WeakRef<T>::tryGet()` is documented for lock-free KJ-side use**
+   (`jsg.h:1660`), which is the H-touches-I pattern the rubric forbids; same
+   for `workerd::WeakRef<IoContext>::tryGet()` from `makeReentryCallbackImpl`
+   (`io-context.h:1811`).
+
+## Inventory: `api/`
+
+Almost all of it falls out of four rules, on top of R1-R9 above.
+
+| Rule | Test | Class |
+|---|---|---|
+| A | `JSG_RESOURCE_TYPE` (232 declarations across 70 headers) | **I**, by R1. The compliance sub-test is what produces the escapees: every member must itself be I, a handle, or a read-only pointer |
+| B | `JSG_STRUCT` (201 declarations) | **I**. Translation is by value (`jsg/struct.h:7`), so the C++ instance exists only within a turn or as a field of an I object |
+| C | Reached through `IoOwn<T>`/`IoPtr<T>`, or created by `IoContext::addObject` | The pointed-to `T` is **H**; the `IoOwn` becomes a handle. Roughly 60 sites, all consistent -- no work beyond the handle rewrite. The `kj::OneOf<uint, IoOwn<...>>` pattern in `Fetcher` (`api/http.h:575`), `DurableObjectNamespace` (`api/actor.h:321`), `KvNamespace` (`api/kv.h:291`) and `R2Bucket` (`api/r2-bucket.h:594`) is instructive: the `uint` arm is already a channel number the host resolves, which is exactly the target shape; the `IoOwn` arm is what has to change |
+| D | Derives from `WorkerInterface::CustomEvent`, `ReadableStreamSource`, `WritableStreamSink`, `kj::AsyncInputStream`/`AsyncOutputStream`, `Fetcher::OutgoingFactory`, `rpc::*::Server` or `capnp::MembranePolicy` | **H**. These are documented as running without the lock: `ReadableStreamSource::tryReadSync` "must not acquire the isolate lock and must not enter JavaScript" (`api/streams/common.h:313`), and `newSystemStream` requires its inner stream to hold no JS references because "the stream is allowed to outlive the isolate" (`api/system-streams.h:21`) |
+| E | No JSG macro, no `kj::Promise`, no `IoOwn`, no event-loop base class | **I**. URL/URLPattern, encoding, base64, form-data, the `CryptoKey::Impl` hierarchy, the zlib/brotli/zstd contexts, lol_html tokens. These hold C-library state through `kj::Own<EVP_PKEY>` and the like, which the host never touches -- so they become I only once BoringSSL's `OPENSSL_malloc`, zlib's `zalloc` (already hooked by `CompressionAllocator`, `api/compression.h:36`), brotli/zstd and lol_html's Rust allocator point at the arena. An allocator problem, not a class problem |
+
+The escapees, condensed:
+
+| Class | Split |
+|---|---|
+| `Fetcher` (`api/http.h:575`, `:326`) | I shell plus an H factory and an H `WorkerInterface` per subrequest, reached by handle. `fetch()` currently creates and drives the `kj::Own<WorkerInterface>` from inside the turn (`api/http.c++:1818`) |
+| `SqlStorage`/`CachedStatement`/`Cursor::State` (`api/sql.h:96`, `:154`, `:249`) | The largest synchronous host-in-turn surface in `api/`: `CachedStatement` embeds a `SqliteDatabase::Statement` by value and a `SqliteDatabase&`, and `State` keeps bindings alive because the query "might contain pointers into strings and blobs" -- that is, into sandbox memory. I keeps `SqlStorage` and `Cursor` plus a statement handle; rows arrive through B |
+| `WebSocket` (`api/web-socket.h:855`) | Already structurally split -- I shell versus `Native` holding `kj::Own<kj::WebSocket>` and a `kj::Canceler` -- except for the raw `AutoResponse&` cached beside its own `IoOwn` at `:904-905` |
+| `DurableObjectNamespace` (`api/actor.h:322`) | I namespace plus the H `ActorIdFactory`, whose vtable is currently called in-turn |
+| `DeferredProxy<T>` (`api/deferred-proxy.h:37`) | The `IoContext::run` result problem in its natural habitat: a promise node graph allocated in-turn and run by the host |
+| `MemoryCache` (`api/memory-cache.h:526`) | I object plus a handle. `SharedMemoryCache` is `kj::AtomicRefcounted` with a `MutexGuarded` map and is shared across isolates by design (`:119`, `:477`) |
+| `CapnpServer` (`api/capnp.h:36`) | An H capnp server holding a `jsg::V8Ref<v8::Object>` and a wrapper reference its own comment marks "only valid if isolate is locked" |
+| `AbortSignal` registration cells (`api/basics.h:804`, `:887`) | The cells are `kj::Arc` + `MutexGuarded` and are taken from *other* IoContexts through `DeleteQueue::scheduleAction`; they become H objects the signal holds by handle |
+| `Rewriter` (`api/html-rewriter.c++:214`) | An H `WritableStreamSink` holding `IoContext&`, the lol_html parser, and handler registrations that call back into JS |
+| `jsg::ExternalMemoryAdjustment` (`api/actor.h:402`, `api/worker-rpc.h:645`) | Holds a `kj::Arc<const ExternalMemoryTarget>` with an `IsolateLiveness` weak ref touched outside the turn, so H objects hold per-isolate state and I objects hold an Arc shared with the GC thread |
+| `PyodideBundleManager` (`api/pyodide/pyodide.h:33`) | H, process-wide and `MutexGuarded`; `ReadOnlyBuffer::source` is an `ArrayPtr` into a process-lifetime bundle read in-turn. Admissible only if those pages are mapped read-only into every arena |
+| `HibernatableSocketParams` (`api/hibernation-event-params.h:14`) | B. Host-produced bytes plus a `kj::Exception` consumed in the turn -- the reverse of the turn outcome, and it needs the same bounded-bytes treatment |
+
+### The cross-isolate work list
+
+This is the set that faults under per-isolate arenas, and it matches what the
+placement experiment hit.
+
+- **JS RPC.** The caller builds a `MallocMessageBuilder` plus V8-serialized
+  bytes under its own lock (`api/worker-rpc.h:186`, built at
+  `worker-rpc.c++:745`); the callee's turn reads the params straight out of
+  the call context, which its own comment describes as "a pointer into the RPC
+  params reader" (`worker-rpc.c++:1527`), and deserializes from
+  `reader.getV8Serialized()` (`:298`). Results go back the same way (`:1639`,
+  `:1918`). Both directions are B message buffers. Whether Cap'n Proto's
+  in-process path copies the message or lets the callee alias the caller's
+  builder could not be settled from the sources available, so aliasing must be
+  assumed.
+- **Streams over RPC.** The receiver's `ExternalPusherImpl::pushByteStream`
+  creates a `kj::newOneWayPipe` (`io/external-pusher.c++:150`) and
+  `unwrapStream` short-circuits through `getLocalServer` to hand the
+  receiver's turn the pipe's input end directly (`:165`, consumed at
+  `api/streams/readable.c++:1109`). One KJ pipe is written by isolate A's pump
+  and read by isolate B's: both ends H, each currently owned from inside an
+  isolate's objects.
+- **Service bindings.** `getSubrequestChannel(channel)` then
+  `startRequest()` returns an H `kj::Own<WorkerInterface>`
+  (`api/http.c++:2900`); the body is pumped with
+  `jsBody.pumpTo(js, newSystemStream(nr.body))` (`:1820`) and arrives on the
+  callee side wrapped by `newSystemStream` (`api/global-scope.c++:343`).
+- **Service stubs.** `Fetcher::deserialize` does
+  `IoContext::current().addObject(kj::addRef(channel))`
+  (`api/http.c++:2466`), so one refcounted `SubrequestChannel` is owned by two
+  IoContexts. The same mechanism serves `DurableObjectClass`, `KvNamespace`,
+  `R2Bucket` and `WrappedBinding`.
+- **AbortSignal over RPC**, **Durable Object replica storage** (which holds
+  the primary's `kj::Own<ActorChannel>` directly in an I object,
+  `api/actor-state.h:206`), **hibernatable WebSockets** (a
+  `kj::Rc<kj::WebSocket>` shared with a manager that outlives the isolate,
+  `api/web-socket.h:676`), the **shared memory cache** (isolate B's
+  `jsg::Deserializer` reads bytes isolate A's turn allocated,
+  `api/memory-cache.c++:440` then `:475`), **Pyodide bundles**, and
+  **WorkerLoader** (the loading isolate's module sources kept alive for the
+  new isolate by `OwnContentWrapper`, `api/worker-loader.c++:112`, with a
+  `CompiledWasmModule` shared through V8's process-wide Wasm engine).
+
+Not cross-isolate, despite appearances: a stream `tee()`'s shared
+`kj::Rc<Entry>` (`api/streams/queue.h:739`) and `MessagePort`
+(`api/messagechannel.h:27`) stay within one isolate.
+
+### Binary buffers
+
+The governing mechanism is `jsg::asBytes`: for an ordinary ArrayBuffer it
+returns `bytes.attach(kj::mv(backing))` (`jsg/util.c++:688`), an aliasing
+`kj::Array` over the V8 backing store, deep-copying only resizable or
+immutable buffers. So **every `kj::Array<byte>` argument in `api/` is a raw
+pointer into the sandbox**, which is arena memory. In the other direction,
+wrapping adopts the array only if it already lies inside the sandbox and
+otherwise copies into a fresh backing store (`jsg/value.h:1037`).
+
+Because of that, nearly every crossing already copies, and the arena changes
+not whether but *where*: an in-turn `kj::heapArray` becomes arena memory the
+host cannot read. That is the mechanism behind the faults the placement
+experiment produced. The actionable lists are therefore short and specific.
+
+Allocated in-turn, consumed by a host pump, sink or RPC -- must come from B
+with a descriptor: `api/web-socket.c++:891` (the send path, whose comment
+already says "data aliases the V8 BackingStore ... Copy while we still hold
+the lock"), `api/streams/internal.c++:1366`, `api/js-readable-stream.h:50`
+(whose comment says the bytes "must not sit in the V8 sandbox"),
+`api/worker-rpc.h:187`, `api/memory-cache.c++:440`.
+
+Filled by the host and read in-turn -- must become a B descriptor the isolate
+bounds-checks and copies from: `api/streams/internal.c++:717`,
+`api/js-readable-stream.h:496`, `api/kv.c++:463`, `api/queue.h:179`,
+`api/hibernation-event-params.h:22`, `api/worker-rpc.c++:298`,
+`api/memory-cache.c++:475`.
+
+One case resists both: `api/sql.h:251` holds raw pointers into sandbox strings
+and blobs as SQLite query bindings, so the host reads sandbox memory while
+stepping the query, and `:255` reads rows back out of SQLite's result memory
+in-turn.
+
+## Inventory: `util/`
+
+The common case is rule 4: a leaf whose instances take their owner's class and
+need no annotation. That covers the value types and header templates --
+`mimetype.h`, `strings.h`, `strong-bool.h`, `uuid.h`'s `UUID`, `string-buffer.h`,
+`state-machine.h`, `ring-buffer.h`, `small-weak-vector.h` and the rest. The
+`constexpr` tables in `strings.h:16` and `header-validation.h` are the ideal
+shape for an I-readable dependency: rodata, so every arena can map them
+read-only and no crossing is needed.
+
+The exceptions are the headers holding process-wide or thread-wide mutable
+state. These are H by rule 3, and a turn reads or writes them today:
+
+| State | Where | Why it is H, and what a guest write does |
+|---|---|---|
+| `globalAutogate`, a `bool[22]` | `autogate.c++:17`, read by `isEnabled` `autogate.c++:94` | Read on hot paths from a dozen `api/` files inside turns. A write flips code paths for every isolate in the process; `COMPRESSION_RS` (`autogate.h:125`) routes all zlib work. Cheap fix: the bitmap is 22 bytes, so copy it into each arena at isolate creation and have in-turn code read the arena copy |
+| `std::atomic<bool> useZlibRs` | `zlib-router.c++` | Consulted on every zlib call a turn makes; a write switches implementation process-wide mid-stream |
+| `ThreadProgressCounter* activeProgressCounter` | `thread-scopes.c++:27` | Thread-local, and its own comment says it "is read in signal handlers". TLS is guest-writable, so one word hands a signal handler an arbitrary pointer to dereference. Same shape as the `guestTurnDepth` counter in `guest-run.c++:22`, which is fixed by restoring from a host frame; this one needs the pointer out of TLS, in gk's per-thread supervisor record |
+| `multiTenantProcess`, `predictableMode`, `gcStressMode` | `thread-scopes.c++:20` | File-scope, read from turns |
+| `thread_local BufferState state`, 4 KiB of unconsumed CSPRNG output | `entropy.c++:21` | The buffer is on the thread the turn runs on, so a turn can read the bytes a later host operation will draw, or choose them. `channel-token.c++:162` takes every AES-GCM IV from it and `:26` takes the token key; `actor-id-impl.c++:64` takes unique actor ids. A chosen or repeated IV under a fixed key loses GCM's integrity guarantee. Host-privileged draws must not share a buffer with in-turn draws |
+| `thread_local int currentVfsRoot` | `sqlite.c++:1846` | It is the directory descriptor for the `openat`, `unlinkat`, `mkdirat` and `readlinkat` that SQLite's VFS issues (`sqlite.c++:1853-1876`). A write redirects where SQLite's file operations land. The root belongs on the `Vfs` object, not in TLS |
+| `SqliteObserver DEFAULT` with a mutable `dbWalSize`; `vfsErrorListener` | `sqlite.h:55`, `sqlite.c++:191` | File-scope and thread-local mutable state on a path a turn drives synchronously |
+| `static kj::NullStream nullStream` | `stream-utils.c++:250` | A file-scope object with a vtable, handed out by reference and by `kj::Own` with a null disposer. Must be rodata or supervisor-mapped |
+| `static const MimeType PLAINTEXT` | `mimetype.h:115` | `const`, but its `kj::String` members point at shared-heap buffers that `const` does not protect. The `ConstMimeType` forms below it (`mimetype.h:117`) are the right shape |
+| `LOG_ONCE` / `LOG_PERIODICALLY` statics | `sentry.h:65`, `:74`, `:86` | Function-local `static bool`s in code that runs at ring 3. Low severity -- a write suppresses or unsuppresses a log line -- but they are H data scattered through I-class code |
+
+The cross-thread primitives are H by construction and need no further argument:
+`xthreadnotifier.h:23`, `sync-wait-list.h:65`, `wait-list.h:60` (an
+`EventLoopLocal`), and `AtomicWeakRef` (`weak-refs.h:21`).
+
+`SqliteDatabase` is a **split**, and the largest one in `util/`. SQLite runs
+synchronously inside the turn (`api/sql.c++:47`, `:118`). The database, `Vfs`,
+`LockManager` and `Lock` (`sqlite.h:833-1040`, holding a `kj::Directory&`, a
+`sqlite3_vfs&` and file descriptors) are H; `Statement` and `Query`
+(`sqlite.h:483`, `:547`) are the per-call objects a JS cursor walks. The
+in-turn side holds a statement handle and receives rows through B. SQLite's
+own global configuration, page cache and allocator hook
+(`sqlite-metering.c++:133`) cannot live in an arena, so queries execute
+host-side.
+
+## Inventory: `server/`
+
+The rule is that `Server` and everything nested in it is H, and it holds: the
+sockets, TLS contexts, `kj::Network&`, `kj::Filesystem&`, timer and entropy
+source (`server.h:140-146`), the service map (`server.h:208`), the actor
+namespaces and the `ChannelTokenHandler` (`server.h:165`). None of it is
+referenced from a V8 wrapper; it is reached through the `IoChannelFactory` and
+`TimerChannel` interfaces that `WorkerService` implements
+(`server.c++:3450`). `workerd.c++`'s `CliMain`, the config loading and the gk
+bring-up all run before any isolate exists.
+
+What a turn nevertheless reaches, every path starting at
+`IoContext::getIoChannelFactory()` (`io-context.h:1165`):
+
+| Reached | Path | Class |
+|---|---|---|
+| `WorkerService::ioChannels` | `Fetcher::fetch` -> `startSubrequest(channel, ...)` (`server.c++:4269`), `getCache()` (`:4364`), `getActorChannel` (`:4440`), `getRpcChannel` (`:4490`) -- host arrays indexed by a guest-supplied channel number, then dispatched through another service's vtable | H. The `uint channel` a JS `Fetcher` carries (`api/http.h:213`) is already the right shape: an index the host validates. What is wrong is that the validation and dispatch run inside the turn |
+| `Server&` itself | `workerdDebugPortServer` (`server.c++:3466`) -> `getWorkerdDebugPort()` (`:4553`) | H. A worker with that binding reaches the `Server` object by pointer from inside its turn |
+| `ChannelTokenHandler::tokenKey`, `keyId` | plain members at `channel-token.h:133-134` of a heap object; used by `getTokenMaybeSync` (`server.c++:3544`) when a `Fetcher` is serialized over JS RPC, in-turn | **Must split.** The key is in the shared heap, so an escaped isolate reads the key that mints subrequest-channel tokens, and the IV comes from the entropy buffer above. The turn should submit the designator through B and get token bytes back |
+| `ActorIdFactoryImpl::key`, a SHA-256-sized HMAC key | `actor-id-impl.h:57`, owned by the JS-visible `DurableObjectNamespace` as a `kj::Own` (`api/actor.h:322`); `newUniqueId()` and `idFromName()` HMAC with it in-turn | **Must split.** The JS object is I and holds a namespace handle; the key and `computeMac` are H |
+| `CompatibilityFlags::Reader` | `WorkerdApi::getFeatureFlags()` (`workerd-api.c++:308`), called from nearly every API entry point during a turn; a capnp `Reader` is a pointer into a host-owned message | I only by copying: snapshot the struct into the arena at isolate creation. `jsg::JsgConfig` (`workerd-api.c++:228`) is already such a by-value copy |
+| `EntropySourceImpl` | `IoContext::getEntropySource()` (`io-context.h:926`) from `crypto.getRandomValues` (`api/crypto/crypto.c++:692`) and key generation | H; in-turn callers take bytes through B |
+| `static Frankenvalue EMPTY_PROPS` | `server.c++:3550`, a mutable file-scope object passed by non-const reference | H data reached in-turn. Fixable by not using a static |
+| `AlarmScheduler`, `ContainerClient`, `FallbackServiceClient` | `storage.setAlarm()` (`server.c++:1767`); `api/container.c++` through a capnp client; module resolution blocking on a thread with a mutex (`fallback-service.h:46`) | H |
+| `WorkerdPlatform` | V8 calls `PostTaskOnWorkerThreadImpl` from inside the turn (`v8-platform-impl.h:5`) | H, but invoked through its vtable from ring 3 |
+
+One structural finding that is not a classification: **not all JS runs in the
+guest.** There are exactly two `jsg::runInGuest` call sites, `runJsTurn`
+(`io-context.c++:1443`) and top-level execution (`worker.c++:2204`). The
+inspector runs user JS outside both: `dispatchProtocolMessage`
+(`worker.c++:3171`) and the microtask drain after it execute under the isolate
+lock with no guest wrap, so with `--inspector-addr` an isolate's JS runs with
+full host privilege. `hibernateWebSockets` (`server.c++:1076`, `:1127`) runs
+V8 code under the lock outside the guest as well, and bindings and globals
+instantiation is deliberately outside (`worker.c++:2084`, comment at `:2039`).
+A plan that relies on every JS turn being confined has to wrap these paths or
+refuse the inspector when gk is on.
+
+## Inventory: KJ and Cap'n Proto types that cross
+
+These are not workerd's classes, but a turn's C++ bindings touch them
+constantly, and most of them cannot be given a class as they stand.
+
+| Type | Why it resists classification | Minimum change |
+|---|---|---|
+| `kj::Own<T>` | A disposer pointer plus an object pointer. Across the boundary the disposer is an attacker-controlled indirect call. `IoOwn<T>` is worse: a raw pointer into host memory plus a refcount on a host `AtomicRefcounted` (`io-own.h:278`, `:89`) | `IoOwn::item` becomes an index into a per-isolate list the host bounds- and owner-checks; `deleteQueue` becomes an arena id rather than an `Arc`. I-internal owns should use a disposer baked into the type so no disposer pointer exists in guest memory |
+| `kj::Promise<T>` and its nodes | One heap object owned by the host `kj::TaskSet` (`io-context.h:1245`), carrying a vtable and event-loop queue links the guest wrote, and embedding guest state (a `jsg::Promise::Resolver`) the host must not touch | The turn emits a request record into B; the host builds the real promise on its side; on completion it writes `{resolver handle, result or exception record}` into B and schedules a turn. The body of the `run(...)` lambda at `io-context.h:1593` already does only that |
+| `kj::Exception` | Owns strings with their own disposers, a context chain and a details array | B after a copy -- it is only data. `GuestTurnOutcome::setException` (`guest-run.c++:78`) already does this for the turn's own outcome; generalize it to carry the detail list, since the ids in `util/exception.h:4` are load-bearing for `decodeTunneledException`, and use it for every rejection that crosses |
+| `kj::String`, `kj::Array<T>` | Pointer, size, and a disposer with a virtual `disposeImpl`. Worse, `jsg::asBytes` returns an `Array` aliasing a V8 backing store (`jsg/util.c++:655`), i.e. arena memory, which is then handed to host network code (`server.c++:4393`) | A B descriptor `{offset, length}` over copied bytes, or for large bodies a host-side read-only mapping of the arena range for the duration of the write |
+| `kj::HttpHeaders` | Views into guest memory plus a reference to a host header table. Built in-turn (`api/http.c++:1150`) and read asynchronously by the host client (`:1818`) | Serialize to a flat `(name, value)*` block in B and let the host build its own `HttpHeaders` against its own table. `HttpOverCapnp` (`server.c++:249`) already defines such a wire form |
+| `kj::AsyncInputStream` / `AsyncOutputStream` | Three faults at once: a vtable call from ring 3 into host code, the host writing into arena memory, and a promise node spanning both sides | A stream handle plus a ring: the turn posts `read(handle, max)`, the host reads into a B chunk and signals `{handle, offset, len, eof}`, the turn copies into its ArrayBuffer |
+| `kj::EventLoop`, `UnixEventPort`, the timer set | Per-thread shared state, found through a thread-local, whose queue every in-turn `.then()` touches; `setTimeout` inserts into the host timer set (`io-context.c++:1020`, `server.c++:4600`) | H, unambiguously. `TimeoutManagerImpl` (`io-context.c++:990`) is already handle-shaped: make `setTimeoutImpl`/`clearTimeoutImpl` B messages and keep the `jsg::Function` callback in the arena, keyed by id. The general case disappears once in-turn code stops creating KJ promises |
+| `capnp::MessageBuilder` / `MessageReader` | The live objects own segments with disposers and an arena with a vtable -- but the *encoded message* is pointer-free, using segment-relative offsets | The only type on this list that already has the right wire form. Allocate segments in B with a `MessageBuilder` whose `allocateSegment` carves from the shared region; each side builds its own Reader or Builder over those bytes, with a traversal limit, since B is untrusted. Nothing with a vtable crosses |
+
+## What the classification implies for the order of work
+
+Three conclusions follow from the inventory rather than from the rubric.
+
+**The faults a per-isolate heap arena produces are not a sign the scheme is
+wrong.** They are the classification being violated, and each one names the
+violation. A service binding faults the callee on the caller's request objects
+because the caller allocated them in its turn, so they went to the caller's
+arena; two workers using `Intl` fault because whichever ran first placed the
+ICU data in its arena; two using `setTimeout` fault because whichever grew the
+thread's timer set placed a node in its arena. In rubric terms, all three are
+H or B data that landed in I memory because placement follows the allocator
+rather than the class.
+
+**So placement cannot be driven by the thread's current arena alone.** An
+isolate-wide switch for the duration of the lock assigns I to everything a
+turn allocates, including the H and B parts. The allocator needs a per-site
+decision: an explicit shared-heap scope for allocations the classification
+calls H or B, process-wide state initialized eagerly or routed to the shared
+heap by its own allocator hook (ICU has `u_setMemoryFunctions` for exactly
+this), and the per-isolate arena as the default for everything else.
+
+**The cheapest crossings to build first are the ones whose data is already
+copied.** The binary-buffer inventory shows the runtime already copies at
+almost every boundary, because of the V8 sandbox and MPK rules; what the
+arena changes is only the destination of the copy. Redirecting those copies
+into B is mechanical and needs no protocol design. The expensive items -- the
+`kj::Promise` channel, the `IoOwn` handle table, the SQLite split -- are where
+the design work actually is.
+
+A reasonable order: redirect the already-copying boundaries into B; make
+placement per-site so the arena stops capturing H data; convert `IoOwn` to a
+handle, which retires the largest single family of raw cross-boundary
+pointers; then the promise channel, which retires the `IoContext::run` result
+problem and the event-loop touches together. The provenance violations found
+along the way -- the `jsg::Lock` data slot, the wasm signal descriptor, the
+guest-writable thread-locals -- are blocked on having H memory at all, so they
+land with the first real H region rather than as separate fixes.
