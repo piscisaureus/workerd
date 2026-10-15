@@ -1695,6 +1695,7 @@ int main(int argc, char* argv[]) {
     workerd::server::ActorIdFactoryImpl::installHostcall();
     workerd::TrackedWasmInstanceList::installHostcall();
     workerd::SqliteDatabase::Vfs::installHostcall();
+    workerd::hostMemory::installResolveHostcall();
     // A turn's path syscalls land beneath the turn directory its VFS root hostcall set, or
     // nowhere (gk_confine_paths in gk.h). The test-only switch leaves them unconfined, so that
     // vfs-root-test.sh can show what the confinement prevents.

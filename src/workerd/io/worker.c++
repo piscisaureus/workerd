@@ -2220,6 +2220,8 @@ Worker::Worker(kj::Own<const Script> scriptParam,
         // once the guest has returned (see runJsTurn in io-context.c++).
         auto threadLocals = GuestTurnThreadLocals::save();
         KJ_DEFER(threadLocals.restore());
+        // Registrations the top-level run makes, batched as a JS turn's are (host-memory.h).
+        hostMemory::ResolveTurn resolveTurn;
         auto outcome = jsg::runInGuest(js, runTopLevel, [&](const kj::Exception& e) {
           // Top-level execution faulted inside the guest. Condemn the isolate so no JS is ever
           // run on it again (this thread holds the isolate lock, so a thread waiting for it

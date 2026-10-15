@@ -37,8 +37,9 @@ gk_user_syscall_resume:
 // R11 the ring-3 return RIP and RFLAGS that SYSCALL saved. Looks the handle up
 // in gk_resolve_table (gk.c; supervisor memory, mapped in every root) and
 // SYSRETs to ring 3 with the entry's pointer in RAX, or 0 for a handle that
-// names nothing: a zero generation (never issued), an index at or past
-// GK_RESOLVE_SLOTS, or an entry whose generation is not the handle's. Runs
+// names nothing: a zero generation (never issued) or an entry whose
+// generation is not the handle's. The index is the handle's low 20 bits and
+// the table holds exactly 2^20 entries, so the mask bounds it. Runs
 // on whatever RSP ring 3 had and never touches it, so a ring-3 stack that is
 // unmapped or garbage costs nothing here; reads only the table, so no value
 // in the handle is ever used as an address; writes nothing, so the table is
@@ -50,7 +51,7 @@ gk_user_syscall_resume:
 // generation. Every scratch register is cleared before SYSRET, so ring 3 gets
 // the pointer and nothing else; RCX and R11 are untouched for SYSRET to use.
 // The entry layout is {void *ptr; uint64_t gen}, 16 bytes, index * 16.
-// Keep 16384 in sync with GK_RESOLVE_SLOTS in gk.h.
+// Keep the split at bit 20 in sync with GK_RESOLVE_INDEX_BITS in gk.h.
 //
 // GK_NEG_RESOLVE (a negative-test build, never shipped) removes the
 // generation check, so a handle to a freed or recycled entry resolves to
@@ -59,11 +60,9 @@ gk_user_syscall_resume:
     .type gk_resolve_tramp, @function
 gk_resolve_tramp:
     movq %rdi, %rax
-    shrq $16, %rax                      /* rax = the handle's generation */
+    shrq $20, %rax                      /* rax = the handle's generation */
     jz 1f
-    movzwl %di, %edi                    /* edi = the handle's index */
-    cmpl $16384, %edi
-    jae 1f
+    andl $0xfffff, %edi                 /* edi = the handle's index, below the table's capacity */
     shlq $4, %rdi
     leaq gk_resolve_table(%rip), %rsi
     addq %rsi, %rdi                     /* rdi = &table[index] */

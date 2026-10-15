@@ -630,6 +630,137 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
       }
     }));
   }
+  // The IoOwn handle (see the comment above and io/io-own.h): the probe object is a T an IoOwn
+  // owns, held in a heap holder that stands in for the JS wrapper's C++ object a turn can write.
+  struct IoOwnProbe {
+    uint64_t magic;
+  };
+  struct IoOwnProbeHolder {
+    IoOwn<IoOwnProbe> own;
+  };
+  constexpr uint64_t IOOWN_GOOD_MAGIC = 0x600d600d600d600d;
+  constexpr uint64_t IOOWN_CHOSEN_MAGIC = 0xbadbadbadbadbad0;
+  constexpr uint64_t IOOWN_OTHER_MAGIC = 0x0e7e70e7e70e7e70;
+  // The handle is the IoOwn's second word, after the delete queue reference; a write primitive
+  // aiming at it writes exactly there.
+  static_assert(sizeof(IoOwn<IoOwnProbe>) == sizeof(kj::Arc<DeleteQueue>) + sizeof(uint64_t));
+  constexpr size_t IOOWN_HANDLE_OFFSET = sizeof(kj::Arc<DeleteQueue>);
+  auto ioOwnHandle = [](IoOwnProbeHolder& holder) {
+    uint64_t handle;
+    memcpy(&handle, reinterpret_cast<byte*>(&holder.own) + IOOWN_HANDLE_OFFSET, sizeof(handle));
+    return handle;
+  };
+  auto setIoOwnHandle = [](IoOwnProbeHolder& holder, uint64_t handle) {
+    memcpy(reinterpret_cast<byte*>(&holder.own) + IOOWN_HANDLE_OFFSET, &handle, sizeof(handle));
+  };
+  // A later turn of the same request uses the IoOwn, as an API call on the wrapper would, and
+  // reports what it reached: the magic it read, or the refusal.
+  auto useIoOwnLater = [addr](IoContext& context, kj::StringPtr what, IoOwnProbeHolder& holder) {
+    return context.run([what, &holder, addr](Worker::Lock&) {
+      kj::String verdict;
+      KJ_IF_SOME(e, kj::runCatchingExceptions([&]() {
+        uint64_t magic = holder.own->magic;
+        verdict = kj::str("read magic 0x", kj::hex(magic), " at ", addr(holder.own.operator->()));
+      })) {
+        verdict = kj::str("refused: ", e.getDescription());
+      }
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: IoOwn use after the overwrite", what, verdict);
+    });
+  };
+  static uint64_t announcedIoOwnHandle = 0;
+  if (probeEnabled && url.endsWith("/__gk_ioown_corrupt")) {
+    auto& context = IoContext::current();
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_GOOD_MAGIC))});
+    IoOwnProbeHolder& h = *holder;
+    uint64_t handle = ioOwnHandle(h);
+    // The buffer the turn chose: an object laid out as the one the handle named, whose T carries
+    // a magic of its own, so a host that dereferences the address reads it.
+    static auto* chosen =
+        new SpecificOwnedObject<IoOwnProbe>(kj::heap<IoOwnProbe>(IOOWN_CHOSEN_MAGIC));
+    static kj::Maybe<kj::Own<OwnedObject>> chosenSlot;
+    chosen->prev = &chosenSlot;
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: created an IoOwn inside the JS turn", url,
+        kj::str("0x", kj::hex(handle)), addr(h.own.operator->()));
+    // A later turn first uses the IoOwn as it is (the control: the handle committed at the end
+    // of this turn resolves to the object) and then overwrites the handle, as the turn's own
+    // act; the use after that runs in a further turn. Then the holder is destroyed on the event
+    // loop, outside any turn, which hands the handle to the delete queue, and one more turn
+    // makes the host drain that queue -- host-side, before the turn enters the guest -- which
+    // must refuse the handle rather than unlink through the chosen address.
+    context.addWaitUntil(
+        useIoOwnLater(context, "intact", h)
+            .then([&context, &h, url = kj::str(url), addr, handle, setIoOwnHandle]() mutable {
+      return context.run([&h, url = kj::mv(url), addr, handle, setIoOwnHandle](Worker::Lock&) {
+        setIoOwnHandle(h, reinterpret_cast<uintptr_t>(chosen));
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: overwrote the IoOwn's handle from inside the JS turn", url,
+            kj::str("0x", kj::hex(handle)), addr(chosen), addr(chosen->ptr.get()));
+      });
+    })
+            .then(
+                [&context, &h, useIoOwnLater]() { return useIoOwnLater(context, "rewritten", h); })
+            .then([holder = kj::mv(holder)]() mutable {
+      return kj::evalLater([holder = kj::mv(holder)]() mutable {
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: destroying the IoOwn's holder on the event loop");
+        holder = nullptr;
+      });
+    }).then([&context]() {
+      // On the event loop, with no current context: the context is alive for as long as this
+      // waitUntil runs, and run() makes it current again for the turn.
+      return context.run([](Worker::Lock&) {
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the turn after the holder's destruction ran");
+      });
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_ioown_announce")) {
+    // This isolate's IoOwn, for another isolate's turn to name. The object lives in this
+    // request's owned list and is retired with the request's context, which the worker's JS
+    // keeps open for a while (see ioown-test.capnp); the holder outlives it.
+    auto& context = IoContext::current();
+    static kj::Maybe<kj::Own<IoOwnProbeHolder>> announced;
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_OTHER_MAGIC))});
+    announcedIoOwnHandle = ioOwnHandle(*holder);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: announced this isolate's IoOwn for another worker's turn", url,
+        kj::str("0x", kj::hex(announcedIoOwnHandle)), addr(holder->own.operator->()));
+    IoOwnProbeHolder& announcedHolder = *holder;
+    announced = kj::mv(holder);
+    context.addWaitUntil(useIoOwnLater(context, "announced-own", announcedHolder));
+  }
+  if (probeEnabled && url.endsWith("/__gk_ioown_steal")) {
+    // From inside this isolate's turn, rewrite an IoOwn of its own to the other isolate's live
+    // handle: the table cannot tell the two tenants apart (the ownership residual), so the use
+    // names the other isolate's object.
+    KJ_REQUIRE(announcedIoOwnHandle != 0, "no IoOwn announced");
+    auto& context = IoContext::current();
+    static kj::Maybe<kj::Own<IoOwnProbeHolder>> thief;
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_GOOD_MAGIC))});
+    IoOwnProbeHolder& h = *holder;
+    uint64_t handle = ioOwnHandle(h);
+    setIoOwnHandle(h, announcedIoOwnHandle);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: overwrote the IoOwn's handle from inside the JS turn with another isolate's",
+        url, kj::str("0x", kj::hex(handle)), kj::str("0x", kj::hex(announcedIoOwnHandle)));
+    // The thief is never destroyed, so the stolen handle is never handed to a delete queue; its
+    // own entry is retired with its context. The use runs now, and again when asked for later.
+    thief = kj::mv(holder);
+    context.addWaitUntil(useIoOwnLater(context, "cross-isolate", h));
+  }
+  if (probeEnabled && url.endsWith("/__gk_ioown_steal_again")) {
+    // The same stolen handle, used after the other isolate's request, and so its context, has
+    // ended: the entry is retired with the context's owned list.
+    static kj::Maybe<kj::Own<IoOwnProbeHolder>> thief2;
+    auto& context = IoContext::current();
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_GOOD_MAGIC))});
+    IoOwnProbeHolder& h = *holder;
+    setIoOwnHandle(h, announcedIoOwnHandle);
+    thief2 = kj::mv(holder);
+    context.addWaitUntil(useIoOwnLater(context, "cross-isolate-after-release", h));
+  }
   if (probeEnabled && url.endsWith("/__gk_corrupt_handle")) {
     KJ_IF_SOME(probe, hostMemory::handleProbeForTest()) {
       static byte chosenKey[32] = {0x41};

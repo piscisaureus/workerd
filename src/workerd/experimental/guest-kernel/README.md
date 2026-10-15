@@ -79,6 +79,14 @@ isolate's JS turn at guest ring 3.
   directory and nothing appears in the directory of the turn's choosing,
   while with the confinement switched off (a test-only switch) the same
   rewrite puts the database there.
+- `ioown-test.sh` / `ioown-test.capnp` — end-to-end check against a built
+  workerd that an `IoOwn` (`io/io-own.h`) names its object by a handle the
+  host validates: a JS turn that rewrites the handle inside its own object,
+  to the address of a buffer the turn chose, leaves the next turn's
+  dereference and the host's drain of the delete queue refusing the handle
+  rather than reaching the buffer, with the isolate still serving; and that a
+  handle rewritten to another isolate's live handle names that isolate's
+  object, the ownership residual the table cannot close, stated as such.
 
 ## API
 
@@ -311,20 +319,35 @@ hardware:
   operation is fixed rather than a registered handler, because embedder code
   at guest ring 0 would need its data mapped supervisor, where any ring-0
   code the guest reaches could read it: the only thing that runs at ring 0 is
-  gk's lookup. The table is `GK_RESOLVE_SLOTS` (16384) entries of `{pointer,
+  gk's lookup. The table is `GK_RESOLVE_SLOTS` (2^20) entries of `{pointer,
   generation}`, registered `GK_PROT_SUPER` -- a weaker class than the
   `GK_PROT_REFUSE` of host memory and the page tables, since a SUPER page is
   in every root with `U` clear while a REFUSE page is in none, and the right
   one here because the lookup has to run inside the guest; host memory stays
-  on REFUSE -- and a handle is validated as a host slot handle is: index
-  bounds-checked, entry live, generation the handle's, so a handle to an
-  unregistered or recycled entry resolves to nothing and nothing is ever
-  read through the handle's own value. The lookup takes no lock and writes
-  nothing: it reads the generation on both sides of the pointer and answers
-  only if both match, and the host publishes an entry pointer-first and
-  retires it generation-first, so a pointer seen between two matching reads
-  was the entry's under that generation. Exhaustion is a registration
-  refused with 0, never fatal. The test registers an entry and resolves it
+  on REFUSE -- and a handle is validated as a host slot handle is: the index
+  is the handle's low 20 bits, which the capacity of exactly 2^20 bounds by
+  masking, the entry must be live and its generation the handle's, so a
+  handle to an unregistered or recycled entry resolves to nothing and
+  nothing is ever read through the handle's own value. The lookup takes no
+  lock and writes nothing: it reads the generation on both sides of the
+  pointer and answers only if both match, and the host publishes an entry
+  pointer-first and retires it generation-first, so a pointer seen between
+  two matching reads was the entry's under that generation. Exhaustion is a
+  registration refused with 0, never fatal. The tenant is `IoOwn`
+  (`io/io-own.h`): the handle it holds names the object the context owns,
+  and every dereference, destruction and unlink resolves it. Its objects are
+  created inside turns, where the table cannot be written, so the host
+  reserves entries for the thread before each turn and commits them after it
+  from the turn's journal (`gk_resolve_reserve`, `gk_resolve_commit`;
+  `ResolveTurn` in `util/host-memory.h`): a commit takes once, only into a
+  reserved entry, and only a pointer to ordinary user memory -- outside gk's
+  supervisor and refused ranges and outside every arena -- so a turn can
+  launder nothing into the table that it could not already write directly,
+  and cannot aim the host at gk's state, host memory or another arena. The
+  capacity is set from the measured live count: five entries per in-flight
+  request parked on a timer, eight per open WebSocket (memory-classes.md,
+  Cost), so 2^20 holds about two hundred thousand such requests, in 16 MiB
+  that cost nothing until written. The test registers an entry and resolves it
   from ring 3 on both kinds of stack, from ring 0 and from the host; feeds
   the lookup a zero handle, an index at and past capacity, generations never
   issued, a slot never taken, the pointer itself, a heap address, a
@@ -344,7 +367,11 @@ hardware:
   cost subtracted, against 6.4 us for a hostcall: 340 times cheaper. A
   negative build (`GK_NEG_RESOLVE`, in `gk_test_neg`) removes the generation
   check and the case fails on the never-issued generations and the recycled
-  slot. The guard build runs the host-side path with allocation forbidden;
+  slot. It also reserves three entries, sees them resolve to nothing from
+  ring 3 until committed, commits one and sees it take once, and sees a
+  commit refused for a committed, retired or never-issued handle and for a
+  NULL, supervisor, refused or arena pointer, from commit and from register
+  alike. The guard build runs the host-side path with allocation forbidden;
   the ring-0 path is asm with no call in it. What it does not give: ring 3
   can resolve as often as it likes with any handle, and learns only the
   pointer behind a live handle it holds, which the lookup makes safe to keep
@@ -609,10 +636,10 @@ so a crossing a turn makes on every dereference belongs on that path.
   routed through `jsg::ArenaPageAllocator` -- so another isolate's V8 heap is
   unmapped and a stray read cannot reach it. It does not cover the C++
   objects that come from the process allocator: `i::Isolate` and malloc'd V8
-  state, JSG `Wrappable`, `IoOwn`, `IoContext`, and the KJ allocations that
-  carry request and response bodies. Those share one heap across isolates, so
-  an escape with only a read primitive can still recover another isolate's
-  in-flight data from it.
+  state, JSG `Wrappable`, `IoContext`, the objects an `IoOwn` names, and the
+  KJ allocations that carry request and response bodies. Those share one
+  heap across isolates, so an escape with only a read primitive can still
+  recover another isolate's in-flight data from it.
 
   Confining this needs the runtime's mutable memory out of ring 3's reach, so
   that an arena maps only the isolate's own pages, the runtime's text and
@@ -637,8 +664,14 @@ so a crossing a turn makes on every dereference belongs on that path.
   signal's handler writes through is in gk's signal field table (see
   "Signal fields" above), registered through a hostcall and found through
   gk's record of the thread rather than through the heap entry or a
-  thread-local.
-  What a rewritten handle can still do is name another live host slot: the
+  thread-local. An `IoOwn` -- the reference a JS heap object holds to a KJ
+  I/O object, the largest family of pointers the host loaded from guest
+  memory -- names its object by a handle into the ring-0 resolve table (see
+  "Ring-0 resolve" above), resolved on every use, so a rewritten one fails
+  the use rather than redirecting it; the object it names is still in the
+  shared heap, as is the delete-queue reference beside the handle.
+  What a rewritten handle can still do is name another live host slot, or
+  another isolate's live resolve entry: the
   table turns "any address" into "one of the live tenants", and telling a
   legitimate use from a swapped one is an ownership question the table cannot
   answer, as with arenas below. Every other object listed above is still in
@@ -672,7 +705,9 @@ so a crossing a turn makes on every dereference belongs on that path.
   rewritten counter would otherwise make the next turn run outside the guest,
   a host-memory object is reached through a host slot handle that gk
   validates against its own table rather than through a pointer the host
-  loads from the heap, a hostcall's handler is selected by an index gk
+  loads from the heap, an `IoOwn`'s object is reached through a resolve
+  handle the same way, with the pointer behind it admitted to the table only
+  if it is ordinary user memory the turn could write anyway, a hostcall's handler is selected by an index gk
   checks against its table and sees a host-memory copy of the arguments,
   never the guest's memory, the Wasm signal handler writes through a
   descriptor gk validated against the thread's arena and keeps in its own

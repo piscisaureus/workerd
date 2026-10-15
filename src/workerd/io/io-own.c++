@@ -6,17 +6,38 @@
 
 namespace workerd {
 
-void DeleteQueue::scheduleDeletion(OwnedObject* object) const {
+void DeleteQueue::scheduleDeletion(hostMemory::ResolveHandle handle) const {
   if (IoContext::hasCurrent() && IoContext::current().deleteQueue.queue.get() == this) {
     // Deletion from same thread. No need to enqueue.
     kj::AllowAsyncDestructorsScope scope;
-    OwnedObjectList::unlink(*object);
+    unlinkOwned(handle);
   } else {
     auto lock = crossThreadDeleteQueue.lockExclusive();
     KJ_IF_SOME(state, *lock) {
-      state.queue.add(object);
+      state.queue.add(handle);
     }
   }
+}
+
+OwnedObject& DeleteQueue::resolveOwned(
+    hostMemory::ResolveHandle handle, const std::type_info& type) {
+  void* object = hostMemory::resolve(handle);
+  if (object == nullptr) {
+    KJ_LOG(ERROR, "IoOwn handle does not name a live owned object; the use is refused",
+        kj::hex(handle), type.name());
+    KJ_FAIL_REQUIRE("IoOwn handle does not name a live owned object", kj::hex(handle), type.name());
+  }
+  return *static_cast<OwnedObject*>(object);
+}
+
+void DeleteQueue::unlinkOwned(hostMemory::ResolveHandle handle) {
+  void* object = hostMemory::resolve(handle);
+  if (object == nullptr) {
+    KJ_LOG(ERROR, "IoOwn handle does not name a live owned object; nothing is unlinked",
+        kj::hex(handle));
+    return;
+  }
+  OwnedObjectList::unlink(*static_cast<OwnedObject*>(object));
 }
 
 void DeleteQueue::scheduleAction(jsg::Lock& js, kj::Function<void(jsg::Lock&)>&& action) const {
@@ -106,6 +127,10 @@ OwnedObjectList::~OwnedObjectList() noexcept(false) {
 }
 
 void OwnedObjectList::unlink(OwnedObject& object) {
+  if (object.handle != 0) {
+    hostMemory::unregisterResolve(object.handle);
+    object.handle = 0;
+  }
   KJ_IF_SOME(next, object.next) {
     next.get()->prev = object.prev;
   }

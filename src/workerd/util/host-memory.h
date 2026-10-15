@@ -68,6 +68,76 @@ SlotHandle allocateSlot(size_t size, size_t alignment);
 void* resolveSlot(SlotHandle handle);
 void freeSlot(SlotHandle handle);
 
+// Resolve handles: a host object named by a handle that is resolved on every use against a table
+// the guest cannot write, for the object an isolate-side holder (a JS heap object's C++ wrapper)
+// reaches on nearly every API call. The table is the guest kernel's ring-0 resolve table
+// (gk_resolve in experimental/guest-kernel/gk.h): it lives in supervisor memory, so a JS turn at
+// guest ring 3 can neither read nor write an entry, and a turn resolves a handle through a trap
+// into ring 0 inside the guest, with no VM exit, in about 19 ns; host code outside the guest
+// reads the same table directly. A handle is validated completely before anything is returned --
+// the entry must be live and its generation must be the handle's -- and nothing is ever read
+// through the handle's own value, so a handle a turn has rewritten, to a pointer or to anything
+// else, resolves to nothing rather than to an address the turn chose. Without the guest kernel a
+// table of the same shape and the same checks backs the handles on the ordinary heap, so the
+// handle semantics, including the refusal of a stale or foreign handle, are the same in both
+// builds and are exercised by the ordinary test suite.
+//
+// The table is process-wide, with RESOLVE_CAPACITY entries for every isolate in the process
+// together; registerResolve() returns 0 when it is full, which the caller turns into a failed
+// operation. Registration and unregistration take a lock and are host-side; resolve() takes no
+// lock and allocates nothing. The pointer resolve() returns is for immediate use, resolved
+// again for each use rather than kept, and names an object the caller must still be entitled
+// to: a handle rewritten to another live entry's names that entry's object, which the table
+// cannot tell from a legitimate use (the ownership residual the host slot table carries too).
+// unregisterResolve() refuses a handle that does not name a live entry, with a report, and
+// retires nothing.
+using ResolveHandle = uint64_t;
+constexpr size_t RESOLVE_CAPACITY = size_t{1} << 20;
+ResolveHandle registerResolve(void* ptr);
+void* resolve(ResolveHandle handle);
+void unregisterResolve(ResolveHandle handle);
+
+// Entries registered or reserved and not yet unregistered, for tests and diagnostics.
+size_t liveResolveEntries();
+
+// A JS turn's registrations, batched. The table is written only by the host, and the objects
+// an IoOwn names are created inside turns, at guest ring 3, where the table cannot be written
+// and where an exit per object (a hostcall, microseconds) would cost more than the lookups
+// save. So the host reserves entries for the thread before the turn and commits them after it:
+// a ResolveTurn on the host frame around a turn (io/io-context.c++, runJsTurn) tops the thread's
+// pool of reserved entries up, hands the turn a journal with their handles, and once the guest
+// has returned commits each handle the turn used with the pointer the turn journaled for it,
+// retires the ones the turn released, and keeps the rest for the next turn. Inside the turn,
+// registerResolve() takes the next reserved handle and journals the pointer, resolve() falls
+// back to the journal for a handle the table does not yet hold, and unregisterResolve() marks
+// a journaled entry released or lists a committed one for retirement at the end; a turn that
+// outruns its reserved entries, or its retire list, refills or flushes through one hostcall.
+// Nested in a turn, a ResolveTurn does nothing: the outermost frame commits.
+//
+// What the host trusts. The pool -- which handles it reserved for this thread -- is in host
+// memory and found through the guest kernel's per-thread words, never through anything a turn
+// can write; the journal is ordinary memory the turn writes, and the host reads it by position,
+// bounded by its own counts, taking from it only the pointers, which the table validates on
+// commit (gk_resolve_commit: ordinary user memory, outside gk's protected ranges and every
+// arena). A turn can therefore commit pointers only into the entries reserved for it, and only
+// pointers to memory it could already write directly; it cannot commit into another tenant's
+// entry, which is committed once, nor send the host into memory it cannot reach itself. A
+// turn's lies about its own journal cost only that turn its registrations.
+class ResolveTurn {
+ public:
+  ResolveTurn();
+  ~ResolveTurn() noexcept(false);
+  KJ_DISALLOW_COPY_AND_MOVE(ResolveTurn);
+
+ private:
+  void* pool;  // the thread's pool, as the host found it at entry; null when nested in a turn
+};
+
+// Installs the hostcall a turn uses to refill its reserved entries or flush its retire list.
+// Called once, host-side, after gk_init() and before any turn runs; a no-op without the guest
+// kernel, where the handler is called directly.
+void installResolveHostcall();
+
 // Test-only hooks for the guest kernel's end-to-end check (experimental/guest-kernel/
 // host-memory-test.sh). A tenant registers itself only when WORKERD_GK_TEST_PROBE is in the
 // environment; there is none otherwise.

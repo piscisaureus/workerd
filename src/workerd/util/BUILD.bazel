@@ -154,6 +154,7 @@ wd_cc_library(
     }),
     visibility = ["//visibility:public"],
     deps = [
+        ":hostcall",
         ":memory-class",
         "@capnp-cpp//src/kj",
     ],

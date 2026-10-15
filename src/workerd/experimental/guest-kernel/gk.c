@@ -349,11 +349,21 @@ _Static_assert(GK_SIGNAL_FIELDS <= (1 << GK_HOST_SLOT_INDEX_BITS), "a field inde
 // handle's generation is never 0. The order of the stores is what the
 // lock-free reader relies on (see gk_resolve_tramp): publish stores the
 // pointer, then the generation; retire stores a zero generation, then a NULL
-// pointer. The free list and counters are in the control block.
+// pointer. A free entry's pointer word holds the free-list link (the next
+// free index + 1, 0 ending the list) rather than a pointer: the reader never
+// returns the word of an entry whose generation is 0, so the list costs no
+// space outside the table, which matters at this capacity. The counters are
+// in the control block.
+//
+// A handle is the entry's index in its low GK_RESOLVE_INDEX_BITS bits and the
+// generation above them. The capacity is exactly 2^GK_RESOLVE_INDEX_BITS, so
+// masking the index bounds it and every 64-bit value decomposes into one
+// (generation, index) pair; the trampoline relies on both.
 typedef struct { void *ptr; uint64_t gen; } gk_resolve_entry;
 _Static_assert(sizeof(gk_resolve_entry) == 16, "gk_resolve_tramp indexes 16-byte entries");
-_Static_assert(GK_RESOLVE_SLOTS == 16384, "gk_resolve_tramp bounds the index by 16384");
-_Static_assert(GK_RESOLVE_SLOTS <= (1 << GK_HOST_SLOT_INDEX_BITS), "an entry index must fit a handle");
+_Static_assert(GK_RESOLVE_INDEX_BITS == 20, "gk_resolve_tramp splits a handle at bit 20");
+_Static_assert(GK_RESOLVE_SLOTS == (1 << GK_RESOLVE_INDEX_BITS), "gk_resolve_tramp bounds the index by masking");
+#define GK_RESOLVE_GEN_BITS (64 - GK_RESOLVE_INDEX_BITS)
 __attribute__((visibility("hidden"), aligned(4096))) union {
   gk_resolve_entry e[GK_RESOLVE_SLOTS];
   char pad[(sizeof(gk_resolve_entry) * GK_RESOLVE_SLOTS + 0xfff) & ~(size_t)0xfff];
@@ -520,8 +530,8 @@ struct gk_ctl {
   uint64_t signal_field_gen;         // the generation of the last registration
 
   // The ring-0 resolve table's bookkeeping (see the resolve section): the
-  // table itself is gk_resolve_table, outside the block. Guarded by G->lock.
-  int resolve_next_free[GK_RESOLVE_SLOTS];  // free-list links, as index + 1; 0 ends the list
+  // table itself is gk_resolve_table, outside the block, and the free list is
+  // threaded through its free entries. Guarded by G->lock.
   int resolve_n;                     // entries ever taken from the table
   int resolve_free;                  // free-list head, as index + 1; 0 when empty
   int resolve_live;                  // entries registered and not yet unregistered
@@ -3046,9 +3056,9 @@ long gk_hostcall(unsigned idx) {
 // allocation guard so the guard build checks the last).
 
 static void *resolve_lookup(gk_resolve_handle h) {
-  uint64_t idx = h & ((1ULL << GK_HOST_SLOT_INDEX_BITS) - 1), gen = h >> GK_HOST_SLOT_INDEX_BITS;
-  if (gen == 0 || idx >= (uint64_t)GK_RESOLVE_SLOTS) return NULL;
-  gk_resolve_entry *e = &gk_resolve_table.e[idx];
+  uint64_t idx = h & ((1ULL << GK_RESOLVE_INDEX_BITS) - 1), gen = h >> GK_RESOLVE_INDEX_BITS;
+  if (gen == 0) return NULL;
+  gk_resolve_entry *e = &gk_resolve_table.e[idx];  // the mask bounds idx (see the table)
   // Acquire loads: the compiler may not reorder them, and the CPU keeps loads
   // in order, which is what makes the generation on both sides of the pointer
   // a check that the pointer was the entry's under that generation.
@@ -3063,36 +3073,94 @@ static void *resolve_lookup(gk_resolve_handle h) {
 #endif
 }
 
-gk_resolve_handle gk_resolve_register(void *ptr) {
-  if (!ptr || !G->initialized) return 0;
-  pthread_mutex_lock(&G->lock);
+// Whether `ptr` may be placed in the table (see gk_resolve_commit in gk.h):
+// ordinary user memory of the process, which the host may dereference without
+// reaching anything the guest could not already write -- so not NULL, not in
+// a supervisor or refused range, and not inside an arena. Caller holds G->lock.
+static int resolve_ptr_ok(const void *ptr) {
+  uintptr_t a = (uintptr_t)ptr;
+  return a != 0 && prot_class(a) == GK_PROT_KEEP && arena_containing(a) == NULL;
+}
+
+// Takes a free entry, gives it a fresh generation and publishes it with `ptr`
+// (NULL for a reservation). Returns the handle, or 0 when the table is full.
+// Caller holds G->lock.
+static gk_resolve_handle resolve_take(void *ptr) {
   int idx;
   if (G->resolve_free) {
     idx = G->resolve_free - 1;
-    G->resolve_free = G->resolve_next_free[idx];
+    G->resolve_free = (int)(uintptr_t)gk_resolve_table.e[idx].ptr;  // the link (see the table)
   } else if (G->resolve_n < GK_RESOLVE_SLOTS) {
     idx = G->resolve_n++;
   } else {
-    pthread_mutex_unlock(&G->lock);
     return 0;  // the table is full: reported, never fatal
   }
-  // A generation is never 0 and never reused: the counter has 48 bits.
+  // A generation is never 0 and never reused: the counter has 44 bits.
   uint64_t gen = ++G->resolve_gen;
-  if (gen >> GK_HOST_SLOT_GEN_BITS) gen = G->resolve_gen = 1;
+  if (gen >> GK_RESOLVE_GEN_BITS) gen = G->resolve_gen = 1;
   gk_resolve_entry *e = &gk_resolve_table.e[idx];
   // Publish: the pointer first, the generation last (see gk_resolve_tramp).
   __atomic_store_n(&e->ptr, ptr, __ATOMIC_RELEASE);
   __atomic_store_n(&e->gen, gen, __ATOMIC_RELEASE);
   G->resolve_live++;
+  return (gen << GK_RESOLVE_INDEX_BITS) | (uint64_t)idx;
+}
+
+gk_resolve_handle gk_resolve_register(void *ptr) {
+  if (!ptr || !G->initialized) return 0;
+  pthread_mutex_lock(&G->lock);
+  gk_resolve_handle h = 0;
+  if (resolve_ptr_ok(ptr)) {
+    h = resolve_take(ptr);
+  } else {
+    fprintf(stderr, "[gk] gk_resolve_register: %p is not ordinary user memory; nothing is "
+            "registered\n", ptr);
+  }
   pthread_mutex_unlock(&G->lock);
-  return (gen << GK_HOST_SLOT_INDEX_BITS) | (uint64_t)idx;
+  return h;
+}
+
+int gk_resolve_reserve(gk_resolve_handle *handles, int n) {
+  if (!handles || n < 0 || !G->initialized) return 0;
+  pthread_mutex_lock(&G->lock);
+  int got = 0;
+  while (got < n) {
+    gk_resolve_handle h = resolve_take(NULL);
+    if (!h) break;
+    handles[got++] = h;
+  }
+  pthread_mutex_unlock(&G->lock);
+  return got;
+}
+
+int gk_resolve_commit(gk_resolve_handle h, void *ptr) {
+  uint64_t idx = h & ((1ULL << GK_RESOLVE_INDEX_BITS) - 1), gen = h >> GK_RESOLVE_INDEX_BITS;
+  pthread_mutex_lock(&G->lock);
+  gk_resolve_entry *e = &gk_resolve_table.e[idx];  // the mask bounds idx (see the table)
+  if (gen == 0 || e->gen != gen || e->ptr != NULL) {
+    pthread_mutex_unlock(&G->lock);
+    fprintf(stderr, "[gk] gk_resolve_commit: %#llx is not the handle of a reserved resolve "
+            "entry; nothing is committed\n", (unsigned long long)h);
+    return -GK_EINVAL;
+  }
+  if (!resolve_ptr_ok(ptr)) {
+    pthread_mutex_unlock(&G->lock);
+    fprintf(stderr, "[gk] gk_resolve_commit: %p is not ordinary user memory; %#llx stays "
+            "unresolvable\n", ptr, (unsigned long long)h);
+    return -GK_EINVAL;
+  }
+  // The generation is already published; the pointer becomes visible with
+  // this store, and a lookup that read NULL before it answered nothing.
+  __atomic_store_n(&e->ptr, ptr, __ATOMIC_RELEASE);
+  pthread_mutex_unlock(&G->lock);
+  return 0;
 }
 
 int gk_resolve_unregister(gk_resolve_handle h) {
-  uint64_t idx = h & ((1ULL << GK_HOST_SLOT_INDEX_BITS) - 1), gen = h >> GK_HOST_SLOT_INDEX_BITS;
+  uint64_t idx = h & ((1ULL << GK_RESOLVE_INDEX_BITS) - 1), gen = h >> GK_RESOLVE_INDEX_BITS;
   pthread_mutex_lock(&G->lock);
-  gk_resolve_entry *e = idx < (uint64_t)GK_RESOLVE_SLOTS ? &gk_resolve_table.e[idx] : NULL;
-  if (!e || gen == 0 || e->gen != gen) {
+  gk_resolve_entry *e = &gk_resolve_table.e[idx];  // the mask bounds idx (see the table)
+  if (gen == 0 || e->gen != gen) {
     pthread_mutex_unlock(&G->lock);
     if (h)
       fprintf(stderr, "[gk] gk_resolve_unregister: %#llx is not the handle of a live resolve "
@@ -3100,11 +3168,11 @@ int gk_resolve_unregister(gk_resolve_handle h) {
     return -GK_EINVAL;
   }
   // Retire: the generation first, so a lookup in flight fails its second
-  // read, then the pointer (see gk_resolve_tramp).
+  // read, then the pointer word, which becomes the free-list link (see
+  // gk_resolve_tramp and the table).
   __atomic_store_n(&e->gen, 0, __ATOMIC_RELEASE);
-  __atomic_store_n(&e->ptr, NULL, __ATOMIC_RELEASE);
-  G->resolve_next_free[idx] = G->resolve_free;
-  G->resolve_free = (int)idx + 1;
+  __atomic_store_n(&e->ptr, (void *)(uintptr_t)G->resolve_free, __ATOMIC_RELEASE);
+  G->resolve_free = idx + 1;
   G->resolve_live--;
   pthread_mutex_unlock(&G->lock);
   return 0;

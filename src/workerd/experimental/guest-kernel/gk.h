@@ -240,7 +240,7 @@ typedef struct {
   int hostcall_handlers;  // hostcall indices with a handler registered (see gk_hostcall_register)
   long hostcalls;         // hostcalls that reached a handler, from either side
   int signal_fields;  // signal fields registered and not yet unregistered (see gk_signal_field_register)
-  int resolve_entries;  // ring-0 resolve entries registered and not yet unregistered (see gk_resolve_register)
+  int resolve_entries;  // ring-0 resolve entries registered or reserved and not yet unregistered (see gk_resolve_register)
   long
       path_refusals;  // forwarded path syscalls the turn-directory policy refused (see gk_confine_paths)
 } gk_stats;
@@ -499,33 +499,75 @@ long gk_hostcall(unsigned idx);
 // definition; it is the first SUPER tenant outside gk's own control block,
 // and what it holds is pointers, which name host objects but are not the
 // objects. The host-memory facilities stay on REFUSE. The handle is the
-// slot's index in its low 16 bits and the generation the slot was registered
-// with above them, and it is validated like a host slot handle: the index is
-// bounds-checked against the table, the entry must be live, and its
-// generation must be the handle's, so a handle to an unregistered entry
-// resolves to nothing even after the slot has been reused -- every
-// registration takes a fresh generation from a counter that does not repeat
-// within 2^48 registrations. Nothing is read through the handle itself, at
-// either ring: a value gk did not issue (a pointer, a stale handle, random
-// bits) resolves to nothing. The lookup takes no lock and writes nothing;
-// against a registration or unregistration in progress on another thread it
-// reads the generation on both sides of the pointer and answers only if both
-// agree, so the pointer it returns was the entry's under that generation.
+// slot's index in its low GK_RESOLVE_INDEX_BITS bits and the generation the
+// slot was registered with above them, and it is validated like a host slot
+// handle: the entry must be live and its generation must be the handle's,
+// so a handle to an unregistered entry resolves to nothing even after the
+// slot has been reused -- every registration takes a fresh generation from
+// a counter that does not repeat within 2^44 registrations. The capacity is
+// exactly 2^GK_RESOLVE_INDEX_BITS, so masking the index bounds it: every
+// 64-bit value decomposes into one (generation, index) pair, and a value gk
+// did not issue (a pointer, a stale handle, random bits) names a generation
+// that no entry holds. Nothing is read through the handle itself, at either
+// ring. The lookup takes no lock and writes nothing; against a registration
+// or unregistration in progress on another thread it reads the generation
+// on both sides of the pointer and answers only if both agree, so the
+// pointer it returns was the entry's under that generation.
+//
+// Capacity. The table is process-wide, one for every isolate in the
+// process, and it is sized for its runtime tenant: workerd registers one
+// entry per object an IoOwn owns (io/io-own.h), and a loaded process holds
+// many of those at once -- measured at five per in-flight request parked on
+// a timer or on a subrequest, so that one worker with a few thousand such
+// requests outgrows a 2^16-entry table (see memory-classes.md, Cost). 2^20
+// entries hold about two hundred thousand of them. The table's 16 MiB are
+// static and untouched until an entry is written, so the capacity costs
+// page-table entries at init and nothing per unused page; the free list is
+// threaded through the free entries themselves, so the control block does
+// not grow with it. Exhaustion is a registration refused with 0, which the
+// runtime turns into a failed request, never a fault.
 //
 // gk_resolve_register places `ptr` in a free slot and returns its handle, or
-// 0 when the table is full (exhaustion is a refusal, never fatal), for a NULL
-// pointer, or before gk_init has succeeded; 0 is never a valid handle.
-// gk_resolve_unregister retires the slot: the handle resolves to nothing from
-// then on, and the slot is free for a later registration under a new
-// generation. A handle that fails validation unregisters nothing, is
-// reported on stderr (as a host slot handle is) and returns -EINVAL. Both are
+// 0 when the table is full (exhaustion is a refusal, never fatal), for a
+// pointer the table will not hold (below), or before gk_init has succeeded;
+// 0 is never a valid handle. gk_resolve_unregister retires the slot: the
+// handle resolves to nothing from then on, and the slot is free for a later
+// registration under a new generation. A handle that fails validation
+// unregisters nothing, is reported on stderr (as a host slot handle is) and
+// returns -EINVAL. gk_resolve resolves a handle to its pointer, or to NULL,
+// from any ring and from the host, and allocates nothing on any path; the
+// GK_GUARD_HANDLER_ALLOC build checks the host-side path, and the ring-0
+// path is asm with no call in it. The pointer it returns names a host object
+// the caller is about to use; it is for immediate use, resolved again for
+// each use, and never stored where the guest can write it.
+//
+// Reservation. The table is written only by the host, and the runtime
+// creates the objects it names inside turns, at ring 3, where it cannot
+// register them and where an exit per object would cost more than the
+// lookups save. So the host reserves entries ahead of a turn and commits
+// them after it: gk_resolve_reserve takes up to n free entries, each under a
+// fresh generation and with no pointer, and returns their handles (fewer
+// than n, down to 0, when the table runs out); a reserved handle resolves to
+// nothing until gk_resolve_commit places a pointer in it, after which it
+// resolves as a registered one, and gk_resolve_unregister retires it either
+// way. The runtime hands reserved handles out inside the turn and keeps the
+// pointers in a journal of its own, and the host commits them from that
+// journal once the turn has returned (util/host-memory.h, ResolveTurn). A
+// commit is refused, with a report and -EINVAL, for a handle that does not
+// name a live entry with no pointer -- a committed entry is committed once,
+// so a handle swapped for another tenant's live one commits nothing -- and
+// for a pointer the table will not hold.
+//
+// What the table holds. The pointer the host will dereference comes from
+// the turn, so registration and commit admit only ordinary user memory of
+// the process: a non-NULL address outside every supervisor and refused range
+// and outside every arena. That is memory a turn can already write directly,
+// so a pointer laundered through the table gives the host nothing to touch
+// that the guest could not touch itself; what the check refuses is the
+// escalation -- a handle whose entry sends the host's write into gk's control
+// state, into host memory, or into another isolate's arena. A refused
+// pointer is reported on stderr. Register, reserve, commit and unregister are
 // host-side: they take gk's lock, and a call at ring 3 faults on the table.
-// gk_resolve resolves a handle to its pointer, or to NULL, from any ring and
-// from the host, and allocates nothing on any path; the GK_GUARD_HANDLER_ALLOC
-// build checks the host-side path, and the ring-0 path is asm with no call in
-// it. The pointer it returns names a host object the caller is about to use;
-// it is for immediate use, resolved again for each use, and never stored
-// where the guest can write it.
 //
 // What this does not give. Ring 3 can resolve as often as it likes, with any
 // handle it likes, and the only thing it learns is the pointer behind a live
@@ -541,9 +583,12 @@ long gk_hostcall(unsigned idx);
 // resolve of its handle is in flight on another thread is the owner's race to
 // avoid, as it is for every lock-free table; in the runtime the entries of an
 // isolate's objects change only on the thread that holds its lock.
-#define GK_RESOLVE_SLOTS 16384
+#define GK_RESOLVE_INDEX_BITS 20
+#define GK_RESOLVE_SLOTS (1 << GK_RESOLVE_INDEX_BITS)
 typedef uint64_t gk_resolve_handle;
 gk_resolve_handle gk_resolve_register(void *ptr);
+int gk_resolve_reserve(gk_resolve_handle *handles, int n);
+int gk_resolve_commit(gk_resolve_handle handle, void *ptr);
 int gk_resolve_unregister(gk_resolve_handle handle);
 void *gk_resolve(gk_resolve_handle handle);
 

@@ -2387,7 +2387,8 @@ static int hostcall_check(void) {
 // supervisor memory, inside the guest, with no VM exit (see gk_resolve in
 // gk.h). Checks: a registered entry resolves from ring 3 (on both kinds of
 // stack), from ring 0 and from the host; a zero handle, an index at and past
-// capacity, generations never issued, a slot never taken, the pointer itself,
+// capacity (which decomposes to a generation never issued, since the index
+// is masked), generations never issued, a slot never taken, the pointer itself,
 // a heap address, a PROT_NONE page's address and all-ones each resolve to
 // nothing with nothing read through them; a handle to an unregistered entry
 // resolves to nothing, and still does once the slot is recycled under a new
@@ -2458,7 +2459,7 @@ static int resolve_check(void) {
 
   // Handles gk did not issue. The PROT_NONE page is the check that resolution
   // reads nothing through the caller's value, at either ring.
-  uint64_t idx = h & 0xffff, gen = h >> 16;
+  uint64_t idx = h & 0xfffff, gen = h >> 20;  // the handle's split (GK_RESOLVE_INDEX_BITS)
   unsigned char *none = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   unsigned char *heap = malloc(64);
   if (none == MAP_FAILED || !heap) { printf("ring-0 resolve: setup failed [FAIL]\n"); return 0; }
@@ -2466,17 +2467,17 @@ static int resolve_check(void) {
   struct rs_probe *p = calloc(1, sizeof *p);
   p->h = h;
   gk_resolve_handle bad[RS_BAD] = {
-      (gen << 16) | GK_RESOLVE_SLOTS,       // index at capacity
-      (gen << 16) | 0xffff,                 // index past capacity
-      ((gen + 1) << 16) | idx,              // a generation not yet issued, same slot
-      ((gen ^ 0x100000) << 16) | idx,       // a generation never issued, same slot
-      (gen << 16) | (idx ^ 1),              // a slot never taken, with a live generation
+      ((gen ^ 0x200000) << 20) | GK_RESOLVE_SLOTS | idx,  // the capacity bit set: the mask discards it, the generation names nothing
+      ((gen ^ 0x200000) << 20) | 0xfffff,   // the last slot, with a generation never issued
+      ((gen + 1) << 20) | idx,              // a generation not yet issued, same slot
+      ((gen ^ 0x100000) << 20) | idx,       // a generation never issued, same slot
+      (gen << 20) | (idx ^ 1),              // a slot never taken, with a live generation
       (gk_resolve_handle)(uintptr_t)&obj,   // the object's own address, as a swapped pointer would be
       (gk_resolve_handle)(uintptr_t)heap,   // a heap buffer the caller controls
       (gk_resolve_handle)(uintptr_t)none,   // an unmapped page
       (gk_resolve_handle)(uintptr_t)none | idx,
       ~(gk_resolve_handle)0, 1, 0x7fff0000,
-      ((gen << 16) | idx) ^ ((gk_resolve_handle)1 << 63)};  // the live handle with its top bit flipped
+      ((gen << 20) | idx) ^ ((gk_resolve_handle)1 << 63)};  // the live handle with its top bit flipped
   memcpy(p->bad, bad, sizeof bad);
 
   // From ring 3 on a private guest stack, ring 3 on the caller's stack, ring
@@ -2570,7 +2571,7 @@ static int resolve_check(void) {
   p->h2 = h2;
   memset(p->r_bad, 0x11, sizeof p->r_bad); p->r_h = &obj; p->r_h2 = NULL;
   long rr = gk_run_user(rs_guest, p);
-  int recycled = h2 != 0 && (h2 & 0xffff) == idx && h2 != h && rr == 0 && p->r_h == NULL &&
+  int recycled = h2 != 0 && (h2 & 0xfffff) == idx && h2 != h && rr == 0 && p->r_h == NULL &&
                  p->r_h2 == &obj2 && gk_resolve(h) == NULL && gk_resolve(h2) == &obj2;
   gk_resolve_unregister(h2);
 
@@ -2600,12 +2601,52 @@ static int resolve_check(void) {
                     s5.resolve_entries == s3.resolve_entries && gk_resolve(all[0]) == NULL &&
                     gk_resolve(all[n - 1]) == NULL;
   gk_resolve_handle h3 = gk_resolve_register(&obj);
-  int fresh = h3 != 0 && (h3 >> 16) > (all[n - 1] >> 16) && gk_resolve(h3) == &obj;
+  int fresh = h3 != 0 && (h3 >> 20) > (all[n - 1] >> 20) && gk_resolve(h3) == &obj;
   gk_resolve_unregister(h3);
+
+  // Reservation: reserved entries resolve to nothing from ring 3 and the host until committed,
+  // a commit takes once and refuses a committed, retired or never-issued handle, and the table
+  // refuses a pointer it will not hold: NULL, gk's supervisor and refused pages, and an arena,
+  // from both commit and register.
+  static int objs3[3];
+  gk_resolve_handle rsv[3] = {0, 0, 0};
+  gk_get_stats(&s3);
+  int reserved = gk_resolve_reserve(rsv, 3);
+  gk_get_stats(&s4);
+  struct rs_all rra = {rsv, (void *[]){NULL, NULL, NULL}, 3};
+  long rsv_unresolved = gk_run_user(rs_resolve_all, &rra);  // 0: every one answered NULL
+  int reserve_ok = reserved == 3 && rsv[0] && rsv[1] && rsv[2] && rsv_unresolved == 0 &&
+                   gk_resolve(rsv[0]) == NULL && s4.resolve_entries == s3.resolve_entries + 3;
+  unsigned long super_addr = 0, refuse_addr = 0;
+  gk_debug_control_addrs(&super_addr, &refuse_addr);
+  gk_arena *rarena = gk_arena_create(1UL << 20);
+  void *arena_ptr = rarena ? gk_arena_base(rarena) : NULL;
+  int commit_ok = gk_resolve_commit(rsv[0], &objs3[0]) == 0 && gk_resolve(rsv[0]) == &objs3[0] &&
+                  gk_resolve_commit(rsv[0], &objs3[1]) == -EINVAL &&   // committed once
+                  gk_resolve(rsv[0]) == &objs3[0] &&
+                  gk_resolve_commit(rsv[1], NULL) == -EINVAL &&
+                  gk_resolve_commit(rsv[1], (void *)super_addr) == -EINVAL &&
+                  gk_resolve_commit(rsv[1], (void *)refuse_addr) == -EINVAL &&
+                  (!arena_ptr || gk_resolve_commit(rsv[1], arena_ptr) == -EINVAL) &&
+                  gk_resolve(rsv[1]) == NULL &&                          // still reserved
+                  gk_resolve_commit(h3, &objs3[2]) == -EINVAL &&         // retired
+                  gk_resolve_commit(bad[3], &objs3[2]) == -EINVAL &&     // never issued
+                  gk_resolve_register((void *)super_addr) == 0 &&
+                  gk_resolve_register((void *)refuse_addr) == 0 &&
+                  (!arena_ptr || gk_resolve_register(arena_ptr) == 0) &&
+                  gk_resolve_commit(rsv[1], &objs3[1]) == 0 && gk_resolve(rsv[1]) == &objs3[1];
+  struct rs_all rrb = {rsv, (void *[]){&objs3[0], &objs3[1], NULL}, 3};
+  long committed_wrong = gk_run_user(rs_resolve_all, &rrb);  // ring 3 sees the two commits
+  for (int i = 0; i < 3; i++) gk_resolve_unregister(rsv[i]);
+  gk_get_stats(&s5);
+  int reserve_freed = s5.resolve_entries == s3.resolve_entries && gk_resolve(rsv[0]) == NULL &&
+                      gk_resolve(rsv[2]) == NULL;
+  if (rarena) gk_arena_destroy(rarena);
   long cpl = gk_run_user(user_cpl, NULL);  // the process survived the faults above
 
   int ok = reg_bad && resolves && user_ok && here_ok && ring0_ok && host_ok && garbage_ok &&
-           walled && bench_ok && freed && recycled && capacity_ok && fresh && cpl == 3;
+           walled && bench_ok && freed && recycled && capacity_ok && fresh && reserve_ok &&
+           commit_ok && committed_wrong == 0 && reserve_freed && cpl == 3;
   printf("ring-0 resolve: NULL refused %s; handle %#llx -> %p (host %s); ring 3 %s, caller's "
          "stack %s, ring 0 %s, host %s; %d garbage handles and 0 -> nothing at every ring (%s, "
          "caller's memory untouched %s); ring-3 read of the table -> %s (fault %#lx == %#lx), "
@@ -2614,18 +2655,21 @@ static int resolve_check(void) {
          "irq_exits in the period), %d answered wrong; %.1f ns per resolve (median of kept, "
          "empty turn %.0f ns subtracted); unregistered -> nothing %s; recycled as %#llx (same "
          "slot %s, old handle -> nothing %s, new -> %p %s); capacity %d: filled %d, next -> "
-         "%#llx, %ld mismatched from ring 3, emptied %s; reusable %s; CPL %ld [%s]\n",
+         "%#llx, %ld mismatched from ring 3, emptied %s; reusable %s; reserved 3 -> nothing "
+         "until committed %s, commits once and refuses NULL, supervisor, refused and arena "
+         "pointers %s (%ld wrong from ring 3), released %s; CPL %ld [%s]\n",
          reg_bad ? "yes" : "NO", (unsigned long long)h, (void *)&obj, resolves ? "ok" : "BROKEN",
          user_ok ? "ok" : "BROKEN", here_ok ? "ok" : "BROKEN", ring0_ok ? "ok" : "BROKEN",
          host_ok ? "ok" : "BROKEN", RS_BAD, garbage_ok && user_ok && host_ok ? "yes" : "NO",
          heap_intact ? "yes" : "NO", r3 == GK_EFAULT ? "FAULT" : "READ", fr3, table,
          w3 == GK_EFAULT ? "FAULT" : "WROTE", fw3, table, RS_SUBRUNS, RS_N, kept, e_empty,
          discarded, extra_exits, irq_delta, wrong, per_call, t_empty, freed ? "yes" : "NO",
-         (unsigned long long)h2, (h2 & 0xffff) == idx ? "yes" : "no",
+         (unsigned long long)h2, (h2 & 0xfffff) == idx ? "yes" : "no",
          p->r_h == NULL ? "yes" : "NO", p->r_h2, p->r_h2 == &obj2 ? "ok" : "WRONG",
          GK_RESOLVE_SLOTS, n, (unsigned long long)over, mismatched,
-         s5.resolve_entries == s3.resolve_entries ? "yes" : "NO", fresh ? "yes" : "NO", cpl,
-         ok ? "OK" : "FAIL");
+         s5.resolve_entries == s3.resolve_entries ? "yes" : "NO", fresh ? "yes" : "NO",
+         reserve_ok ? "yes" : "NO", commit_ok ? "yes" : "NO", committed_wrong,
+         reserve_freed ? "yes" : "NO", cpl, ok ? "OK" : "FAIL");
   free(p);
   free(heap);
   munmap(none, 4096);
