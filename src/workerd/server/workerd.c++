@@ -101,12 +101,16 @@ namespace {
 // Syscall allowlist for JS turns that run inside the guest kernel. gk forwards
 // every syscall the guest makes to the host; this filter bounds that to what
 // V8 and the runtime need during a turn, and everything else fails with EPERM
-// in the guest (an escaped ring-3 isolate then cannot open files, exec, ptrace,
-// and so on). Runs on gk's syscall-forward path, so it must not allocate.
+// in the guest (an escaped ring-3 isolate then cannot exec, ptrace, and so
+// on). The syscalls that change mappings are allowed only for a range the
+// guest may change (gk_mapping_syscall_ok in gk.h): the isolate's own arena
+// and the memory the process allocator hands out, but not gk's control
+// memory, another isolate's arena, the runtime's image or the main thread's
+// stack. Runs on gk's syscall-forward path, so it must not allocate.
 //
 // Adapted from Deno Deploy's V8 seccomp allowlist (x86_64 set).
 // TODO: see if this can be tightened further.
-int guestKernelSyscallFilter(long nr, long, long, long, long, long, long) {
+int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
 #ifndef SYS_clone3
   constexpr long SYS_clone3 = 435;
 #endif
@@ -114,6 +118,13 @@ int guestKernelSyscallFilter(long nr, long, long, long, long, long, long) {
   constexpr long SYS_rseq = 334;
 #endif
   switch (nr) {
+    case SYS_madvise:
+    case SYS_mmap:
+    case SYS_mprotect:
+    case SYS_mremap:
+    case SYS_munmap:
+    case SYS_pkey_mprotect:
+      return gk_mapping_syscall_ok(nr, a1, a2, a3, a4, a5, a6);
     case SYS_accept4:
     case SYS_access:
     case SYS_bind:
@@ -143,14 +154,8 @@ int guestKernelSyscallFilter(long nr, long, long, long, long, long, long) {
     case SYS_gettid:
     case SYS_ioctl:
     case SYS_lseek:
-    case SYS_madvise:
-    case SYS_mmap:
-    case SYS_mprotect:
-    case SYS_mremap:
-    case SYS_munmap:
     case SYS_newfstatat:
     case SYS_openat:
-    case SYS_pkey_mprotect:
     case SYS_poll:
     case SYS_prctl:
     case SYS_prlimit64:

@@ -252,6 +252,37 @@ typedef int (*gk_syscall_filter)(long nr, long a1, long a2, long a3, long a4,
                                  long a5, long a6);
 void gk_set_syscall_filter(gk_syscall_filter f);
 
+// Mapping-change policy, for a filter to apply to the memory syscalls it
+// allows. A forwarded mmap/mprotect/munmap/mremap/madvise/pkey_mprotect
+// reaches the host with the guest's own arguments, so a filter that admits
+// those by number alone lets ring-3 code change or remove any mapping in the
+// process: make the runtime's text writable, unmap it, or map a file over the
+// host's structures. These functions are the range check that closes that.
+//
+// gk_mapping_change_ok answers, for the calling thread, whether a change to
+// the mappings of [addr, addr+len) is the guest's to make: it is unless the
+// range, rounded out to pages, overlaps gk's own supervisor or refused memory
+// (the control block, page tables, GDT/IDT, handler text, kvm_run, exception
+// and host-side stacks), an arena other than the one the calling thread is
+// active in (every arena when none is active), or the runtime image: the
+// loaded segments of the executable and of every shared object present at
+// gk_init, and the main thread's stack, recorded then. A zero length names no
+// page and is accepted; the kernel's own answer to it (EINVAL, or a no-op)
+// stands. A range that wraps around the address space is refused. The thread's active arena is read from gk's own
+// record of it, not from anything the guest can write. May take gk's lock;
+// never allocates, so it may run on the syscall-forward path.
+//
+// gk_mapping_syscall_ok applies that to one syscall as the filter receives
+// it: the range of an mprotect, pkey_mprotect, munmap or madvise; the
+// range of an mmap with MAP_FIXED or MAP_FIXED_NOREPLACE; and for mremap the
+// old range extended to the new size, plus the destination of an
+// MREMAP_FIXED move. An mmap the kernel places itself, and any other syscall,
+// is accepted without a range check: neither can touch an existing mapping.
+// Returns nonzero to allow, zero to deny, like a filter.
+int gk_mapping_change_ok(unsigned long addr, unsigned long len);
+int gk_mapping_syscall_ok(long nr, long a1, long a2, long a3, long a4, long a5,
+                          long a6);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1635,6 +1635,152 @@ static int nesting_check(void) {
   return ok;
 }
 
+// ---- mapping-change policy ------------------------------------------------
+// With a filter that applies gk_mapping_syscall_ok, a ring-3 turn inside an
+// arena cannot change or remove the mappings of the test binary's own text, a
+// page of another live arena, gk's control block, gk's page tables or the
+// main thread's stack: each of mprotect, munmap, mremap, madvise and
+// pkey_mprotect on them fails with EPERM and the memory is intact afterwards.
+// The same turn still commits, writes, remaps and decommits its own arena's
+// pages, and takes an ordinary kernel-placed mmap, so the policy refuses what
+// is not the guest's rather than everything. With no arena active, the
+// arena's pages are off limits too.
+static int guard_filter(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
+  return gk_mapping_syscall_ok(nr, a1, a2, a3, a4, a5, a6);
+}
+
+// Lives in the test binary's text; its page is a target below and it is
+// called afterwards, from ring 3 and from the host, to show the page still
+// maps and executes.
+static long __attribute__((noinline)) guard_text_fn(long x) {
+  __asm__ __volatile__("" : "+r"(x));
+  return x * 3 + 1;
+}
+
+enum { GUARD_TARGETS = 5 };
+struct guard_target { void *page; long mprotect, munmap, mremap, madvise, pkey; };
+struct guard_probe {
+  struct guard_target tgt[GUARD_TARGETS];
+  void *mine;  // a page of the active arena
+  long own_mprotect, own_write, own_mmap, own_mmap_write, own_madvise, own_munmap,
+       own_reserve, own_anon, text_call;
+};
+
+// Runs at ring 3 under the arena that owns `mine`.
+static long guard_probe_fn(void *arg) {
+  struct guard_probe *p = arg;
+  for (int i = 0; i < GUARD_TARGETS; i++) {
+    struct guard_target *g = &p->tgt[i];
+    g->mprotect = mprotect(g->page, 4096, PROT_READ | PROT_WRITE) ? -errno : 0;
+    g->munmap = munmap(g->page, 4096) ? -errno : 0;
+    g->mremap = mremap(g->page, 4096, 8192, 0) == MAP_FAILED ? -errno : 0;
+    g->madvise = madvise(g->page, 4096, MADV_DONTNEED) ? -errno : 0;
+    g->pkey = pkey_mprotect(g->page, 4096, PROT_READ, -1) ? -errno : 0;
+  }
+  // The arena's own page, as V8 treats one: commit, use, replace with a fresh
+  // fixed mapping, trim, decommit, and reserve again.
+  volatile unsigned char *b = p->mine;
+  p->own_mprotect = mprotect(p->mine, 4096, PROT_READ | PROT_WRITE) ? -errno : 0;
+  if (p->own_mprotect == 0) { b[0] = 0x5A; p->own_write = b[0]; }
+  void *m = mmap(p->mine, 4096, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  p->own_mmap = m == MAP_FAILED ? -errno : (m == p->mine ? 0 : -1000);
+  if (p->own_mmap == 0) { b[0] = 0x6B; p->own_mmap_write = b[0]; }
+  p->own_madvise = madvise(p->mine, 4096, MADV_DONTNEED) ? -errno : 0;
+  p->own_munmap = munmap(p->mine, 4096) ? -errno : 0;
+  m = mmap(p->mine, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE,
+           -1, 0);
+  p->own_reserve = m == MAP_FAILED ? -errno : (m == p->mine ? 0 : -1000);
+  // A mapping the kernel places, as the process allocator takes.
+  unsigned char *anon = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+                             -1, 0);
+  if (anon == MAP_FAILED) p->own_anon = -errno;
+  else {
+    anon[0] = 1;
+    long seen = anon[0];
+    p->own_anon = munmap(anon, 4096) ? -errno : seen == 1 ? 0 : -1000;
+  }
+  p->text_call = guard_text_fn(7);
+  return 0;
+}
+
+// Runs at ring 3 with no arena active: one mprotect of an arena page.
+static long guard_mprotect_only(void *arg) {
+  return mprotect(arg, 4096, PROT_READ | PROT_WRITE) ? -errno : 0;
+}
+
+static int mapping_guard_check(void) {
+  gk_arena *A = gk_arena_create(4096), *B = gk_arena_create(4096);
+  if (!A || !B) { printf("mapping policy: create failed [FAIL]\n"); return 0; }
+  unsigned char *pa = gk_arena_base(A), *pb = gk_arena_base(B);
+  // B holds a live page, committed and written by the host.
+  int mb = mprotect(pb, 4096, PROT_READ | PROT_WRITE) == 0;
+  pb[0] = 0xB7;
+  unsigned long ctl = gk_debug_ctl_addr(GK_CTL_SCRATCH), refuse = 0;
+  gk_debug_control_addrs(NULL, &refuse);
+  *(volatile unsigned long *)ctl = 0x5c7a7c4;
+  volatile unsigned char stack_local = 0x3C;  // on the main thread's stack
+
+  struct guard_probe *p = calloc(1, sizeof *p);
+  const char *names[GUARD_TARGETS] = {"own text", "other arena", "control block",
+                                      "page tables", "main stack"};
+  p->tgt[0].page = (void *)((uintptr_t)&guard_text_fn & ~0xfffUL);
+  p->tgt[1].page = pb;
+  p->tgt[2].page = (void *)(ctl & ~0xfffUL);
+  p->tgt[3].page = (void *)refuse;
+  p->tgt[4].page = (void *)((uintptr_t)&stack_local & ~0xfffUL);
+  p->mine = pa;
+
+  // The filter installed for this case only; whatever was installed before
+  // (the suite runs without one) is put back afterwards.
+  gk_syscall_filter saved = *(gk_syscall_filter *)gk_debug_ctl_addr(GK_CTL_FILTER);
+  gk_set_syscall_filter(guard_filter);
+  gk_arena_enter(A);
+  long run = gk_run_user(guard_probe_fn, p);
+  gk_arena_enter(NULL);
+  long none = gk_run_user(guard_mprotect_only, pa);
+  gk_set_syscall_filter(saved);
+
+  int refused = 1;
+  for (int i = 0; i < GUARD_TARGETS; i++) {
+    const struct guard_target *g = &p->tgt[i];
+    int r = g->mprotect == -EPERM && g->munmap == -EPERM && g->mremap == -EPERM &&
+            g->madvise == -EPERM && g->pkey == -EPERM;
+    if (!r)
+      printf("mapping policy: %s: mprotect %ld munmap %ld mremap %ld madvise %ld "
+             "pkey_mprotect %ld (want all %d) [FAIL]\n", names[i], g->mprotect, g->munmap,
+             g->mremap, g->madvise, g->pkey, -EPERM);
+    refused = refused && r;
+  }
+  // Still intact: the text executes (the probe called it at ring 3 and the
+  // host calls it now), B's byte, the control word and the stack local read
+  // back, and the registry still holds its ranges.
+  gk_stats st;
+  gk_get_stats(&st);
+  int intact = p->text_call == 22 && guard_text_fn(7) == 22 && pb[0] == 0xB7 &&
+               *(volatile unsigned long *)ctl == 0x5c7a7c4 && stack_local == 0x3C &&
+               st.prot_ranges > 0;
+  int own_ok = run == 0 && p->own_mprotect == 0 && p->own_write == 0x5A && p->own_mmap == 0 &&
+               p->own_mmap_write == 0x6B && p->own_madvise == 0 && p->own_munmap == 0 &&
+               p->own_reserve == 0 && p->own_anon == 0;
+  int none_ok = none == -EPERM;
+  int ok = mb && refused && intact && own_ok && none_ok;
+  printf("mapping policy: ring 3 in arena A: own text, arena B page, control block, page "
+         "tables, main stack: mprotect/munmap/mremap/madvise/pkey_mprotect -> %s; afterwards "
+         "text runs %s, B byte %#x, control word %s, stack local %#x; A's own page: mprotect "
+         "%ld write %#lx, fixed mmap %ld write %#lx, madvise %ld, munmap %ld, re-reserve %ld, "
+         "kernel-placed mmap %ld, run %ld; no arena active: mprotect A page -> %ld [%s]\n",
+         refused ? "all EPERM" : "NOT all refused", p->text_call == 22 && guard_text_fn(7) == 22 ? "yes" : "no",
+         pb[0], *(volatile unsigned long *)ctl == 0x5c7a7c4 ? "intact" : "CHANGED",
+         stack_local, p->own_mprotect, p->own_write, p->own_mmap, p->own_mmap_write,
+         p->own_madvise, p->own_munmap, p->own_reserve, p->own_anon, run, none,
+         ok ? "OK" : "FAIL");
+  free(p);
+  gk_arena_destroy(A);
+  gk_arena_destroy(B);
+  return ok;
+}
+
 // ---- AVX-512 state in the guest ----------------------------------------------
 // The guest CPUID is the host's, so glibc's ifunc resolvers and any JIT pick
 // AVX-512 code paths on a CPU that has them; the guest's XCR0 must then have
@@ -2376,9 +2522,16 @@ int main(void) {
   // cannot select a root, and the nesting bound holds (see nesting_check).
   int ok25 = nesting_check() == 1;
 
+  // ---- mapping-change policy --------------------------------------------------
+  // With a filter applying gk_mapping_syscall_ok, a ring-3 turn cannot change
+  // the mappings of the runtime image, another arena or gk's control memory,
+  // while its own arena's pages still commit and decommit (see
+  // mapping_guard_check).
+  int ok26 = mapping_guard_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
-            ok22 && ok23 && ok24 && ok25;
+            ok22 && ok23 && ok24 && ok25 && ok26;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

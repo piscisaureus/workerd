@@ -41,6 +41,8 @@ gk_arena *gk_arena_enter(gk_arena*);         // select this thread's active cage
 void      gk_arena_destroy(gk_arena*);
 
 void gk_set_syscall_filter(gk_syscall_filter); // bound what forwarded code may do
+int  gk_mapping_syscall_ok(long nr, long a1, ..., long a6); // a filter's range check
+                                                            // for the memory syscalls
 ```
 
 `gk_run` returns `fn`'s return value, or `GK_EFAULT` if the guest took an
@@ -265,14 +267,15 @@ decides the overall cost.
   that names an arena has the pointer checked against gk's own arena pool
   before anything is read through it, the arena page allocator refuses an
   address outside the tail it owns before handing it to `mprotect` or
-  `mmap(MAP_FIXED)`, a turn's outcome crosses to the host as bounded plain
-  bytes rather than as a `kj::Exception` the guest wrote, and the guest-turn
-  depth is restored from a value saved in a host frame instead of being
-  decremented, since a rewritten counter would otherwise make the next turn
-  run outside the guest. What validation cannot settle is ownership: a pointer
-  swapped for another live arena's is indistinguishable from a legitimate
-  call, so a turn can still name a different isolate's arena and cost that
-  isolate its memory. Nor does it help with the objects a turn hands back --
+  `mmap(MAP_FIXED)`, the memory syscalls a turn issues itself are checked by
+  range before they are forwarded (see the syscall-policy entry below), a
+  turn's outcome crosses to the host as bounded plain bytes rather than as a
+  `kj::Exception` the guest wrote, and the guest-turn depth is restored from
+  a value saved in a host frame instead of being decremented, since a
+  rewritten counter would otherwise make the next turn run outside the guest.
+  What validation cannot settle is ownership: a pointer swapped for another
+  live arena's is indistinguishable from a legitimate call, so a turn can
+  still name a different isolate's arena and cost that isolate its memory. Nor does it help with the objects a turn hands back --
   the non-void results of `IoContext::run`, which are mostly `kj::Promise`,
   and the `kj::Own` graph the delete queue walks -- which are heap objects
   carrying their own vtables and disposers. Those become safe when the
@@ -290,9 +293,33 @@ decides the overall cost.
 - **No signal delivery** into the library's API yet; only faults are caught,
   via the in-guest IDT handlers. (Injecting a host signal as a guest interrupt
   is demonstrated separately and would be wired in here.)
-- **Syscall policy is a single filter hook.** `gk_set_syscall_filter` bounds
-  forwarded syscalls, but there is no default allowlist or host-side seccomp on
-  the forwarding thread itself yet.
+- **Syscall policy is a single filter hook, and it leaves files and the
+  network open.** `gk_set_syscall_filter` is the only gate on a forwarded
+  syscall: gk has no default allowlist, and no host-side seccomp on the
+  forwarding thread. workerd's filter (`guestKernelSyscallFilter` in
+  `src/workerd/server/workerd.c++`) admits syscalls by number, and for the
+  ones that change mappings also by range, through `gk_mapping_syscall_ok`:
+  `mprotect`, `pkey_mprotect`, `munmap`, `madvise`, `mmap` with `MAP_FIXED`
+  or `MAP_FIXED_NOREPLACE`, and `mremap` (its old range extended to the new
+  size, and the destination of an `MREMAP_FIXED` move) are refused with
+  `EPERM`, before anything reaches the host, when the range overlaps gk's
+  supervisor or refused memory, an arena other than the one the calling
+  thread is active in (every arena when none is), or the runtime image:
+  the loaded segments of the executable and of the shared objects present at
+  `gk_init`, and the main thread's stack. The calling thread's arena comes
+  from gk's own record in supervisor memory, so ring 3 cannot change what the
+  check compares against. An `mmap` the kernel places is not range-checked,
+  since it can only land in free space and the process allocator grows during
+  a turn. What that leaves open: `openat`, `read`, `write`, `socket`,
+  `connect`, `bind`, `accept4`, `sendto`, `recvfrom` and the rest of the
+  socket set are on the allowlist, so an escaped isolate can open any file
+  the process can and reach the network, as the process. The range check
+  covers only the sets above: the heap, glibc's data, other threads' stacks
+  and any object `dlopen`ed after `gk_init` can still be remapped or
+  unmapped by a turn, as they can be written by it directly (see the first
+  entry), and `brk` is unchecked. A kernel-placed `mmap` can also be steered
+  by its hint into free space the runtime relies on staying free, such as the
+  growth room below the main thread's stack.
 - **The MMU backs whole 2 MiB windows, not exact VMAs.** It reparses
   `/proc/self/maps` per fault (each read also settles the fault's aligned
   256 KiB neighborhood, see `demand_map_neighbors` in `gk.c`, so a growing

@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include <fcntl.h>
+#include <link.h>
 #include <linux/kvm.h>
 #include <pthread.h>
 #include <signal.h>
@@ -15,6 +16,7 @@
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -261,6 +263,12 @@ typedef struct gk_region {
 #define GK_MAX_PKEY_RANGES 4096
 typedef struct { uintptr_t start, end; int pkey; } gk_pkey_range;
 
+// A page-aligned [start, end) span of the runtime image (see the
+// mapping-change policy section). Each loaded object has a handful of PT_LOAD
+// segments; the stack is one more.
+#define GK_MAX_IMAGE_RANGES 64
+typedef struct { uintptr_t start, end; } gk_span;
+
 #define GK_CPUID_ENTRIES 128
 
 struct gk_ctl {
@@ -359,6 +367,13 @@ struct gk_ctl {
   // Protection-key ranges (see the protection-keys section). Guarded by G->lock.
   gk_pkey_range pkeys[GK_MAX_PKEY_RANGES];
   int pkey_n;
+
+  // The runtime image: the loaded segments of the executable and of every
+  // shared object present at gk_init, and the main thread's stack (see the
+  // mapping-change policy section). Written once by gk_init, read-only
+  // afterwards.
+  gk_span image[GK_MAX_IMAGE_RANGES];
+  int image_n;
 
   // A word for tests to read and write through the guest (gk_debug_ctl_addr).
   unsigned long debug_scratch;
@@ -1862,6 +1877,75 @@ static int map_handler_text(void) {
   return mmu_map_range(lo, hi, 1 | 4);  // r-x
 }
 
+// ---- the runtime image ------------------------------------------------------
+// The set of ranges gk_mapping_change_ok refuses on behalf of the runtime
+// itself (see the mapping-change policy section): the loaded segments (text,
+// rodata, data and bss, from the program headers) of the main executable and
+// of every shared object the dynamic loader has mapped when gk_init runs
+// (libc, ld.so, the vDSO), and the main thread's stack. Recorded once here, in
+// the supervisor control block, so the syscall path consults a small array
+// rather than re-reading /proc/self/maps, and so the set cannot be edited
+// from ring 3. An object loaded later (dlopen) is not in the set.
+static int image_add(uintptr_t s, uintptr_t e) {
+  if (G->image_n >= GK_MAX_IMAGE_RANGES) return -1;
+  G->image[G->image_n++] = (gk_span){s & ~0xfffUL, (e + 0xfffUL) & ~0xfffUL};
+  return 0;
+}
+
+// One loaded object: its PT_LOAD segments, with p_memsz (which extends past
+// the file for bss), join the image. `data` points at an error flag; the
+// walk stops once the set is full.
+static int image_phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
+  (void)size;
+  for (int i = 0; i < info->dlpi_phnum; i++) {
+    const ElfW(Phdr) *p = &info->dlpi_phdr[i];
+    if (p->p_type != PT_LOAD || p->p_memsz == 0) continue;
+    uintptr_t s = info->dlpi_addr + p->p_vaddr;
+    if (image_add(s, s + p->p_memsz) < 0) { *(int *)data = 1; return 1; }
+  }
+  return 0;
+}
+
+// The main thread's stack is the kernel's [stack] mapping, which grows down on
+// demand: the recorded range reaches below the mapping's current start by the
+// room the kernel will grant it, RLIMIT_STACK (1GiB when that is unlimited,
+// in which case the kernel's legacy mmap layout keeps everything else far
+// away). Nothing but the stack is ever placed in that room by the kernel.
+static int image_record_stack(void) {
+  FILE *f = fopen("/proc/self/maps", "r");
+  if (!f) return -1;
+  char *line = NULL;
+  size_t cap = 0;
+  int found = 0;
+  uintptr_t ss = 0, se = 0;
+  while (getline(&line, &cap, f) >= 0) {
+    size_t n = strlen(line);
+    const char *tag = "[stack]\n";
+    size_t tl = strlen(tag);
+    if (n < tl || memcmp(line + n - tl, tag, tl) != 0) continue;
+    int perms;
+    if (parse_maps_line(line, line + n, &ss, &se, &perms)) found = 1;
+    break;
+  }
+  free(line);
+  fclose(f);
+  if (!found) return -1;
+  struct rlimit rl;
+  uintptr_t room = 1UL << 30;
+  if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < room)
+    room = (uintptr_t)rl.rlim_cur;
+  uintptr_t lo = se > room ? se - room : 0;
+  if (lo > ss) lo = ss;
+  return image_add(lo, se);
+}
+
+static int image_record(void) {
+  int full = 0;
+  dl_iterate_phdr(image_phdr_cb, &full);
+  if (full || G->image_n == 0) return -1;
+  return image_record_stack();
+}
+
 // Pick the TLB flush stub (see gk_asm.S): INVPCID when the CPUID every vCPU
 // gets (the host's, as KVM supports it) carries it in leaf 7 EBX bit 10 --
 // KVM then lets the guest execute it natively under nested paging, one VM
@@ -2015,6 +2099,7 @@ int gk_init(void) {
   }
   if (G->dbg) fprintf(stderr, "[gk] registers via %s\n", G->sync_regs ? "kvm_run" : "ioctl");
   if (pthread_key_create(&G->thread_key, thread_key_dtor) != 0) { G->err = "pthread_key_create"; return -1; }
+  if (image_record() < 0) { G->err = "record the runtime image"; return -1; }
 
   // Bring up the calling thread's record and vCPU.
   gk_thread *t = thread_get();
@@ -2499,6 +2584,102 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
               a4, a4 == -1 ? pkey_lookup(rs) : (int)a4);
   }
   return ret;
+}
+
+// ---- mapping-change policy ------------------------------------------------
+// The memory syscalls a turn needs (V8 commits and decommits sandbox pages
+// with mprotect and fixed mmap/munmap, JIT code moves between RW and RX, the
+// process allocator grows and trims) reach the host with the guest's own
+// arguments, so a syscall filter that admits them by number alone lets an
+// escaped ring-3 turn rewrite or remove any mapping in the process. These two
+// functions are the range check such a filter adds (see gk.h). They run on the
+// syscall-forward path, so they allocate nothing and consult only the small
+// arrays in the control block: the supervisor/refuse registry, the arena list
+// and the runtime image, each checked by overlap rather than page by page,
+// since the guest may name a range of any size.
+
+// Whether [s, e) (page-aligned, s < e) is clear of every range the calling
+// thread may not change. Caller holds G->lock.
+static int range_clear_locked(uintptr_t s, uintptr_t e, const gk_arena *mine) {
+  for (int i = 0; i < G->image_n; i++)
+    if (s < G->image[i].end && G->image[i].start < e) return 0;
+  for (int i = 0; i < G->arena_n; i++) {
+    const gk_arena *a = G->arenas[i];
+    if (a != mine && s < a->end && a->base < e) return 0;
+  }
+  // The registry is sorted and disjoint: the first range ending past s is the
+  // only candidate for an overlap.
+  int lo = 0, hi = G->prot_n;
+  while (lo < hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (G->prot[mid].end <= s) lo = mid + 1;
+    else hi = mid;
+  }
+  return !(lo < G->prot_n && G->prot[lo].start < e);
+}
+
+int gk_mapping_change_ok(unsigned long addr, unsigned long len) {
+  if (len == 0) return 1;  // names no page; the kernel's own answer stands
+  uintptr_t s = (uintptr_t)addr & ~0xfffUL;
+  uintptr_t e = (uintptr_t)addr + (uintptr_t)len;
+  if (e < (uintptr_t)addr) return 0;  // wraps around the address space
+  e = (e + 0xfffUL) & ~0xfffUL;
+  if (e <= s) return 0;  // the rounding wrapped
+  // The thread's active arena comes from its own record, in supervisor
+  // memory; thread_cur validates the record by kernel tid, so ring 3 cannot
+  // point this thread at another thread's record. A thread with no record
+  // (host code outside any turn) has no arena.
+  gk_thread *t = thread_cur();
+  const gk_arena *mine = t ? t->active_arena : NULL;
+  // forward_syscall calls the filter before it takes G->lock for the
+  // reflection, and nothing holds G->lock across a KVM_RUN, so taking it
+  // here cannot deadlock against the thread's own forward path.
+  pthread_mutex_lock(&G->lock);
+  int ok = range_clear_locked(s, e, mine);
+  pthread_mutex_unlock(&G->lock);
+  return ok;
+}
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+#ifndef MREMAP_FIXED
+#define MREMAP_FIXED 2
+#endif
+int gk_mapping_syscall_ok(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
+  (void)a6;
+  switch (nr) {
+    case SYS_mmap:
+      // A mapping the kernel places itself can affect nothing that exists:
+      // the kernel only ever puts it in free space. It stays allowed without
+      // a range check, deliberately: the process allocator grows during a
+      // turn, and refusing its growth would break the runtime for no
+      // security gain. MAP_FIXED replaces whatever is at the address, so it
+      // is checked; MAP_FIXED_NOREPLACE cannot replace anything but is
+      // checked too, as the cheaper of the two choices.
+      if ((a4 & (MAP_FIXED | MAP_FIXED_NOREPLACE)) == 0) return 1;
+      return gk_mapping_change_ok((unsigned long)a1, (unsigned long)a2);
+    case SYS_mprotect:
+    case SYS_pkey_mprotect:
+    case SYS_munmap:
+    case SYS_madvise:
+      // PROT_GROWSDOWN/GROWSUP widen an mprotect only within a growsdown
+      // mapping: the main thread's stack, refused in full, or one the guest
+      // created for itself.
+      return gk_mapping_change_ok((unsigned long)a1, (unsigned long)a2);
+    case SYS_mremap: {
+      // The old range, and the new size at the old address (a grow in place
+      // extends over whatever follows); then the destination of a move the
+      // guest places itself. A move the kernel places lands in free space.
+      unsigned long old_len = (unsigned long)a2, new_len = (unsigned long)a3;
+      if (!gk_mapping_change_ok((unsigned long)a1, old_len > new_len ? old_len : new_len))
+        return 0;
+      if (a4 & MREMAP_FIXED) return gk_mapping_change_ok((unsigned long)a5, new_len);
+      return 1;
+    }
+    default:
+      return 1;
+  }
 }
 
 // The host thread's PKRU is what KVM's page backing (get_user_pages) checks
