@@ -3364,8 +3364,23 @@ fail:
   return NULL;
 }
 
-void *gk_arena_base(const gk_arena *a) { return a ? (void *)a->base : NULL; }
-size_t gk_arena_size(const gk_arena *a) { return a ? a->size : 0; }
+// Validated like gk_arena_destroy's argument: the host derives the bounds it
+// checks its own mapping calls against from these, so a pointer that is not a
+// live arena must not produce a value at all.
+void *gk_arena_base(const gk_arena *a) {
+  if (!a) return NULL;
+  pthread_mutex_lock(&G->lock);
+  void *base = arena_live_locked(a) ? (void *)a->base : NULL;
+  pthread_mutex_unlock(&G->lock);
+  return base;
+}
+size_t gk_arena_size(const gk_arena *a) {
+  if (!a) return 0;
+  pthread_mutex_lock(&G->lock);
+  size_t size = arena_live_locked(a) ? a->size : 0;
+  pthread_mutex_unlock(&G->lock);
+  return size;
+}
 
 int gk_arena_enter(gk_arena *a) {
   gk_thread *t = thread_get();
@@ -3437,11 +3452,25 @@ int gk_arena_leave(void) {
 // is being unmapped under it) keeps a root that must stay intact and private,
 // so in that case the tables, slots and struct are leaked instead of recycled;
 // the memslots and reservation still go.
+// `a` is validated before anything is read through it, for the same reason
+// gk_arena_enter validates: the runtime keeps the pointer in an ordinary heap
+// object, which ring-3 execution can write, and everything below reads the
+// struct, frees the page tables it names and unmaps the range it describes. A
+// pointer that is not a live arena is refused unread. Naming another live
+// arena remains possible and costs that arena's isolate its memory, which no
+// check here can tell from a legitimate destroy; it is a host-side ownership
+// question, recorded as a limitation in the README.
 void gk_arena_destroy(gk_arena *a) {
   if (!a) return;
+  pthread_mutex_lock(&G->lock);
+  if (!arena_live_locked(a)) {
+    pthread_mutex_unlock(&G->lock);
+    fprintf(stderr, "[gk] gk_arena_destroy: %p is not a live arena; nothing is destroyed\n",
+            (const void *)a);
+    return;
+  }
   gk_thread *t = thread_cur();
   if (t && t->active_arena == a) arena_select(t, NULL);
-  pthread_mutex_lock(&G->lock);
   for (int i = 0; i < G->arena_n; i++)
     if (G->arenas[i] == a) { G->arenas[i] = G->arenas[--G->arena_n]; break; }
   a->registered = 0;

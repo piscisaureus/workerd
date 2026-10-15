@@ -1514,7 +1514,9 @@ static long neighborhood_check(void) {
 // destroyed while it sits in a thread's history is replaced by the base root
 // there, even once its struct has been recycled for a new arena. A leave with
 // nothing entered selects the base root, and nesting past GK_ARENA_NEST is
-// refused with the root unchanged.
+// refused with the root unchanged. gk_arena_destroy validates its argument the
+// same way, and destroying the arena the calling thread is under leaves that
+// thread on the base root.
 static int nesting_check(void) {
   gk_arena *A = gk_arena_create(4096), *B = gk_arena_create(4096);
   if (!A || !B) { printf("nesting: create failed\n"); return 0; }
@@ -1558,6 +1560,20 @@ static int nesting_check(void) {
   long ra4 = gk_run(read_byte, pa);
   int bogus_ok = eb == -22 && ra3 == 0xA5 && junk_intact && ec == -22 && ra4 == 0xA5;
 
+  // Destroy refuses the same two pointers. It would otherwise read the struct,
+  // free the page tables it names and unmap the range it describes, so the
+  // heap-shaped one must come back untouched and the thread must keep working
+  // under A. Destroying C a second time is refused by its flag.
+  unsigned char *junk2 = malloc(JUNK);
+  memset(junk2, 0xEE, JUNK);
+  gk_arena_destroy((gk_arena *)junk2);
+  int junk2_intact = 1;
+  for (int i = 0; i < JUNK; i++) if (junk2[i] != 0xEE) junk2_intact = 0;
+  free(junk2);
+  gk_arena_destroy(C);
+  long ra5 = gk_run(read_byte, pa);
+  int destroy_bogus_ok = junk2_intact && ra5 == 0xA5;
+
   // A destroyed arena in the history. Under B on top of A, A is destroyed and a
   // new arena D takes its struct (the pool recycles it); leaving B must land on
   // the base root, not under D, which is reachable only once entered itself.
@@ -1591,18 +1607,31 @@ static int nesting_check(void) {
   long ro0 = gk_run(read_byte, pb);
   over_ok = over_ok && eo == -12 && ro == 0xB6 && ro0 == GK_EFAULT;
 
+  // Destroying the arena the calling thread is under: the thread leaves it
+  // first, so the destroy goes ahead and the thread is left on the base root,
+  // where the arena's memory is gone.
+  gk_arena *E = gk_arena_create(4096);
+  unsigned char *pe = gk_arena_base(E);
+  gk_arena_enter(E);
+  gk_arena_destroy(E);
+  long re = gk_run(read_byte, pe);
+  gk_arena_enter(NULL);
+  int self_ok = pe != NULL && re == GK_EFAULT;
+
   gk_arena_enter(NULL);
   gk_arena_destroy(B);
   gk_arena_destroy(D);
-  int ok = nest_ok && bogus_ok && scrub_ok && under_ok && over_ok;
+  int ok = nest_ok && bogus_ok && destroy_bogus_ok && scrub_ok && under_ok && over_ok && self_ok;
   printf("arena nesting: A/B nest+leave %s; bogus heap pointer -> %d (root kept %s, memory "
          "untouched %s), destroyed pool struct -> %d (root kept %s); destroyed-in-history "
          "(struct recycled: %s) leave -> base root %s; underflow -> %d (base root %s); "
-         "overflow at %d -> %d (root kept %s, unwinds %s) [%s]\n",
+         "overflow at %d -> %d (root kept %s, unwinds %s); destroy refuses bogus %s, "
+         "self-destroy -> base root %s [%s]\n",
          nest_ok ? "OK" : "FAIL", eb, ra3 == 0xA5 ? "yes" : "no", junk_intact ? "yes" : "no",
          ec, ra4 == 0xA5 ? "yes" : "no", recycled ? "yes" : "no",
          scrub_ok ? "yes" : "no", l5, ru == GK_EFAULT ? "yes" : "no", GK_ARENA_NEST, eo,
-         ro == 0xB6 ? "yes" : "no", ro0 == GK_EFAULT ? "yes" : "no", ok ? "OK" : "FAIL");
+         ro == 0xB6 ? "yes" : "no", ro0 == GK_EFAULT ? "yes" : "no",
+         destroy_bogus_ok ? "yes" : "no", self_ok ? "yes" : "no", ok ? "OK" : "FAIL");
   return ok;
 }
 
