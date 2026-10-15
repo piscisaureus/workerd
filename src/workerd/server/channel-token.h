@@ -142,8 +142,11 @@ class ChannelTokenHandler {
   // the guest's choosing. The two places that use it, serializeTokenImpl() and
   // decodeChannelTokenImpl(), are reached from inside JS turns (a stub serialized or deserialized
   // over JS RPC); with the guest kernel enabled they therefore run on the event loop, outside
-  // the guest, see finishToken() and decodeToken(). The key id is the public 16-byte prefix of
-  // the key's SHA-256 and goes into every token header in the clear.
+  // the guest, see finishToken() and decodeToken(). The key, and the nonce of every token minted
+  // with it, are drawn with getHostEntropy() (util/host-entropy.h), whose buffer is in host
+  // memory too: a nonce the guest could read or choose would let it repeat one under this key,
+  // which forfeits GCM's integrity guarantee however well the key is hidden. The key id is the
+  // public 16-byte prefix of the key's SHA-256 and goes into every token header in the clear.
   HostSlot<kj::FixedArray<byte, AES_KEY_SIZE>> tokenKey;
   byte keyId[KEY_ID_SIZE];
 

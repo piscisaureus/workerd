@@ -7,12 +7,13 @@
 #include <workerd/api/restore.h>
 #include <workerd/jsg/setup.h>
 #include <workerd/server/channel-token.capnp.h>
-#include <workerd/util/entropy.h>
+#include <workerd/util/host-entropy.h>
 
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 
 #include <capnp/serialize-packed.h>
+#include <kj/encoding.h>
 #include <kj/io.h>
 
 // It's 2025, nobody uses big-endian anymore. But just in case someone tries, flag it here.
@@ -39,7 +40,7 @@ bool keyUseMustLeaveTurn(IoChannelFactory::ChannelTokenUsage usage) {
 ChannelTokenHandler::ChannelTokenHandler(Resolver& resolver)
     : resolver(resolver),
       tokenKey(hostSlot<kj::FixedArray<byte, AES_KEY_SIZE>>()) {
-  getEntropy(*tokenKey);
+  getHostEntropy(*tokenKey);
 
   SHA256_CTX ctx{};
   KJ_ASSERT(SHA256_Init(&ctx));
@@ -57,7 +58,7 @@ ChannelTokenHandler::ChannelTokenHandler(Resolver& resolver)
     const void* key = tokenKey->begin();
     KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: channel token key",
         kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(key))), hostMemory::contains(key));
-    hostMemory::setProbeTargetForTest(key);
+    hostMemory::setProbeTargetForTest("token-key", key);
     // And where the handle to it lives, with the host-side use of the key the check runs after
     // a JS turn has overwritten the handle (see hostMemory::setHandleProbeForTest): the same
     // resolution serializeTokenImpl() and decodeChannelTokenImpl() perform, logged instead of
@@ -72,6 +73,17 @@ ChannelTokenHandler::ChannelTokenHandler(Resolver& resolver)
             e.getDescription());
       }
     }});
+    // And a host-side mint of an RPC token (see hostMemory::setHostUseForTest), which logs the
+    // nonce the token carries: the check runs it after a turn has overwritten the thread-local
+    // entropy buffer, and the nonce must not be what the turn wrote.
+    hostMemory::setHostUseForTest("mint-token", [this]() {
+      capnp::MallocMessageBuilder message;
+      message.initRoot<ChannelToken>().setType(ChannelToken::Type::SUBREQUEST);
+      auto token = serializeTokenImpl(IoChannelFactory::ChannelTokenUsage::RPC, message);
+      auto& header = *reinterpret_cast<const TokenHeader*>(token.begin());
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: minted a token on the host with nonce",
+          kj::encodeHex(kj::arrayPtr(header.iv)));
+    });
   }
 }
 
@@ -222,7 +234,7 @@ kj::Array<byte> ChannelTokenHandler::serializeTokenImpl(
       auto& header = *reinterpret_cast<TokenHeader*>(result.begin());
 
       header.magic = ChannelToken::RPC_TOKEN_MAGIC;
-      getEntropy(header.iv);
+      getHostEntropy(header.iv);
       kj::arrayPtr(header.keyId).copyFrom(keyId);
 
       EVP_CIPHER_CTX* aesCtx = EVP_CIPHER_CTX_new();

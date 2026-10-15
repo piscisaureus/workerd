@@ -28,11 +28,14 @@ isolate's JS turn at guest ring 3.
   loop) runs correctly with the worker's JS turn at guest ring 3, and that a
   Wasm bounds violation surfaces as a `WebAssembly.RuntimeError` rather than a
   guest fault.
-- `host-memory-test.sh` — end-to-end check against a built workerd that the
-  channel token key lives in host memory, that a JS turn overwriting the
-  handle the host reaches it through leaves the host refusing the use rather
-  than reading a key of the turn's choosing, and that a JS turn at guest
-  ring 3 reading the key faults at the key's address, failing only that
+- `host-memory-test.sh` / `host-memory-test.capnp` — end-to-end check against
+  a built workerd that the channel token key and the host entropy buffer live
+  in host memory, that a JS turn overwriting the handle the host reaches the
+  key through leaves the host refusing the use rather than reading a key of
+  the turn's choosing, that a JS turn overwriting the thread-local entropy
+  buffer decides what the host's next `getEntropy()` draw returns but not the
+  nonce of the token the host mints, and that a JS turn at guest ring 3
+  reading the key or the buffer faults at the address read, failing only that
   request and condemning only that isolate.
 
 ## API
@@ -155,10 +158,32 @@ hardware:
   Limitations). In workerd, `HostSlot<T>` (`util/host-memory.h`) owns a
   host-memory object through such a handle, which is its only member, with a
   table of the same shape on the ordinary heap when the guest kernel is off;
-  the channel token key is held this way. `host-memory-test.sh` shows a
-  handle rewritten from inside a turn resolving to nothing, the host
-  refusing the use instead of reading the turn's buffer, and a ring-3 read
-  of the key faulting.
+  the channel token key and the host entropy buffer are held this way.
+  `host-memory-test.sh` shows a handle rewritten from inside a turn resolving
+  to nothing, the host refusing the use instead of reading the turn's buffer,
+  and a ring-3 read of the key, and of the buffer, faulting.
+- **Host entropy.** A secret in host memory is only as good as the generator
+  that produced it, and workerd's `getEntropy()` buffers 4 KiB of unconsumed
+  CSPRNG output in thread-local storage, which is shared runtime memory a
+  ring-3 turn can read and write: the bytes the thread's next draw returns
+  are the turn's to read or to choose. That is harmless for the draws a turn
+  makes for itself, whose bytes go to the isolate anyway, and fatal for a
+  nonce: AES-GCM under a fixed key with a repeated nonce gives up its
+  integrity guarantee, so a turn that could choose the nonce of the next
+  channel token could forge tokens without ever reading the key. Host-side
+  secrets -- the channel token key and the nonce of every token minted with
+  it -- are therefore drawn with `getHostEntropy()` (`util/host-entropy.h`),
+  whose buffer, cursor and lock are one host-memory block reached through a
+  host slot handle, and which refills from the operating system's generator
+  (`getrandom(2)`) rather than from BoringSSL's in-process DRBG, whose
+  per-thread state is in the shared heap too and, on a CPU without a fast
+  RDRAND, determines the DRBG's output outright. The in-turn draws keep
+  `getEntropy()` and its thread-local buffer, since routing bytes the isolate
+  receives anyway through host memory would cost a crossing for nothing.
+  `host-memory-test.sh` overwrites the thread-local buffer from inside a turn
+  with a pattern and shows the host's next `getEntropy()` draw on that thread
+  returning the pattern and the token the host mints carrying a nonce that is
+  not.
 - **Threads as vCPUs.** Each host thread that enters the guest gets its own
   vCPU, stack and TLS base, sharing the VM and memory. Four threads run in the
   guest concurrently, and two threads each locked into their own arena run at
@@ -320,9 +345,12 @@ decides the overall cost.
   an object moved into host memory faults the turn until the turn's accesses
   to it become messages. The channel token key is in host memory, the two
   functions that read it run on the event loop, outside the guest, when a
-  turn asks for a token, and the handler reaches the key through a host slot
+  turn asks for a token, the handler reaches the key through a host slot
   handle (`HostSlot<T>`), so a write primitive that rewrites the handle makes
-  the host refuse the use rather than read a key of the guest's choosing.
+  the host refuse the use rather than read a key of the guest's choosing, and
+  the key and every token nonce are drawn from a buffer in host memory
+  (`util/host-entropy.h`) rather than from the thread-local one a turn can
+  write.
   What a rewritten handle can still do is name another live host slot: the
   table turns "any address" into "one of the live tenants", and telling a
   legitimate use from a swapped one is an ownership question the table cannot
@@ -339,8 +367,8 @@ decides the overall cost.
   (`src/workerd/util/memory-class.h`), which is a handful so far; every other
   class is unchecked. Placement by class exists for H only, as an explicit
   choice per object (`HostOwn<T>` and `HostSlot<T>`, `util/host-memory.h`)
-  rather than something the allocator decides, and one object has been
-  placed.
+  rather than something the allocator decides, and two objects have been
+  placed: the channel token key and the host entropy buffer.
 - **The host acts on data a ring-3 turn can write.** The runtime's heap is in
   the guest's address space, so every host-side structure the guest can reach
   is attacker-controlled input to the host, and the dangerous cases are the

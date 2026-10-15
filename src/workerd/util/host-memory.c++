@@ -199,21 +199,47 @@ void freeSlot(SlotHandle handle) {
 }
 
 namespace {
-const void* probeTarget = nullptr;
+
+// The registrations are few and named by string literals, so a short fixed table suffices.
+constexpr size_t MAX_PROBES = 4;
+
+struct ProbeTarget {
+  kj::StringPtr name;
+  const void* target = nullptr;
+};
+ProbeTarget probeTargets[MAX_PROBES];
+
+struct HostUse {
+  kj::StringPtr name;
+  kj::Maybe<kj::Function<void()>> use;  // none marks a free entry
+};
+kj::ArrayPtr<HostUse> hostUses() {
+  static HostUse uses[MAX_PROBES];
+  return uses;
+}
 
 kj::Maybe<HandleProbeForTest>& handleProbe() {
   static kj::Maybe<HandleProbeForTest> probe;
   return probe;
 }
+
 }  // namespace
 
-void setProbeTargetForTest(const void* target) {
-  probeTarget = target;
+void setProbeTargetForTest(kj::StringPtr name, const void* target) {
+  for (auto& entry: probeTargets) {
+    if (entry.target == nullptr || entry.name == name) {
+      entry = {.name = name, .target = target};
+      return;
+    }
+  }
+  KJ_FAIL_REQUIRE("too many probe targets registered", name);
 }
 
-kj::Maybe<const void*> probeTargetForTest() {
-  if (probeTarget == nullptr) return kj::none;
-  return probeTarget;
+kj::Maybe<const void*> probeTargetForTest(kj::StringPtr name) {
+  for (auto& entry: probeTargets) {
+    if (entry.target != nullptr && entry.name == name) return entry.target;
+  }
+  return kj::none;
 }
 
 void setHandleProbeForTest(HandleProbeForTest probe) {
@@ -222,6 +248,23 @@ void setHandleProbeForTest(HandleProbeForTest probe) {
 
 kj::Maybe<HandleProbeForTest&> handleProbeForTest() {
   return handleProbe();
+}
+
+void setHostUseForTest(kj::StringPtr name, kj::Function<void()> use) {
+  for (auto& entry: hostUses()) {
+    if (entry.use == kj::none || entry.name == name) {
+      entry = HostUse{.name = name, .use = kj::mv(use)};
+      return;
+    }
+  }
+  KJ_FAIL_REQUIRE("too many host uses registered", name);
+}
+
+kj::Maybe<kj::Function<void()>&> hostUseForTest(kj::StringPtr name) {
+  for (auto& entry: hostUses()) {
+    if (entry.use != kj::none && entry.name == name) return entry.use;
+  }
+  return kj::none;
 }
 
 bool contains(const void* ptr) {

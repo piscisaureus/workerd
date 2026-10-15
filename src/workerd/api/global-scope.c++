@@ -32,6 +32,7 @@
 #include <workerd/jsg/ser.h>
 #include <workerd/jsg/setup.h>
 #include <workerd/jsg/util.h>
+#include <workerd/util/entropy.h>
 #include <workerd/util/host-memory.h>
 #include <workerd/util/sentry.h>
 #include <workerd/util/stream-utils.h>
@@ -319,10 +320,20 @@ namespace {
 // running without the guest kernel, where the dereference would be a host-side SIGSEGV.
 //
 // With WORKERD_GK_TEST_PROBE set, a request whose path is /__gk_probe_host instead reads one
-// byte of the host-memory tenant registered through hostMemory::setProbeTargetForTest() (the
-// channel token key) from inside the JS turn. Host memory is mapped into no guest root, so at
-// ring 3 that is the same kind of fault, at the byte's own address; this is how the guest
-// kernel's host-memory-test.sh shows the key is out of a turn's reach. The same two gates apply.
+// byte of the channel token key, and one whose path is /__gk_probe_host_entropy one byte of the
+// host entropy buffer, from inside the JS turn; both are host-memory tenants registered through
+// hostMemory::setProbeTargetForTest(). Host memory is mapped into no guest root, so at ring 3
+// that is the same kind of fault, at the byte's own address; this is how the guest kernel's
+// host-memory-test.sh shows both are out of a turn's reach. The same two gates apply.
+//
+// With the same variable set, a request whose path is /__gk_poison_entropy overwrites, from
+// inside the JS turn, the whole of this thread's getEntropy() buffer with one byte value and
+// marks all of it unconsumed, which is what a turn that wants to choose the bytes a later draw
+// on the thread returns would do. On the event loop afterwards, outside the guest, the host
+// mints an RPC channel token (see hostMemory::setHostUseForTest) and logs its nonce, then draws
+// from getEntropy() and logs that too: the latter must be the pattern, showing the turn's write
+// reached the host's next draw on that path, and the nonce must not be, showing the token's
+// nonce comes from somewhere else. The buffer is then discarded so later draws are fresh.
 //
 // With the same variable set, a request whose path is /__gk_corrupt_handle overwrites, from
 // inside the JS turn, the handle through which the tenant's owner reaches it (registered through
@@ -340,13 +351,36 @@ void maybeForceGuestFaultForTest(kj::StringPtr url) {
   }
   static const bool probeEnabled =
       jsg::isGuestKernelEnabled() && getenv("WORKERD_GK_TEST_PROBE") != nullptr;
-  if (probeEnabled && url.endsWith("/__gk_probe_host")) {
-    KJ_IF_SOME(target, hostMemory::probeTargetForTest()) {
+  auto probeHost = [&](kj::StringPtr name) {
+    KJ_IF_SOME(target, hostMemory::probeTargetForTest(name)) {
       KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: reading host memory from inside the JS turn", url,
-          kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(target))));
+          name, kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(target))));
       volatile byte probed = *static_cast<const volatile byte*>(target);
       (void)probed;
     }
+  };
+  if (probeEnabled && url.endsWith("/__gk_probe_host")) {
+    probeHost("token-key");
+  }
+  if (probeEnabled && url.endsWith("/__gk_probe_host_entropy")) {
+    probeHost("host-entropy");
+  }
+  if (probeEnabled && url.endsWith("/__gk_poison_entropy")) {
+    constexpr byte PATTERN = 0x5a;
+    poisonEntropyBufferForTest(PATTERN);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: overwrote this thread's entropy buffer from inside the JS turn",
+        url, kj::hex(PATTERN));
+    IoContext::current().addTask(kj::evalLater([]() {
+      KJ_IF_SOME(mint, hostMemory::hostUseForTest("mint-token")) {
+        mint();
+      }
+      byte drawn[12] = {};
+      getEntropy(drawn);
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: getEntropy() on the host after the turn returned",
+          kj::encodeHex(kj::arrayPtr(drawn)));
+      discardEntropyBufferForTest();
+    }));
   }
   if (probeEnabled && url.endsWith("/__gk_corrupt_handle")) {
     KJ_IF_SOME(probe, hostMemory::handleProbeForTest()) {

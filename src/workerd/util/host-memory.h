@@ -9,6 +9,7 @@
 #include <kj/common.h>
 #include <kj/debug.h>
 #include <kj/function.h>
+#include <kj/string.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -71,11 +72,12 @@ void freeSlot(SlotHandle handle);
 // host-memory-test.sh). A tenant registers itself only when WORKERD_GK_TEST_PROBE is in the
 // environment; there is none otherwise.
 //
-// The probe target is the address of one host-memory tenant, which a request to
-// /__gk_probe_host reads from inside a JS turn (see maybeForceGuestFaultForTest in
-// api/global-scope.c++), expecting the guest fault a ring-3 read of host memory takes.
-void setProbeTargetForTest(const void* target);
-kj::Maybe<const void*> probeTargetForTest();
+// A probe target is the address of one host-memory tenant, registered under a name, which a
+// request from inside a JS turn reads (see maybeForceGuestFaultForTest in api/global-scope.c++),
+// expecting the guest fault a ring-3 read of host memory takes. "token-key" is the channel token
+// key (server/channel-token.c++) and "host-entropy" the host entropy buffer (host-entropy.c++).
+void setProbeTargetForTest(kj::StringPtr name, const void* target);
+kj::Maybe<const void*> probeTargetForTest(kj::StringPtr name);
 
 // The handle probe is where the tenant's owner keeps the handle that names the tenant (the
 // sizeof(SlotHandle) bytes a HostSlot occupies) together with a host-side use of the tenant
@@ -90,6 +92,14 @@ struct HandleProbeForTest {
 };
 void setHandleProbeForTest(HandleProbeForTest probe);
 kj::Maybe<HandleProbeForTest&> handleProbeForTest();
+
+// A host use is a host-side operation registered under a name, which a request runs on the
+// event loop, outside the guest, after a turn has done something to the memory it draws on, and
+// which logs what it got. "mint-token" (server/channel-token.c++) mints an RPC channel token and
+// logs its nonce, for the check that the nonce does not come from the thread-local entropy
+// buffer a turn can overwrite (see /__gk_poison_entropy in api/global-scope.c++).
+void setHostUseForTest(kj::StringPtr name, kj::Function<void()> use);
+kj::Maybe<kj::Function<void()>&> hostUseForTest(kj::StringPtr name);
 
 }  // namespace hostMemory
 
