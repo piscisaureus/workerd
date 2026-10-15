@@ -51,6 +51,9 @@ static long test_raw_write(void *arg) {
   return ret;
 }
 
+// A text address, for checks that ask which memory is not host memory.
+static void gk_test_dummy_text(void) {}
+
 // Reads the first byte at the address given as arg, and returns it. Used to
 // probe arena isolation: reachable memory returns its byte; unreachable memory
 // faults and gk_run returns GK_EFAULT.
@@ -1850,6 +1853,135 @@ static int mapping_guard_check(void) {
   return ok;
 }
 
+// ---- host memory -------------------------------------------------------------
+// gk_host_alloc hands out memory the host uses as ordinary memory while no
+// guest root maps it: a ring-3 read or write of it faults at the accessed
+// address, on the base root and inside an arena (on the caller's stack, the
+// production path), and so does a ring-0 read, since a REFUSE page is never
+// mapped at all. The host's bytes are intact afterwards. The allocator recycles
+// blocks through free lists inside its regions, so many allocate/free cycles,
+// and a burst larger than one region, leave the supervisor/refuse registry
+// where the regions put it rather than growing it per block; a recycled block
+// comes back zero-filled; a zero or oversized request is refused.
+static int host_memory_check(void) {
+  gk_stats s0, s1, s2, s3, s4;
+  gk_get_stats(&s0);
+  unsigned char *k = gk_host_alloc(32);
+  if (!k) { printf("host memory: gk_host_alloc failed [FAIL]\n"); return 0; }
+  gk_get_stats(&s1);
+  int zero = 1;
+  for (int i = 0; i < 32; i++) if (k[i]) zero = 0;
+  for (int i = 0; i < 32; i++) k[i] = (unsigned char)(0xC0 + i);
+  unsigned char stack_byte = 0;
+  unsigned char *heap = malloc(16);
+  int owns = gk_host_owns(k) && gk_host_owns(k + 31) && !gk_host_owns(&stack_byte) &&
+             !gk_host_owns(heap) && !gk_host_owns(gk_test_dummy_text);
+  free(heap);
+  int registered = s1.prot_ranges == s0.prot_ranges + 1 && s1.host_regions == 1 &&
+                   s1.host_blocks == s0.host_blocks + 1;
+  int host_rw = k[0] == 0xC0 && k[31] == 0xDF;
+
+  // Ring 3 on the base root: a read of one byte in the middle of the block, and
+  // a write, each fault at the byte's own address.
+  long r3 = gk_run_user(read_byte, k + 7);
+  unsigned long f3 = gk_fault_addr();
+  long w3 = gk_run_user(user_write_here, k + 9);
+  unsigned long fw3 = gk_fault_addr();
+  // Ring 3 under an arena, on the caller's stack.
+  gk_arena *a = gk_arena_create(4096);
+  long r3a = -1; unsigned long f3a = 0;
+  if (a) {
+    gk_arena_enter(a);
+    r3a = gk_run_here_user(read_byte, k + 11);
+    f3a = gk_fault_addr();
+    gk_arena_enter(NULL);
+    gk_arena_destroy(a);
+  }
+  // Ring 0, both ways of entering the guest.
+  long r0 = gk_run(read_byte, k + 13);
+  unsigned long f0 = gk_fault_addr();
+  long r0h = gk_run_here(read_byte, k + 15);
+  unsigned long f0h = gk_fault_addr();
+  int faults = r3 == GK_EFAULT && f3 == (unsigned long)(k + 7) && w3 == GK_EFAULT &&
+               fw3 == (unsigned long)(k + 9) && a && r3a == GK_EFAULT &&
+               f3a == (unsigned long)(k + 11) && r0 == GK_EFAULT && f0 == (unsigned long)(k + 13) &&
+               r0h == GK_EFAULT && f0h == (unsigned long)(k + 15);
+  int intact = 1;
+  for (int i = 0; i < 32; i++) if (k[i] != (unsigned char)(0xC0 + i)) intact = 0;
+  long cpl = gk_run_user(user_cpl, NULL);  // the process survived every fault
+
+  // Churn: allocate and free blocks of every class, one at a time, then in
+  // bursts that together exceed one region (so a second region is mapped and
+  // registered once), repeated; the registry and the region count settle
+  // after the first burst and then hold.
+  gk_get_stats(&s2);
+  int churn_ok = 1;
+  for (int i = 0; i < 20000 && churn_ok; i++) {
+    size_t n = (size_t)16 << (i % 17);  // 16 bytes .. 1 MiB
+    unsigned char *p = gk_host_alloc(n);
+    if (!p || p[0] || p[n - 1]) { churn_ok = 0; break; }
+    memset(p, 0xff, n);
+    gk_host_free(p, n);
+  }
+  enum { BURST = 6, ROUNDS = 5 };
+  unsigned char *burst[BURST];
+  for (int round = 0; round < ROUNDS && churn_ok; round++) {
+    for (int j = 0; j < BURST; j++) {
+      burst[j] = gk_host_alloc(1 << 20);
+      if (!burst[j]) churn_ok = 0;
+      else burst[j][0] = (unsigned char)j, burst[j][(1 << 20) - 1] = (unsigned char)~j;
+    }
+    for (int j = 0; j < BURST && churn_ok; j++)
+      if (burst[j][0] != (unsigned char)j || burst[j][(1 << 20) - 1] != (unsigned char)~j)
+        churn_ok = 0;
+    for (int j = 0; j < BURST; j++) if (burst[j]) gk_host_free(burst[j], 1 << 20);
+    if (round == 0) gk_get_stats(&s3);
+  }
+  gk_get_stats(&s4);
+  int bounded = churn_ok && s3.host_regions >= 2 && s4.host_regions == s3.host_regions &&
+                s4.prot_ranges == s3.prot_ranges &&
+                s3.prot_ranges - s2.prot_ranges == s3.host_regions - s2.host_regions &&
+                s4.host_blocks == s2.host_blocks;
+
+  // A freed block is recycled zero-filled, and the limits hold.
+  unsigned char *q = gk_host_alloc(64);
+  memset(q, 0xAB, 64);
+  gk_host_free(q, 64);
+  unsigned char *q2 = gk_host_alloc(64);
+  int rezeroed = q2 == q;
+  for (int i = 0; i < 64; i++) if (q2[i]) rezeroed = 0;
+  gk_host_free(q2, 64);
+  int limits = gk_host_alloc(0) == NULL && gk_host_alloc(GK_HOST_MAX_ALLOC + 1) == NULL;
+  unsigned char *big = gk_host_alloc(GK_HOST_MAX_ALLOC);
+  limits = limits && big != NULL;
+  gk_host_free(big, GK_HOST_MAX_ALLOC);
+  gk_host_free(k, 32);
+  gk_stats s5;
+  gk_get_stats(&s5);
+  int balanced = s5.host_blocks == s0.host_blocks && s5.prot_ranges == s4.prot_ranges;
+
+  int ok = zero && owns && registered && host_rw && faults && intact && cpl == 3 && bounded &&
+           rezeroed && limits && balanced;
+  printf("host memory: block @%p zero-filled %s, host r/w %s, owned %s, +%d registry range(s) "
+         "for %d region(s); ring-3 read -> %s (fault %#lx == %p), ring-3 write -> %s (fault "
+         "%#lx == %p), ring 3 in arena -> %s (fault %#lx == %p), ring 0 -> %s (fault %#lx == %p), "
+         "ring 0 on caller stack -> %s (fault %#lx == %p); host bytes %s, ring 3 at CPL %ld; "
+         "20000 cycles + %dx%d MiB bursts: regions %d -> %d, registry %d -> %d (%s); "
+         "recycled block %s; limits %s; after frees %ld live blocks [%s]\n",
+         (void *)k, zero ? "yes" : "NO", host_rw ? "ok" : "BROKEN", owns ? "yes" : "NO",
+         s1.prot_ranges - s0.prot_ranges, s1.host_regions,
+         r3 == GK_EFAULT ? "FAULT" : "READ", f3, (void *)(k + 7),
+         w3 == GK_EFAULT ? "FAULT" : "WROTE", fw3, (void *)(k + 9),
+         r3a == GK_EFAULT ? "FAULT" : "READ", f3a, (void *)(k + 11),
+         r0 == GK_EFAULT ? "FAULT" : "READ", f0, (void *)(k + 13),
+         r0h == GK_EFAULT ? "FAULT" : "READ", f0h, (void *)(k + 15),
+         intact ? "intact" : "CHANGED", cpl, ROUNDS, BURST, s3.host_regions, s4.host_regions,
+         s3.prot_ranges, s4.prot_ranges, bounded ? "bounded" : "GREW",
+         rezeroed ? "same address, zero" : "WRONG", limits ? "ok" : "WRONG", s5.host_blocks,
+         ok ? "OK" : "FAIL");
+  return ok;
+}
+
 // ---- AVX-512 state in the guest ----------------------------------------------
 // The guest CPUID is the host's, so glibc's ifunc resolvers and any JIT pick
 // AVX-512 code paths on a CPU that has them; the guest's XCR0 must then have
@@ -2603,9 +2735,15 @@ int main(void) {
   // address (see mremap_reflect_check).
   int ok27 = mremap_reflect_check() == 1;
 
+  // ---- host memory ------------------------------------------------------------
+  // Memory from gk_host_alloc is the host's to use and faults for the guest at
+  // every ring, inside and outside an arena, and the allocator recycles blocks
+  // without growing the supervisor/refuse registry (see host_memory_check).
+  int ok28 = host_memory_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
-            ok22 && ok23 && ok24 && ok25 && ok26 && ok27;
+            ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

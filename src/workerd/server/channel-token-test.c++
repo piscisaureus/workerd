@@ -180,8 +180,8 @@ class MockActorChannel: public IoChannelFactory::ActorChannel {
       auto promise = kj::mv(p);
       readyPromise = kj::none;
       return promise.then([&h, usage, this]() mutable -> kj::Array<byte> {
-        return h.encodeActorChannelToken(usage, namespaceKey, id,
-            name.map([](kj::String& s) -> kj::StringPtr { return s; }), persistent);
+        return expectSync(h.encodeActorChannelToken(usage, namespaceKey, id,
+            name.map([](kj::String& s) -> kj::StringPtr { return s; }), persistent));
       });
     } else {
       return h.encodeActorChannelToken(usage, namespaceKey, id,
@@ -376,8 +376,8 @@ KJ_TEST("actor channel tokens") {
 
   const byte actorId[] = {12, 34, 56, 78};
 
-  auto token = handler.encodeActorChannelToken(
-      Usage::RPC, "foo-namespace", actorId, "my-actor"_kj, Persistent::NO);
+  auto token = expectSync(handler.encodeActorChannelToken(
+      Usage::RPC, "foo-namespace", actorId, "my-actor"_kj, Persistent::NO));
 
   {
     auto channel =
@@ -386,8 +386,8 @@ KJ_TEST("actor channel tokens") {
     KJ_EXPECT(channel->persistent == Persistent::NO);
   }
 
-  auto storageToken = handler.encodeActorChannelToken(Usage::STORAGE, "foo-namespace", actorId,
-      kj::Maybe<kj::StringPtr>(kj::none), Persistent::YES);
+  auto storageToken = expectSync(handler.encodeActorChannelToken(Usage::STORAGE, "foo-namespace",
+      actorId, kj::Maybe<kj::StringPtr>(kj::none), Persistent::YES));
 
   {
     auto channel = handler.decodeSubrequestChannelToken(Usage::STORAGE, storageToken)

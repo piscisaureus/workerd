@@ -30,11 +30,18 @@ follows from who serves the crossing: state a ring-0 helper inside the guest
 has to reach is `GK_PROT_SUPER` (mapped, `PTE_U` clear, so ring 0 reaches it
 and ring 3 faults), and state only the host proper touches is
 `GK_PROT_REFUSE`, never mapped into any guest root at all. Both are how gk
-already protects its own control state; see `prot_add` in `gk.c`. Preferring
-REFUSE is the safer default, since a SUPER range is reachable by any ring-0
-code the guest can get to run. May hold raw pointers to other H objects. Refers to an I object only
-as an opaque handle together with the arena it belongs to; dereferencing one
-means entering that arena, which only a turn or a ring-0 helper does.
+already protects its own control state; see `prot_add` in `gk.c`. REFUSE is
+the default, since a SUPER range is reachable by any ring-0 code the guest
+can get to run, and there is no in-guest ring-0 helper yet that would need
+SUPER. What backs H today is `gk_host_alloc` (`gk.h`): regions mapped by the
+host and registered REFUSE once each, suballocated by size class, so the
+fixed-size protection registry is spent per region rather than per object.
+`util/host-memory.h` wraps it for C++: `hostOwned<T>(...)` constructs a `T`
+there and `HostOwn<T>` owns it, as `kj::heap` and `kj::Own` do on the heap,
+and without the guest kernel the same code uses the ordinary heap. May hold
+raw pointers to other H objects. Refers to an I object only as an opaque
+handle together with the arena it belongs to; dereferencing one means
+entering that arena, which only a turn or a ring-0 helper does.
 
 **Boundary (B).** The one region both sides touch, one per isolate. Holds the
 messages the two sides exchange, the handle tables' isolate-visible halves,
@@ -121,7 +128,9 @@ Three layers, each catching what the one before cannot.
 
 1. **Placement.** The allocator decides the class in practice: an I object has
    to come from the isolate's arena and an H object from memory no arena maps.
-   Per-isolate heap arenas are the mechanism (`jsg::HeapArena`).
+   Per-isolate heap arenas are the mechanism for I (`jsg::HeapArena`); for H
+   it is `gk_host_alloc` behind `HostOwn<T>`, chosen per object by the code
+   that owns it rather than by the allocator.
 2. **A static check.** The classes are a type-level property, so the
    clang-tidy check `workerd-memory-class` (`tools/clang-tidy/memory-class.c++`)
    makes an H class with an I-class member, or an I class holding a `kj::Own`
@@ -432,7 +441,7 @@ state. These are H by rule 3, and a turn reads or writes them today:
 | `std::atomic<bool> useZlibRs` | `zlib-router.c++` | Consulted on every zlib call a turn makes; a write switches implementation process-wide mid-stream |
 | `ThreadProgressCounter* activeProgressCounter` | `thread-scopes.c++:27` | Thread-local, and its own comment says it "is read in signal handlers". TLS is guest-writable, so one word hands a signal handler an arbitrary pointer to dereference. Same shape as the `guestTurnDepth` counter in `guest-run.c++:22`, which is fixed by restoring from a host frame; this one needs the pointer out of TLS, in gk's per-thread supervisor record |
 | `multiTenantProcess`, `predictableMode`, `gcStressMode` | `thread-scopes.c++:20` | File-scope, read from turns |
-| `thread_local BufferState state`, 4 KiB of unconsumed CSPRNG output | `entropy.c++:21` | The buffer is on the thread the turn runs on, so a turn can read the bytes a later host operation will draw, or choose them. `channel-token.c++:162` takes every AES-GCM IV from it and `:26` takes the token key; `actor-id-impl.c++:64` takes unique actor ids. A chosen or repeated IV under a fixed key loses GCM's integrity guarantee. Host-privileged draws must not share a buffer with in-turn draws |
+| `thread_local BufferState state`, 4 KiB of unconsumed CSPRNG output | `entropy.c++:21` | The buffer is on the thread the turn runs on, so a turn can read the bytes a later host operation will draw, or choose them. `channel-token.c++` takes every AES-GCM IV from it (on the event loop under the guest kernel, but from the same thread-local buffer a turn on that thread shares) and the token key at startup; `actor-id-impl.c++:64` takes unique actor ids. A chosen or repeated IV under a fixed key loses GCM's integrity guarantee. Host-privileged draws must not share a buffer with in-turn draws: the host-side buffer belongs in host memory, with the in-turn path drawing from its own |
 | `thread_local int currentVfsRoot` | `sqlite.c++:1846` | It is the directory descriptor for the `openat`, `unlinkat`, `mkdirat` and `readlinkat` that SQLite's VFS issues (`sqlite.c++:1853-1876`). A write redirects where SQLite's file operations land. The root belongs on the `Vfs` object, not in TLS |
 | `SqliteObserver DEFAULT` with a mutable `dbWalSize`; `vfsErrorListener` | `sqlite.h:55`, `sqlite.c++:191` | File-scope and thread-local mutable state on a path a turn drives synchronously |
 | `static kj::NullStream nullStream` | `stream-utils.c++:250` | A file-scope object with a vtable, handed out by reference and by `kj::Own` with a null disposer. Must be rodata or supervisor-mapped |
@@ -471,7 +480,7 @@ What a turn nevertheless reaches, every path starting at
 |---|---|---|
 | `WorkerService::ioChannels` | `Fetcher::fetch` -> `startSubrequest(channel, ...)` (`server.c++:4269`), `getCache()` (`:4364`), `getActorChannel` (`:4440`), `getRpcChannel` (`:4490`) -- host arrays indexed by a guest-supplied channel number, then dispatched through another service's vtable | H. The `uint channel` a JS `Fetcher` carries (`api/http.h:213`) is already the right shape: an index the host validates. What is wrong is that the validation and dispatch run inside the turn |
 | `Server&` itself | `workerdDebugPortServer` (`server.c++:3466`) -> `getWorkerdDebugPort()` (`:4553`) | H. A worker with that binding reaches the `Server` object by pointer from inside its turn |
-| `ChannelTokenHandler::tokenKey`, `keyId` | plain members at `channel-token.h:133-134` of a heap object; used by `getTokenMaybeSync` (`server.c++:3544`) when a `Fetcher` is serialized over JS RPC, in-turn | **Must split.** The key is in the shared heap, so an escaped isolate reads the key that mints subrequest-channel tokens, and the IV comes from the entropy buffer above. The turn should submit the designator through B and get token bytes back |
+| `ChannelTokenHandler::tokenKey` | a `HostOwn<kj::FixedArray<byte, 32>>` (`channel-token.h`), reached from `getTokenMaybeSync` (`server.c++`) when a `Fetcher` is serialized over JS RPC, in-turn, and from `*FromToken` when one is deserialized | **In H memory; the crossing is interim.** The key bytes are in host memory, so an escaped isolate cannot read the key that mints subrequest-channel tokens. The two functions that read it run on the event loop, outside the guest, when the guest kernel is on: a turn that mints an RPC token gets a `kj::Promise` for the bytes, and one that decodes a token gets a promised channel, both forms the callers already handle. That is a crossing by way of a guest-built promise (violation 5 below), not yet the B message the turn should submit; and the `HostOwn` itself sits in the handler, in the shared heap, so a write primitive can swap the pointer, though not read through it, which the final split removes by moving the handler's host half to H. The IV still comes from the entropy buffer above |
 | `ActorIdFactoryImpl::key`, a SHA-256-sized HMAC key | `actor-id-impl.h:57`, owned by the JS-visible `DurableObjectNamespace` as a `kj::Own` (`api/actor.h:322`); `newUniqueId()` and `idFromName()` HMAC with it in-turn | **Must split.** The JS object is I and holds a namespace handle; the key and `computeMac` are H |
 | `CompatibilityFlags::Reader` | `WorkerdApi::getFeatureFlags()` (`workerd-api.c++:308`), called from nearly every API entry point during a turn; a capnp `Reader` is a pointer into a host-owned message | I only by copying: snapshot the struct into the arena at isolate creation. `jsg::JsgConfig` (`workerd-api.c++:228`) is already such a by-value copy |
 | `EntropySourceImpl` | `IoContext::getEntropySource()` (`io-context.h:926`) from `crypto.getRandomValues` (`api/crypto/crypto.c++:692`) and key generation | H; in-turn callers take bytes through B |
@@ -541,7 +550,30 @@ A reasonable order: redirect the already-copying boundaries into B; make
 placement per-site so the arena stops capturing H data; convert `IoOwn` to a
 handle, which retires the largest single family of raw cross-boundary
 pointers; then the promise channel, which retires the `IoContext::run` result
-problem and the event-loop touches together. The provenance violations found
-along the way -- the `jsg::Lock` data slot, the wasm signal descriptor, the
-guest-writable thread-locals -- are blocked on having H memory at all, so they
-land with the first real H region rather than as separate fixes.
+problem and the event-loop touches together.
+
+## What is in H memory
+
+H memory exists: `gk_host_alloc` with `HostOwn<T>` over it (see "Host (H)"
+above). Its tenants, and what is waiting on the same facility:
+
+- **In H memory:** `ChannelTokenHandler::tokenKey` (`server/channel-token.h`),
+  with the key's two readers deferred to the event loop under the guest
+  kernel. `host-memory-test.sh` shows a ring-3 read of it faulting.
+- **Waiting, same remedy:** the provenance violations above, each of which
+  needs the host to read a pointer or a descriptor from memory the guest
+  cannot write -- the `jsg::Lock` data slot (violation 1), the wasm signal
+  descriptor (violation 2), the guest-writable thread-locals
+  `threadLocalRequest`, `currentApi` and `guestTurnArena` (violation 3), the
+  `activeProgressCounter` pointer a signal handler dereferences
+  (`thread-scopes.c++:27`), and the host-side entropy buffer (`entropy.c++`).
+  Also `ActorIdFactoryImpl::key` (`actor-id-impl.h:57`), the other secret a
+  turn HMACs with today. Each of these is a `HostOwn` plus a crossing for the
+  in-turn reader, and the thread-local ones need the host side to find its
+  record without a thread-local, through gk's per-thread supervisor record.
+- **Not addressed by H memory alone:** the pointer to an H object is as safe
+  as the memory it sits in. A `HostOwn` in a shared-heap object protects the
+  object's bytes and lets the guest kernel refuse a swapped pointer at free
+  time, but the host still dereferences whatever pointer is there; the chain
+  from the event loop down to each H object has to be H all the way, which
+  is what the splits in the inventories above are for.

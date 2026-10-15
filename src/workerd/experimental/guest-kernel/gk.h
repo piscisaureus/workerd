@@ -87,10 +87,12 @@ long gk_run_here(long (*fn)(void *), void *arg);
 // heap, glibc, and every guest thread's stack -- including the parts of the
 // calling thread's stack that fn itself uses, and other threads' stacks, whose
 // host frames the wall of their own turn does not hold against this thread --
-// are ordinary user-mapped pages that ring-3 code can read and write. A
-// sandbox escape that gains arbitrary code execution can therefore still
-// corrupt shared runtime state; containing that requires keeping the runtime's
-// own memory out of ring 3's reach, which is remaining work.
+// are ordinary user-mapped pages that ring-3 code can read and write. The
+// exception is memory from gk_host_alloc (below), which no guest root maps:
+// runtime state placed there is out of ring 3's reach, and the remaining work
+// is moving the rest of the runtime's own memory there, so that a sandbox
+// escape that gains arbitrary code execution can no longer corrupt shared
+// runtime state.
 //
 // Threads created inside the guest run at their creator's privilege: a thread
 // a ring-3 fn creates (clone/clone3) starts at ring 3 too, and so do its own
@@ -221,8 +223,51 @@ typedef struct {
                         // skip, a reflected mprotect/munmap, freed page tables (wall_flushed is the
                         // wall's share)
   int flush_invpcid;    // the flush stub in use: 1 = INVPCID (one VM exit), 0 = CR4.PGE toggle (three)
+  int host_regions;     // host-memory regions mapped (each is one entry in the registry)
+  long host_blocks;     // host-memory blocks allocated and not yet freed
 } gk_stats;
 void gk_get_stats(gk_stats *s);
+
+// Host memory: memory the host side of the runtime owns and that no guest
+// page-table root maps. gk_host_alloc returns a zero-filled block of at least
+// `size` bytes that the host reads and writes as ordinary memory, while any
+// guest access to it, at ring 3 or at ring 0, inside an arena or on the base
+// root, takes a fault at the accessed address: a guest read does not see zeroes
+// or stale bytes, it does not complete. The block comes from a region
+// registered GK_PROT_REFUSE in the supervisor/refuse registry (so a forwarded
+// mprotect/munmap/mremap over it is refused too, see gk_mapping_change_ok),
+// and is never mapped into any root. This is the memory class memory-classes.md
+// calls Host (H): runtime state that only host code touches, such as secrets
+// and anything a pointer the host dereferences is loaded from.
+//
+// Regions are mapped a few MiB at a time and registered once each, so the
+// registry grows by one entry per region, never per block, and the number of
+// regions is bounded (a bounded total of host memory); blocks are suballocated
+// by size class and recycled through free lists kept inside the refused pages
+// themselves. gk_host_free scrubs the block before recycling it. `size` must
+// be the size the block was allocated with. The block is aligned to the
+// smaller of its size rounded up to a power of two and 4 KiB.
+//
+// Host-side only: both functions take gk's lock, may map memory, and write the
+// block, so a call from inside the guest faults or returns an error rather
+// than working, and neither runs on gk's fault or syscall-forward path.
+// gk_host_alloc returns NULL for a zero size, a size above GK_HOST_MAX_ALLOC,
+// when the region bound or the host's memory is exhausted, and before gk_init
+// has succeeded (see gk_initialized), so an embedder that must never fall back
+// to ordinary memory checks the result. Freeing a pointer that gk_host_alloc
+// did not return, or with a size of another class, is a fatal integrity
+// error: a free is a write through the pointer, and the pointer may have been
+// loaded from memory the guest can rewrite.
+#define GK_HOST_MAX_ALLOC (1UL << 20)
+void *gk_host_alloc(size_t size);
+void gk_host_free(void *ptr, size_t size);
+
+// Whether `ptr` lies in host memory: in a block gk_host_alloc has handed out
+// or could hand out. For tests and for an embedder's own assertions.
+int gk_host_owns(const void *ptr);
+
+// Nonzero once gk_init has succeeded in this process.
+int gk_initialized(void);
 
 // Test/diagnostic: drop the guest PTE for the page holding `addr` from every
 // root, flushing no TLB. A vCPU that holds a translation of the page in its TLB

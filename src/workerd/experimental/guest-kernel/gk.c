@@ -231,20 +231,34 @@ struct gk_arena {
   gk_arena *next_free;        // free-list link while the struct is unused
 };
 
+// Host memory (see gk_host_alloc in gk.h): regions mapped by the host,
+// registered GK_PROT_REFUSE once each, and suballocated by power-of-two size
+// class. A region is never unmapped or unregistered, so the registry holds at
+// most GK_MAX_HOST_REGIONS entries for them, whatever the allocation pattern.
+#define GK_HOST_REGION_BYTES (4UL << 20)
+#define GK_MAX_HOST_REGIONS 64
+#define GK_HOST_MIN_SHIFT 4   // the smallest block, 16 bytes: room for a free-list link
+#define GK_HOST_MAX_SHIFT 20  // the largest block, GK_HOST_MAX_ALLOC
+#define GK_HOST_CLASSES (GK_HOST_MAX_SHIFT + 1)
+typedef struct { uintptr_t start, end, bump; } gk_host_region;
+_Static_assert((1UL << GK_HOST_MAX_SHIFT) == GK_HOST_MAX_ALLOC, "gk.h and gk.c disagree");
+_Static_assert(GK_HOST_MAX_ALLOC <= GK_HOST_REGION_BYTES, "a block must fit a region");
+
 // The supervisor/refuse registry (see prot_class below). An unregistered page
 // is user-accessible, so the registry must never be too small to hold every
 // range gk wants to protect: prot_add is fatal when it is full. The capacity
 // covers the worst case, which is 4 ranges per vCPU (kvm_run and the IST/TSS
 // region, which stay registered while the vCPU is pooled, plus a gk_run_here
 // side stack and a guest thread's host stack, which are different classes and
-// so cannot be coalesced), the fixed init ranges (control block, page-table
+// so cannot be coalesced), one range per host-memory region (see the
+// host-memory section), the fixed init ranges (control block, page-table
 // area, GDT/IDT, handler text), and headroom.
 #define GK_PROT_KEEP 0
 #define GK_PROT_SUPER 1
 #define GK_PROT_REFUSE 2
-#define GK_MAX_PROT_RANGES (4 * GK_MAX_VCPUS + 1024)
+#define GK_MAX_PROT_RANGES (4 * GK_MAX_VCPUS + GK_MAX_HOST_REGIONS + 1024)
 typedef struct { uintptr_t start, end; int kind; } gk_prot_range;
-_Static_assert(GK_MAX_PROT_RANGES >= 2 * GK_MAX_VCPUS + 512,
+_Static_assert(GK_MAX_PROT_RANGES >= 2 * GK_MAX_VCPUS + GK_MAX_HOST_REGIONS + 512,
                "registry must hold every vCPU's permanent ranges with headroom");
 
 // A memslot-backed window (see the MMU layer below).
@@ -354,6 +368,17 @@ struct gk_ctl {
   // by G->lock.
   gk_prot_range prot[GK_MAX_PROT_RANGES];
   int prot_n;
+
+  // Host memory (see the host-memory section): the regions, the bump pointer
+  // of the newest one, and a free list per size class, linked through the
+  // first word of each free block. Guarded by G->lock.
+  gk_host_region host_regions[GK_MAX_HOST_REGIONS];
+  int host_region_n;
+  void *host_free[GK_HOST_CLASSES];
+  long host_blocks;                  // blocks handed out and not yet freed
+
+  // Set at the end of a successful gk_init (see gk_initialized).
+  int initialized;
 
   // The memslot interval tree and its node pool (see the MMU layer). Guarded
   // by G->lock.
@@ -605,6 +630,113 @@ static void prot_remove(uintptr_t s, uintptr_t e) {
     return;
   }
 }
+
+// ---- host memory -----------------------------------------------------------
+// Memory for the host side of the runtime that no guest root maps (see
+// gk_host_alloc in gk.h). The protection is the registry's REFUSE class, the
+// same one that keeps gk's page tables and kvm_run from the guest: demand_map
+// refuses a fault in the range, so no root ever holds a PTE for it, at any
+// ring. Registering costs one registry entry, and the registry is fixed-size
+// and fatal when full, so the entries are spent on a bounded number of large
+// regions, registered when mapped, and never on individual blocks.
+//
+// The allocator over the regions is deliberately simple: a block of n bytes
+// takes the size class 2^k >= n (16 bytes to GK_HOST_MAX_ALLOC), is carved
+// from the newest region's bump pointer if that class's free list is empty,
+// and goes back on that free list when freed. The free-list link is the first
+// word of the free block, inside the refused page, so the guest cannot read
+// or forge it; the list heads and the region table are in the control block,
+// which is supervisor memory. Blocks are never split or coalesced: the
+// tenants are small, long-lived objects (keys, descriptors, host records),
+// so internal fragmentation is bounded by a factor of two and the regions'
+// address space is reused through the free lists. A block is zeroed when
+// freed, so a recycled block never carries a previous tenant's bytes, and
+// a fresh region is zero from mmap, so every block comes back zero-filled.
+//
+// Host-side only: takes G->lock and may mmap, and is never on the fault path.
+// The caller's size on free selects the class, so a pointer that is not the
+// start of a block of that class -- a pointer loaded from memory the guest
+// could rewrite -- is refused as fatal rather than written through.
+
+static int host_class_of(size_t n) {
+  int k = GK_HOST_MIN_SHIFT;
+  while (((size_t)1 << k) < n) k++;
+  return k;
+}
+
+// Map and register one more region. Caller holds G->lock.
+static int host_region_add(void) {
+  if (G->host_region_n >= GK_MAX_HOST_REGIONS) return -1;
+  void *m = mmap(NULL, GK_HOST_REGION_BYTES, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED) return -1;
+  uintptr_t s = (uintptr_t)m, e = s + GK_HOST_REGION_BYTES;
+  // Registered before any block in it is handed out, so no guest thread can
+  // have touched it as a user page first.
+  prot_add(s, e, GK_PROT_REFUSE);
+  G->host_regions[G->host_region_n++] = (gk_host_region){s, e, s};
+  return 0;
+}
+
+// The region holding `p`, or NULL. Caller holds G->lock.
+static gk_host_region *host_region_of(uintptr_t p) {
+  for (int i = 0; i < G->host_region_n; i++)
+    if (p >= G->host_regions[i].start && p < G->host_regions[i].end) return &G->host_regions[i];
+  return NULL;
+}
+
+void *gk_host_alloc(size_t n) {
+  if (n == 0 || n > GK_HOST_MAX_ALLOC || !G->initialized) return NULL;
+  int k = host_class_of(n);
+  size_t sz = (size_t)1 << k, align = sz < 0x1000 ? sz : 0x1000;
+  pthread_mutex_lock(&G->lock);
+  void *p = G->host_free[k];
+  if (p) {
+    G->host_free[k] = *(void **)p;
+    *(void **)p = NULL;  // the rest of the block was zeroed when it was freed
+  } else {
+    for (;;) {
+      if (G->host_region_n > 0) {
+        gk_host_region *r = &G->host_regions[G->host_region_n - 1];
+        uintptr_t b = (r->bump + align - 1) & ~(align - 1);
+        if (b + sz <= r->end) { p = (void *)b; r->bump = b + sz; break; }
+      }
+      if (host_region_add() < 0) break;
+    }
+  }
+  if (p) G->host_blocks++;
+  pthread_mutex_unlock(&G->lock);
+  return p;
+}
+
+void gk_host_free(void *ptr, size_t n) {
+  if (!ptr) return;
+  if (n == 0 || n > GK_HOST_MAX_ALLOC) gk_fatal("gk_host_free with a size no block can have");
+  int k = host_class_of(n);
+  size_t sz = (size_t)1 << k, align = sz < 0x1000 ? sz : 0x1000;
+  uintptr_t p = (uintptr_t)ptr;
+  pthread_mutex_lock(&G->lock);
+  gk_host_region *r = host_region_of(p);
+  if (!r || (p & (align - 1)) || p + sz > r->bump)
+    gk_fatal("gk_host_free of a pointer that is not a host-memory block of that size");
+  // Scrub before the block is recycled; the write cannot be elided, and it
+  // happens before the link makes the block reachable from the free list.
+  memset(ptr, 0, sz);
+  __asm__ __volatile__("" : : "r"(ptr) : "memory");
+  *(void **)ptr = G->host_free[k];
+  G->host_free[k] = ptr;
+  G->host_blocks--;
+  pthread_mutex_unlock(&G->lock);
+}
+
+int gk_host_owns(const void *ptr) {
+  pthread_mutex_lock(&G->lock);
+  int owns = host_region_of((uintptr_t)ptr) != NULL;
+  pthread_mutex_unlock(&G->lock);
+  return owns;
+}
+
+int gk_initialized(void) { return G->initialized; }
 
 // ---- global pages ----------------------------------------------------------
 // The guest runs with CR4.PGE, so a PTE carrying the G bit yields a TLB entry
@@ -2104,7 +2236,9 @@ int gk_init(void) {
   // Bring up the calling thread's record and vCPU.
   gk_thread *t = thread_get();
   if (!t) { G->err = "thread record"; return -1; }
-  return vcpu_init(t, GK_VCPU_STACK);
+  int r = vcpu_init(t, GK_VCPU_STACK);
+  if (r == 0) G->initialized = 1;
+  return r;
 }
 
 int gk_vcpu_count(void) { return atomic_load(&G->vcpus_created); }
@@ -3734,6 +3868,8 @@ void gk_get_stats(gk_stats *s) {
   s->root_switches = atomic_load_explicit(&G->root_switches, memory_order_relaxed);
   s->tlb_flushes = atomic_load_explicit(&G->tlb_flushes, memory_order_relaxed);
   s->flush_invpcid = G->flush_stub == gk_flush_stub_invpcid;
+  s->host_regions = G->host_region_n;
+  s->host_blocks = G->host_blocks;
   pthread_mutex_unlock(&G->lock);
 }
 

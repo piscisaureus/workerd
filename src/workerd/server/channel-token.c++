@@ -5,6 +5,7 @@
 #include "channel-token.h"
 
 #include <workerd/api/restore.h>
+#include <workerd/jsg/setup.h>
 #include <workerd/server/channel-token.capnp.h>
 #include <workerd/util/entropy.h>
 
@@ -22,18 +23,73 @@
 
 namespace workerd::server {
 
-ChannelTokenHandler::ChannelTokenHandler(Resolver& resolver): resolver(resolver) {
-  getEntropy(tokenKey);
+namespace {
+
+// Whether a use of the token key must leave the JS turn. With the guest kernel enabled the key
+// is in host memory, which a turn at guest ring 3 cannot read, so the encryption and decryption
+// of RPC tokens are deferred to the event loop, which runs outside the guest. Storage tokens
+// carry no key. This decides only which path is taken: were it wrong, the read would fault
+// inside the guest and fail the turn, not expose the key.
+bool keyUseMustLeaveTurn(IoChannelFactory::ChannelTokenUsage usage) {
+  return usage == IoChannelFactory::ChannelTokenUsage::RPC && jsg::isGuestKernelEnabled();
+}
+
+}  // namespace
+
+ChannelTokenHandler::ChannelTokenHandler(Resolver& resolver)
+    : resolver(resolver),
+      tokenKey(hostOwned<kj::FixedArray<byte, AES_KEY_SIZE>>()) {
+  getEntropy(*tokenKey);
 
   SHA256_CTX ctx{};
   KJ_ASSERT(SHA256_Init(&ctx));
-  KJ_ASSERT(SHA256_Update(&ctx, tokenKey, sizeof(tokenKey)));
+  KJ_ASSERT(SHA256_Update(&ctx, tokenKey->begin(), tokenKey->size()));
 
   byte hash[SHA256_DIGEST_LENGTH]{};
   KJ_ASSERT(SHA256_Final(hash, &ctx));
 
   static_assert(KEY_ID_SIZE <= SHA256_DIGEST_LENGTH);
   kj::arrayPtr(keyId).copyFrom(kj::arrayPtr(hash).first(KEY_ID_SIZE));
+
+  if (getenv("WORKERD_GK_TEST_PROBE") != nullptr) {
+    // Test-only (see hostMemory::setProbeTargetForTest): publish where the key lives, so the
+    // guest kernel's end-to-end check can read it from inside a JS turn and expect the fault.
+    const void* key = tokenKey->begin();
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: channel token key",
+        kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(key))), hostMemory::contains(key));
+    hostMemory::setProbeTargetForTest(key);
+  }
+}
+
+kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> ChannelTokenHandler::finishToken(
+    IoChannelFactory::ChannelTokenUsage usage,
+    kj::Own<capnp::MallocMessageBuilder> message,
+    kj::Vector<kj::Promise<void>> promises) {
+  if (promises.empty()) {
+    if (!keyUseMustLeaveTurn(usage)) {
+      return serializeTokenImpl(usage, *message);
+    }
+    return kj::evalLater([this, usage, message = kj::mv(message)]() mutable {
+      return serializeTokenImpl(usage, *message);
+    });
+  }
+  return kj::joinPromisesFailFast(promises.releaseAsArray())
+      .then([this, usage, message = kj::mv(message)]() mutable {
+    return serializeTokenImpl(usage, *message);
+  });
+}
+
+template <typename T>
+kj::Own<T> ChannelTokenHandler::decodeToken(ChannelToken::Type type,
+    IoChannelFactory::ChannelTokenUsage usage,
+    kj::ArrayPtr<const byte> token) {
+  if (keyUseMustLeaveTurn(usage)) {
+    return newPromisedChannel<T>(
+        kj::evalLater([this, type, usage, token = kj::heapArray<byte>(token)]() {
+      return decodeChannelTokenImpl(type, usage, token).template downcast<T>();
+    }));
+  }
+  return decodeChannelTokenImpl(type, usage, token).template downcast<T>();
 }
 
 void ChannelTokenHandler::requireStorable(
@@ -82,14 +138,7 @@ kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> ChannelTokenHandler::
 
   encodeFrankenvalue(usage, props, service.initProps(), promises);
 
-  if (promises.empty()) {
-    return serializeTokenImpl(usage, *message);
-  } else {
-    return kj::joinPromisesFailFast(promises.releaseAsArray())
-        .then([this, usage, message = kj::mv(message)]() mutable {
-      return serializeTokenImpl(usage, *message);
-    });
-  }
+  return finishToken(usage, kj::mv(message), kj::mv(promises));
 }
 
 void ChannelTokenHandler::encodeFrankenvalue(IoChannelFactory::ChannelTokenUsage usage,
@@ -166,7 +215,7 @@ kj::Array<byte> ChannelTokenHandler::serializeTokenImpl(
       KJ_ASSERT(aesCtx != nullptr);
       KJ_DEFER(EVP_CIPHER_CTX_free(aesCtx));
 
-      KJ_ASSERT(EVP_EncryptInit(aesCtx, EVP_aes_256_gcm(), tokenKey, header.iv));
+      KJ_ASSERT(EVP_EncryptInit(aesCtx, EVP_aes_256_gcm(), tokenKey->begin(), header.iv));
 
       // Add header as AAD first.
       {
@@ -227,17 +276,16 @@ kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> ChannelTokenHandler::
       ChannelToken::Type::ACTOR_CLASS, usage, serviceName, entrypoint, props, persistent);
 }
 
-kj::Array<byte> ChannelTokenHandler::encodeActorChannelToken(
-    IoChannelFactory::ChannelTokenUsage usage,
-    kj::StringPtr namespaceKey,
-    kj::ArrayPtr<const byte> id,
-    kj::Maybe<kj::StringPtr> name,
-    Persistent persistent) {
+kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> ChannelTokenHandler::
+    encodeActorChannelToken(IoChannelFactory::ChannelTokenUsage usage,
+        kj::StringPtr namespaceKey,
+        kj::ArrayPtr<const byte> id,
+        kj::Maybe<kj::StringPtr> name,
+        Persistent persistent) {
   requireStorable(usage, persistent);
 
-  capnp::word scratch[128]{};
-  capnp::MallocMessageBuilder message(scratch);
-  auto builder = message.getRoot<ChannelToken>();
+  auto message = kj::heap<capnp::MallocMessageBuilder>(128);
+  auto builder = message->getRoot<ChannelToken>();
   builder.setType(ChannelToken::Type::SUBREQUEST);
   encodePersistent(builder, persistent);
 
@@ -248,7 +296,7 @@ kj::Array<byte> ChannelTokenHandler::encodeActorChannelToken(
     actor.setName(n);
   }
 
-  return serializeTokenImpl(usage, message);
+  return finishToken(usage, kj::mv(message), {});
 }
 
 kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> ChannelTokenHandler::
@@ -270,14 +318,7 @@ kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> ChannelTokenHandler::
   kj::Vector<kj::Promise<void>> promises;
   encodeFrankenvalue(usage, restoreArg, restored.initRestoreArg(), promises);
 
-  if (promises.empty()) {
-    return serializeTokenImpl(usage, *message);
-  } else {
-    return kj::joinPromisesFailFast(promises.releaseAsArray())
-        .then([this, usage, message = kj::mv(message)]() mutable {
-      return serializeTokenImpl(usage, *message);
-    });
-  }
+  return finishToken(usage, kj::mv(message), kj::mv(promises));
 }
 
 kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> ChannelTokenHandler::
@@ -620,7 +661,7 @@ kj::Own<Frankenvalue::CapTableEntry> ChannelTokenHandler::decodeChannelTokenImpl
       KJ_ASSERT(aesCtx != nullptr);
       KJ_DEFER(EVP_CIPHER_CTX_free(aesCtx));
 
-      KJ_ASSERT(EVP_DecryptInit(aesCtx, EVP_aes_256_gcm(), tokenKey, header.iv));
+      KJ_ASSERT(EVP_DecryptInit(aesCtx, EVP_aes_256_gcm(), tokenKey->begin(), header.iv));
 
       // Add header as AAD first.
       {
@@ -728,7 +769,11 @@ kj::Own<Frankenvalue::CapTableEntry> ChannelTokenHandler::decodeChannelTokenImpl
 
     case ChannelToken::RESTORED: {
       auto restored = reader.getRestored();
-      auto vendor = decodeSubrequestChannelToken(usage, restored.getVendor());
+      // Nested tokens are decoded here, synchronously: this already runs where the key is
+      // readable, so there is nothing to defer again.
+      auto vendor =
+          decodeChannelTokenImpl(ChannelToken::Type::SUBREQUEST, usage, restored.getVendor())
+              .downcast<IoChannelFactory::SubrequestChannel>();
       auto restoreArg = decodeFrankenvalue(usage, restored.getRestoreArg());
 
       switch (type) {
@@ -763,14 +808,18 @@ Frankenvalue ChannelTokenHandler::decodeFrankenvalue(
       switch (cap.which()) {
         case ChannelToken::FrankenvalueCapTable::Cap::UNKNOWN:
           break;
+        // Decoded synchronously: this runs from decodeChannelTokenImpl, where the key is
+        // readable, so there is nothing to defer again.
         case ChannelToken::FrankenvalueCapTable::Cap::SUBREQUEST_CHANNEL:
-          capTable.add(decodeSubrequestChannelToken(usage, cap.getSubrequestChannel()));
+          capTable.add(decodeChannelTokenImpl(
+              ChannelToken::Type::SUBREQUEST, usage, cap.getSubrequestChannel()));
           continue;
         case ChannelToken::FrankenvalueCapTable::Cap::ACTOR_CLASS_CHANNEL:
-          capTable.add(decodeActorClassChannelToken(usage, cap.getActorClassChannel()));
+          capTable.add(decodeChannelTokenImpl(
+              ChannelToken::Type::ACTOR_CLASS, usage, cap.getActorClassChannel()));
           continue;
         case ChannelToken::FrankenvalueCapTable::Cap::RPC_CHANNEL:
-          capTable.add(decodeRpcChannelToken(usage, cap.getRpcChannel()));
+          capTable.add(decodeChannelTokenImpl(ChannelToken::Type::RPC, usage, cap.getRpcChannel()));
           continue;
       }
       KJ_FAIL_REQUIRE("unknown cap table type", cap.which());
@@ -782,20 +831,19 @@ Frankenvalue ChannelTokenHandler::decodeFrankenvalue(
 
 kj::Own<IoChannelFactory::SubrequestChannel> ChannelTokenHandler::decodeSubrequestChannelToken(
     IoChannelFactory::ChannelTokenUsage usage, kj::ArrayPtr<const byte> token) {
-  return decodeChannelTokenImpl(ChannelToken::Type::SUBREQUEST, usage, token)
-      .downcast<IoChannelFactory::SubrequestChannel>();
+  return decodeToken<IoChannelFactory::SubrequestChannel>(
+      ChannelToken::Type::SUBREQUEST, usage, token);
 }
 
 kj::Own<IoChannelFactory::ActorClassChannel> ChannelTokenHandler::decodeActorClassChannelToken(
     IoChannelFactory::ChannelTokenUsage usage, kj::ArrayPtr<const byte> token) {
-  return decodeChannelTokenImpl(ChannelToken::Type::ACTOR_CLASS, usage, token)
-      .downcast<IoChannelFactory::ActorClassChannel>();
+  return decodeToken<IoChannelFactory::ActorClassChannel>(
+      ChannelToken::Type::ACTOR_CLASS, usage, token);
 }
 
 kj::Own<IoChannelFactory::RpcChannel> ChannelTokenHandler::decodeRpcChannelToken(
     IoChannelFactory::ChannelTokenUsage usage, kj::ArrayPtr<const byte> token) {
-  return decodeChannelTokenImpl(ChannelToken::Type::RPC, usage, token)
-      .downcast<IoChannelFactory::RpcChannel>();
+  return decodeToken<IoChannelFactory::RpcChannel>(ChannelToken::Type::RPC, usage, token);
 }
 
 }  // namespace workerd::server

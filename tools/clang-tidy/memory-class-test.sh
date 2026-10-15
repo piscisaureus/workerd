@@ -133,8 +133,12 @@ expect_diag_at "$(line_of '  v8::Global<v8::Value> slots[2];')" \
   "field 'slots' of host class 'workerd::HostWithGlobalArray' has type 'v8::Global<v8::Value>[2]', which holds isolate-side type 'v8::Global<v8::Value>'; ${HOST_WHY}" \
   "P23: array of V8 handles in a host class"
 
+expect_diag_at "$(line_of '  T* pointer;')" \
+  "field 'pointer' of host class 'workerd::HostPointerHolder<workerd::IsolateThing>' is a pointer to isolate class 'workerd::IsolateThing'; ${HOST_WHY}" \
+  "P24: pointer to a template parameter, reported on the violating instantiation"
+
 # Exact-count lock: one diagnostic per positive case, no more, no fewer.
-expected_count=23
+expected_count=24
 actual_count=$(grep -c "\[${CHECK}" <<<"${positive_output}" || true)
 if [[ "${actual_count}" -ne "${expected_count}" ]]; then
   printf 'Expected exactly %s %s diagnostics, got %s\n' \

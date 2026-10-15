@@ -152,6 +152,15 @@ class WD_MEMORY_CLASS_ISOLATE IsolateHolder {
 IsolateHolder<int> holderOfInt;
 IsolateHolder<kj::TaskSet> holderOfTaskSet;
 
+// Case P24: a pointer to a template parameter, decided on the instantiation:
+// one diagnostic, for the pointer to an isolate class.
+template <typename T>
+class WD_MEMORY_CLASS_HOST HostPointerHolder {
+  T* pointer;
+};
+HostPointerHolder<int> pointerHolderOfInt;
+HostPointerHolder<IsolateThing> pointerHolderOfIsolateThing;
+
 // Case P13: an isolate class holding a host mutex.
 class WD_MEMORY_CLASS_ISOLATE IsolateWithMutex {
   kj::MutexGuarded<int> guarded;

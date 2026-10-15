@@ -28,6 +28,10 @@ isolate's JS turn at guest ring 3.
   loop) runs correctly with the worker's JS turn at guest ring 3, and that a
   Wasm bounds violation surfaces as a `WebAssembly.RuntimeError` rather than a
   guest fault.
+- `host-memory-test.sh` — end-to-end check against a built workerd that the
+  channel token key lives in host memory and that a JS turn at guest ring 3
+  reading it faults at the key's address, failing only that request and
+  condemning only that isolate.
 
 ## API
 
@@ -43,6 +47,9 @@ void      gk_arena_destroy(gk_arena*);
 void gk_set_syscall_filter(gk_syscall_filter); // bound what forwarded code may do
 int  gk_mapping_syscall_ok(long nr, long a1, ..., long a6); // a filter's range check
                                                             // for the memory syscalls
+
+void *gk_host_alloc(size_t);                 // host memory: mapped into no guest root
+void  gk_host_free(void*, size_t);
 ```
 
 `gk_run` returns `fn`'s return value, or `GK_EFAULT` if the guest took an
@@ -92,15 +99,32 @@ hardware:
   redirect a thread to another root. The test writes to each structure from
   ring 3 and checks the fault, then reads and writes from ring 0.
 
-  This is the extent of the guarantee: cross-arena isolation and gk's own
-  control state hold against arbitrary code execution inside an isolate. The
-  shared, non-arena runtime memory does not: the C++/KJ heap, glibc, and every
-  vCPU's guest stack (including the caller's stack that `gk_run_here_user` runs
-  the turn on) are user-mapped and readable and writable from ring 3. A sandbox
-  escape that reaches arbitrary code execution can therefore corrupt shared
-  runtime state and, through a host return address on that shared stack, may
-  reach host execution. Keeping the runtime's own memory out of ring 3's reach
-  is remaining work (see Limitations).
+  This is the extent of the guarantee: cross-arena isolation, gk's own
+  control state and host memory (next) hold against arbitrary code execution
+  inside an isolate. The rest of the shared, non-arena runtime memory does
+  not: the C++/KJ heap, glibc, and every vCPU's guest stack (including the
+  caller's stack that `gk_run_here_user` runs the turn on) are user-mapped and
+  readable and writable from ring 3. A sandbox escape that reaches arbitrary
+  code execution can therefore corrupt shared runtime state and, through a
+  host return address on that shared stack, may reach host execution. Moving
+  the runtime's own mutable state into host memory is remaining work (see
+  Limitations).
+- **Host memory.** `gk_host_alloc` hands the host side of the runtime memory
+  that no guest page-table root maps: the host reads and writes it as
+  ordinary memory, and a guest access at any ring -- ring 3 or ring 0, inside
+  an arena or on the base root -- faults at the accessed address, since the
+  pages are registered in the refuse class that also keeps gk's page tables
+  and `kvm_run` from the guest. Regions of a few MiB are mapped and registered
+  once each (the registry is fixed-size and fatal when full, so it is never
+  spent per block) and suballocated by power-of-two size class through free
+  lists kept inside the refused pages; blocks come back zero-filled and are
+  scrubbed when freed. The test writes and reads a block from the host, shows
+  every kind of guest access faulting at the exact address with the host's
+  bytes intact, and runs tens of thousands of allocate/free cycles and
+  multi-region bursts without the registry growing past the regions. In
+  workerd, `util/host-memory.h` wraps this (`HostOwn<T>`, ordinary heap memory
+  when the guest kernel is off) and the channel token key is its first tenant;
+  `host-memory-test.sh` shows a ring-3 read of the key faulting.
 - **Threads as vCPUs.** Each host thread that enters the guest gets its own
   vCPU, stack and TLS base, sharing the VM and memory. Four threads run in the
   guest concurrently, and two threads each locked into their own arena run at
@@ -233,12 +257,13 @@ decides the overall cost.
 
 ## Limitations (remaining work)
 
-- **The shared runtime memory is reachable from ring 3.** The ring-3 wall
-  covers other isolates' arenas and gk's control state, not the runtime's own
-  memory: the C++/KJ heap, glibc, and every guest thread's stack (the JS turn
-  runs on the calling thread's stack, above host frames) are user-mapped. Code
-  execution inside an isolate can corrupt that shared state and, via a host
-  return address on the stack, potentially reach host execution.
+- **Most of the shared runtime memory is reachable from ring 3.** The ring-3
+  wall covers other isolates' arenas, gk's control state and host memory, not
+  the rest of the runtime's own memory: the C++/KJ heap, glibc, and every
+  guest thread's stack (the JS turn runs on the calling thread's stack, above
+  host frames) are user-mapped. Code execution inside an isolate can corrupt
+  that shared state and, via a host return address on the stack, potentially
+  reach host execution.
 
   That memory is also *readable*, which matters even without code execution.
   The per-isolate arena covers what V8 reserves page-granularly -- the
@@ -254,14 +279,20 @@ decides the overall cost.
   Confining this needs the runtime's mutable memory out of ring 3's reach, so
   that an arena maps only the isolate's own pages, the runtime's text and
   read-only data, and a per-isolate channel for talking to a host-side
-  runtime. gk already has the enforcement primitive for it: `prot_add()`
-  classes a range `GK_PROT_SUPER` (mapped, `PTE_U` cleared, so ring 3 faults)
-  or `GK_PROT_REFUSE` (never mapped), which is how gk's own control state is
-  protected. What is missing is the interface: the C++ bindings reach runtime
-  state through direct pointers, so reclassifying that memory faults the turn
-  until those accesses become messages. Moving the malloc'd objects into the
-  arena needs a per-isolate allocator arena, which means an allocator with
-  extent hooks; workerd uses tcmalloc, which has none.
+  runtime. The memory for that exists: `gk_host_alloc` (see "Host memory"
+  above) gives the host side memory that no guest root maps, and
+  `util/host-memory.h` places a C++ object there. What is still missing is the
+  interface: the C++ bindings reach runtime state through direct pointers, so
+  an object moved into host memory faults the turn until the turn's accesses
+  to it become messages. The channel token key is in host memory, and the two
+  functions that read it run on the event loop, outside the guest, when a
+  turn asks for a token; every other object listed above is still in the
+  shared heap, and the pointer *to* a host-memory object (the `HostOwn`) is
+  itself in whatever memory its owner is in, so until the owner moves too, a
+  write primitive can swap it, though not read through it. Moving the
+  malloc'd objects into the arena needs a per-isolate allocator arena, which
+  means an allocator with extent hooks; workerd uses tcmalloc, which has
+  none.
 - **The memory classification of runtime objects is applied to few of
   them.** Which side of the boundary each runtime C++ class belongs on is
   written down in `memory-classes.md`, together with the rules that decide
@@ -269,7 +300,9 @@ decides the overall cost.
   violates it today. The clang-tidy check `workerd-memory-class` enforces it
   for the classes that carry a `WD_MEMORY_CLASS_*` annotation
   (`src/workerd/util/memory-class.h`), which is a handful so far; every other
-  class is unchecked, and the allocator does not yet place objects by class.
+  class is unchecked. Placement by class exists for H only, as an explicit
+  choice per object (`HostOwn<T>`, `util/host-memory.h`) rather than
+  something the allocator decides, and one object has been placed.
 - **The host acts on data a ring-3 turn can write.** The runtime's heap is in
   the guest's address space, so every host-side structure the guest can reach
   is attacker-controlled input to the host, and the dangerous cases are the

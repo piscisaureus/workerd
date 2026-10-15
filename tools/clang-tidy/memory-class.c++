@@ -244,16 +244,19 @@ std::optional<Finding> findCrossing(
   auto other = opposite(cls);
   std::string otherName = className(other).str();
 
-  // Pointers and references to a class of the other side.
+  // Pointers and references to a class of the other side. A pointee that is
+  // still a template parameter is decided on each instantiation.
   bool isReference = qt->isReferenceType();
   auto bare = stripped(qt);
   if (isReference || bare->isAnyPointerType()) {
-    auto pointee = isReference ? bare : bare->getPointeeType();
-    if (const auto* rd = stripped(pointee)->getAsCXXRecordDecl()) {
+    auto pointee = stripped(isReference ? bare : bare->getPointeeType());
+    if (const auto* rd = pointee->getAsCXXRecordDecl()) {
       if (annotationOf(rd) == other) {
         return Finding{.noun = std::string(isReference ? "a reference to " : "a pointer to ") +
               otherName + " class '" + rd->getQualifiedNameAsString() + "'"};
       }
+    } else if (pointee->isDependentType()) {
+      undecided = true;
     }
     return std::nullopt;
   }

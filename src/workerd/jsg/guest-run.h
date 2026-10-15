@@ -21,12 +21,13 @@ namespace workerd::jsg {
 // root and can address this isolate's sandbox and no other's. At ring 3, `body` (V8, JIT, and
 // the C++ runtime it calls) cannot reload CR3, run privileged instructions, or touch gk's
 // supervisor/refused pages: any such attempt faults and gk_run_here_user() returns GK_EFAULT.
-// That confines it to this isolate's arena and keeps it out of gk's control state, but not out
-// of the shared runtime memory (the C++/KJ heap, glibc, and this thread's stack, which `body`
-// runs on and which holds the host frames below the guest boundary): those are user-mapped, so
-// an escape to arbitrary code execution can still corrupt shared state and, through a host
-// return address on the stack, potentially reach host execution. See gk.h; containing that is
-// remaining work.
+// That confines it to this isolate's arena and keeps it out of gk's control state and of host
+// memory (util/host-memory.h, the memory no guest root maps, where runtime secrets go), but not
+// out of the rest of the shared runtime memory (the C++/KJ heap, glibc, and this thread's stack,
+// which `body` runs on and which holds the host frames below the guest boundary): those are
+// user-mapped, so an escape to arbitrary code execution can still corrupt shared state and,
+// through a host return address on the stack, potentially reach host execution. See gk.h;
+// moving the rest of the runtime's mutable state into host memory is remaining work.
 //
 // The guest boundary is not a C++ call frame, so an exception thrown inside `body` cannot unwind
 // across it. The trampoline that runs `body` in the guest catches everything and records it,

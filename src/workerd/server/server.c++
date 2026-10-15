@@ -811,9 +811,19 @@ class Server::ActorNamespace final {
           return getChannelTokenImpl(usage, c.id, persistent);
         }
         KJ_CASE_ONEOF(promise, kj::ForkedPromise<void>) {
-          return promise.addBranch().then([this, usage, persistent]() {
-            return getChannelTokenImpl(
-                usage, KJ_ASSERT_NONNULL(classAndId.tryGet<ClassAndId>()).id, persistent);
+          return promise.addBranch().then(
+              [this, usage, persistent]() -> kj::Promise<kj::Array<byte>> {
+            KJ_SWITCH_ONEOF(getChannelTokenImpl(usage,
+                                KJ_ASSERT_NONNULL(classAndId.tryGet<ClassAndId>()).id,
+                                persistent)) {
+              KJ_CASE_ONEOF(token, kj::Array<byte>) {
+                return kj::mv(token);
+              }
+              KJ_CASE_ONEOF(tokenPromise, kj::Promise<kj::Array<byte>>) {
+                return kj::mv(tokenPromise);
+              }
+            }
+            KJ_UNREACHABLE;
           });
         }
       }
@@ -1391,7 +1401,8 @@ class Server::ActorNamespace final {
       co_return ClassAndId(info.actorClass.downcast<ActorClass>(), kj::mv(info.id));
     }
 
-    kj::Array<byte> getChannelTokenImpl(IoChannelFactory::ChannelTokenUsage usage,
+    kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getChannelTokenImpl(
+        IoChannelFactory::ChannelTokenUsage usage,
         const Worker::Actor::Id& id,
         Persistent persistent) {
       kj::StringPtr uniqueKey = KJ_ASSERT_NONNULL(ns.getConfig().tryGet<Durable>()).uniqueKey;

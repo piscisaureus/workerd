@@ -1333,19 +1333,6 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
         context.enableStructuredLogging();
       }
 
-#ifdef WORKERD_HAS_GUEST_KERNEL
-      // Experimental: make this process a KVM guest so that each isolate's JS
-      // turns can run at guest ring 3 in their own arena (see jsg::runInGuest).
-      // Must happen before the V8 platform starts its worker threads and before
-      // V8::Initialize reserves the sandbox/cage. Off unless the env var is set.
-      if (getenv("WORKERD_EXPERIMENTAL_GUEST_KERNEL") != nullptr) {
-        KJ_REQUIRE(gk_init() >= 0, "guest-kernel: gk_init() failed",
-            kj::StringPtr(gk_last_error() != nullptr ? gk_last_error() : "unknown"));
-        gk_set_syscall_filter(&guestKernelSyscallFilter);
-        KJ_LOG(WARNING, "guest-kernel isolation enabled (experimental)");
-      }
-#endif
-
       auto platform = jsg::defaultPlatform(0);
       WorkerdPlatform v8Platform(*platform);
       jsg::V8System v8System(v8Platform,
@@ -1668,6 +1655,24 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
 
 int main(int argc, char* argv[]) {
   workerd::server::StructuredLoggingProcessContext context(argv[0]);
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  // Experimental: make this process a KVM guest so that each isolate's JS turn
+  // can run at guest ring 3 in its own arena (see jsg::runInGuest). This comes
+  // first of all: before the Server is constructed, since it owns objects that
+  // live in guest-kernel host memory (the channel token key, see
+  // util/host-memory.h) and host memory exists only once gk_init() has run;
+  // and before the V8 platform starts its worker threads and V8::Initialize
+  // reserves the sandbox/cage. Off unless the env var is set.
+  if (getenv("WORKERD_EXPERIMENTAL_GUEST_KERNEL") != nullptr) {
+    if (gk_init() < 0) {
+      context.exitError(kj::str("guest-kernel: gk_init() failed: ",
+          gk_last_error() != nullptr ? gk_last_error() : "unknown"));
+    }
+    gk_set_syscall_filter(&workerd::server::guestKernelSyscallFilter);
+    KJ_LOG(WARNING, "guest-kernel isolation enabled (experimental)");
+  }
+#endif
 
   workerd::server::CliMain mainObject(context, argv);
 

@@ -138,6 +138,27 @@ wd_cc_library(
     visibility = ["//visibility:public"],
 )
 
+# Host memory (see host-memory.h): backed by the guest kernel's gk_host_alloc on
+# the platform that has it, by the ordinary heap elsewhere.
+wd_cc_library(
+    name = "host-memory",
+    srcs = ["host-memory.c++"],
+    hdrs = ["host-memory.h"],
+    implementation_deps = select({
+        # Experimental guest-kernel isolation is x86-64 Linux only; the dep and
+        # its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
+    visibility = ["//visibility:public"],
+    deps = [
+        ":memory-class",
+        "@capnp-cpp//src/kj",
+    ],
+)
+
 wd_cc_library(
     name = "checked-queue",
     hdrs = ["checked-queue.h"],

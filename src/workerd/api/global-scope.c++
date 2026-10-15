@@ -32,6 +32,7 @@
 #include <workerd/jsg/ser.h>
 #include <workerd/jsg/setup.h>
 #include <workerd/jsg/util.h>
+#include <workerd/util/host-memory.h>
 #include <workerd/util/sentry.h>
 #include <workerd/util/stream-utils.h>
 #include <workerd/util/thread-scopes.h>
@@ -307,19 +308,35 @@ kj::Promise<void> ServiceWorkerGlobalScope::connectUdp(kj::String host,
 
 namespace {
 
-// Test-only hook for the experimental guest kernel's fault path. With the guest kernel enabled
+// Test-only hooks for the experimental guest kernel's fault path. With the guest kernel enabled
 // and WORKERD_GK_TEST_FAULT set, a request whose path is /__gk_fault dereferences a null pointer
 // from inside the JS turn. At guest ring 3 that is a page fault the guest cannot service, so
 // gk_run_here_user() returns GK_EFAULT to IoContext::runImpl (see runJsTurn there), which must
 // fail the request, condemn the isolate and keep the process serving. Both gates are required: a
 // production process (no WORKERD_GK_TEST_FAULT) never takes this branch, and neither does one
 // running without the guest kernel, where the dereference would be a host-side SIGSEGV.
+//
+// With WORKERD_GK_TEST_PROBE set, a request whose path is /__gk_probe_host instead reads one
+// byte of the host-memory tenant registered through hostMemory::setProbeTargetForTest() (the
+// channel token key) from inside the JS turn. Host memory is mapped into no guest root, so at
+// ring 3 that is the same kind of fault, at the byte's own address; this is how the guest
+// kernel's host-memory-test.sh shows the key is out of a turn's reach. The same two gates apply.
 void maybeForceGuestFaultForTest(kj::StringPtr url) {
-  static const bool enabled =
+  static const bool faultEnabled =
       jsg::isGuestKernelEnabled() && getenv("WORKERD_GK_TEST_FAULT") != nullptr;
-  if (enabled && url.endsWith("/__gk_fault")) {
+  if (faultEnabled && url.endsWith("/__gk_fault")) {
     KJ_LOG(WARNING, "WORKERD_GK_TEST_FAULT: forcing a guest fault for this request", url);
     *static_cast<volatile int*>(nullptr) = 0;
+  }
+  static const bool probeEnabled =
+      jsg::isGuestKernelEnabled() && getenv("WORKERD_GK_TEST_PROBE") != nullptr;
+  if (probeEnabled && url.endsWith("/__gk_probe_host")) {
+    KJ_IF_SOME(target, hostMemory::probeTargetForTest()) {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: reading host memory from inside the JS turn", url,
+          kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(target))));
+      volatile byte probed = *static_cast<const volatile byte*>(target);
+      (void)probed;
+    }
   }
 }
 
