@@ -9,18 +9,25 @@
 // one. This is the real-V8 counterpart of gk_test.c's arena-isolation test: guest execution
 // under one isolate's lock can touch that isolate's ArrayBuffer memory, JIT code, bytecode,
 // cppgc objects and pointer tables, and takes a hardware fault on another isolate's.
+//
+// Where heap arenas are built in (HeapArena in heap-arena.h, with jemalloc as the allocator),
+// the isolate lock also puts the thread's malloc() and operator new on the isolate's heap
+// arena, in the upper part of the tail, so the same holds for the isolate's C++ objects.
 
 #include "jsg-test.h"
 
 #ifdef WORKERD_HAS_GUEST_KERNEL
 #include <workerd/experimental/guest-kernel/gk.h>
 #include <workerd/jsg/guest-run.h>
+#include <workerd/jsg/heap-arena.h>
 
 #include <cppgc/allocation.h>
 #include <cppgc/garbage-collected.h>
 #include <cppgc/persistent.h>
 #include <v8-cppgc.h>
 #include <v8-internal.h>
+
+#include <kj/map.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -302,6 +309,55 @@ struct JsTurn {
   }
 };
 
+#ifdef WORKERD_HAS_HEAP_ARENA
+// Allocation sizes spanning jemalloc's small, large and huge size classes.
+constexpr size_t HEAP_SIZES[] = {16, 96, 1024, 4096, 20000, 300 * 1024, 3 * 1024 * 1024};
+constexpr size_t HEAP_COUNT = kj::size(HEAP_SIZES);
+
+// One round of C++ heap allocations, made by code running at guest ring 3 or on the host and
+// read back by the host afterwards. A record is allocated with no lock held, so it lies in the
+// shared heap: a turn under any arena can read it and allocate() can write it (it is off the
+// stack, so the host-frame wall does not apply), and release() writes nothing to it.
+struct HeapTurn {
+  void* blocks[HEAP_COUNT] = {};
+  unsigned char* object = nullptr;
+  unsigned arenaIndex = 0;
+
+  // Allocates a block of each size with malloc() and an array with new, filling each.
+  static long allocate(void* arg) {
+    auto& self = *reinterpret_cast<HeapTurn*>(arg);
+    self.arenaIndex = currentHeapArenaIndex();
+    for (size_t i = 0; i < HEAP_COUNT; i++) {
+      void* p = malloc(HEAP_SIZES[i]);
+      if (p == nullptr) return -1;
+      memset(p, BUFFER_FILL, HEAP_SIZES[i]);
+      self.blocks[i] = p;
+    }
+    self.object = new unsigned char[64];
+    memset(self.object, BUFFER_FILL, 64);
+    return 0;
+  }
+
+  // Frees what allocate() recorded, under whatever arena is active at the time.
+  static long release(void* arg) {
+    auto& self = *reinterpret_cast<HeapTurn*>(arg);
+    for (void* p: self.blocks) free(p);
+    delete[] self.object;
+    return 0;
+  }
+
+  template <typename Func>
+  void forEach(Func&& func) {
+    for (size_t i = 0; i < HEAP_COUNT; i++) func(blocks[i], HEAP_SIZES[i]);
+    func(static_cast<void*>(object), size_t(64));
+  }
+};
+
+bool inHeap(GuestArena& arena, const void* p) {
+  return KJ_ASSERT_NONNULL(arena.getHeapArena()).contains(p);
+}
+#endif  // WORKERD_HAS_HEAP_ARENA
+
 // A single case with a single pair of isolates: gk supports one round of arenas per process
 // (a guest entry after arenas were destroyed and new ones created spins in KVM), so every check
 // shares these two. Natives syntax lets a script force optimization, so that an isolate's code
@@ -523,6 +579,162 @@ KJ_TEST("each isolate's memory lives in its own guest-kernel arena") {
     }
     KJ_EXPECT(jsThrown);
   });
+
+#ifdef WORKERD_HAS_HEAP_ARENA
+  // Part 5: the C++ heap. Each isolate has a jemalloc arena over the heap part of its arena's
+  // tail, and its lock puts the thread's malloc() and operator new on it (HeapArenaScope, via
+  // GuestArenaScope), whether the allocation is made on the host side of the lock or at guest
+  // ring 3 inside a turn. With no lock held the thread allocates from one of jemalloc's
+  // automatic arenas, in no isolate's memory.
+  KJ_EXPECT(heapArenasAvailable());
+  auto& heapA = KJ_ASSERT_NONNULL(arenaA.getHeapArena());
+  auto& heapB = KJ_ASSERT_NONNULL(arenaB.getHeapArena());
+  KJ_EXPECT(heapA.getIndex() != heapB.getIndex());
+  KJ_EXPECT(!isAutomaticHeapArena(heapA.getIndex()));
+  KJ_EXPECT(!isAutomaticHeapArena(heapB.getIndex()));
+
+  // The heap part of the tail follows V8's part and ends at the end of the reservation, which
+  // gk rounds up to a whole 512 GiB slot.
+  constexpr uintptr_t SLOT = uintptr_t(1) << 39;
+  auto reservationEnd = [](GuestArena& arena) {
+    auto base = reinterpret_cast<uintptr_t>(arena.base());
+    return (base + arena.size() + SLOT - 1) / SLOT * SLOT;
+  };
+  KJ_EXPECT(heapA.getBegin() == tailA.end());
+  KJ_EXPECT(heapA.getEnd() == reservationEnd(arenaA));
+  KJ_EXPECT(heapB.getBegin() == tailB.end());
+  KJ_EXPECT(heapB.getEnd() == reservationEnd(arenaB));
+
+  // The isolate objects themselves are in the shared heap: isolate creation stays off the heap
+  // arena (see newIsolate() in setup.c++).
+  KJ_EXPECT(!inHeap(arenaA, a.getIsolate()) && !inHeap(arenaB, a.getIsolate()));
+  KJ_EXPECT(!inHeap(arenaA, b.getIsolate()) && !inHeap(arenaB, b.getIsolate()));
+
+  // No lock held: the thread is on an automatic arena, and what it allocates lies in neither
+  // isolate's arena. The turn records are allocated here, in the shared heap.
+  unsigned homeIndex = currentHeapArenaIndex();
+  KJ_EXPECT(isAutomaticHeapArena(homeIndex), homeIndex);
+  auto hostTurn = kj::heap<HeapTurn>();
+  auto turnA = kj::heap<HeapTurn>();
+  auto turnB = kj::heap<HeapTurn>();
+  KJ_EXPECT(!inHeap(arenaA, hostTurn.get()) && !inHeap(arenaB, hostTurn.get()));
+  KJ_EXPECT(HeapTurn::allocate(hostTurn.get()) == 0);
+  KJ_EXPECT(hostTurn->arenaIndex == homeIndex);
+  hostTurn->forEach([&](void* p, size_t size) {
+    KJ_EXPECT(!inHeap(arenaA, p) && !inHeap(arenaB, p), p, size);
+    KJ_EXPECT(!contains(arenaA, p) && !contains(arenaB, p), p, size);
+    KJ_EXPECT(!inTail(arenaA, p) && !inTail(arenaB, p), p, size);
+  });
+  KJ_EXPECT(HeapTurn::release(hostTurn.get()) == 0);
+
+  // Under A's lock the thread is on A's heap arena. Allocations made on the host side of the
+  // lock and at guest ring 3 inside a turn both land in A's heap region (not in its sandbox or
+  // V8's part of the tail), where the guest can read and write them.
+  a.runInLockScope([&](ArenaIsolate::Lock& lock) {
+    KJ_EXPECT(currentHeapArenaIndex() == heapA.getIndex());
+    KJ_EXPECT(HeapTurn::allocate(hostTurn.get()) == 0);
+    KJ_EXPECT(hostTurn->arenaIndex == heapA.getIndex());
+    hostTurn->forEach([&](void* p, size_t size) {
+      KJ_EXPECT(inHeap(arenaA, p), p, size);
+      KJ_EXPECT(!inHeap(arenaB, p), p, size);
+    });
+
+    KJ_EXPECT(gk_run_here_user(&HeapTurn::allocate, turnA.get()) == 0);
+    KJ_EXPECT(turnA->arenaIndex == heapA.getIndex());
+    turnA->forEach([&](void* p, size_t size) {
+      KJ_EXPECT(inHeap(arenaA, p), p, size);
+      KJ_EXPECT(!inHeap(arenaB, p), p, size);
+      KJ_EXPECT(!contains(arenaA, p) && !inTail(arenaA, p), p, size);
+      KJ_EXPECT(gk_run_here_user(&touchByte, p) == BUFFER_FILL, p, size);
+      KJ_EXPECT(gk_run_here(&touchByte, static_cast<kj::byte*>(p) + size - 1) == BUFFER_FILL);
+    });
+  });
+  KJ_EXPECT(currentHeapArenaIndex() == homeIndex);
+
+  // With no lock held the thread is back on the base root: A's heap objects are unaddressable
+  // from the guest, while the host still reads them.
+  turnA->forEach([&](void* p, size_t size) {
+    KJ_EXPECT(gk_run_here(&touchByte, p) == GK_EFAULT, p, size);
+    KJ_EXPECT(gk_fault_addr() == reinterpret_cast<uintptr_t>(p));
+    KJ_EXPECT(static_cast<unsigned char*>(p)[0] == BUFFER_FILL);
+    KJ_EXPECT(static_cast<unsigned char*>(p)[size - 1] == BUFFER_FILL);
+  });
+
+  // Under B's lock: B's allocations land in B's heap region; A's heap objects fault; and A's
+  // objects can be freed from B's turn, at ring 3 with A's arena unmapped, since a free touches
+  // only the allocator's shared bookkeeping and never the object.
+  b.runInLockScope([&](ArenaIsolate::Lock& lock) {
+    KJ_EXPECT(currentHeapArenaIndex() == heapB.getIndex());
+    KJ_EXPECT(gk_run_here_user(&HeapTurn::allocate, turnB.get()) == 0);
+    KJ_EXPECT(turnB->arenaIndex == heapB.getIndex());
+    turnB->forEach([&](void* p, size_t size) {
+      KJ_EXPECT(inHeap(arenaB, p), p, size);
+      KJ_EXPECT(!inHeap(arenaA, p), p, size);
+      KJ_EXPECT(gk_run_here_user(&touchByte, p) == BUFFER_FILL, p, size);
+    });
+    turnA->forEach([&](void* p, size_t size) {
+      KJ_EXPECT(gk_run_here_user(&touchByte, p) == GK_EFAULT, p, size);
+      KJ_EXPECT(gk_fault_addr() == reinterpret_cast<uintptr_t>(p));
+    });
+    KJ_EXPECT(gk_run_here_user(&HeapTurn::release, turnA.get()) == 0);
+  });
+  // Frees from the host with no lock held, of B's turn's objects and of A's host-side ones.
+  KJ_EXPECT(HeapTurn::release(turnB.get()) == 0);
+  KJ_EXPECT(HeapTurn::release(hostTurn.get()) == 0);
+
+  // Repeatedly: allocate in A's turn and free from B's turn, from the host with no lock held,
+  // or from A's own turn. The process survives every round, and the memory is reused rather
+  // than consumed: the rounds allocate far more in total than the arena takes from its region,
+  // and the addresses handed out repeat.
+  constexpr int ROUNDS = 500;
+  size_t perRound = 64;
+  for (size_t size: HEAP_SIZES) perRound += size;
+  size_t mappedBefore = heapA.getRegionBytes();
+  kj::HashSet<uintptr_t> addresses;
+  for (int round = 0; round < ROUNDS; round++) {
+    a.runInLockScope([&](ArenaIsolate::Lock& lock) {
+      KJ_ASSERT(gk_run_here_user(&HeapTurn::allocate, turnA.get()) == 0, round);
+    });
+    turnA->forEach([&](void* p, size_t size) {
+      KJ_ASSERT(inHeap(arenaA, p), round, p, size);
+      auto addr = reinterpret_cast<uintptr_t>(p);
+      if (addresses.find(addr) == kj::none) addresses.insert(addr);
+    });
+    switch (round % 3) {
+      case 0:
+        b.runInLockScope([&](ArenaIsolate::Lock& lock) {
+          KJ_ASSERT(gk_run_here_user(&HeapTurn::release, turnA.get()) == 0, round);
+        });
+        break;
+      case 1:
+        KJ_ASSERT(HeapTurn::release(turnA.get()) == 0, round);
+        break;
+      case 2:
+        a.runInLockScope([&](ArenaIsolate::Lock& lock) {
+          KJ_ASSERT(gk_run_here_user(&HeapTurn::release, turnA.get()) == 0, round);
+        });
+        break;
+    }
+  }
+  size_t mappedAfter = heapA.getRegionBytes();
+  size_t allocated = ROUNDS * perRound;
+  KJ_LOG(INFO, "heap reuse over all rounds", allocated, mappedBefore, mappedAfter, addresses.size(),
+      ROUNDS * (HEAP_COUNT + 1));
+  KJ_EXPECT(mappedAfter - mappedBefore < allocated / 8, mappedBefore, mappedAfter, allocated);
+  KJ_EXPECT(addresses.size() < ROUNDS * (HEAP_COUNT + 1) / 4, addresses.size());
+
+  // After all those frees, an allocation for B still comes from B's region and one on the host
+  // from neither: memory freed from one arena is never recycled into another.
+  b.runInLockScope([&](ArenaIsolate::Lock& lock) {
+    KJ_EXPECT(gk_run_here_user(&HeapTurn::allocate, turnB.get()) == 0);
+    turnB->forEach([&](void* p, size_t size) { KJ_EXPECT(inHeap(arenaB, p), p, size); });
+    KJ_EXPECT(gk_run_here_user(&HeapTurn::release, turnB.get()) == 0);
+  });
+  KJ_EXPECT(HeapTurn::allocate(hostTurn.get()) == 0);
+  hostTurn->forEach(
+      [&](void* p, size_t size) { KJ_EXPECT(!inHeap(arenaA, p) && !inHeap(arenaB, p), p, size); });
+  KJ_EXPECT(HeapTurn::release(hostTurn.get()) == 0);
+#endif  // WORKERD_HAS_HEAP_ARENA
 }
 
 // The host reads the turn record as bytes. A description length past the buffer is clamped to

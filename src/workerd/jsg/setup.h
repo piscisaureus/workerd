@@ -6,6 +6,7 @@
 // Public API for setting up JavaScript context. Only high-level code needs to include this file.
 
 #include "async-context.h"
+#include "heap-arena.h"
 #include "jsg.h"
 #include "v8-platform-wrapper.h"
 
@@ -183,14 +184,24 @@ class ArenaPageAllocator final: public v8::PageAllocator {
 //
 // gk reserves arenas in whole 512 GiB page-table slots, so the reservation extends past the
 // requested size to the end of the last slot. That tail is arena memory like the rest, only
-// not part of the sandbox; it is handed to V8 through an ArenaPageAllocator for the group's
-// out-of-sandbox memory (trusted range, code range, pointer tables, cppgc heap), which thereby
-// gets the same hardware isolation as the sandbox.
+// not part of the sandbox, and it is split in two. The lower part is handed to V8 through an
+// ArenaPageAllocator for the group's out-of-sandbox memory (trusted range, code range, pointer
+// tables, cppgc heap). The upper part backs the isolate's C++ heap arena (HeapArena, where heap
+// arenas are built in): the objects the runtime allocates for the isolate while its lock is
+// held. Both thereby get the same hardware isolation as the sandbox.
 //
 // The arena must outlive the isolate group placed in it: V8 adopts the reservation for the
 // group's sandbox and, on teardown, decommits inside it but never unmaps it; destroying the
 // arena releases the reservation. The page allocator lives as long as the arena, as
 // v8::IsolateGroup::CreateParams::page_allocator requires.
+//
+// An arena that held a heap arena is never released: destroying a GuestArena then retains the
+// reservation, the page allocators and the jemalloc arena for the life of the process, mapped
+// to the host and addressable from no later isolate's guest execution. Objects allocated under
+// the isolate's lock can outlive the isolate -- a cached string, a promise node, and in
+// particular the storage of process-wide registries that the thread happened to grow while on
+// the isolate's arena (V8's wasm type canonicalizer, for one) -- and the process keeps reading
+// and eventually freeing them, which needs the memory mapped and the jemalloc arena alive.
 class GuestArena final {
  public:
   // Takes ownership of `arena`, which must have been created by gk_arena_create().
@@ -206,16 +217,24 @@ class GuestArena final {
   size_t size() const;
 
 #ifdef WORKERD_HAS_GUEST_KERNEL
-  // The allocator over the arena's tail, [base() + size(), end of the reservation).
+  // The allocator over V8's part of the tail, [base() + size(), the heap arena's region), or the
+  // whole tail where heap arenas are not built in.
   ArenaPageAllocator& getPageAllocator() {
     return *pageAllocator;
   }
 #endif
+  // The isolate's C++ heap arena, over the heap part of the tail, [getPageAllocator().end(),
+  // end of the reservation): present where heap arenas are built in and the allocator is set up
+  // for them (heapArenasAvailable()).
+  kj::Maybe<HeapArena&> getHeapArena();
 
  private:
   gk_arena* arena;
 #ifdef WORKERD_HAS_GUEST_KERNEL
   kj::Own<ArenaPageAllocator> pageAllocator;
+#endif
+#ifdef WORKERD_HAS_HEAP_ARENA
+  kj::Maybe<kj::Own<HeapArena>> heapArena;
 #endif
 };
 

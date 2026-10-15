@@ -240,24 +240,49 @@ decides the overall cost.
   The per-isolate arena covers what V8 reserves page-granularly -- the
   sandbox, trusted and code ranges, pointer tables and cppgc pages, all
   routed through `jsg::ArenaPageAllocator` -- so another isolate's V8 heap is
-  unmapped and a stray read cannot reach it. It does not cover the C++
-  objects that come from the process allocator: `i::Isolate` and malloc'd V8
-  state, JSG `Wrappable`, `IoOwn`, `IoContext`, and the KJ allocations that
-  carry request and response bodies. Those share one heap across isolates, so
-  an escape with only a read primitive can still recover another isolate's
-  in-flight data from it.
+  unmapped and a stray read cannot reach it. With jemalloc as the allocator
+  (`--//src/workerd/server:allocator=jemalloc`) it also covers the C++
+  objects the runtime allocates for the isolate while its lock is held: each
+  isolate has a jemalloc arena over the upper part of its gk arena's tail
+  (`jsg::HeapArena`), and the isolate lock switches the thread onto it, so
+  JSG wrappers, `IoOwn`'d objects, V8's per-turn malloc'd state and the KJ
+  allocations that carry request data are unaddressable from other isolates'
+  turns too; `src/workerd/jsg/guest-arena-test.c++` checks this. The arena's
+  bookkeeping is shared, so a free from any context touches only shared
+  memory, and jemalloc's thread cache is off process-wide, since it would
+  recycle one isolate's freed blocks into another's allocations. What stays
+  shared, and readable, is what is allocated with no isolate lock held: the
+  isolate object itself and the rest of what V8 allocates while creating it
+  (creation also grows process-wide registries, which must not die with one
+  isolate), and whatever V8's background threads allocate on an isolate's
+  behalf, since they run on their own arenas.
 
-  Confining this needs the runtime's mutable memory out of ring 3's reach, so
-  that an arena maps only the isolate's own pages, the runtime's text and
-  read-only data, and a per-isolate channel for talking to a host-side
-  runtime. gk already has the enforcement primitive for it: `prot_add()`
-  classes a range `GK_PROT_SUPER` (mapped, `PTE_U` cleared, so ring 3 faults)
-  or `GK_PROT_REFUSE` (never mapped), which is how gk's own control state is
-  protected. What is missing is the interface: the C++ bindings reach runtime
-  state through direct pointers, so reclassifying that memory faults the turn
-  until those accesses become messages. Moving the malloc'd objects into the
-  arena needs a per-isolate allocator arena, which means an allocator with
-  extent hooks; workerd uses tcmalloc, which has none.
+  Three things do not work under this scheme, all because the per-thread
+  arena switch places everything a turn allocates in the isolate's arena.
+  Objects handed from one isolate's turn to another's fault: an in-process
+  service binding faults the callee's first turn on the request objects the
+  caller built. Process-wide state that is lazily initialized during a turn
+  lands in that isolate's arena: a second worker using `Intl` faults on the
+  ICU data the first one loaded, and V8's wasm type canonicalizer grows its
+  tables on whichever isolate first creates a context. And process-wide
+  mutable containers get nodes and backing arrays from whichever isolate's
+  turn grows them, so another isolate's turn faults when it rebalances or
+  resizes past one: two workers using `setTimeout` concurrently fault each
+  other on the event loop's timer set, and a turn abandoned in the middle of
+  such an update leaves the container inconsistent, after which the whole
+  process stops serving. Workers that share nothing of the kind -- no timers,
+  no `Intl`, no calls between them -- serve concurrently without faults. For
+  the second reason a destroyed isolate's arena is retained for the life of
+  the process rather than unmapped. Confining the remaining shared memory needs the
+  runtime's mutable memory out of ring 3's reach, so that an arena maps only
+  the isolate's own pages, the runtime's text and read-only data, and a
+  per-isolate channel for talking to a host-side runtime. gk already has the
+  enforcement primitive for it: `prot_add()` classes a range `GK_PROT_SUPER`
+  (mapped, `PTE_U` cleared, so ring 3 faults) or `GK_PROT_REFUSE` (never
+  mapped), which is how gk's own control state is protected. What is missing
+  is the interface: the C++ bindings reach runtime state through direct
+  pointers, so reclassifying that memory faults the turn until those accesses
+  become messages.
 - **No cross-vCPU TLB shootdown IPIs yet.** Adding mappings needs none (a
   not-present entry has nothing stale to flush), which is why dynamic `mmap`
   and per-thread stacks work across vCPUs. Removing or shrinking a mapping

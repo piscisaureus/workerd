@@ -1328,6 +1328,7 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
         KJ_REQUIRE(gk_init() >= 0, "guest-kernel: gk_init() failed",
             kj::StringPtr(gk_last_error() != nullptr ? gk_last_error() : "unknown"));
         gk_set_syscall_filter(&guestKernelSyscallFilter);
+        jsg::checkHeapArenaSupport();
         KJ_LOG(WARNING, "guest-kernel isolation enabled (experimental)");
       }
 #endif

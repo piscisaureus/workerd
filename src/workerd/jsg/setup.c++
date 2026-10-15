@@ -416,6 +416,12 @@ v8::PageAllocator* outOfSandboxPageAllocator(kj::Maybe<kj::Own<GuestArena>>& gue
 #endif
   return nullptr;
 }
+// Isolate creation is deliberately not placed on the isolate's heap arena (HeapArena), although
+// that is where the isolate object itself would then live: creating an isolate also inserts it
+// into process-wide registries (V8's perfetto logger keeps a hash map of all isolates, for one),
+// whose storage is then reallocated on the creating thread's arena and dies with that isolate
+// while the registry is still in use by every other. The isolate's objects go on its heap arena
+// from its first lock on (GuestArenaScope).
 static v8::Isolate* newIsolate(
     v8::Isolate::CreateParams&& params, v8::CppHeap* cppHeap, v8::IsolateGroup group) {
   return jsg::runInV8Stack([&](jsg::V8StackScope& stackScope) -> v8::Isolate* {
@@ -458,6 +464,16 @@ constexpr size_t GUEST_ARENA_SLOT_SIZE = size_t(1) << 39;
 // The page size gk maps guest memory at, and the host's on x86-64 Linux.
 constexpr size_t GUEST_ARENA_PAGE_SIZE = 4096;
 
+// The size of the heap part of an arena's tail (see GuestArena), which backs the isolate's
+// C++ heap arena. Memory in it is only given back when the isolate goes away, so this is sized
+// for an isolate's peak C++ heap use, not its steady state. Zero where heap arenas are not
+// built in: V8 then gets the whole tail.
+#ifdef WORKERD_HAS_HEAP_ARENA
+constexpr size_t GUEST_ARENA_HEAP_SIZE = 16ull * 1024 * 1024 * 1024;
+#else
+constexpr size_t GUEST_ARENA_HEAP_SIZE = 0;
+#endif
+
 int protectionFor(v8::PageAllocator::Permission permission) {
   switch (permission) {
     case v8::PageAllocator::kNoAccess:
@@ -498,7 +514,7 @@ static_assert(v8::internal::kSandboxSizeLog2 == 37 &&
 // and the JS dispatch table at 128 MiB) and the cppgc heap.
 constexpr size_t GUEST_ARENA_TAIL_SIZE =
     GUEST_ARENA_SLOT_SIZE - GUEST_ARENA_RESERVATION_SIZE % GUEST_ARENA_SLOT_SIZE;
-static_assert(GUEST_ARENA_TAIL_SIZE >= 8ull * 1024 * 1024 * 1024 &&
+static_assert(GUEST_ARENA_TAIL_SIZE - GUEST_ARENA_HEAP_SIZE >= 8ull * 1024 * 1024 * 1024 &&
         (GUEST_ARENA_RESERVATION_SIZE % (4ull * 1024 * 1024 * 1024)) == 0,
     "guest-kernel arena tail is too small for V8's out-of-sandbox memory");
 #endif
@@ -697,17 +713,69 @@ GuestArena::GuestArena(gk_arena* arena): arena(arena) {
   KJ_REQUIRE(tailEnd - tailBegin == GUEST_ARENA_TAIL_SIZE,
       "guest-kernel arena has an unexpected tail", tailBegin, tailEnd);
 #endif
-  pageAllocator = kj::heap<ArenaPageAllocator>(tailBegin, tailEnd);
+  KJ_REQUIRE(tailEnd - tailBegin > GUEST_ARENA_HEAP_SIZE,
+      "guest-kernel arena tail has no room for V8 beside the heap part", tailBegin, tailEnd);
+  uintptr_t heapBegin = tailEnd - GUEST_ARENA_HEAP_SIZE;
+  pageAllocator = kj::heap<ArenaPageAllocator>(tailBegin, heapBegin);
+#ifdef WORKERD_HAS_HEAP_ARENA
+  if (heapArenasAvailable()) {
+    heapArena = kj::heap<HeapArena>(heapBegin, tailEnd);
+  } else {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      KJ_LOG(WARNING,
+          "guest-kernel: the allocator is not set up for per-isolate heap arenas (see "
+          "heapArenasAvailable()); isolates' C++ objects share one heap");
+    }
+  }
+#endif
 #endif
 }
 
+#ifdef WORKERD_HAS_HEAP_ARENA
+namespace {
+// The arenas of destroyed isolates that held heap arenas, kept for the life of the process (see
+// GuestArena). A retained arena keeps everything a pointer into its memory may still need.
+struct RetainedArena {
+  kj::Own<ArenaPageAllocator> pageAllocator;
+  kj::Own<HeapArena> heapArena;
+};
+kj::MutexGuarded<kj::Vector<RetainedArena>>& retainedArenas() {
+  static kj::MutexGuarded<kj::Vector<RetainedArena>> arenas;
+  return arenas;
+}
+}  // namespace
+#endif
+
 GuestArena::~GuestArena() noexcept(false) {
 #ifdef WORKERD_HAS_GUEST_KERNEL
+#ifdef WORKERD_HAS_HEAP_ARENA
+  KJ_IF_SOME(a, heapArena) {
+    auto lock = retainedArenas().lockExclusive();
+    lock->add(RetainedArena{kj::mv(pageAllocator), kj::mv(a)});
+    heapArena = kj::none;
+    KJ_LOG(WARNING,
+        "guest-kernel: retaining a destroyed isolate's arena, as its heap may still "
+        "be referenced; retained arenas so far",
+        lock->size());
+    return;
+  }
+#endif
   // The isolate group that used the tail is gone by now (the arena outlives it), so nothing
   // references the allocator any more.
   pageAllocator = nullptr;
   gk_arena_destroy(arena);
 #endif
+}
+
+kj::Maybe<HeapArena&> GuestArena::getHeapArena() {
+#ifdef WORKERD_HAS_HEAP_ARENA
+  KJ_IF_SOME(a, heapArena) {
+    return *a;
+  }
+#endif
+  return kj::none;
 }
 
 void* GuestArena::base() const {

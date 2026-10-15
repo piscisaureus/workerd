@@ -142,7 +142,19 @@ void Data::moveFromTraced(Data& other, v8::TracedReference<v8::Data>& otherTrace
   other.tracedHandle = kj::none;
 }
 
-GuestArenaScope::GuestArenaScope(v8::Isolate* isolate) {
+namespace {
+// The C++ heap arena of `isolate`'s guest-kernel arena, if it has one.
+kj::Maybe<HeapArena&> heapArenaOf(v8::Isolate* isolate) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  KJ_IF_SOME(arena, IsolateBase::from(isolate).getGuestArena()) {
+    return arena.getHeapArena();
+  }
+#endif
+  return kj::none;
+}
+}  // namespace
+
+GuestArenaScope::GuestArenaScope(v8::Isolate* isolate): heapArenaScope(heapArenaOf(isolate)) {
 #ifdef WORKERD_HAS_GUEST_KERNEL
   KJ_IF_SOME(arena, IsolateBase::from(isolate).getGuestArena()) {
     int result = gk_arena_enter(arena.get());
