@@ -56,3 +56,7 @@ perf.data
 
 # python
 __pycache__
+
+# Binaries built by the standalone guest-kernel Makefile.
+/src/workerd/experimental/guest-kernel/gk_test
+/src/workerd/experimental/guest-kernel/gk_test_guard

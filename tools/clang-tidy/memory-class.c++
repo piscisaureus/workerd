@@ -111,6 +111,15 @@ const llvm::StringRef kHostSideTypes[] = {
   "kj::Executor",
 };
 
+// Value types that rule R6 names as side-neutral: a thin wrapper over an
+// integer, with no pointer and a trivial destructor, so it carries nothing
+// into a boundary record that a plain integer would not. The structural checks
+// above still apply, so one of these growing a vtable would be reported.
+const llvm::StringRef kBoundaryValueTypes[] = {
+  "kj::Date",
+  "kj::Duration",
+};
+
 // Wrappers whose side is decided by what they hold. The owning ones carry a
 // disposer or refcount that lives with the pointee, which is exactly what
 // must not cross; the rest are plain containers.
@@ -330,6 +339,10 @@ std::optional<Finding> findBoundaryViolation(
     if (!def->hasTrivialDestructor()) {
       return Finding{
         .predicate = prefix + "has type " + name + ", which has a non-trivial destructor"};
+    }
+    std::string qualified = rd->getQualifiedNameAsString();
+    for (llvm::StringRef allowed: kBoundaryValueTypes) {
+      if (qualified == allowed) return std::nullopt;
     }
     return Finding{.predicate = prefix + "has type " + name + ", which is not a boundary class"};
   }

@@ -34,6 +34,14 @@ class ArrayPtr {
   T* ptr;
   unsigned long size;
 };
+class Date {
+ public:
+  long long value;
+};
+class Duration {
+ public:
+  long long value;
+};
 }  // namespace kj
 
 namespace v8 {
@@ -133,6 +141,14 @@ struct WD_MEMORY_CLASS_BOUNDARY Descriptor {
   unsigned long handle;
   unsigned int offset;
   unsigned int length;
+};
+
+// A boundary record may carry the value types rule R6 names as side-neutral:
+// they are integers in a wrapper, with no pointer and a trivial destructor.
+struct WD_MEMORY_CLASS_BOUNDARY Stamped {
+  unsigned long handle;
+  kj::Date at;
+  kj::Duration took;
 };
 
 struct WD_MEMORY_CLASS_BOUNDARY Message {

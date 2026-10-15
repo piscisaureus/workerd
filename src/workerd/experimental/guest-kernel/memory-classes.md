@@ -142,8 +142,9 @@ Three layers, each catching what the one before cannot.
      `kj::TaskSet`, `kj::PromiseFulfiller`, `kj::Canceler`, `kj::MutexGuarded`
      and `kj::Executor`;
    - in a B class, anything but integers, enums, bools, floating-point values,
-     arrays of those and other B classes: no pointer, reference, vtable or
-     non-trivial destructor, and the B class itself is not polymorphic.
+     arrays of those, the R6 value types `kj::Date` and `kj::Duration`, and
+     other B classes: no pointer, reference, vtable or non-trivial destructor,
+     and the B class itself is not polymorphic.
 
    Unannotated classes are not examined, so adoption is per class: a class is
    annotated once it passes, and a class that needs a split (see the
