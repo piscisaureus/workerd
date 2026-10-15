@@ -1709,6 +1709,75 @@ static long guard_mprotect_only(void *arg) {
   return mprotect(arg, 4096, PROT_READ | PROT_WRITE) ? -errno : 0;
 }
 
+// ---- mremap and the guest's translations ------------------------------------
+// A mapping the guest moves with mremap must take its guest PTEs with it. A
+// translation left at the old address keeps resolving, and guest physical is
+// host virtual, so it would reach whatever the host maps there next without
+// that mapping passing the class check a demand fault makes. So after a move
+// from the guest, a read of the old address must fault, at that address.
+struct mremap_case {
+  unsigned char *old;
+  unsigned char *dest;
+  size_t len;
+  unsigned char *moved;
+  long err;
+};
+
+// Runs at ring 3: move the range to `dest`, then read its first byte there. The
+// destination is named outright, as an mremap of an unchanged size to no
+// particular address is free to leave the mapping where it is.
+static long mremap_move(void *arg) {
+  struct mremap_case *c = arg;
+  void *p = mremap(c->old, c->len, c->len, MREMAP_MAYMOVE | MREMAP_FIXED, c->dest);
+  if (p == MAP_FAILED) { c->err = errno; return -1; }
+  c->moved = p;
+  return ((volatile unsigned char *)p)[0];
+}
+
+static int mremap_reflect_check(void) {
+  size_t len = 8192;
+  unsigned char *m = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED) { printf("mremap reflection: mmap failed [FAIL]\n"); return 0; }
+  m[0] = 0x7e;
+  m[4096] = 0x7e;
+  // The guest reads it first, so it holds translations for both pages.
+  long before = gk_run_here_user(read_byte, m);
+  long before2 = gk_run_here_user(read_byte, m + 4096);
+
+  // On the heap, not this frame: gk_run_here_user walls the caller's stack off
+  // from the turn, so a ring-3 turn cannot read an argument that lives there.
+  // The destination is reserved up front, so the move has to relocate the
+  // mapping rather than keeping it in place.
+  unsigned char *dest = mmap(NULL, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (dest == MAP_FAILED) { printf("mremap reflection: reserve failed [FAIL]\n"); return 0; }
+  struct mremap_case *c = malloc(sizeof *c);
+  if (c == NULL) { printf("mremap reflection: malloc failed [FAIL]\n"); return 0; }
+  *c = (struct mremap_case){m, dest, len, NULL, 0};
+  long moved = gk_run_here_user(mremap_move, c);
+
+  // The old address: its mapping is gone, so the guest must fault there, at
+  // that address, instead of still reading through a stale translation.
+  long after = gk_run_here_user(read_byte, m);
+  uintptr_t fault = gk_fault_addr();
+  long after2 = gk_run_here_user(read_byte, m + 4096);
+  uintptr_t fault2 = gk_fault_addr();
+  // The new address is readable from the guest, with the contents it had.
+  long at_new = c->moved ? gk_run_here_user(read_byte, c->moved) : -1;
+
+  int ok = before == 0x7e && before2 == 0x7e && moved == 0x7e && c->moved == dest &&
+           after == GK_EFAULT && fault == (uintptr_t)m &&
+           after2 == GK_EFAULT && fault2 == (uintptr_t)(m + 4096) && at_new == 0x7e;
+  if (c->moved) munmap(c->moved, len);
+  printf("mremap reflection: old range read %ld, %ld before the move; moved %s (guest read "
+         "%ld, errno %ld); old range after -> %ld at %#lx and %ld at %#lx; new range -> %ld "
+         "[%s]\n",
+         before, before2, c->moved ? "yes" : "no", moved, c->err, after, (unsigned long)fault,
+         after2, (unsigned long)fault2, at_new, ok ? "OK" : "FAIL");
+  free(c);
+  return ok;
+}
+
 static int mapping_guard_check(void) {
   gk_arena *A = gk_arena_create(4096), *B = gk_arena_create(4096);
   if (!A || !B) { printf("mapping policy: create failed [FAIL]\n"); return 0; }
@@ -2529,9 +2598,14 @@ int main(void) {
   // mapping_guard_check).
   int ok26 = mapping_guard_check() == 1;
 
+  // ---- mremap and the guest's translations ------------------------------------
+  // A range the guest moves with mremap leaves no translation behind at its old
+  // address (see mremap_reflect_check).
+  int ok27 = mremap_reflect_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
-            ok22 && ok23 && ok24 && ok25 && ok26;
+            ok22 && ok23 && ok24 && ok25 && ok26 && ok27;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

@@ -161,7 +161,9 @@ hardware:
 - **W^X.** Pages are mapped with their host protection: executable pages are not
   writable and writable pages are not executable (NX is enabled in the guest,
   and `CR0.WP` is set so the ring-0 guest cannot write a read-only page either).
-  `mprotect` and `munmap` are reflected into the affected guest PTEs and the
+  `mprotect`, `munmap`, a fixed `mmap` and `mremap` (both the range it leaves
+  and the one it arrives at, so no translation survives at an address the
+  mapping has left) are reflected into the affected guest PTEs and the
   TLB is flushed (the guest runs `INVPCID` type 2, or toggles `CR4.PGE` on a
   CPU without `INVPCID`; either drops global entries too. `INVPCID` is not
   intercepted under nested paging, so that flush costs one VM exit where the

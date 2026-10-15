@@ -2502,8 +2502,9 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
   // the range readable rewrites the PTEs the guest already has, in place, to
   // the protection it just set (see reprotect_range_all); everything else --
   // munmap, a fixed mmap, an mprotect to PROT_NONE, a pkey_mprotect (whose key
-  // the PTEs must pick up too) -- clears them (see unmap_range_all), so the
-  // next access re-faults and demand-maps with the new host state. Together
+  // the PTEs must pick up too), an mremap (both of its ranges) -- clears them
+  // (see unmap_range_all), so the next access re-faults and demand-maps with
+  // the new host state. Together
   // this is what makes W^X, JIT code and V8's commit/decommit of sandbox pages
   // work. The host call and the PTE update happen under G->lock so a demand
   // fault on another vCPU cannot install a PTE with the old protection in
@@ -2521,9 +2522,15 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
   int reflect = (nr == SYS_mprotect || nr == SYS_munmap ||
                  nr == SYS_pkey_mprotect ||
                  (nr == SYS_mmap && (a4 & MAP_FIXED))) && a2 > 0;
+  // mremap is reflected on its own, as it names two ranges: the mapping may
+  // move, so the PTEs of the old range have to go as well as those of the new
+  // one. A PTE left behind at the old address keeps resolving, and guest
+  // physical is host virtual, so it would reach whatever the host maps there
+  // next without that mapping ever passing the demand fault's class check.
+  int reflect_mremap = nr == SYS_mremap && a2 > 0;
   uintptr_t rs = (uintptr_t)a1 & ~0xfffUL;
   uintptr_t re = ((uintptr_t)a1 + (uintptr_t)a2 + 0xfff) & ~0xfffUL;
-  if (reflect) pthread_mutex_lock(&G->lock);
+  if (reflect || reflect_mremap) pthread_mutex_lock(&G->lock);
   if (nr == SYS_pkey_mprotect) {
     long pkey = a4;
     if (pkey != -1 && (pkey < 0 || pkey > 15 || !pkey_room()))
@@ -2535,7 +2542,22 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
   } else {
     ret = host_syscall(nr, a1, a2, a3, a4, a5, a6);
   }
-  if (reflect) {
+  if (reflect_mremap) {
+    if ((unsigned long)ret < (unsigned long)-4096) {
+      uintptr_t ns = (uintptr_t)ret & ~0xfffUL;
+      uintptr_t ne = ((uintptr_t)ret + (uintptr_t)a3 + 0xfff) & ~0xfffUL;
+      if (pkey_set_range(rs, re, 0) < 0 && G->dbg)
+        fprintf(stderr, "[gk] pkey table full; [%#lx,%#lx) keeps a stale key\n",
+                (unsigned long)rs, (unsigned long)re);
+      if (pkey_set_range(ns, ne, 0) < 0 && G->dbg)
+        fprintf(stderr, "[gk] pkey table full; [%#lx,%#lx) keeps a stale key\n",
+                (unsigned long)ns, (unsigned long)ne);
+      unmap_range_all(rs, re);
+      if (ns < rs || ne > re) unmap_range_all(ns, ne);
+    }
+    pthread_mutex_unlock(&G->lock);
+    flush_tlb(t, r);
+  } else if (reflect) {
     if (nr == SYS_mmap ? ret == a1 : ret == 0) {
       // A new or removed mapping has no key.
       if ((nr == SYS_munmap || nr == SYS_mmap) && pkey_set_range(rs, re, 0) < 0 && G->dbg)
