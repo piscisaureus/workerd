@@ -74,6 +74,15 @@
 // handler index is in RDI. Recognized at the syscall exit next to the exit
 // sentinel, before the filter and before any forwarding.
 #define GK_HOSTCALL_SYSCALL 0xF4241
+// Reserved syscall number for a ring-0 resolve (see gk_resolve in gk.h): the
+// handle is in RDI. Answered by the syscall trampoline itself, inside the
+// guest (gk_resolve_tramp in gk_asm.S), so it never reaches this file's
+// syscall exit. Keep in sync with the literal in gk_asm.S.
+#define GK_RESOLVE_SYSCALL 0xF4242
+// The ring-3 code selector SYSRET loads (STAR[63:48] + 16, see vcpu_init and
+// the GDT layout in gk_init): the only CS a guest runs with at ring 3, and so
+// the sign that a caller is at guest ring 3 (see gk_resolve).
+#define GK_USER_CS 0x2b
 
 // ---- gk control data ---------------------------------------------------------
 // Everything gk trusts to enforce isolation -- the page-table allocator's
@@ -329,6 +338,29 @@ typedef struct {
 } gk_signal_field;
 _Static_assert(GK_SIGNAL_FIELDS <= (1 << GK_HOST_SLOT_INDEX_BITS), "a field index must fit a handle");
 
+// The ring-0 resolve table (see gk_resolve in gk.h): GK_RESOLVE_SLOTS entries
+// of {pointer, generation}, read at guest ring 0 by gk_resolve_tramp
+// (gk_asm.S) and on the host by gk_resolve, written only by the host under
+// G->lock. It is a separate page-aligned object rather than a member of the
+// control block so that the trampoline can address it RIP-relative by symbol;
+// gk_init registers it GK_PROT_SUPER and maps it into the base root, which
+// every arena root shares, before the first guest entry, so the lookup never
+// takes a demand fault. An entry is live while its generation is nonzero; a
+// handle's generation is never 0. The order of the stores is what the
+// lock-free reader relies on (see gk_resolve_tramp): publish stores the
+// pointer, then the generation; retire stores a zero generation, then a NULL
+// pointer. The free list and counters are in the control block.
+typedef struct { void *ptr; uint64_t gen; } gk_resolve_entry;
+_Static_assert(sizeof(gk_resolve_entry) == 16, "gk_resolve_tramp indexes 16-byte entries");
+_Static_assert(GK_RESOLVE_SLOTS == 16384, "gk_resolve_tramp bounds the index by 16384");
+_Static_assert(GK_RESOLVE_SLOTS <= (1 << GK_HOST_SLOT_INDEX_BITS), "an entry index must fit a handle");
+__attribute__((visibility("hidden"), aligned(4096))) union {
+  gk_resolve_entry e[GK_RESOLVE_SLOTS];
+  char pad[(sizeof(gk_resolve_entry) * GK_RESOLVE_SLOTS + 0xfff) & ~(size_t)0xfff];
+} gk_resolve_table;
+#define GK_RESOLVE_START ((uintptr_t)&gk_resolve_table)
+#define GK_RESOLVE_END (GK_RESOLVE_START + sizeof gk_resolve_table)
+
 // The supervisor/refuse registry (see prot_class below). An unregistered page
 // is user-accessible, so the registry must never be too small to hold every
 // range gk wants to protect: prot_add is fatal when it is full. The capacity
@@ -487,6 +519,14 @@ struct gk_ctl {
   int signal_field_live;             // fields registered and not yet unregistered
   uint64_t signal_field_gen;         // the generation of the last registration
 
+  // The ring-0 resolve table's bookkeeping (see the resolve section): the
+  // table itself is gk_resolve_table, outside the block. Guarded by G->lock.
+  int resolve_next_free[GK_RESOLVE_SLOTS];  // free-list links, as index + 1; 0 ends the list
+  int resolve_n;                     // entries ever taken from the table
+  int resolve_free;                  // free-list head, as index + 1; 0 when empty
+  int resolve_live;                  // entries registered and not yet unregistered
+  uint64_t resolve_gen;              // the generation of the last registration
+
   // The turn-directory policy (see gk_confine_paths in gk.h): when set,
   // forward_syscall confines every thread's path syscalls to its turn
   // directory. path_refusals counts the syscalls the policy refused.
@@ -540,6 +580,7 @@ static void arena_thp_advise(uintptr_t s, uintptr_t e);  // see the arenas secti
 // Trampolines and exception handlers (gk_asm.S), in this binary's mapped text.
 extern void gk_syscall_tramp(void);
 extern void gk_syscall_tramp_resume(void);
+extern void gk_resolve_tramp(void);
 extern void gk_user_syscall_resume(void);
 extern void gk_user_launch(void);
 extern void gk_launch_cr3(void);
@@ -2243,6 +2284,7 @@ static int map_handler_text(void) {
   uintptr_t hs[] = {
       (uintptr_t)&gk_exc_de, (uintptr_t)&gk_exc_ud, (uintptr_t)&gk_exc_df,
       (uintptr_t)&gk_exc_gp, (uintptr_t)&gk_exc_pf, (uintptr_t)&gk_syscall_tramp,
+      (uintptr_t)&gk_resolve_tramp,
       (uintptr_t)&gk_exit_tramp, (uintptr_t)&gk_pkru_stub, (uintptr_t)&gk_flush_stub,
       (uintptr_t)&gk_flush_stub_invpcid, (uintptr_t)gk_invpcid_desc,
       (uintptr_t)&gk_user_syscall_resume, (uintptr_t)&gk_user_launch,
@@ -2415,6 +2457,8 @@ int gk_init(void) {
   G->pml4_gen = 1;
   G->rand_state = 0x9e3779b9u;
   prot_add(GK_CTL_START, GK_CTL_END, GK_PROT_SUPER);
+  // The resolve table too: ring 0 reads it inside the guest, ring 3 must fault.
+  prot_add(GK_RESOLVE_START, GK_RESOLVE_END, GK_PROT_SUPER);
   G->dbg = getenv("GK_DEBUG") != NULL;
   G->thp = getenv("GK_NO_THP") == NULL;
   *(void **)&G->tls_static_info = dlsym(RTLD_DEFAULT, "_dl_get_tls_static_info");
@@ -2477,6 +2521,10 @@ int gk_init(void) {
   // GDT/IDT and the handler text must be present before the first fault.
   if (mmu_map_range(G->gdt_va, G->gdt_va + 0x2000, 1 | 2) < 0) { G->err = "map gdt/idt"; return -1; }
   if (map_handler_text() < 0) { G->err = "map handler text"; return -1; }
+  // The resolve table is read by the trampoline at ring 0, on the caller's
+  // (ring-3) stack; mapping it now, supervisor r/w, keeps that path free of
+  // demand faults in every root.
+  if (mmu_map_range(GK_RESOLVE_START, GK_RESOLVE_END, 1 | 2) < 0) { G->err = "map resolve table"; return -1; }
 
   GK_CPUID->nent = GK_CPUID_ENTRIES;
   if (ioctl(G->kvm, KVM_GET_SUPPORTED_CPUID, GK_CPUID) < 0) { G->err = "GET_SUPPORTED_CPUID"; return -1; }
@@ -2546,6 +2594,7 @@ unsigned long gk_debug_ctl_addr(int which) {
     case GK_CTL_HOST_SLOTS: return (unsigned long)&G->host_slots[0];
     case GK_CTL_HOSTCALLS: return (unsigned long)&G->hostcalls[0];
     case GK_CTL_SIGNAL_FIELDS: return (unsigned long)&G->signal_fields[0];
+    case GK_CTL_RESOLVE: return (unsigned long)&gk_resolve_table.e[0];
     case GK_CTL_THREAD_WORDS: {
 #ifdef GK_NEG_THREAD_WORDS
       return (unsigned long)&neg_words[0];
@@ -2556,6 +2605,36 @@ unsigned long gk_debug_ctl_addr(int which) {
     }
     default: return 0;
   }
+}
+
+long gk_debug_vcpu_stat(const char *name) {
+#ifdef KVM_GET_STATS_FD
+  gk_thread *t = thread_cur();
+  if (!t || !t->inited) return -1;
+  int fd = ioctl(t->fd, KVM_GET_STATS_FD, NULL);
+  if (fd < 0) return -1;
+  long v = -1;
+  struct kvm_stats_header hdr;
+  // One descriptor at a time into a fixed buffer: the path allocates nothing.
+  union { struct kvm_stats_desc d; char raw[sizeof(struct kvm_stats_desc) + 256]; } desc;
+  if (pread(fd, &hdr, sizeof hdr, 0) == (ssize_t)sizeof hdr && hdr.name_size <= 256) {
+    size_t dsz = sizeof(struct kvm_stats_desc) + hdr.name_size;
+    for (uint32_t i = 0; i < hdr.num_desc; i++) {
+      if (pread(fd, &desc, dsz, hdr.desc_offset + i * dsz) != (ssize_t)dsz) break;
+      desc.raw[dsz - 1] = 0;
+      if (strcmp(desc.d.name, name) != 0) continue;
+      uint64_t val;
+      if (pread(fd, &val, sizeof val, hdr.data_offset + desc.d.offset) == (ssize_t)sizeof val)
+        v = (long)val;
+      break;
+    }
+  }
+  close(fd);
+  return v;
+#else
+  (void)name;
+  return -1;
+#endif
 }
 
 // ---- vCPU registers ---------------------------------------------------------
@@ -2955,6 +3034,102 @@ long gk_hostcall(unsigned idx) {
   gk_thread *t = thread_get();
   if (!t) return -GK_ENOMEM;
   return hostcall_dispatch(t, idx);
+}
+
+// ---- ring-0 resolve ------------------------------------------------------------
+// The host side of the resolve table (see gk_resolve in gk.h and
+// gk_resolve_tramp in gk_asm.S): registration and unregistration under
+// G->lock, and the direct lookup that gk_resolve takes when the caller is not
+// at guest ring 3. The lookup is the trampoline's, in C: the same bounds
+// check, the same generation read on both sides of the pointer, nothing read
+// through the handle, no lock, no write, no allocation (it runs under the
+// allocation guard so the guard build checks the last).
+
+static void *resolve_lookup(gk_resolve_handle h) {
+  uint64_t idx = h & ((1ULL << GK_HOST_SLOT_INDEX_BITS) - 1), gen = h >> GK_HOST_SLOT_INDEX_BITS;
+  if (gen == 0 || idx >= (uint64_t)GK_RESOLVE_SLOTS) return NULL;
+  gk_resolve_entry *e = &gk_resolve_table.e[idx];
+  // Acquire loads: the compiler may not reorder them, and the CPU keeps loads
+  // in order, which is what makes the generation on both sides of the pointer
+  // a check that the pointer was the entry's under that generation.
+  uint64_t g1 = __atomic_load_n(&e->gen, __ATOMIC_ACQUIRE);
+  void *p = __atomic_load_n(&e->ptr, __ATOMIC_ACQUIRE);
+  uint64_t g2 = __atomic_load_n(&e->gen, __ATOMIC_ACQUIRE);
+#ifdef GK_NEG_RESOLVE
+  (void)g1; (void)g2; (void)gen;
+  return p;
+#else
+  return (g1 == gen && g2 == gen) ? p : NULL;
+#endif
+}
+
+gk_resolve_handle gk_resolve_register(void *ptr) {
+  if (!ptr || !G->initialized) return 0;
+  pthread_mutex_lock(&G->lock);
+  int idx;
+  if (G->resolve_free) {
+    idx = G->resolve_free - 1;
+    G->resolve_free = G->resolve_next_free[idx];
+  } else if (G->resolve_n < GK_RESOLVE_SLOTS) {
+    idx = G->resolve_n++;
+  } else {
+    pthread_mutex_unlock(&G->lock);
+    return 0;  // the table is full: reported, never fatal
+  }
+  // A generation is never 0 and never reused: the counter has 48 bits.
+  uint64_t gen = ++G->resolve_gen;
+  if (gen >> GK_HOST_SLOT_GEN_BITS) gen = G->resolve_gen = 1;
+  gk_resolve_entry *e = &gk_resolve_table.e[idx];
+  // Publish: the pointer first, the generation last (see gk_resolve_tramp).
+  __atomic_store_n(&e->ptr, ptr, __ATOMIC_RELEASE);
+  __atomic_store_n(&e->gen, gen, __ATOMIC_RELEASE);
+  G->resolve_live++;
+  pthread_mutex_unlock(&G->lock);
+  return (gen << GK_HOST_SLOT_INDEX_BITS) | (uint64_t)idx;
+}
+
+int gk_resolve_unregister(gk_resolve_handle h) {
+  uint64_t idx = h & ((1ULL << GK_HOST_SLOT_INDEX_BITS) - 1), gen = h >> GK_HOST_SLOT_INDEX_BITS;
+  pthread_mutex_lock(&G->lock);
+  gk_resolve_entry *e = idx < (uint64_t)GK_RESOLVE_SLOTS ? &gk_resolve_table.e[idx] : NULL;
+  if (!e || gen == 0 || e->gen != gen) {
+    pthread_mutex_unlock(&G->lock);
+    if (h)
+      fprintf(stderr, "[gk] gk_resolve_unregister: %#llx is not the handle of a live resolve "
+              "entry; nothing is unregistered\n", (unsigned long long)h);
+    return -GK_EINVAL;
+  }
+  // Retire: the generation first, so a lookup in flight fails its second
+  // read, then the pointer (see gk_resolve_tramp).
+  __atomic_store_n(&e->gen, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&e->ptr, NULL, __ATOMIC_RELEASE);
+  G->resolve_next_free[idx] = G->resolve_free;
+  G->resolve_free = (int)idx + 1;
+  G->resolve_live--;
+  pthread_mutex_unlock(&G->lock);
+  return 0;
+}
+
+void *gk_resolve(gk_resolve_handle h) {
+  // The caller's ring, from CS: at guest ring 3 the selector is the one
+  // SYSRET loads, and the lookup is the trap. At guest ring 0 (CS 0x08) and on
+  // the host (the kernel's user selector) the table is read directly. Nothing
+  // in memory decides this, so there is nothing to rewrite.
+  unsigned short cs;
+  __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
+  if (cs == GK_USER_CS) {
+    void *p;
+    uint64_t rdi = h;
+    __asm__ __volatile__("syscall"
+                         : "=a"(p), "+D"(rdi)
+                         : "a"((long)GK_RESOLVE_SYSCALL)
+                         : "rcx", "r11", "rsi", "rdx", "cc");
+    return p;
+  }
+  GK_HANDLER_ENTER();
+  void *p = resolve_lookup(h);
+  GK_HANDLER_LEAVE();
+  return p;
 }
 
 // ---- signal fields -----------------------------------------------------------
@@ -4714,6 +4889,7 @@ void gk_get_stats(gk_stats *s) {
   s->hostcall_handlers = G->hostcall_n;
   s->hostcalls = atomic_load_explicit(&G->hostcall_calls, memory_order_relaxed);
   s->signal_fields = G->signal_field_live;
+  s->resolve_entries = G->resolve_live;
   s->path_refusals = atomic_load_explicit(&G->path_refusals, memory_order_relaxed);
   pthread_mutex_unlock(&G->lock);
 }

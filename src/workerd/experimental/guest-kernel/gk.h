@@ -134,6 +134,7 @@ enum {
   GK_CTL_HOST_SLOTS,     // the host slot table
   GK_CTL_HOSTCALLS,      // the hostcall handler table
   GK_CTL_SIGNAL_FIELDS,  // the signal field table
+  GK_CTL_RESOLVE,        // the ring-0 resolve table
   GK_CTL_THREAD_WORDS,   // the calling thread's thread words (0 if it has no record)
   GK_CTL_COUNT
 };
@@ -239,6 +240,7 @@ typedef struct {
   int hostcall_handlers;  // hostcall indices with a handler registered (see gk_hostcall_register)
   long hostcalls;         // hostcalls that reached a handler, from either side
   int signal_fields;  // signal fields registered and not yet unregistered (see gk_signal_field_register)
+  int resolve_entries;  // ring-0 resolve entries registered and not yet unregistered (see gk_resolve_register)
   long
       path_refusals;  // forwarded path syscalls the turn-directory policy refused (see gk_confine_paths)
 } gk_stats;
@@ -455,6 +457,96 @@ gk_hostcall_frame *gk_hostcall_region(void);
 // inside the guest; a direct call on the host side.
 long gk_hostcall(unsigned idx);
 
+// Ring-0 resolve: a handle-to-pointer lookup that ring-3 guest code makes
+// against a table in supervisor memory, served at ring 0 inside the guest,
+// without a VM exit. It is the crossing for an operation a turn makes often --
+// resolving the handle an isolate-side object holds for a host object, on
+// every dereference -- where the hostcall's exit (a few microseconds) is out
+// of the question and the answer cannot come from memory the guest can
+// write, since a table ring 3 can read is a table ring 3 can rewrite.
+//
+// The mechanism. The guest issues a syscall with the reserved number
+// GK_RESOLVE_SYSCALL and the handle in RDI. SYSCALL lands in gk's trampoline
+// at ring 0, which recognizes the number before the hypercall that would
+// leave the VM, looks the handle up in the table, and SYSRETs straight back
+// to ring 3 with the pointer, or 0, in RAX. The whole path is a few dozen
+// instructions of gk's own handler text, touching no stack and no memory but
+// the table, and runs at guest ring 0 with the VM never exited: the round
+// trip is about 19 ns on the test machine, against 6.4 us for a hostcall
+// (measured by resolve_check in gk_test.c, which also proves the no-exit
+// claim from KVM's own per-vCPU exit counter). The operation is fixed, not a
+// handler the embedder registers: embedder code run at guest ring 0 would
+// need its data mapped supervisor, where any ring-0 code the guest reaches
+// could read it, so the only thing that runs at ring 0 is gk's lookup, and
+// the set of operations is this one. gk_resolve is the call: at guest ring 3
+// it is the trap; at guest ring 0 and on the host side it reads the table
+// directly, with the same validation. Which path is taken is decided from
+// the CS register -- the ring-3 code selector gk's GDT hands out is the only
+// one that traps -- not from any value in memory, so there is nothing for
+// the guest to rewrite and no privilege the trap could confer on a caller
+// that already has ring 0 (a ring-0 caller issuing the syscall directly,
+// bypassing gk_resolve, would be returned to ring 3, which is a trusted
+// caller's own doing).
+//
+// The table. GK_RESOLVE_SLOTS entries of {pointer, generation}, fixed; the
+// table is gk's own, registered GK_PROT_SUPER: mapped with U clear in every
+// root, so the trampoline reaches it at ring 0 and a ring-3 access faults.
+// SUPER is a weaker class than the GK_PROT_REFUSE that host memory
+// (gk_host_alloc) and the page tables use -- a REFUSE page is in no guest
+// root at all, while a SUPER page is readable by any ring-0 code the guest
+// can get to run -- and it is the right class here because the lookup has to
+// run inside the guest, at ring 0, which REFUSE memory cannot serve by
+// definition; it is the first SUPER tenant outside gk's own control block,
+// and what it holds is pointers, which name host objects but are not the
+// objects. The host-memory facilities stay on REFUSE. The handle is the
+// slot's index in its low 16 bits and the generation the slot was registered
+// with above them, and it is validated like a host slot handle: the index is
+// bounds-checked against the table, the entry must be live, and its
+// generation must be the handle's, so a handle to an unregistered entry
+// resolves to nothing even after the slot has been reused -- every
+// registration takes a fresh generation from a counter that does not repeat
+// within 2^48 registrations. Nothing is read through the handle itself, at
+// either ring: a value gk did not issue (a pointer, a stale handle, random
+// bits) resolves to nothing. The lookup takes no lock and writes nothing;
+// against a registration or unregistration in progress on another thread it
+// reads the generation on both sides of the pointer and answers only if both
+// agree, so the pointer it returns was the entry's under that generation.
+//
+// gk_resolve_register places `ptr` in a free slot and returns its handle, or
+// 0 when the table is full (exhaustion is a refusal, never fatal), for a NULL
+// pointer, or before gk_init has succeeded; 0 is never a valid handle.
+// gk_resolve_unregister retires the slot: the handle resolves to nothing from
+// then on, and the slot is free for a later registration under a new
+// generation. A handle that fails validation unregisters nothing, is
+// reported on stderr (as a host slot handle is) and returns -EINVAL. Both are
+// host-side: they take gk's lock, and a call at ring 3 faults on the table.
+// gk_resolve resolves a handle to its pointer, or to NULL, from any ring and
+// from the host, and allocates nothing on any path; the GK_GUARD_HANDLER_ALLOC
+// build checks the host-side path, and the ring-0 path is asm with no call in
+// it. The pointer it returns names a host object the caller is about to use;
+// it is for immediate use, resolved again for each use, and never stored
+// where the guest can write it.
+//
+// What this does not give. Ring 3 can resolve as often as it likes, with any
+// handle it likes, and the only thing it learns is the pointer behind a live
+// handle it holds -- a pointer it could not dereference anyway if the object
+// is in host memory, and which the owner must therefore still protect as an
+// address: the lookup makes a handle safe to keep in guest memory, it does not
+// make the object safe to reach from there. The operation must be safe for
+// arbitrary input, and is: it reads the table and nothing else. And a handle
+// rewritten to another live entry's names that entry, which the table cannot
+// tell from a legitimate use -- the ownership residual that gk_arena_enter and
+// the host slot table carry too (see the README's limitations). Nor does the
+// table know what it points at: an object unregistered and freed while a
+// resolve of its handle is in flight on another thread is the owner's race to
+// avoid, as it is for every lock-free table; in the runtime the entries of an
+// isolate's objects change only on the thread that holds its lock.
+#define GK_RESOLVE_SLOTS 16384
+typedef uint64_t gk_resolve_handle;
+gk_resolve_handle gk_resolve_register(void *ptr);
+int gk_resolve_unregister(gk_resolve_handle handle);
+void *gk_resolve(gk_resolve_handle handle);
+
 // Signal fields: 4-byte words inside an arena that the host writes from a
 // signal handler, found through a table in gk's supervisor memory rather than
 // through anything the guest can write.
@@ -630,6 +722,15 @@ int gk_turn_dir_set(int dirfd);
 
 // Nonzero once gk_init has succeeded in this process.
 int gk_initialized(void);
+
+// Test/diagnostic: the value of the named per-vCPU statistic of the calling
+// thread's vCPU, read from KVM's own statistics file (KVM_GET_STATS_FD), or
+// -1 if the thread has no vCPU, the kernel does not export the statistic, or
+// the file cannot be read. "exits" counts every VM exit the vCPU has taken,
+// including the ones the kernel services without returning to gk (nested
+// page faults, host interrupts), so a run whose "exits" did not move provably
+// stayed inside the guest. Host-side; allocates nothing.
+long gk_debug_vcpu_stat(const char *name);
 
 // Test/diagnostic: drop the guest PTE for the page holding `addr` from every
 // root, flushing no TLB. A vCPU that holds a translation of the page in its TLB

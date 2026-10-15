@@ -32,8 +32,11 @@ and ring 3 faults), and state only the host proper touches is
 `GK_PROT_REFUSE`, never mapped into any guest root at all. Both are how gk
 already protects its own control state; see `prot_add` in `gk.c`. REFUSE is
 the default, since a SUPER range is reachable by any ring-0 code the guest
-can get to run, and there is no in-guest ring-0 helper yet that would need
-SUPER. What backs H today is `gk_host_alloc` (`gk.h`): regions mapped by the
+can get to run; the one SUPER tenant outside gk's control block is the ring-0
+resolve table (`gk_resolve` in `gk.h`), the handle-to-pointer lookup a ring-3
+turn makes on every dereference of a host object, which has to be served
+inside the guest and so cannot be REFUSE, and which holds pointers rather
+than the objects they name. What backs H today is `gk_host_alloc` (`gk.h`): regions mapped by the
 host and registered REFUSE once each, suballocated by size class, so the
 fixed-size protection registry is spent per region rather than per object.
 `util/host-memory.h` wraps it for C++: `hostOwned<T>(...)` constructs a `T`
@@ -121,7 +124,11 @@ running disposers inside the arena.
 This is what `IoOwn` and `DeleteQueue` (`src/workerd/io/io-own.h`) already do
 in spirit -- make a JS-heap reference to a KJ I/O object safe across context
 teardown -- with the ownership and the validity check moved to the side the
-guest cannot write.
+guest cannot write. The lookup itself is `gk_resolve` (`gk.h`): the handle
+goes into a table in supervisor memory that validates index, liveness and
+generation, and a ring-3 turn resolves it through a ring 3 to ring 0 trap
+inside the guest, with no VM exit, so the check costs a dereference tens of
+nanoseconds rather than microseconds (see Cost).
 
 **A returned object becomes a message.** A turn that produces a value for the
 host writes it into the boundary region in a form with no pointers and no
@@ -210,16 +217,37 @@ through an integer.
 ## Cost
 
 The classification implies a crossing wherever a turn reaches H state today.
-The crossing that exists is the hostcall, a VM exit: **6.4 us per round trip,
+Two crossings exist. The hostcall is a VM exit: **6.4 us per round trip,
 measured** (`hostcall_check` in `gk_test.c`), which is affordable for an
 operation a turn makes a few times (an actor id) and not for the bulk of its
-crossings. For those the crossing should be a ring 3 to ring 0 transition
-inside the guest, not an exit: **22 ns, measured, 212 times cheaper than the
-4.75 us of an exit** (see `m10_ringtrap` in the benchmark suite). At the ~43
-crossings a hello turn takes that is about 1 us, roughly 1% of the request.
-The explicit trap is 9.5 times cheaper than servicing a demand fault, so that
-interface should be a call into ring 0 rather than fault-and-service; a
-ring-0 helper is what would need the SUPER class of H memory.
+crossings. The ring-0 resolve (`gk_resolve`) is a ring 3 to ring 0 transition
+inside the guest, not an exit: **18.8 ns per round trip, measured**
+(`resolve_check` in `gk_test.c`, which proves from KVM's per-vCPU exit
+counter that the resolves ran with no exit), 340 times cheaper than the
+hostcall and in line with the 22 ns the bare trap measured in the benchmark
+suite (`m10_ringtrap`), where the explicit trap was also 9.5 times cheaper
+than servicing a demand fault, which is why the interface is a call into
+ring 0 rather than fault-and-service. It is the one in-guest ring-0 helper,
+and its table is the one tenant of the SUPER class of H memory.
+
+What the resolve is for is the `IoOwn`/`IoPtr` dereference, and how many a
+turn makes decides whether resolving each one is affordable. Counted with an
+atomic counter in each `operator->` and a per-turn log line around
+`runJsTurn`, over 1000 requests each, on the Zen 5 test machine: a
+hello-world request is one turn with **6 `IoOwn` dereferences** and no
+`IoPtr`; the Wasm/WebCrypto/irregexp surface worker (`surface-test.capnp`)
+and a request that instantiates 1000 Wasm modules are also 6 each; a SQLite
+Durable Object `/get` through a service binding (`disk-sqlite-test.capnp`)
+is 3 turns with 15 `IoOwn` and 1 `IoPtr`, and a `/put` 4 turns with 25 and
+2. `ReverseIoOwn` is never dereferenced in a turn. At 18.8 ns each that is
+0.1 to 0.5 us per request, against a hello-world request latency of about
+620 us under the guest kernel (p50 over one connection on the same machine):
+the conversion is viable on cost, and the dereference is not where a turn's
+time goes. (The ~43 foreign accesses a
+hello turn makes, measured by `GK_TRACE_FOREIGN`, are mostly the allocator's
+global state, which per-isolate heap arenas remove rather than convert into
+crossings, so that count is an upper bound the placement work reduces
+first.)
 
 Most of the foreign accesses a hello turn makes -- roughly seven in ten of
 the recorded hits -- are to the allocator's global state, which per-isolate
@@ -260,7 +288,7 @@ The splits, with the half each member goes to:
 |---|---|
 | `IoContext` (`io-context.h:277`) | H keeps the event-loop state: `tasks`/`waitUntilTasks` (`:1235`, `:1245`), `abortFulfiller`/`abortPromise` (`:1210`), `canceler` (`:1250`), `ownedObjects` (`:1221`), `localCapSet` (`:1187`), `thread` (`:1172`), `limitEnforcer` (`:1180`). I gets a mirror: the `Id`, the JsRefs (`:1269`), the invocation span context, the policy constants, and the handle tables. `IoContext::current()` becomes a read of the mirror through a slot the host writes before each turn |
 | `IoContext::Runnable`/`RunnableImpl` (`:1272`, `:1450`) | Becomes a B message `{closure handle, input descriptors, result slot}`. This is where the non-void result problem lives |
-| `IoOwn`/`IoPtr`/`ReverseIoOwn` (`io-own.h:245`, `:290`, `:322`) | I side becomes `{context slot, object index}`; `operator->` is deleted for an H `T`, so every use becomes a message keyed by the handle. H keeps `OwnedObjectList`, split by `T`: it owns H objects outright and holds an arena handle for I ones (the functors from `addFunctor`, the `SpanBuilder` tuple at `:629`) |
+| `IoOwn`/`IoPtr`/`ReverseIoOwn` (`io-own.h:245`, `:290`, `:322`) | I side becomes `{context slot, object index}`; `operator->` is deleted for an H `T`, so every use becomes a message keyed by the handle. H keeps `OwnedObjectList`, split by `T`: it owns H objects outright and holds an arena handle for I ones (the functors from `addFunctor`, the `SpanBuilder` tuple at `:629`). The crossing for the index is `gk_resolve` (see Cost); the conversion is not done |
 | `DeleteQueue` (`io-own.h:89`) | `State::queue`/`actions` become a B ring of `{release handle}` and `{closure handle}` records, so `~IoOwn` stops taking a host mutex from inside the arena during GC (`io-own.c++:15`). The cross-thread wakeup stays H |
 | `jsg::Lock` (`jsg.h:2746`) | H: the `v8::Locker` and `GuestArenaScope`. I: `v8Isolate`, `isolateScope`, `warningsLogged` and the wrap/alloc methods. The lock slot `Lock::from` reads is neither: it is written by the host and put back from the host frame that entered the guest (violation 1, closed). The object itself is still one heap allocation holding both halves (`server/workerd-api.c++:305`), reached from the stack `Worker::Lock` through its heap `Impl` |
 | `jsg::IsolateBase` (`setup.h:244`) | I: `ptr`, the behaviour flags, `typeHandlerRegistry`, the V8 global templates, `heapTracer`. H: `v8System`, `observer`, the external-memory target. B: the deferred-destruction queue becomes a ring of `{kind, handle}` records rather than `kj::OneOf<GlobalToDelete, RefToDelete, kj::Own<void>>` (`setup.h:584`), and `codeMap` (`:739`) becomes a B array of `{start, size, name offset}` the host signal handler bounds-checks |
@@ -625,7 +653,7 @@ constantly, and most of them cannot be given a class as they stand.
 
 | Type | Why it resists classification | Minimum change |
 |---|---|---|
-| `kj::Own<T>` | A disposer pointer plus an object pointer. Across the boundary the disposer is an attacker-controlled indirect call. `IoOwn<T>` is worse: a raw pointer into host memory plus a refcount on a host `AtomicRefcounted` (`io-own.h:278`, `:89`) | `IoOwn::item` becomes an index into a per-isolate list the host bounds- and owner-checks; `deleteQueue` becomes an arena id rather than an `Arc`. I-internal owns should use a disposer baked into the type so no disposer pointer exists in guest memory |
+| `kj::Own<T>` | A disposer pointer plus an object pointer. Across the boundary the disposer is an attacker-controlled indirect call. `IoOwn<T>` is worse: a raw pointer into host memory plus a refcount on a host `AtomicRefcounted` (`io-own.h:278`, `:89`) | `IoOwn::item` becomes a `gk_resolve` handle, validated at ring 0 inside the guest on every dereference (bounds, liveness, generation; see Cost); `deleteQueue` becomes an arena id rather than an `Arc`. I-internal owns should use a disposer baked into the type so no disposer pointer exists in guest memory |
 | `kj::Promise<T>` and its nodes | One heap object owned by the host `kj::TaskSet` (`io-context.h:1245`), carrying a vtable and event-loop queue links the guest wrote, and embedding guest state (a `jsg::Promise::Resolver`) the host must not touch | The turn emits a request record into B; the host builds the real promise on its side; on completion it writes `{resolver handle, result or exception record}` into B and schedules a turn. The body of the `run(...)` lambda at `io-context.h:1593` already does only that |
 | `kj::Exception` | Owns strings with their own disposers, a context chain and a details array | B after a copy -- it is only data. `GuestTurnOutcome::setException` (`guest-run.c++:78`) already does this for the turn's own outcome; generalize it to carry the detail list, since the ids in `util/exception.h:4` are load-bearing for `decodeTunneledException`, and use it for every rejection that crosses |
 | `kj::String`, `kj::Array<T>` | Pointer, size, and a disposer with a virtual `disposeImpl`. Worse, `jsg::asBytes` returns an `Array` aliasing a V8 backing store (`jsg/util.c++:655`), i.e. arena memory, which is then handed to host network code (`server.c++:4393`) | A B descriptor `{offset, length}` over copied bytes, or for large bodies a host-side read-only mapping of the arena range for the duration of the write |
@@ -667,8 +695,23 @@ the design work actually is.
 A reasonable order: redirect the already-copying boundaries into B; make
 placement per-site so the arena stops capturing H data; convert `IoOwn` to a
 handle, which retires the largest single family of raw cross-boundary
-pointers; then the promise channel, which retires the `IoContext::run` result
+pointers and whose crossing, `gk_resolve`, now exists and is priced (see
+Cost); then the promise channel, which retires the `IoContext::run` result
 problem and the event-loop touches together.
+
+What the `IoOwn` conversion still needs, given the crossing. `IoOwn<T>` is
+`{kj::Arc<DeleteQueue>, SpecificOwnedObject<T>*}` (`io-own.h:278`): the
+pointer becomes a `gk_resolve_handle` that `IoContext::addObject` registers
+and `OwnedObjectList::unlink` unregisters, with `operator->` calling
+`gk_resolve` and throwing on NULL where `checkFarGet` throws today; the
+`Arc<DeleteQueue>` is the harder half, since it is a refcount on a host
+object that the arena's GC touches (violation 4), and it becomes an id the
+host validates. The table is process-wide with 16384 entries and one
+generation counter, so a per-isolate list on top of it, or a larger table
+keyed by context, is a sizing decision to make from the live `IoOwn` count
+of a loaded process. And resolving names a host object that must then be
+safe to reach: the `T`s behind `IoOwn` are H by rule C, and until they are
+placed in H memory the resolve protects the handle, not the object.
 
 ## What is in H memory
 
@@ -703,6 +746,11 @@ what is waiting on the same facility:
   cases below need: the handler finds its state through gk's per-thread
   supervisor record -- the thread's record by kernel tid, the arena from the
   record -- and never through a thread-local.
+- **In gk's supervisor memory, mapped SUPER rather than REFUSE:** the ring-0
+  resolve table (`gk_resolve_table` in `gk.c`), the one table a ring-3 turn
+  reads through a ring-0 trap inside the guest rather than through the host;
+  it holds pointers to host objects, named by validated handles, and has no
+  runtime tenant yet (see Cost for the `IoOwn` case it exists for).
 - **In gk's supervisor memory, found by thread:** the watchdog progress
   counter's state (`thread-scopes.c++:27`), in gk's per-thread supervisor
   words (`gk_thread_words_*`), read by the watchdog signal handler through

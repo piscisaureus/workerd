@@ -105,6 +105,11 @@ int   gk_hostcall_register(unsigned idx, gk_hostcall_fn, void *ctx); // a host h
 gk_hostcall_frame *gk_hostcall_region(void); // the thread's exchange frame: args in, result out
 long  gk_hostcall(unsigned idx);             // call handler idx synchronously (one VM exit)
 
+gk_resolve_handle gk_resolve_register(void *ptr); // a pointer named by a handle, in gk's supervisor table
+int   gk_resolve_unregister(gk_resolve_handle);
+void *gk_resolve(gk_resolve_handle);         // handle -> pointer or NULL; at ring 3 a ring-0 trap
+                                             // inside the guest, no VM exit (about 19 ns)
+
 int   gk_signal_field_register(uintptr_t off, size_t len, uint32_t field, unsigned kind,
                                gk_signal_handle *h); // a word in the thread's arena a signal handler may write
 int   gk_signal_field_unregister(gk_signal_handle);
@@ -287,6 +292,68 @@ hardware:
   every handler is an attack surface that validates its own inputs, and a
   handle swapped for another live tenant's is one it cannot tell from the
   owner's own.
+- **Ring-0 resolve.** The hostcall's exit prices it out of anything a turn
+  does often, and the next crossing the runtime needs is exactly that: an
+  isolate-side object that holds a host object by handle, and resolves the
+  handle on every dereference, as `IoOwn` would once it stops holding a raw
+  pointer. The answer cannot come from memory the guest can write, since a
+  table ring 3 can read is a table ring 3 can rewrite, so it comes from a
+  table in supervisor memory, read at ring 0 inside the guest. `gk_resolve`
+  is that crossing: at guest ring 3 it issues a reserved syscall number with
+  the handle in `RDI`, and gk's SYSCALL trampoline, in the guest at ring 0,
+  recognizes the number before the hypercall that would leave the VM, looks
+  the handle up in `gk_resolve_table` and SYSRETs back with the pointer, or
+  0, in `RAX`: a few dozen instructions of gk's own handler text, touching
+  no stack and nothing but the table, with the VM never exited. Which path a
+  caller takes comes from its CS selector -- only the ring-3 code selector
+  gk's GDT hands out traps; guest ring 0 and the host read the table
+  directly, with the same validation -- so nothing in memory decides it. The
+  operation is fixed rather than a registered handler, because embedder code
+  at guest ring 0 would need its data mapped supervisor, where any ring-0
+  code the guest reaches could read it: the only thing that runs at ring 0 is
+  gk's lookup. The table is `GK_RESOLVE_SLOTS` (16384) entries of `{pointer,
+  generation}`, registered `GK_PROT_SUPER` -- a weaker class than the
+  `GK_PROT_REFUSE` of host memory and the page tables, since a SUPER page is
+  in every root with `U` clear while a REFUSE page is in none, and the right
+  one here because the lookup has to run inside the guest; host memory stays
+  on REFUSE -- and a handle is validated as a host slot handle is: index
+  bounds-checked, entry live, generation the handle's, so a handle to an
+  unregistered or recycled entry resolves to nothing and nothing is ever
+  read through the handle's own value. The lookup takes no lock and writes
+  nothing: it reads the generation on both sides of the pointer and answers
+  only if both match, and the host publishes an entry pointer-first and
+  retires it generation-first, so a pointer seen between two matching reads
+  was the entry's under that generation. Exhaustion is a registration
+  refused with 0, never fatal. The test registers an entry and resolves it
+  from ring 3 on both kinds of stack, from ring 0 and from the host; feeds
+  the lookup a zero handle, an index at and past capacity, generations never
+  issued, a slot never taken, the pointer itself, a heap address, a
+  `PROT_NONE` page's address and all-ones, and gets nothing each time with
+  the caller's memory untouched; shows a ring-3 read and write of the table
+  faulting at the table; unregisters and recycles the slot and shows the old
+  handle still resolving to nothing; fills the table to capacity, sees the
+  next registration refused and every entry resolve to its own pointer from
+  ring 3, and empties it; and times the round trip in sub-runs of 8000
+  ring-3 resolves, each bracketed by a read of KVM's own per-vCPU `exits`
+  counter (`KVM_GET_STATS_FD`, which counts the exits the kernel services
+  without returning to gk): a kept sub-run is one whose counter moved by
+  exactly the one exit that ends the turn, so its 8000 resolves provably
+  stayed inside the guest, and the sub-runs that moved by more were host
+  timer interrupts (`irq_exits`) and are discarded. **18.8 ns per resolve**
+  on the test machine, the median over kept sub-runs with the empty turn's
+  cost subtracted, against 6.4 us for a hostcall: 340 times cheaper. A
+  negative build (`GK_NEG_RESOLVE`, in `gk_test_neg`) removes the generation
+  check and the case fails on the never-issued generations and the recycled
+  slot. The guard build runs the host-side path with allocation forbidden;
+  the ring-0 path is asm with no call in it. What it does not give: ring 3
+  can resolve as often as it likes with any handle, and learns only the
+  pointer behind a live handle it holds, which the lookup makes safe to keep
+  in guest memory but does not make safe to reach from there -- the object's
+  own placement does that -- and a handle rewritten to another live entry's
+  names that entry, the ownership residual the arena and host slot facilities
+  carry too. Nothing in workerd uses it yet; `IoOwn` is the intended first
+  user (see `memory-classes.md`, Cost, for what a turn's dereference count
+  implies).
 - **Signal fields.** A runtime that tells a Wasm module its CPU budget is
   nearly spent does so by writing a constant into the module's linear memory
   from the handler of a per-thread CPU timer, while the turn runs. The
@@ -522,7 +589,9 @@ trip costs about 4.7 microseconds and a hostcall round trip about 6.4 (the
 exit plus the exchange-frame copies and the handler). The switch is roughly
 two orders of magnitude cheaper than an exit, so batching the dominant
 syscalls is what decides the overall cost, and a hostcall is for an operation
-rare enough to pay for an exit each time.
+rare enough to pay for an exit each time. A ring-0 resolve (`gk_resolve`),
+which stays inside the guest, costs about 19 ns on the Zen 5 test machine,
+so a crossing a turn makes on every dereference belongs on that path.
 
 ## Limitations (remaining work)
 

@@ -2382,6 +2382,256 @@ static int hostcall_check(void) {
   return ok;
 }
 
+// ---- ring-0 resolve ------------------------------------------------------------
+// A ring-0 resolve answers a ring-3 handle lookup against gk's table in
+// supervisor memory, inside the guest, with no VM exit (see gk_resolve in
+// gk.h). Checks: a registered entry resolves from ring 3 (on both kinds of
+// stack), from ring 0 and from the host; a zero handle, an index at and past
+// capacity, generations never issued, a slot never taken, the pointer itself,
+// a heap address, a PROT_NONE page's address and all-ones each resolve to
+// nothing with nothing read through them; a handle to an unregistered entry
+// resolves to nothing, and still does once the slot is recycled under a new
+// generation; a ring-3 read and write of the table fault at the table; the
+// table fills to GK_RESOLVE_SLOTS exactly, the next registration is refused
+// with 0, every entry resolves to its own pointer, and the table empties and
+// is reusable; and the round trip is timed in sub-runs around which KVM's
+// own per-vCPU exit counter is read, so a kept sub-run is one that took
+// exactly the one exit that ends the turn, however many resolves it made.
+// The guard build runs the host-side path with allocation forbidden; the
+// ring-0 path is asm.
+
+enum { RS_N = 8000, RS_SUBRUNS = 64, RS_BAD = 13 };
+
+struct rs_probe {
+  gk_resolve_handle h, h2;   // a live handle, and the recycled slot's new one
+  gk_resolve_handle bad[RS_BAD];
+  void *r_h, *r_h2, *r_zero;
+  void *r_bad[RS_BAD];
+};
+
+// Runs in the guest (ring 3, and once at ring 0) and on the host: resolves
+// every handle in the probe.
+static long rs_guest(void *arg) {
+  struct rs_probe *p = arg;
+  p->r_h = gk_resolve(p->h);
+  p->r_h2 = gk_resolve(p->h2);
+  p->r_zero = gk_resolve(0);
+  for (int i = 0; i < RS_BAD; i++) p->r_bad[i] = gk_resolve(p->bad[i]);
+  return 0;
+}
+
+// Runs in the guest (ring 3): RS_N resolves of one live handle, counting the
+// ones that answered with the registered pointer.
+struct rs_bench { gk_resolve_handle h; void *want; };
+static long rs_bench(void *arg) {
+  struct rs_bench *b = arg;
+  long acc = 0;
+  for (int i = 0; i < RS_N; i++) acc += gk_resolve(b->h) == b->want;
+  return acc;
+}
+static long rs_empty(void *arg) { (void)arg; return 0; }
+
+// Runs in the guest (ring 3): resolves every handle of a full table and
+// returns how many did not answer with their own pointer.
+struct rs_all { gk_resolve_handle *h; void **want; int n; };
+static long rs_resolve_all(void *arg) {
+  struct rs_all *a = arg;
+  long bad = 0;
+  for (int i = 0; i < a->n; i++) bad += gk_resolve(a->h[i]) != a->want[i];
+  return bad;
+}
+
+static int cmp_double(const void *a, const void *b) {
+  double x = *(const double *)a, y = *(const double *)b;
+  return x < y ? -1 : x > y;
+}
+
+static int resolve_check(void) {
+  gk_stats s0, s1, s2, s3, s4, s5;
+  gk_get_stats(&s0);
+  static int obj, obj2;
+  int reg_bad = gk_resolve_register(NULL) == 0;
+  gk_resolve_handle h = gk_resolve_register(&obj);
+  if (!h) { printf("ring-0 resolve: gk_resolve_register failed [FAIL]\n"); return 0; }
+  gk_get_stats(&s1);
+  int resolves = gk_resolve(h) == &obj && s1.resolve_entries == s0.resolve_entries + 1;
+
+  // Handles gk did not issue. The PROT_NONE page is the check that resolution
+  // reads nothing through the caller's value, at either ring.
+  uint64_t idx = h & 0xffff, gen = h >> 16;
+  unsigned char *none = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  unsigned char *heap = malloc(64);
+  if (none == MAP_FAILED || !heap) { printf("ring-0 resolve: setup failed [FAIL]\n"); return 0; }
+  memset(heap, 0xEE, 64);
+  struct rs_probe *p = calloc(1, sizeof *p);
+  p->h = h;
+  gk_resolve_handle bad[RS_BAD] = {
+      (gen << 16) | GK_RESOLVE_SLOTS,       // index at capacity
+      (gen << 16) | 0xffff,                 // index past capacity
+      ((gen + 1) << 16) | idx,              // a generation not yet issued, same slot
+      ((gen ^ 0x100000) << 16) | idx,       // a generation never issued, same slot
+      (gen << 16) | (idx ^ 1),              // a slot never taken, with a live generation
+      (gk_resolve_handle)(uintptr_t)&obj,   // the object's own address, as a swapped pointer would be
+      (gk_resolve_handle)(uintptr_t)heap,   // a heap buffer the caller controls
+      (gk_resolve_handle)(uintptr_t)none,   // an unmapped page
+      (gk_resolve_handle)(uintptr_t)none | idx,
+      ~(gk_resolve_handle)0, 1, 0x7fff0000,
+      ((gen << 16) | idx) ^ ((gk_resolve_handle)1 << 63)};  // the live handle with its top bit flipped
+  memcpy(p->bad, bad, sizeof bad);
+
+  // From ring 3 on a private guest stack, ring 3 on the caller's stack, ring
+  // 0, and the host: the live handle resolves, everything else to nothing.
+  long ru = gk_run_user(rs_guest, p);
+  int user_ok = ru == 0 && p->r_h == &obj && p->r_zero == NULL && p->r_h2 == NULL;
+  for (int i = 0; i < RS_BAD; i++) if (p->r_bad[i] != NULL) user_ok = 0;
+  memset(p->r_bad, 0x11, sizeof p->r_bad); p->r_h = NULL;
+  long rh = gk_run_here_user(rs_guest, p);
+  int here_ok = rh == 0 && p->r_h == &obj && p->r_zero == NULL;
+  for (int i = 0; i < RS_BAD; i++) if (p->r_bad[i] != NULL) here_ok = 0;
+  memset(p->r_bad, 0x11, sizeof p->r_bad); p->r_h = NULL;
+  long r0 = gk_run(rs_guest, p);
+  int ring0_ok = r0 == 0 && p->r_h == &obj && p->r_zero == NULL;
+  for (int i = 0; i < RS_BAD; i++) if (p->r_bad[i] != NULL) ring0_ok = 0;
+  memset(p->r_bad, 0x11, sizeof p->r_bad); p->r_h = NULL;
+  long rhost = rs_guest(p);
+  int host_ok = rhost == 0 && p->r_h == &obj && p->r_zero == NULL;
+  for (int i = 0; i < RS_BAD; i++) if (p->r_bad[i] != NULL) host_ok = 0;
+  int heap_intact = 1;
+  for (int i = 0; i < 64; i++) if (heap[i] != 0xEE) heap_intact = 0;
+  gk_get_stats(&s2);
+  int garbage_ok = heap_intact && s2.resolve_entries == s1.resolve_entries;
+
+  // The table is supervisor memory: a ring-3 read and a ring-3 write fault
+  // at the table.
+  unsigned long table = gk_debug_ctl_addr(GK_CTL_RESOLVE);
+  long r3 = gk_run_user(read_byte, (void *)table);
+  unsigned long fr3 = gk_fault_addr();
+  long w3 = gk_run_user(user_write_here, (void *)table);
+  unsigned long fw3 = gk_fault_addr();
+  int walled = r3 == GK_EFAULT && fr3 == table && w3 == GK_EFAULT && fw3 == table;
+
+  // Round trip and the no-exit proof. Sub-runs of RS_N resolves from ring 3
+  // on the caller's stack (the production path), each bracketed by a read of
+  // the vCPU's exit counter. The counter moves by the one exit that ends the
+  // turn (the exit syscall); a sub-run during which it moved by more took a
+  // host interrupt or a demand fault and is discarded, so a kept sub-run
+  // provably ran its RS_N resolves with no VM exit. The empty turn's exits
+  // and time are measured the same way, and subtracted. Timing is the
+  // median over kept sub-runs.
+  struct rs_bench b = {h, &obj};
+  gk_run_here_user(rs_bench, &b);  // warm up: pages, the vCPU's TLB
+  long e_empty = -1;
+  double t_empty = 0;
+  int empty_runs = 0;
+  for (int i = 0; i < 16; i++) {
+    long e0 = gk_debug_vcpu_stat("exits");
+    double t0 = now_ns();
+    gk_run_here_user(rs_empty, NULL);
+    double t1 = now_ns();
+    long e1 = gk_debug_vcpu_stat("exits");
+    if (e0 < 0 || e1 < 0) break;
+    if (e_empty < 0 || e1 - e0 < e_empty) { e_empty = e1 - e0; t_empty = t1 - t0; empty_runs = 1; }
+    else if (e1 - e0 == e_empty) { t_empty += t1 - t0; empty_runs++; }
+  }
+  if (empty_runs) t_empty /= empty_runs;
+  static double kept_ns[RS_SUBRUNS];
+  int kept = 0, discarded = 0, wrong = 0;
+  long extra_exits = 0, irq0 = gk_debug_vcpu_stat("irq_exits");
+  for (int i = 0; i < RS_SUBRUNS; i++) {
+    long e0 = gk_debug_vcpu_stat("exits");
+    double t0 = now_ns();
+    long acc = gk_run_here_user(rs_bench, &b);
+    double t1 = now_ns();
+    long e1 = gk_debug_vcpu_stat("exits");
+    if (acc != RS_N) wrong++;
+    if (e0 >= 0 && e1 >= 0 && e1 - e0 == e_empty) kept_ns[kept++] = (t1 - t0 - t_empty) / RS_N;
+    else { discarded++; extra_exits += (e1 - e0) - e_empty; }
+  }
+  long irq_delta = gk_debug_vcpu_stat("irq_exits") - irq0;
+  qsort(kept_ns, (size_t)kept, sizeof kept_ns[0], cmp_double);
+  double per_call = kept ? kept_ns[kept / 2] : -1;
+  int bench_ok = e_empty >= 0 && kept >= RS_SUBRUNS / 4 && wrong == 0 && per_call > 0;
+
+  // Unregistered: the handle resolves to nothing from ring 3 and the host; a
+  // second unregister and the garbage handles are refused with nothing
+  // changed. Recycled: the next registration takes the slot under a new
+  // generation; the old handle still resolves to nothing from ring 3 while
+  // the new one resolves to the new object.
+  int unreg = gk_resolve_unregister(h) == 0;
+  gk_get_stats(&s3);
+  memset(p->r_bad, 0x11, sizeof p->r_bad); p->r_h = &obj;
+  long rf = gk_run_user(rs_guest, p);
+  int freed = unreg && rf == 0 && p->r_h == NULL && gk_resolve(h) == NULL &&
+              s3.resolve_entries == s0.resolve_entries && gk_resolve_unregister(h) == -EINVAL;
+  for (int i = 0; i < RS_BAD; i++) if (gk_resolve_unregister(bad[i]) != -EINVAL) freed = 0;
+  gk_get_stats(&s3);
+  freed = freed && s3.resolve_entries == s0.resolve_entries;
+  gk_resolve_handle h2 = gk_resolve_register(&obj2);
+  p->h2 = h2;
+  memset(p->r_bad, 0x11, sizeof p->r_bad); p->r_h = &obj; p->r_h2 = NULL;
+  long rr = gk_run_user(rs_guest, p);
+  int recycled = h2 != 0 && (h2 & 0xffff) == idx && h2 != h && rr == 0 && p->r_h == NULL &&
+                 p->r_h2 == &obj2 && gk_resolve(h) == NULL && gk_resolve(h2) == &obj2;
+  gk_resolve_unregister(h2);
+
+  // Capacity: the table fills to GK_RESOLVE_SLOTS exactly, the next
+  // registration reports 0, every handle resolves from ring 3 to its own
+  // pointer, and, unregistered in an order that scrambles the free list, the
+  // table empties and is reusable under a fresh generation.
+  static gk_resolve_handle all[GK_RESOLVE_SLOTS + 1];
+  static void *want[GK_RESOLVE_SLOTS + 1];
+  static char objs[GK_RESOLVE_SLOTS + 1];
+  gk_get_stats(&s3);
+  int n = 0;
+  for (; n <= GK_RESOLVE_SLOTS; n++) {
+    want[n] = &objs[n];
+    all[n] = gk_resolve_register(want[n]);
+    if (!all[n]) break;
+  }
+  gk_resolve_handle over = n <= GK_RESOLVE_SLOTS ? all[n] : gk_resolve_register(&objs[0]);
+  gk_get_stats(&s4);
+  struct rs_all ra = {all, want, n};
+  long mismatched = gk_run_user(rs_resolve_all, &ra);
+  for (int i = 0; i < n; i += 2) gk_resolve_unregister(all[i]);
+  for (int i = (n - 1) | 1; i >= 1; i -= 2) if (i < n) gk_resolve_unregister(all[i]);
+  gk_get_stats(&s5);
+  int capacity_ok = n == GK_RESOLVE_SLOTS - s3.resolve_entries && over == 0 &&
+                    s4.resolve_entries == GK_RESOLVE_SLOTS && mismatched == 0 &&
+                    s5.resolve_entries == s3.resolve_entries && gk_resolve(all[0]) == NULL &&
+                    gk_resolve(all[n - 1]) == NULL;
+  gk_resolve_handle h3 = gk_resolve_register(&obj);
+  int fresh = h3 != 0 && (h3 >> 16) > (all[n - 1] >> 16) && gk_resolve(h3) == &obj;
+  gk_resolve_unregister(h3);
+  long cpl = gk_run_user(user_cpl, NULL);  // the process survived the faults above
+
+  int ok = reg_bad && resolves && user_ok && here_ok && ring0_ok && host_ok && garbage_ok &&
+           walled && bench_ok && freed && recycled && capacity_ok && fresh && cpl == 3;
+  printf("ring-0 resolve: NULL refused %s; handle %#llx -> %p (host %s); ring 3 %s, caller's "
+         "stack %s, ring 0 %s, host %s; %d garbage handles and 0 -> nothing at every ring (%s, "
+         "caller's memory untouched %s); ring-3 read of the table -> %s (fault %#lx == %#lx), "
+         "write -> %s (fault %#lx == %#lx); %d sub-runs of %d ring-3 resolves: %d kept with "
+         "exactly the %ld exit(s) of an empty turn, %d discarded (%ld extra exits, %ld of all "
+         "irq_exits in the period), %d answered wrong; %.1f ns per resolve (median of kept, "
+         "empty turn %.0f ns subtracted); unregistered -> nothing %s; recycled as %#llx (same "
+         "slot %s, old handle -> nothing %s, new -> %p %s); capacity %d: filled %d, next -> "
+         "%#llx, %ld mismatched from ring 3, emptied %s; reusable %s; CPL %ld [%s]\n",
+         reg_bad ? "yes" : "NO", (unsigned long long)h, (void *)&obj, resolves ? "ok" : "BROKEN",
+         user_ok ? "ok" : "BROKEN", here_ok ? "ok" : "BROKEN", ring0_ok ? "ok" : "BROKEN",
+         host_ok ? "ok" : "BROKEN", RS_BAD, garbage_ok && user_ok && host_ok ? "yes" : "NO",
+         heap_intact ? "yes" : "NO", r3 == GK_EFAULT ? "FAULT" : "READ", fr3, table,
+         w3 == GK_EFAULT ? "FAULT" : "WROTE", fw3, table, RS_SUBRUNS, RS_N, kept, e_empty,
+         discarded, extra_exits, irq_delta, wrong, per_call, t_empty, freed ? "yes" : "NO",
+         (unsigned long long)h2, (h2 & 0xffff) == idx ? "yes" : "no",
+         p->r_h == NULL ? "yes" : "NO", p->r_h2, p->r_h2 == &obj2 ? "ok" : "WRONG",
+         GK_RESOLVE_SLOTS, n, (unsigned long long)over, mismatched,
+         s5.resolve_entries == s3.resolve_entries ? "yes" : "NO", fresh ? "yes" : "NO", cpl,
+         ok ? "OK" : "FAIL");
+  free(p);
+  free(heap);
+  munmap(none, 4096);
+  return ok;
+}
+
 // ---- signal fields -----------------------------------------------------------
 // A signal field is a 4-byte word in an arena that the host writes from a
 // signal handler, through a descriptor the host validated and keeps in
@@ -3897,10 +4147,18 @@ int main(void) {
   // turn_dir_check).
   int ok33 = turn_dir_check() == 1;
 
+  // ---- ring-0 resolve ---------------------------------------------------------
+  // A ring-3 turn resolves a handle against gk's table in supervisor memory
+  // at ring 0 inside the guest, with no VM exit, in tens of nanoseconds; a
+  // handle gk did not issue, or issued for an entry since unregistered or
+  // recycled, resolves to nothing with nothing read through it; the table is
+  // unreachable from ring 3 and its capacity bound holds (see resolve_check).
+  int ok34 = resolve_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
             ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28 && ok29 && ok30 && ok31 &&
-            ok32 && ok33;
+            ok32 && ok33 && ok34;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

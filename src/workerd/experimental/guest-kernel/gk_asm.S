@@ -2,9 +2,16 @@
 // guest in ring 0 and live in this binary's text, which gk maps into the guest.
     .text
 
+// SYSCALL entry (MSR_LSTAR). A ring-0 resolve (see gk_resolve in gk.h) is
+// answered here, inside the guest, by gk_resolve_tramp below; everything else
+// is the outb hypercall that leaves the VM for the host's syscall exit. The
+// compare costs the forwarded path one predictable branch. Keep 0xF4242 in
+// sync with GK_RESOLVE_SYSCALL in gk.c.
     .globl gk_syscall_tramp
     .type gk_syscall_tramp, @function
 gk_syscall_tramp:
+    cmpq $0xF4242, %rax
+    je gk_resolve_tramp
     outb %al, $0x11
 // The instruction after the hypercall. The host resumes the guest here when it
 // ran a stub (below) in the middle of a syscall exit (see run_stub in gk.c), as
@@ -25,6 +32,60 @@ gk_syscall_tramp_resume:
     .type gk_user_syscall_resume, @function
 gk_user_syscall_resume:
     sysretq
+
+// The ring-0 resolve (see gk_resolve in gk.h): RDI holds the handle, RCX and
+// R11 the ring-3 return RIP and RFLAGS that SYSCALL saved. Looks the handle up
+// in gk_resolve_table (gk.c; supervisor memory, mapped in every root) and
+// SYSRETs to ring 3 with the entry's pointer in RAX, or 0 for a handle that
+// names nothing: a zero generation (never issued), an index at or past
+// GK_RESOLVE_SLOTS, or an entry whose generation is not the handle's. Runs
+// on whatever RSP ring 3 had and never touches it, so a ring-3 stack that is
+// unmapped or garbage costs nothing here; reads only the table, so no value
+// in the handle is ever used as an address; writes nothing, so the table is
+// as the host left it and the path needs no lock. The generation is read
+// before and after the pointer and both reads must match the handle: the
+// host retires an entry by zeroing the generation first and publishes one by
+// storing the pointer first (gk.c), and x86 keeps loads in program order, so
+// a pointer seen between two matching reads was the entry's under that
+// generation. Every scratch register is cleared before SYSRET, so ring 3 gets
+// the pointer and nothing else; RCX and R11 are untouched for SYSRET to use.
+// The entry layout is {void *ptr; uint64_t gen}, 16 bytes, index * 16.
+// Keep 16384 in sync with GK_RESOLVE_SLOTS in gk.h.
+//
+// GK_NEG_RESOLVE (a negative-test build, never shipped) removes the
+// generation check, so a handle to a freed or recycled entry resolves to
+// whatever the slot holds; gk_test's resolve case must then fail.
+    .globl gk_resolve_tramp
+    .type gk_resolve_tramp, @function
+gk_resolve_tramp:
+    movq %rdi, %rax
+    shrq $16, %rax                      /* rax = the handle's generation */
+    jz 1f
+    movzwl %di, %edi                    /* edi = the handle's index */
+    cmpl $16384, %edi
+    jae 1f
+    shlq $4, %rdi
+    leaq gk_resolve_table(%rip), %rsi
+    addq %rsi, %rdi                     /* rdi = &table[index] */
+    movq 8(%rdi), %rsi                  /* generation, before */
+    movq (%rdi), %rdx                   /* pointer */
+#ifndef GK_NEG_RESOLVE
+    cmpq %rsi, %rax
+    jne 1f
+    cmpq 8(%rdi), %rax                  /* generation, after */
+    jne 1f
+#endif
+    movq %rdx, %rax
+    xorl %edx, %edx
+    xorl %esi, %esi
+    xorl %edi, %edi
+    sysretq
+1:  xorl %eax, %eax
+    xorl %edx, %edx
+    xorl %esi, %esi
+    xorl %edi, %edi
+    sysretq
+    .hidden gk_resolve_table            /* RIP-relative above: must resolve within this object */
 
 // Drop into ring 3 to launch a guest function. The host sets RCX = the entry
 // point, R11 = the initial RFLAGS (0x2), RSP = the user stack and RDI = the
