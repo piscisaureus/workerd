@@ -68,6 +68,10 @@
 // number, so it never collides with a forwarded call. Keep in sync with the
 // literal in gk_asm.S.
 #define GK_EXIT_SYSCALL 0xF4240
+// Reserved syscall number for a hostcall (see gk_hostcall in gk.h): the
+// handler index is in RDI. Recognized at the syscall exit next to the exit
+// sentinel, before the filter and before any forwarding.
+#define GK_HOSTCALL_SYSCALL 0xF4241
 
 // ---- gk control data ---------------------------------------------------------
 // Everything gk trusts to enforce isolation -- the page-table allocator's
@@ -106,8 +110,11 @@
 // Guarded by G->lock.
 #define GK_MAX_VCPUS 4096
 #define GK_EPERM 1
+#define GK_E2BIG 7
 #define GK_ENOMEM 12
+#define GK_EBUSY 16
 #define GK_EINVAL 22
+#define GK_ENOSYS 38
 // The kvm_run register sets gk exchanges with KVM_CAP_SYNC_REGS (see regs_get).
 // The constants are KVM ABI; spelled out for headers that predate them.
 #ifndef KVM_CAP_SYNC_REGS
@@ -188,11 +195,22 @@ typedef struct gk_thread {
     int user;              // the parent ran at ring 3, so the child starts there too
     int parent_id;
   } start;
+  // This record's host-side hostcall frame (see the hostcalls section): a
+  // block of host memory allocated when the record is first taken from the
+  // pool and kept across its recycling, so the pool's records own at most
+  // GK_MAX_VCPUS frames between them.
+  gk_hostcall_frame *hostcall_frame;
   struct gk_thread *next_free;
 } gk_thread;
 // 1 + the index of this thread's record in G->threads; 0 while it has none.
 // User memory: validated by thread_cur before every use.
 static __thread int tls_rec;
+// Whether the thread is inside the guest, set by the host side around every
+// guest entry, and the thread's hostcall exchange region. Both are the guest's
+// own copies, in user memory, read by gk_hostcall and gk_hostcall_region and
+// trusted by nothing on the host (see the hostcalls section).
+static __thread int tls_in_guest;
+static __thread gk_hostcall_frame *tls_hostcall_region;
 
 // An arena is a PROT_NONE host reservation spanning whole PML4 slots (512GiB
 // each), demand-paged into its private page-table root only while it is a
@@ -260,6 +278,17 @@ typedef struct {
   int live;
 } gk_host_slot;
 _Static_assert(GK_HOST_SLOTS <= (1 << GK_HOST_SLOT_INDEX_BITS), "a slot index must fit a handle");
+
+// A hostcall handler table entry (see gk_hostcall_register in gk.h). Empty
+// while fn is NULL. The exchange regions are carved from one reservation of
+// GK_MAX_VCPUS regions, indexed by thread record, so a record's region is a
+// fixed address the host computes from the record and the guest can neither
+// move (the mapping policy refuses the whole reservation) nor choose.
+typedef struct { gk_hostcall_fn fn; void *ctx; } gk_hostcall_entry;
+#define GK_HOSTCALL_REGION_BYTES (8UL << 10)
+#define GK_HOSTCALL_AREA_BYTES ((size_t)GK_MAX_VCPUS * GK_HOSTCALL_REGION_BYTES)
+_Static_assert(sizeof(gk_hostcall_frame) <= GK_HOSTCALL_REGION_BYTES, "a frame must fit its region");
+_Static_assert(sizeof(gk_hostcall_frame) <= GK_HOST_MAX_ALLOC, "a frame must fit a host block");
 
 // The supervisor/refuse registry (see prot_class below). An unregistered page
 // is user-accessible, so the registry must never be too small to hold every
@@ -401,6 +430,14 @@ struct gk_ctl {
   int host_slot_free;                // free-list head, as index + 1; 0 when empty
   int host_slot_live;                // slots allocated and not yet freed
   uint64_t host_slot_gen;            // the generation of the last allocation
+
+  // Hostcalls (see the hostcalls section): the handler table, in supervisor
+  // memory so no ring-3 access reaches an entry, and the exchange-region
+  // reservation. Guarded by G->lock; hostcall_calls is a counter.
+  gk_hostcall_entry hostcalls[GK_HOSTCALLS];
+  int hostcall_n;                    // entries with a handler
+  atomic_long hostcall_calls;        // calls that reached a handler
+  uintptr_t hostcall_area;           // GK_HOSTCALL_AREA_BYTES, PROT_NONE until a region is committed
 
   // Set at the end of a successful gk_init (see gk_initialized).
   int initialized;
@@ -859,6 +896,38 @@ void gk_host_slot_free(gk_host_handle h) {
 }
 
 int gk_initialized(void) { return G->initialized; }
+
+// ---- hostcalls -------------------------------------------------------------
+// A synchronous call from the guest to a registered host handler (see
+// gk_hostcall in gk.h). The pieces: the handler table in the control block,
+// one exchange region per thread record in a reservation the mapping policy
+// refuses to the guest, and one host-memory frame per record that the handler
+// sees instead of the region. The dispatch validates the index against the
+// table alone, reads each header field of the region once, bounds the copy by
+// GK_HOSTCALL_BYTES, and hands the handler only the host frame, so no value
+// the guest wrote is ever used as an address or read twice. The path is
+// malloc-free and runs under the allocation guard; the handler is the
+// embedder's, called outside G->lock.
+
+// The exchange region of record `t`: a fixed slot of the reservation.
+static gk_hostcall_frame *hostcall_region_of(const gk_thread *t) {
+  return (gk_hostcall_frame *)(G->hostcall_area +
+                               (uintptr_t)(t - G->threads) * GK_HOSTCALL_REGION_BYTES);
+}
+
+// Gives a record taken for the first time its host frame and commits its
+// region. Caller holds G->lock; host-side (the record is taken by host code:
+// thread_get, or clone_thread on the parent's syscall exit).
+static int hostcall_record_init_locked(gk_thread *t) {
+  gk_hostcall_frame *f = host_alloc_locked(sizeof *f);
+  if (!f) return -1;
+  if (mprotect(hostcall_region_of(t), GK_HOSTCALL_REGION_BYTES, PROT_READ | PROT_WRITE) != 0) {
+    host_free_locked(f, sizeof *f);
+    return -1;
+  }
+  t->hostcall_frame = f;
+  return 0;
+}
 
 // ---- global pages ----------------------------------------------------------
 // The guest runs with CR4.PGE, so a PTE carrying the G bit yields a TLB entry
@@ -1796,9 +1865,16 @@ static gk_thread *thread_cur(void) {
 static gk_thread *thread_alloc_locked(long tid) {
   gk_thread *t = G->thread_free;
   if (t) G->thread_free = t->next_free;
-  else if (G->thread_n < GK_MAX_VCPUS) t = &G->threads[G->thread_n++];
-  else return NULL;
+  else if (G->thread_n < GK_MAX_VCPUS) {
+    // A record taken for the first time gets its hostcall frame and region
+    // now (see the hostcalls section); both stay with it when it is recycled.
+    t = &G->threads[G->thread_n];
+    if (hostcall_record_init_locked(t) < 0) return NULL;
+    G->thread_n++;
+  } else return NULL;
+  gk_hostcall_frame *frame = t->hostcall_frame;
   memset(t, 0, sizeof *t);
+  t->hostcall_frame = frame;
   t->tid = tid;
   t->active_pml4 = G->pml4;
   return t;
@@ -1809,6 +1885,7 @@ static gk_thread *thread_alloc_locked(long tid) {
 // opposed to a guest-created thread, which ends through its exit syscall.
 static void thread_bind(gk_thread *t, int host) {
   tls_rec = (int)(t - G->threads) + 1;
+  tls_hostcall_region = hostcall_region_of(t);
   if (host) pthread_setspecific(G->thread_key, t);
 }
 
@@ -1883,6 +1960,12 @@ static void thread_release(gk_thread *t) {
   arena_select(t, NULL);
   t->arena_depth = 0;
   tls_rec = 0;
+  tls_hostcall_region = NULL;
+  // The next thread to take the record starts with an empty region and an
+  // empty host frame: no argument, result or handler state carries over.
+  memset(hostcall_region_of(t), 0, sizeof(gk_hostcall_frame));
+  memset(t->hostcall_frame, 0, sizeof *t->hostcall_frame);
+  __asm__ __volatile__("" : : "r"(t->hostcall_frame) : "memory");
   pthread_mutex_lock(&G->lock);
   t->tid = 0;
   t->next_free = G->thread_free;
@@ -2354,6 +2437,13 @@ int gk_init(void) {
   if (G->dbg) fprintf(stderr, "[gk] registers via %s\n", G->sync_regs ? "kvm_run" : "ioctl");
   if (pthread_key_create(&G->thread_key, thread_key_dtor) != 0) { G->err = "pthread_key_create"; return -1; }
   if (image_record() < 0) { G->err = "record the runtime image"; return -1; }
+  // The hostcall exchange regions (see the hostcalls section): one
+  // reservation, committed a region at a time as thread records are taken.
+  // Reserved before the first record below needs its region.
+  void *area = mmap(NULL, GK_HOSTCALL_AREA_BYTES, PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (area == MAP_FAILED) { G->err = "mmap hostcall regions"; return -1; }
+  G->hostcall_area = (uintptr_t)area;
 
   // Bring up the calling thread's record and vCPU.
   gk_thread *t = thread_get();
@@ -2396,6 +2486,7 @@ unsigned long gk_debug_ctl_addr(int which) {
     case GK_CTL_ROOT: return (unsigned long)&G->pml4;
     case GK_CTL_FILTER: return (unsigned long)&G->filter;
     case GK_CTL_HOST_SLOTS: return (unsigned long)&G->host_slots[0];
+    case GK_CTL_HOSTCALLS: return (unsigned long)&G->hostcalls[0];
     default: return 0;
   }
 }
@@ -2612,6 +2703,7 @@ static long child_entry(void *arg) {
     fprintf(stderr, "[gk] vcpu %d: guest thread tid %ld (from vcpu %d) rip=%#llx rsp=%#llx pkru=%#x ring %d\n",
             t->id, t->tid, t->start.parent_id, (unsigned long long)t->start.regs.rip,
             (unsigned long long)t->start.regs.rsp, t->start.pkru, t->start.user ? 3 : 0);
+  tls_in_guest = 1;  // the thread only ever leaves the guest by exiting
   long r = run_vcpu(t);
   // A guest thread only leaves through exit/exit_group, handled in
   // forward_syscall; reaching here means it faulted or the VM shut down. The
@@ -2712,6 +2804,90 @@ static long clone_thread(gk_thread *t, struct kvm_regs *r, long nr) {
     munmap(hs, GK_HOST_STACK);
   }
   return tid;
+}
+
+// ---- hostcalls: dispatch ------------------------------------------------------
+// The call side of the hostcalls section above; placed here because it runs
+// under the allocation guard and on the syscall exit, beside forward_syscall.
+
+// Runs handler `idx` for the calling thread's record `t`, from the guest's
+// syscall exit or from gk_hostcall on the host side. Returns what the guest
+// sees in RAX.
+static long hostcall_dispatch(gk_thread *t, uint64_t idx) {
+  if (idx >= GK_HOSTCALLS) return -GK_ENOSYS;
+  pthread_mutex_lock(&G->lock);
+  gk_hostcall_entry e = G->hostcalls[idx];
+  pthread_mutex_unlock(&G->lock);
+  if (!e.fn) return -GK_ENOSYS;
+  GK_HANDLER_ENTER();
+  // The region is the guest's; every field is read once, into the host frame,
+  // and the copy is bounded by the frame, not by anything the guest wrote.
+  volatile gk_hostcall_frame *g = hostcall_region_of(t);
+  gk_hostcall_frame *h = t->hostcall_frame;
+  uint64_t in_len = g->in_len;
+  if (in_len > GK_HOSTCALL_BYTES) { GK_HANDLER_LEAVE(); return -GK_E2BIG; }
+  for (int i = 0; i < 4; i++) h->args[i] = g->args[i];
+  h->in_len = in_len;
+  h->out_len = 0;
+  memcpy(h->buf, (const void *)g->buf, in_len);
+  atomic_fetch_add_explicit(&G->hostcall_calls, 1, memory_order_relaxed);
+  long r = e.fn(e.ctx, h);
+  uint64_t out_len = h->out_len;
+  if (out_len > GK_HOSTCALL_BYTES) {
+    write_stderr("[gk] hostcall: handler set out_len past the frame; the guest gets EINVAL "
+                 "and no bytes\n");
+    r = -GK_EINVAL;
+    out_len = 0;
+  }
+  memcpy((void *)g->buf, h->buf, out_len);
+  g->out_len = out_len;
+  // The exchanged bytes leave the host frame with the call; `state` stays.
+  memset(h->buf, 0, in_len > out_len ? in_len : out_len);
+  memset(h->args, 0, sizeof h->args);
+  h->in_len = h->out_len = 0;
+  __asm__ __volatile__("" : : "r"(h) : "memory");
+  GK_HANDLER_LEAVE();
+  return r;
+}
+
+int gk_hostcall_register(unsigned idx, gk_hostcall_fn fn, void *ctx) {
+  if (idx >= GK_HOSTCALLS || !fn) return -GK_EINVAL;
+  pthread_mutex_lock(&G->lock);
+  if (G->hostcalls[idx].fn) { pthread_mutex_unlock(&G->lock); return -GK_EBUSY; }
+  G->hostcalls[idx] = (gk_hostcall_entry){fn, ctx};
+  G->hostcall_n++;
+  pthread_mutex_unlock(&G->lock);
+  return 0;
+}
+
+int gk_hostcall_unregister(unsigned idx) {
+  if (idx >= GK_HOSTCALLS) return -GK_EINVAL;
+  pthread_mutex_lock(&G->lock);
+  int bound = G->hostcalls[idx].fn != NULL;
+  G->hostcalls[idx] = (gk_hostcall_entry){NULL, NULL};
+  if (bound) G->hostcall_n--;
+  pthread_mutex_unlock(&G->lock);
+  return bound ? 0 : -GK_ENOSYS;
+}
+
+gk_hostcall_frame *gk_hostcall_region(void) {
+  if (tls_in_guest) return tls_hostcall_region;
+  gk_thread *t = thread_get();
+  return t ? hostcall_region_of(t) : NULL;
+}
+
+long gk_hostcall(unsigned idx) {
+  if (tls_in_guest) {
+    long ret;
+    __asm__ __volatile__("syscall"
+                         : "=a"(ret)
+                         : "a"((long)GK_HOSTCALL_SYSCALL), "D"((long)idx)
+                         : "rcx", "r11", "memory");
+    return ret;
+  }
+  gk_thread *t = thread_get();
+  if (!t) return -GK_ENOMEM;
+  return hostcall_dispatch(t, idx);
 }
 
 // ---- syscall forwarding ----------------------------------------------------
@@ -2882,6 +3058,9 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
 static int range_clear_locked(uintptr_t s, uintptr_t e, const gk_arena *mine) {
   for (int i = 0; i < G->image_n; i++)
     if (s < G->image[i].end && G->image[i].start < e) return 0;
+  // The hostcall exchange regions: the host copies from and to a thread's
+  // region on every hostcall, so the guest may not pull the mapping away.
+  if (s < G->hostcall_area + GK_HOSTCALL_AREA_BYTES && G->hostcall_area < e) return 0;
   for (int i = 0; i < G->arena_n; i++) {
     const gk_arena *a = G->arenas[i];
     if (a != mine && s < a->end && a->base < e) return 0;
@@ -3170,7 +3349,10 @@ static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t st
   }
   regs_set(t, &regs);
   t->user_mode = user;
-  return run_vcpu(t);
+  tls_in_guest = 1;
+  long r = run_vcpu(t);
+  tls_in_guest = 0;
+  return r;
 }
 
 long gk_run(long (*fn)(void *), void *arg) {
@@ -3573,7 +3755,10 @@ static long run_vcpu(gk_thread *t) {
           // A ring-3 guest leaves through the sentinel exit syscall (ring 3
           // cannot use PORT_EXIT's OUT): its result is in RDI.
           if (r.rax == GK_EXIT_SYSCALL) return (long)r.rdi;
-          r.rax = (uint64_t)forward_syscall(t, &r);
+          // A hostcall (see the hostcalls section) is answered here, never
+          // forwarded and never shown to the filter.
+          if (r.rax == GK_HOSTCALL_SYSCALL) r.rax = (uint64_t)hostcall_dispatch(t, r.rdi);
+          else r.rax = (uint64_t)forward_syscall(t, &r);
           // A ring-3 guest's syscall trampoline ran in ring 0; return it to
           // ring 3 with SYSRET rather than the ring-0 jmp. forward_syscall left
           // RCX/R11 (the SYSCALL-saved return RIP and flags) intact and may
@@ -3994,6 +4179,8 @@ void gk_get_stats(gk_stats *s) {
   s->host_regions = G->host_region_n;
   s->host_blocks = G->host_blocks;
   s->host_slots = G->host_slot_live;
+  s->hostcall_handlers = G->hostcall_n;
+  s->hostcalls = atomic_load_explicit(&G->hostcall_calls, memory_order_relaxed);
   pthread_mutex_unlock(&G->lock);
 }
 

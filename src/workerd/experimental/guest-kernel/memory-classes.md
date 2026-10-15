@@ -47,7 +47,11 @@ against that table -- bounds, liveness and generation -- so a rewritten
 handle resolves to nothing rather than to an address the guest chose. Refers
 to an I object only as an opaque handle together with the arena it belongs
 to; dereferencing one means entering that arena, which only a turn or a
-ring-0 helper does.
+ring-0 helper does. A turn that needs an H object's help synchronously --
+an operation on a secret whose JS caller gets the result directly -- makes a
+hostcall (`gk_hostcall` in `gk.h`, `util/hostcall.h` in C++): the host
+handler it names by a validated index runs host-side, on a copy of the
+arguments in H memory, and the turn resumes with the result.
 
 **Boundary (B).** The one region both sides touch, one per isolate. Holds the
 messages the two sides exchange, the handle tables' isolate-visible halves,
@@ -127,6 +131,18 @@ return a `kj::Promise`, whose node is built in the arena and carries a vtable
 the host would call through. The promise has to be created host-side and the
 turn has to resolve it through the channel.
 
+**A synchronous in-turn use of H state becomes a hostcall.** When the JS
+API is synchronous, there is no promise to return, so the turn cannot defer
+the use to the event loop; it submits a hostcall instead. The handler is
+selected by a small integer the host checks against its table, the
+arguments and the result cross through a per-thread exchange frame the host
+owns and snapshots into H memory before the handler runs, and the handler
+validates every field it reads, because the turn calls it whenever and with
+whatever it likes. `ActorIdFactoryImpl` (`server/actor-id-impl.h`) is the
+pattern: the key is H, reached by a host slot handle the frame carries, and
+the HMAC runs in the handler. A hostcall costs a VM exit, so it is for the
+rare operation, not the bulk of a turn's crossings (see Cost).
+
 **Binary data becomes a descriptor.** An `ArrayBuffer` backing store or a body
 chunk crosses as `{handle, offset, length}` against a buffer the host owns,
 checked on every use, rather than as a pointer the host dereferences. This is
@@ -191,12 +207,16 @@ through an integer.
 ## Cost
 
 The classification implies a crossing wherever a turn reaches H state today.
-The crossing is a ring 3 to ring 0 transition inside the guest, not a VM exit:
-**22 ns, measured, 212 times cheaper than the 4.75 us of an exit** (see
-`m10_ringtrap` in the benchmark suite). At the ~43 crossings a hello turn
-takes that is about 1 us, roughly 1% of the request. The explicit trap is 9.5
-times cheaper than servicing a demand fault, so the interface should be a call
-into ring 0 rather than fault-and-service.
+The crossing that exists is the hostcall, a VM exit: **6.4 us per round trip,
+measured** (`hostcall_check` in `gk_test.c`), which is affordable for an
+operation a turn makes a few times (an actor id) and not for the bulk of its
+crossings. For those the crossing should be a ring 3 to ring 0 transition
+inside the guest, not an exit: **22 ns, measured, 212 times cheaper than the
+4.75 us of an exit** (see `m10_ringtrap` in the benchmark suite). At the ~43
+crossings a hello turn takes that is about 1 us, roughly 1% of the request.
+The explicit trap is 9.5 times cheaper than servicing a demand fault, so that
+interface should be a call into ring 0 rather than fault-and-service; a
+ring-0 helper is what would need the SUPER class of H memory.
 
 Most of the foreign accesses a hello turn makes -- roughly seven in ten of
 the recorded hits -- are to the allocator's global state, which per-isolate
@@ -346,7 +366,7 @@ The escapees, condensed:
 | `Fetcher` (`api/http.h:575`, `:326`) | I shell plus an H factory and an H `WorkerInterface` per subrequest, reached by handle. `fetch()` currently creates and drives the `kj::Own<WorkerInterface>` from inside the turn (`api/http.c++:1818`) |
 | `SqlStorage`/`CachedStatement`/`Cursor::State` (`api/sql.h:96`, `:154`, `:249`) | The largest synchronous host-in-turn surface in `api/`: `CachedStatement` embeds a `SqliteDatabase::Statement` by value and a `SqliteDatabase&`, and `State` keeps bindings alive because the query "might contain pointers into strings and blobs" -- that is, into sandbox memory. I keeps `SqlStorage` and `Cursor` plus a statement handle; rows arrive through B |
 | `WebSocket` (`api/web-socket.h:855`) | Already structurally split -- I shell versus `Native` holding `kj::Own<kj::WebSocket>` and a `kj::Canceler` -- except for the raw `AutoResponse&` cached beside its own `IoOwn` at `:904-905` |
-| `DurableObjectNamespace` (`api/actor.h:322`) | I namespace plus the H `ActorIdFactory`, whose vtable is currently called in-turn |
+| `DurableObjectNamespace` (`api/actor.h:322`) | I namespace plus the H `ActorIdFactory`, whose vtable is currently called in-turn; the factory's keyed operations are already a hostcall (`server/actor-id-impl.h`), so what the in-turn call reaches is the heap object that holds the key's slot handle, not the key |
 | `DeferredProxy<T>` (`api/deferred-proxy.h:37`) | The `IoContext::run` result problem in its natural habitat: a promise node graph allocated in-turn and run by the host |
 | `MemoryCache` (`api/memory-cache.h:526`) | I object plus a handle. `SharedMemoryCache` is `kj::AtomicRefcounted` with a `MutexGuarded` map and is shared across isolates by design (`:119`, `:477`) |
 | `CapnpServer` (`api/capnp.h:36`) | An H capnp server holding a `jsg::V8Ref<v8::Object>` and a wrapper reference its own comment marks "only valid if isolate is locked" |
@@ -455,7 +475,7 @@ state. These are H by rule 3, and a turn reads or writes them today:
 | `std::atomic<bool> useZlibRs` | `zlib-router.c++` | Consulted on every zlib call a turn makes; a write switches implementation process-wide mid-stream |
 | `ThreadProgressCounter* activeProgressCounter` | `thread-scopes.c++:27` | Thread-local, and its own comment says it "is read in signal handlers". TLS is guest-writable, so one word hands a signal handler an arbitrary pointer to dereference. Same shape as the `guestTurnDepth` counter in `guest-run.c++:22`, which is fixed by restoring from a host frame; this one needs the pointer out of TLS, in gk's per-thread supervisor record |
 | `multiTenantProcess`, `predictableMode`, `gcStressMode` | `thread-scopes.c++:20` | File-scope, read from turns |
-| `thread_local BufferState state`, 4 KiB of unconsumed CSPRNG output | `entropy.c++`, behind `getEntropy()` | The buffer is on the thread the turn runs on, so a turn can read the bytes a later draw on that thread returns, or choose them. **Split by caller, not moved.** The host-privileged draws -- the channel token key at startup and the nonce of every RPC token (`channel-token.c++`) -- use `getHostEntropy()` (`host-entropy.h`) instead: its buffer, cursor and lock are one H block reached through a host slot handle, and it refills from the operating system's generator rather than from BoringSSL's in-process DRBG, whose per-thread state is in the shared heap as well and, on a CPU without a fast RDRAND, determines the DRBG's output outright. So neither the bytes a token nonce is drawn from nor the generator state behind them is in memory a guest can reach; `host-memory-test.sh` shows a turn's overwrite of the thread-local buffer reaching the host's next `getEntropy()` draw and not the nonce. `getEntropy()` keeps its thread-local buffer for the draws a turn makes for itself (`crypto.getRandomValues`, multipart boundaries, hyperdrive suffixes, retry seeds), whose bytes go to the isolate anyway, so their confidentiality from it is meaningless and a crossing would buy nothing. What remains exposed through it is every draw that a turn makes but that is *not* only for that turn: `actor-id-impl.c++:64` takes the 16 random bytes of a `newUniqueId()` actor id from it, in-turn, so a turn with a write primitive can decide the random half of the next unique id minted on that thread, by any worker, and so predict or collide ids; the HMAC half is computed with `ActorIdFactoryImpl::key`, which is in the shared heap too (see `server/` below), so the same escape can forge ids outright. `newUniqueId()` is synchronous to JS and there is no synchronous crossing primitive yet, so its draw cannot be moved host-side as a substitution; both halves move together when the factory splits. `sentry.c++`'s internal error ids are the other in-turn draw whose value leaves the turn; they correlate a log line with a user-visible message and are not a secret, so a chosen id can at worst mislabel a log line |
+| `thread_local BufferState state`, 4 KiB of unconsumed CSPRNG output | `entropy.c++`, behind `getEntropy()` | The buffer is on the thread the turn runs on, so a turn can read the bytes a later draw on that thread returns, or choose them. **Split by caller, not moved.** The host-privileged draws -- the channel token key at startup and the nonce of every RPC token (`channel-token.c++`) -- use `getHostEntropy()` (`host-entropy.h`) instead: its buffer, cursor and lock are one H block reached through a host slot handle, and it refills from the operating system's generator rather than from BoringSSL's in-process DRBG, whose per-thread state is in the shared heap as well and, on a CPU without a fast RDRAND, determines the DRBG's output outright. So neither the bytes a token nonce is drawn from nor the generator state behind them is in memory a guest can reach; `host-memory-test.sh` shows a turn's overwrite of the thread-local buffer reaching the host's next `getEntropy()` draw and not the nonce. `getEntropy()` keeps its thread-local buffer for the draws a turn makes for itself (`crypto.getRandomValues`, multipart boundaries, hyperdrive suffixes, retry seeds), whose bytes go to the isolate anyway, so their confidentiality from it is meaningless and a crossing would buy nothing. The one in-turn draw whose value is *not* only for that turn, the 16 random bytes of a `newUniqueId()` actor id, is no longer made from it: the id is minted by the actor-id hostcall (`server/actor-id-impl.c++`), host-side, and the handler draws the random half from `getHostEntropy()` in the same call that HMACs it, so neither half of an id is a turn's to read or choose. `sentry.c++`'s internal error ids are the remaining in-turn draw whose value leaves the turn; they correlate a log line with a user-visible message and are not a secret, so a chosen id can at worst mislabel a log line |
 | `thread_local int currentVfsRoot` | `sqlite.c++:1846` | It is the directory descriptor for the `openat`, `unlinkat`, `mkdirat` and `readlinkat` that SQLite's VFS issues (`sqlite.c++:1853-1876`). A write redirects where SQLite's file operations land. The root belongs on the `Vfs` object, not in TLS |
 | `SqliteObserver DEFAULT` with a mutable `dbWalSize`; `vfsErrorListener` | `sqlite.h:55`, `sqlite.c++:191` | File-scope and thread-local mutable state on a path a turn drives synchronously |
 | `static kj::NullStream nullStream` | `stream-utils.c++:250` | A file-scope object with a vtable, handed out by reference and by `kj::Own` with a null disposer. Must be rodata or supervisor-mapped |
@@ -495,7 +515,7 @@ What a turn nevertheless reaches, every path starting at
 | `WorkerService::ioChannels` | `Fetcher::fetch` -> `startSubrequest(channel, ...)` (`server.c++:4269`), `getCache()` (`:4364`), `getActorChannel` (`:4440`), `getRpcChannel` (`:4490`) -- host arrays indexed by a guest-supplied channel number, then dispatched through another service's vtable | H. The `uint channel` a JS `Fetcher` carries (`api/http.h:213`) is already the right shape: an index the host validates. What is wrong is that the validation and dispatch run inside the turn |
 | `Server&` itself | `workerdDebugPortServer` (`server.c++:3466`) -> `getWorkerdDebugPort()` (`:4553`) | H. A worker with that binding reaches the `Server` object by pointer from inside its turn |
 | `ChannelTokenHandler::tokenKey` | a `HostSlot<kj::FixedArray<byte, 32>>` (`channel-token.h`), reached from `getTokenMaybeSync` (`server.c++`) when a `Fetcher` is serialized over JS RPC, in-turn, and from `*FromToken` when one is deserialized | **In H memory, reached by handle; the crossing is interim.** The key bytes are in host memory, so an escaped isolate cannot read the key that mints subrequest-channel tokens, and the handler, which is in the shared heap, holds only a host slot handle to them: a write primitive that rewrites the handle makes the host's next use resolve to nothing and throw, rather than encrypt or decrypt with a key at an address the guest chose. What it can still do is rewrite the handle to another live host slot's, the ownership residual above; with one tenant there is no other slot to name. The two functions that read the key run on the event loop, outside the guest, when the guest kernel is on: a turn that mints an RPC token gets a `kj::Promise` for the bytes, and one that decodes a token gets a promised channel, both forms the callers already handle. That is a crossing by way of a guest-built promise (violation 5 below), not yet the B message the turn should submit, which the final split removes by moving the handler's host half to H. The key and the nonce of every token are drawn with `getHostEntropy()`, from a buffer in H memory, not from the thread-local one above |
-| `ActorIdFactoryImpl::key`, a SHA-256-sized HMAC key | `actor-id-impl.h:57`, owned by the JS-visible `DurableObjectNamespace` as a `kj::Own` (`api/actor.h:322`); `newUniqueId()` and `idFromName()` HMAC with it in-turn | **Must split.** The JS object is I and holds a namespace handle; the key and `computeMac` are H |
+| `ActorIdFactoryImpl::key`, a SHA-256-sized HMAC key | a `HostSlot<Key>` (`actor-id-impl.h`) in a refcounted holder the factory owns, the factory itself owned by the JS-visible `DurableObjectNamespace` as a `kj::Own` (`api/actor.h:322`); `newUniqueId()`, `idFromName()` and `idFromString()` are called in-turn | **In H memory, reached by a hostcall.** The key bytes are in host memory, tagged, so an escaped isolate cannot read the key that mints and validates its namespace's ids, and the factory, in the shared heap, holds only a host slot handle to them. Every keyed operation is the actor-id hostcall (`hostcall::ACTOR_ID`): the turn puts the operation, the handle and the bytes in the exchange frame, the handler resolves the handle through gk's table, checks the tag, and HMACs host-side; a unique id's random half is drawn there from `getHostEntropy()`; a name longer than a frame crosses in chunks with the running HMAC in the frame's host-side state. A write primitive that rewrites the handle makes the handler refuse the call (a handle that resolves to nothing, or to a slot without the tag) rather than HMAC with bytes at an address the turn chose; what it can still do is rewrite the handle to another namespace's live key handle and mint that namespace's ids, the ownership residual, and it can still swap the factory's vtable, since the factory is a heap object the turn calls through. Without the guest kernel the same handler is called directly |
 | `CompatibilityFlags::Reader` | `WorkerdApi::getFeatureFlags()` (`workerd-api.c++:308`), called from nearly every API entry point during a turn; a capnp `Reader` is a pointer into a host-owned message | I only by copying: snapshot the struct into the arena at isolate creation. `jsg::JsgConfig` (`workerd-api.c++:228`) is already such a by-value copy |
 | `EntropySourceImpl` | `IoContext::getEntropySource()` (`io-context.h:926`) from `crypto.getRandomValues` (`api/crypto/crypto.c++:692`) and key generation | H; in-turn callers take bytes through B |
 | `static Frankenvalue EMPTY_PROPS` | `server.c++:3550`, a mutable file-scope object passed by non-const reference | H data reached in-turn. Fixable by not using a static |
@@ -574,27 +594,37 @@ what is waiting on the same facility:
 
 - **In H memory:** `ChannelTokenHandler::tokenKey` (`server/channel-token.h`),
   held through a host slot handle, with the key's two readers deferred to the
-  event loop under the guest kernel; and the host entropy buffer
+  event loop under the guest kernel; the host entropy buffer
   (`util/host-entropy.c++`), one block holding the unconsumed system-generator
   output, its cursor and the lock that serializes draws, held through a host
-  slot handle in a function-local static, from which the key and every token
-  nonce are drawn. `host-memory-test.sh` shows a ring-3 read of each faulting,
-  a handle rewritten from inside a turn resolving to nothing, with the host
-  refusing the use, and a turn's overwrite of the thread-local entropy buffer
-  reaching the host's next `getEntropy()` draw but not a token's nonce.
+  slot handle in a function-local static, from which the token key, every
+  token nonce and the random half of every unique actor id are drawn; and
+  `ActorIdFactoryImpl::key` (`server/actor-id-impl.h`), held through a host
+  slot handle in a refcounted holder, with its readers -- synchronous to JS
+  -- reaching it through the actor-id hostcall. `host-memory-test.sh` shows a
+  ring-3 read of the first two faulting, a handle rewritten from inside a
+  turn resolving to nothing, with the host refusing the use, and a turn's
+  overwrite of the thread-local entropy buffer reaching the host's next
+  `getEntropy()` draw but not a token's nonce; `actor-id-test.sh` shows a
+  ring-3 read of the key faulting while the ids turns mint through the
+  hostcall are distinct, derive from the configured key and address working
+  Durable Objects.
 - **Waiting, same remedy:** the provenance violations above, each of which
   needs the host to read a pointer or a descriptor from memory the guest
   cannot write -- the `jsg::Lock` data slot (violation 1), the wasm signal
   descriptor (violation 2), the guest-writable thread-locals
   `threadLocalRequest`, `currentApi` and `guestTurnArena` (violation 3), the
   `activeProgressCounter` pointer a signal handler dereferences
-  (`thread-scopes.c++:27`). Also `ActorIdFactoryImpl::key` (`actor-id-impl.h:57`),
-  the other secret a turn HMACs with today, together with the random half of
-  the unique ids it mints, which `newUniqueId()` still draws in-turn from the
-  thread-local entropy buffer. Each of these is a `HostSlot` plus a crossing
-  for the in-turn reader, and the thread-local ones need the host side to
-  find its record without a thread-local, through gk's per-thread supervisor
-  record.
+  (`thread-scopes.c++:27`). Each of these is a `HostSlot` plus a crossing for
+  the in-turn reader, and the thread-local ones need the host side to find
+  its record without a thread-local, through gk's per-thread supervisor
+  record. The wasm descriptor's registration is synchronous to the turn
+  (`registerTrackedWasmInstance` runs inside `shimWebAssemblyInstantiate`),
+  so its crossing is a hostcall: the turn submits `{arena, buffer offset
+  within the arena, signal offset, length}` and the handler validates the
+  buffer against the arena's bounds host-side and keeps the validated copy in
+  H memory, where the signal handler reads it; the pointer-plus-size pair in
+  the shared heap that the signal handler trusts today goes away with it.
 - **Not addressed by H memory alone:** the pointer to an H object is as safe
   as the memory it sits in. A `HostOwn` in a shared-heap object protects the
   object's bytes and lets the guest kernel refuse a swapped pointer at free

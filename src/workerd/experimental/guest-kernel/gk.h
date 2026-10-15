@@ -132,6 +132,7 @@ enum {
   GK_CTL_ROOT,         // the base page-table root pointer
   GK_CTL_FILTER,       // the syscall filter
   GK_CTL_HOST_SLOTS,   // the host slot table
+  GK_CTL_HOSTCALLS,    // the hostcall handler table
   GK_CTL_COUNT
 };
 unsigned long gk_debug_ctl_addr(int which);
@@ -231,6 +232,8 @@ typedef struct {
   int host_regions;     // host-memory regions mapped (each is one entry in the registry)
   long host_blocks;     // host-memory blocks allocated and not yet freed
   int host_slots;       // host slots allocated and not yet freed (see gk_host_slot_alloc)
+  int hostcall_handlers;  // hostcall indices with a handler registered (see gk_hostcall_register)
+  long hostcalls;       // hostcalls that reached a handler, from either side
 } gk_stats;
 void gk_get_stats(gk_stats *s);
 
@@ -326,6 +329,124 @@ typedef uint64_t gk_host_handle;
 gk_host_handle gk_host_slot_alloc(size_t size);
 void *gk_host_slot_get(gk_host_handle handle);
 void gk_host_slot_free(gk_host_handle handle);
+
+// Hostcalls: a synchronous call from the guest to a handler the host has
+// registered, with a result back before the guest's next instruction. It is
+// the crossing for a runtime operation that is synchronous to JS -- one whose
+// caller cannot be handed a promise -- and that must run host-side because it
+// touches host memory: minting an actor id with a key in a host slot, say.
+//
+// The guest issues it as a syscall with the reserved number
+// GK_HOSTCALL_SYSCALL and the handler's index in RDI, which gk's syscall exit
+// recognizes, like the exit sentinel, before any forwarding or filtering: a
+// hostcall never reaches the kernel and never passes the syscall filter. It
+// costs one VM exit and the handler's own work. gk_hostcall issues it; the
+// same function called on the host side, outside the guest, runs the handler
+// directly through the same table and the same frame, so an embedder calls
+// one function from either side of the boundary. Which side it is on comes
+// from a per-thread flag gk sets around every guest entry; the flag is
+// thread-local storage, which the guest can rewrite, and a lie costs only the
+// liar: a hostcall issued from the host reaches the kernel and comes back
+// -ENOSYS, and the direct path taken at ring 3 faults on the supervisor record
+// it reads.
+//
+// Selection. The guest names the handler by a small integer index, nothing
+// else: never an address, never a pointer the host would call through. The
+// index is checked against the handler table, which lives in gk's supervisor
+// control block (ring 3 can neither read nor write it) and has GK_HOSTCALLS
+// entries, fixed; an index at or past the table, an index whose entry is
+// empty, and any index while nothing is registered all return -ENOSYS to the
+// guest with nothing called and nothing read. Registration is host-side:
+// gk_hostcall_register binds an index to a handler and a context pointer, or
+// returns -EINVAL for an index past the table or a NULL handler and -EBUSY for
+// an index already bound (unregister it first); the capacity is GK_HOSTCALLS
+// indices and a table that is full is a registration refused, never a fault.
+// The context pointer is handed back to the handler from the table, never from
+// the guest, so by the provenance rule it may be dereferenced -- and what it
+// points at should itself be in host memory, so that the guest cannot change
+// what the handler finds there.
+//
+// Arguments and results. The handler is never handed a pointer the guest
+// chose. Everything crosses through a per-thread exchange region whose
+// location and bounds gk owns: one gk_hostcall_frame per thread record, in a
+// reservation gk made at init and commits one region at a time, which the
+// mapping policy (gk_mapping_change_ok) refuses to let the guest unmap,
+// decommit or reprotect. The region is ordinary user memory -- the guest
+// writes its arguments there and reads its result back -- and so it is
+// untrusted: before the handler runs, gk reads in_len from the region once,
+// refuses the call with -E2BIG if it exceeds GK_HOSTCALL_BYTES, and copies the
+// args words and the first in_len bytes of buf into a second frame in host
+// memory, which the handler alone sees. Nothing in the region is read twice,
+// and nothing read after the copy can change what the handler was given, so a
+// second guest thread rewriting the region under the call changes nothing the
+// handler sees. On return gk copies the handler's out_len bytes of buf back
+// to the region (a handler that sets out_len past the frame has made a host
+// error: nothing is copied and the guest gets -EINVAL), scrubs the exchanged
+// bytes from the host frame, and the handler's return value becomes the
+// guest's. The by-value words in args are for small arguments -- an operation
+// code, a host slot handle -- and buf for bulk bytes. By-value registers alone
+// were not enough: the operations this exists for carry keys' worth of bytes
+// each way, and a name of any length in. A pointer argument into guest memory
+// would have been simpler and is exactly the thing this design exists to
+// refuse. The region is reached by the guest through gk_hostcall_region,
+// whose answer comes from thread-local storage: a guest that rewrites it only
+// misdirects its own writes, since the host locates the region through its
+// record of the thread in supervisor memory, never through that value.
+//
+// The host frame also carries `state`: GK_HOSTCALL_STATE bytes of host
+// memory per thread that gk never copies to or from the guest and zeroes when
+// the thread record is taken, for a handler whose operation spans several
+// calls (a hash over more bytes than buf holds). It is shared by every
+// handler on that thread, and the guest decides what calls come between, so a
+// handler keeps a tag in it and checks the tag on every continuation.
+//
+// What a handler is. It runs on the calling thread, on the host side of the
+// exit, with gk's lock not held: on the vCPU's refused side stack for a
+// gk_run_here/gk_run_here_user turn or a guest-created thread, on the thread's
+// own stack for gk_run/gk_run_user. It must return rather than unwind (no
+// exception, no longjmp may cross gk's frames), must not enter the guest or
+// make a hostcall itself (the nested call reaches the kernel and fails), and
+// should not take the process heap: the guest issued the call at a point of
+// its choosing, possibly in the middle of the allocator, so a handler that
+// locks the heap can be deadlocked by the guest that called it. gk's own part
+// of the path -- the exit, the table check, the copies, the resume --
+// allocates nothing, which the GK_GUARD_HANDLER_ALLOC build checks. A handler
+// returning one of gk's own refusal values (-ENOSYS, -E2BIG, -EINVAL) is
+// indistinguishable to the guest from the refusal.
+//
+// What this does not give. A hostcall is a host-side call at ring 3's
+// request: the guest can make it as often as it likes, with any index it
+// likes (only registered ones answer) and any arguments it likes, and the
+// handler runs with host privilege on the guest's behalf. Every handler is
+// therefore an attack surface: it validates its own arguments -- a handle it
+// receives resolves through gk_host_slot_get, a length is bounds-checked
+// against in_len, an operation code is matched against a closed set -- and it
+// gives the guest only what the guest is entitled to compute. A handle
+// rewritten to another live tenant's names that tenant (the host-slot
+// ownership residual), and a handler cannot tell. Nor does the crossing
+// protect the guest's side of it: the arguments and the result sit in the
+// region, which any guest thread of the process can read and write.
+#define GK_HOSTCALLS 64
+#define GK_HOSTCALL_BYTES 4096
+#define GK_HOSTCALL_STATE 1024
+typedef struct {
+  uint64_t args[4];    // guest to host: by-value words
+  uint64_t in_len;     // guest to host: bytes of buf that carry arguments (<= GK_HOSTCALL_BYTES)
+  uint64_t out_len;    // host to guest: bytes of buf that carry the result
+  unsigned char buf[GK_HOSTCALL_BYTES];
+  unsigned char state[GK_HOSTCALL_STATE];  // host frame only: handler state across calls
+} gk_hostcall_frame;
+typedef long (*gk_hostcall_fn)(void *ctx, gk_hostcall_frame *frame);
+int gk_hostcall_register(unsigned idx, gk_hostcall_fn fn, void *ctx);
+int gk_hostcall_unregister(unsigned idx);
+// The calling thread's exchange region: fill args, in_len and buf, call,
+// read out_len and buf. Callable at any ring inside the guest; on the host
+// side it gives the thread a record if it has none. NULL only if that fails.
+gk_hostcall_frame *gk_hostcall_region(void);
+// Calls handler `idx` on the frame in the calling thread's region and returns
+// its result, or gk's refusal (-ENOSYS, -E2BIG, -EINVAL). One VM exit from
+// inside the guest; a direct call on the host side.
+long gk_hostcall(unsigned idx);
 
 // Nonzero once gk_init has succeeded in this process.
 int gk_initialized(void);

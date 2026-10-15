@@ -75,7 +75,8 @@ void freeSlot(SlotHandle handle);
 // A probe target is the address of one host-memory tenant, registered under a name, which a
 // request from inside a JS turn reads (see maybeForceGuestFaultForTest in api/global-scope.c++),
 // expecting the guest fault a ring-3 read of host memory takes. "token-key" is the channel token
-// key (server/channel-token.c++) and "host-entropy" the host entropy buffer (host-entropy.c++).
+// key (server/channel-token.c++), "host-entropy" the host entropy buffer (host-entropy.c++) and
+// "actor-id-key" the first actor-id namespace's HMAC key (server/actor-id-impl.c++).
 void setProbeTargetForTest(kj::StringPtr name, const void* target);
 kj::Maybe<const void*> probeTargetForTest(kj::StringPtr name);
 
@@ -245,6 +246,13 @@ class WD_MEMORY_CLASS_HOST HostSlot {
   }
   bool operator==(decltype(nullptr)) const {
     return handle == 0;
+  }
+
+  // The handle itself, for a hostcall (util/hostcall.h) whose handler resolves it host-side: the
+  // handle is the one thing about the object that may cross the boundary, since the handler
+  // validates it against the table like any other use. 0 when the HostSlot is empty.
+  hostMemory::SlotHandle getHandle() const {
+    return handle;
   }
 
  private:

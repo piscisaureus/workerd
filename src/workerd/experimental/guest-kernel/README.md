@@ -37,6 +37,13 @@ isolate's JS turn at guest ring 3.
   nonce of the token the host mints, and that a JS turn at guest ring 3
   reading the key or the buffer faults at the address read, failing only that
   request and condemning only that isolate.
+- `actor-id-test.sh` / `actor-id-test.capnp` / `actor-id-test.js` — end-to-end
+  check against a built workerd that a Durable Object namespace's HMAC key
+  lives in host memory while the ids a JS turn mints with it, through a
+  hostcall, are distinct, derive from the configured key (for a short name and
+  for one longer than a hostcall frame), address working Durable Objects, and
+  that a forged id is refused and a ring-3 read of the key faults at the
+  address read.
 
 ## API
 
@@ -58,6 +65,10 @@ void  gk_host_free(void*, size_t);
 gk_host_handle gk_host_slot_alloc(size_t);   // a host-memory block named by a handle
 void *gk_host_slot_get(gk_host_handle);      // validated against gk's table; NULL otherwise
 void  gk_host_slot_free(gk_host_handle);
+
+int   gk_hostcall_register(unsigned idx, gk_hostcall_fn, void *ctx); // a host handler the guest may call
+gk_hostcall_frame *gk_hostcall_region(void); // the thread's exchange frame: args in, result out
+long  gk_hostcall(unsigned idx);             // call handler idx synchronously (one VM exit)
 ```
 
 `gk_run` returns `fn`'s return value, or `GK_EFAULT` if the guest took an
@@ -184,6 +195,51 @@ hardware:
   with a pattern and shows the host's next `getEntropy()` draw on that thread
   returning the pattern and the token the host mints carrying a nonce that is
   not.
+- **Hostcalls.** A secret in host memory is of no use to a runtime operation
+  that needs it inside a turn, and some of those are synchronous to JS -- a
+  Durable Object namespace's `newUniqueId()` and `idFromName()` return the id
+  directly -- so they cannot be deferred to the event loop as the token key's
+  readers are. `gk_hostcall` is the synchronous crossing: the guest issues a
+  reserved syscall number with a handler index in `RDI`, which gk's syscall
+  exit answers itself, before the filter and before any forwarding, by
+  running the handler the host registered under that index and resuming the
+  guest with its result. The index is checked against a fixed table of
+  `GK_HOSTCALLS` entries in the supervisor control block, so the guest can
+  name nothing but a registered small integer: an index at or past the
+  table, an empty entry, and any index while nothing is registered all
+  return `-ENOSYS` with nothing called. Arguments and results cross through
+  a per-thread exchange frame in a reservation gk owns, which the mapping
+  policy refuses to let the guest unmap or reprotect; before the handler
+  runs, gk reads the frame's length once, refuses one past the frame unread
+  (`-E2BIG`), and copies the arguments into a second frame in host memory,
+  which is all the handler sees, so a handler is never handed a pointer the
+  guest chose and no byte it reads can change under it. The same function
+  on the host side runs the handler directly through the same table, so an
+  embedder calls one function from either side. The test registers a
+  handler, calls it from ring 3 on both kinds of stack, from ring 0 and from
+  the host, checks that the handler saw exactly the arguments the guest
+  passed and the guest got exactly the handler's bytes back, feeds it the
+  unregistered, at-table, past-table, all-ones and pointer-shaped indices
+  and a length past the frame -- with every argument and the whole buffer
+  set to the address of a `PROT_NONE` page -- and gets the refusal each
+  time with the handler's call count unchanged, shows a ring-3 write to the
+  table faulting and the region unmappable by the guest, unregisters and
+  sees the index refused again, and times the round trip: **6.4 us** per
+  call on the test machine, one VM exit plus a trivial handler. The guard
+  build runs the whole path with allocation forbidden. In workerd,
+  `util/hostcall.h` wraps this (a direct call when the guest kernel is off),
+  and `ActorIdFactoryImpl` (`server/actor-id-impl.h`) is its first user:
+  the namespace key is in host memory behind a host slot handle, every
+  keyed operation -- the HMAC of a name, the HMAC of an id's first half, the
+  draw of a unique id's random half from `getHostEntropy()` -- runs in the
+  handler host-side, and a name longer than one frame crosses in chunks with
+  the running HMAC kept in the frame's host-side state. `actor-id-test.sh`
+  shows the ids a turn mints being right and a ring-3 read of the key
+  faulting. What the primitive does not give: a handler runs with host
+  privilege whenever ring 3 asks, with arguments of ring 3's choosing, so
+  every handler is an attack surface that validates its own inputs, and a
+  handle swapped for another live tenant's is one it cannot tell from the
+  owner's own.
 - **Threads as vCPUs.** Each host thread that enters the guest gets its own
   vCPU, stack and TLS base, sharing the VM and memory. Four threads run in the
   guest concurrently, and two threads each locked into their own arena run at
@@ -310,9 +366,11 @@ instruction at ring 3 and ring 0 and checks its result on a CPU that has one.
 
 On a Zen 3 test machine the CR3 write behind `gk_arena_enter` costs about 217
 cycles and does not trap to the host, while a forwarded-syscall VM exit round
-trip costs about 4.7 microseconds. The switch is roughly two orders of
-magnitude cheaper than an exit, so batching the dominant syscalls is what
-decides the overall cost.
+trip costs about 4.7 microseconds and a hostcall round trip about 6.4 (the
+exit plus the exchange-frame copies and the handler). The switch is roughly
+two orders of magnitude cheaper than an exit, so batching the dominant
+syscalls is what decides the overall cost, and a hostcall is for an operation
+rare enough to pay for an exit each time.
 
 ## Limitations (remaining work)
 
@@ -350,7 +408,11 @@ decides the overall cost.
   the host refuse the use rather than read a key of the guest's choosing, and
   the key and every token nonce are drawn from a buffer in host memory
   (`util/host-entropy.h`) rather than from the thread-local one a turn can
-  write.
+  write. The actor-id namespace key is in host memory the same way, and its
+  readers, which are synchronous to JS, reach it through a hostcall (see
+  "Hostcalls" above): the HMAC runs host-side inside the turn, on a key the
+  turn cannot read, with the random half of a unique id drawn from the
+  host-memory buffer in the same call.
   What a rewritten handle can still do is name another live host slot: the
   table turns "any address" into "one of the live tenants", and telling a
   legitimate use from a swapped one is an ownership question the table cannot
@@ -367,8 +429,9 @@ decides the overall cost.
   (`src/workerd/util/memory-class.h`), which is a handful so far; every other
   class is unchecked. Placement by class exists for H only, as an explicit
   choice per object (`HostOwn<T>` and `HostSlot<T>`, `util/host-memory.h`)
-  rather than something the allocator decides, and two objects have been
-  placed: the channel token key and the host entropy buffer.
+  rather than something the allocator decides, and three objects have been
+  placed: the channel token key, the host entropy buffer and the actor-id
+  namespace key.
 - **The host acts on data a ring-3 turn can write.** The runtime's heap is in
   the guest's address space, so every host-side structure the guest can reach
   is attacker-controlled input to the host, and the dangerous cases are the
@@ -382,9 +445,11 @@ decides the overall cost.
   `kj::Exception` the guest wrote, and the guest-turn depth is restored from
   a value saved in a host frame instead of being decremented, since a
   rewritten counter would otherwise make the next turn run outside the guest,
-  and a host-memory object is reached through a host slot handle that gk
+  a host-memory object is reached through a host slot handle that gk
   validates against its own table rather than through a pointer the host
-  loads from the heap. What validation cannot settle is ownership: a pointer
+  loads from the heap, and a hostcall's handler is selected by an index gk
+  checks against its table and sees a host-memory copy of the arguments,
+  never the guest's memory. What validation cannot settle is ownership: a pointer
   swapped for another live arena's, or a handle swapped for another live
   slot's, is indistinguishable from a legitimate call, so a turn can still
   name a different isolate's arena and cost that isolate its memory, or name

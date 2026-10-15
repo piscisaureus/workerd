@@ -365,6 +365,9 @@ void maybeForceGuestFaultForTest(kj::StringPtr url) {
   if (probeEnabled && url.endsWith("/__gk_probe_host_entropy")) {
     probeHost("host-entropy");
   }
+  if (probeEnabled && url.endsWith("/__gk_probe_actor_key")) {
+    probeHost("actor-id-key");
+  }
   if (probeEnabled && url.endsWith("/__gk_poison_entropy")) {
     constexpr byte PATTERN = 0x5a;
     poisonEntropyBufferForTest(PATTERN);

@@ -374,6 +374,22 @@ wd_cc_library(
     deps = ["@capnp-cpp//src/kj"],
 )
 
+# Hostcalls (see hostcall.h): a synchronous call from a JS turn to a host-side handler, through
+# the guest kernel on the platform that has it, by direct call elsewhere.
+wd_cc_library(
+    name = "hostcall",
+    srcs = ["hostcall.c++"],
+    hdrs = ["hostcall.h"],
+    implementation_deps = select({
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
+    visibility = ["//visibility:public"],
+    deps = ["@capnp-cpp//src/kj"],
+)
+
 # Entropy for host-side secrets (see host-entropy.h): buffered in host memory and drawn from the
 # system generator, so nothing a guest can reach decides the bytes.
 wd_cc_library(

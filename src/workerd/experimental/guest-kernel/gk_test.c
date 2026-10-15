@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 #include <pthread.h>
 
@@ -1877,7 +1878,11 @@ static int host_memory_check(void) {
   int owns = gk_host_owns(k) && gk_host_owns(k + 31) && !gk_host_owns(&stack_byte) &&
              !gk_host_owns(heap) && !gk_host_owns(gk_test_dummy_text);
   free(heap);
-  int registered = s1.prot_ranges == s0.prot_ranges + 1 && s1.host_regions == 1 &&
+  // The first region may already exist: every thread record carries a
+  // hostcall frame in host memory from gk_init on. Either way the block costs
+  // the registry exactly what it costs in regions, and nothing per block.
+  int registered = s1.host_regions >= 1 &&
+                   s1.prot_ranges - s0.prot_ranges == s1.host_regions - s0.host_regions &&
                    s1.host_blocks == s0.host_blocks + 1;
   int host_rw = k[0] == 0xC0 && k[31] == 0xDF;
 
@@ -2126,6 +2131,251 @@ static int host_slot_check(void) {
          distinct ? "yes" : "NO", s5.prot_ranges - s4.prot_ranges,
          s5.host_regions - s4.host_regions, s6.host_slots == s4.host_slots ? "yes" : "NO",
          fresh ? "yes" : "NO", cpl, ok ? "OK" : "FAIL");
+  return ok;
+}
+
+// ---- hostcalls ---------------------------------------------------------------
+// A hostcall runs a registered host handler at the guest's request and hands
+// the result back before the guest's next instruction. The guest selects the
+// handler by an index checked against gk's table (in supervisor memory):
+// an unregistered index, an index at or past the table, a garbage index --
+// a pointer-shaped 64-bit value in RDI, all ones -- and any index while
+// nothing is registered all return -ENOSYS with no handler called. Arguments
+// cross through the thread's exchange region, which gk locates from its own
+// record and copies into a host-memory frame before the handler runs, so the
+// handler's view is exactly what the guest wrote and a length past the frame
+// is refused unread; the region's mapping is the guest's to use but not to
+// change. Pointer-shaped arguments reach the handler as numbers only. The
+// same call works from ring 0 and from the host side, the table is
+// unreachable from ring 3, and the round trip is timed.
+
+// The handler's own record of what it was given. In host memory, so the
+// guest cannot write it between the call and the check.
+struct hc_rec {
+  uint64_t args[4];
+  uint64_t in_len;
+  unsigned char first[16];
+};
+struct hc_seen {
+  long calls;
+  struct hc_rec rec[8];  // one per call, in order
+};
+enum { HC_IDX = 5, HC_IDX2 = GK_HOSTCALLS - 1, HC_UNREG = 6, HC_N = 20000 };
+
+// Records the frame it was given, answers with every byte of buf incremented
+// and the sum of the args. Allocates nothing: this runs under the guard build.
+static long hc_handler(void *ctx, gk_hostcall_frame *f) {
+  struct hc_seen *s = ctx;
+  if (s->calls < 8) {
+    struct hc_rec *r = &s->rec[s->calls];
+    memcpy(r->args, f->args, sizeof r->args);
+    r->in_len = f->in_len;
+    memcpy(r->first, f->buf, sizeof r->first);
+  }
+  s->calls++;
+  for (uint64_t i = 0; i < f->in_len; i++) f->buf[i] = (unsigned char)(f->buf[i] + 1);
+  f->out_len = f->in_len;
+  return (long)(f->args[0] + f->args[1] + f->args[2] + f->args[3]);
+}
+
+// A second handler, as cheap as one can be, for the timing loop.
+static long hc_handler2(void *ctx, gk_hostcall_frame *f) {
+  (void)ctx; (void)f;
+  return 0x2222;
+}
+
+// A raw hostcall with a 64-bit RDI, past the C prototype's unsigned index: the
+// values below are what a guest that ignores gk_hostcall can put there.
+static long hc_raw(uint64_t rdi) {
+  long ret;
+  __asm__ __volatile__("syscall" : "=a"(ret) : "a"(0xF4241L), "D"((long)rdi)
+                       : "rcx", "r11", "memory");
+  return ret;
+}
+
+struct hc_probe {
+  gk_hostcall_frame *region;
+  long r_ok, r_two, r_unreg, r_at, r_past, r_huge, r_ptr, r_max, r_over, r_all;
+  uint64_t out_len_ok, out_len_max;
+  unsigned char out[16];
+  unsigned long none;  // a PROT_NONE page's address, used as every argument
+};
+
+// Runs in the guest (ring 3, and once at ring 0).
+static long hc_guest(void *arg) {
+  struct hc_probe *p = arg;
+  gk_hostcall_frame *r = gk_hostcall_region();
+  p->region = r;
+  if (!r) return -1;
+  // A registered handler, with arguments: the handler must see these.
+  r->args[0] = 1; r->args[1] = 20; r->args[2] = 300; r->args[3] = 4000;
+  r->in_len = 16;
+  memcpy(r->buf, "0123456789abcdef", 16);
+  p->r_ok = gk_hostcall(HC_IDX);
+  p->out_len_ok = r->out_len;
+  memcpy(p->out, r->buf, 16);
+  p->r_two = gk_hostcall(HC_IDX2);
+  // Indices that name nothing.
+  p->r_unreg = gk_hostcall(HC_UNREG);
+  p->r_at = gk_hostcall(GK_HOSTCALLS);
+  p->r_past = gk_hostcall(GK_HOSTCALLS + 1);
+  p->r_huge = hc_raw(~0ULL);
+  p->r_ptr = hc_raw((uint64_t)(uintptr_t)r);
+  // Lengths: the frame's full size is served; one more, and all ones, are
+  // refused unread. The arguments and the buffer are the address of a page
+  // nothing may touch, so a dereference anywhere would be a crash.
+  for (int i = 0; i < 4; i++) r->args[i] = p->none;
+  for (size_t i = 0; i + sizeof p->none <= GK_HOSTCALL_BYTES; i += sizeof p->none)
+    memcpy(r->buf + i, &p->none, sizeof p->none);
+  r->in_len = GK_HOSTCALL_BYTES;
+  p->r_max = gk_hostcall(HC_IDX);
+  p->out_len_max = r->out_len;
+  r->in_len = GK_HOSTCALL_BYTES + 1;
+  p->r_over = gk_hostcall(HC_IDX);
+  r->in_len = ~0ULL;
+  p->r_all = gk_hostcall(HC_IDX);
+  return 0;
+}
+
+// Runs in the guest: HC_N calls of the cheap handler, for the timing.
+static long hc_bench(void *arg) {
+  (void)arg;
+  long acc = 0;
+  gk_hostcall_frame *r = gk_hostcall_region();
+  r->in_len = 0;
+  for (int i = 0; i < HC_N; i++) acc += gk_hostcall(HC_IDX2);
+  return acc;
+}
+static long hc_empty(void *arg) { (void)arg; return 0; }
+
+static double now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
+}
+
+static int hostcall_check(void) {
+  gk_stats s0, s1, s2;
+  gk_get_stats(&s0);
+  struct hc_seen *seen = gk_host_alloc(sizeof *seen);
+  struct hc_probe *p = calloc(1, sizeof *p);
+  unsigned char *none = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (!seen || !p || none == MAP_FAILED) { printf("hostcalls: setup failed [FAIL]\n"); return 0; }
+  p->none = (unsigned long)(uintptr_t)none;
+
+  // Nothing registered: every index fails without a handler to call.
+  long n_a = gk_run_user(hc_guest, p);
+  int none_ok = n_a == 0 && p->r_ok == -ENOSYS && p->r_two == -ENOSYS && p->r_at == -ENOSYS &&
+                p->r_huge == -ENOSYS && p->r_max == -ENOSYS && s0.hostcall_handlers == 0;
+  // Registration: bounds, a NULL handler, and a taken index are refused.
+  int reg_bad = gk_hostcall_register(GK_HOSTCALLS, hc_handler, seen) == -EINVAL &&
+                gk_hostcall_register(HC_IDX, NULL, seen) == -EINVAL;
+  int reg = gk_hostcall_register(HC_IDX, hc_handler, seen) == 0 &&
+            gk_hostcall_register(HC_IDX2, hc_handler2, NULL) == 0 &&
+            gk_hostcall_register(HC_IDX, hc_handler2, NULL) == -EBUSY;
+  gk_get_stats(&s1);
+
+  // From ring 3, on a private guest stack and on the caller's stack.
+  memset(p, 0, sizeof *p);
+  p->none = (unsigned long)(uintptr_t)none;
+  long ru = gk_run_user(hc_guest, p);
+  int out_ok = 1;
+  for (int i = 0; i < 16; i++) if (p->out[i] != (unsigned char)("0123456789abcdef"[i] + 1)) out_ok = 0;
+  int call_ok = ru == 0 && p->r_ok == 4321 && p->out_len_ok == 16 && out_ok && p->r_two == 0x2222;
+  // The handler ran twice in that run (the first call and the max-length
+  // one): the refused indices and lengths added nothing.
+  const struct hc_rec *c0 = &seen->rec[0], *c1 = &seen->rec[1];
+  int seen_ok = seen->calls == 2 && c0->args[0] == 1 && c0->args[1] == 20 &&
+                c0->args[2] == 300 && c0->args[3] == 4000 && c0->in_len == 16 &&
+                memcmp(c0->first, "0123456789abcdef", 16) == 0;
+  int refused_ok = p->r_unreg == -ENOSYS && p->r_at == -ENOSYS && p->r_past == -ENOSYS &&
+                   p->r_huge == -ENOSYS && p->r_ptr == -ENOSYS;
+  int len_ok = p->r_max == (long)(4 * p->none) && p->out_len_max == GK_HOSTCALL_BYTES &&
+               c1->in_len == GK_HOSTCALL_BYTES && c1->args[0] == p->none &&
+               c1->args[3] == p->none && memcmp(c1->first, &p->none, sizeof p->none) == 0 &&
+               p->r_over == -E2BIG && p->r_all == -E2BIG;
+  long calls_after_user = seen->calls;
+  struct hc_probe *q = calloc(1, sizeof *q);
+  q->none = p->none;
+  long rh = gk_run_here_user(hc_guest, q);
+  int here_ok = rh == 0 && q->r_ok == 4321 && q->r_two == 0x2222 && q->r_unreg == -ENOSYS &&
+                q->r_huge == -ENOSYS && q->r_max == (long)(4 * q->none) && q->r_over == -E2BIG &&
+                q->region == p->region && seen->calls == calls_after_user + 2;
+  // From ring 0, and from the host side: the same function, the same table.
+  struct hc_probe *k = calloc(1, sizeof *k);
+  k->none = p->none;
+  long r0 = gk_run(hc_guest, k);
+  int ring0_ok = r0 == 0 && k->r_ok == 4321 && k->r_unreg == -ENOSYS && k->r_over == -E2BIG;
+  struct hc_probe *h = calloc(1, sizeof *h);
+  h->none = p->none;
+  long rhost = hc_guest(h);
+  int host_ok = rhost == 0 && h->r_ok == 4321 && h->r_two == 0x2222 && h->r_unreg == -ENOSYS &&
+                h->r_at == -ENOSYS && h->r_over == -E2BIG && h->region == p->region &&
+                h->r_huge == -ENOSYS;  // the raw syscall on the host reaches the kernel
+  gk_get_stats(&s2);
+  int stats_ok = s1.hostcall_handlers == s0.hostcall_handlers + 2 &&
+                 s2.hostcalls - s0.hostcalls == 3 * 4;
+
+  // The table is supervisor memory: a ring-3 write faults. The region is the
+  // guest's to use, not to remap: the mapping policy refuses it, with the
+  // guest's own page next to it still allowed.
+  unsigned long table = gk_debug_ctl_addr(GK_CTL_HOSTCALLS);
+  long w3 = gk_run_user(user_write_here, (void *)table);
+  unsigned long fw3 = gk_fault_addr();
+  unsigned char *own = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  int walled = w3 == GK_EFAULT && fw3 == table &&
+               !gk_mapping_change_ok((unsigned long)(uintptr_t)p->region, 4096) &&
+               !gk_mapping_change_ok((unsigned long)(uintptr_t)p->region + 4096, 1) &&
+               gk_mapping_change_ok((unsigned long)(uintptr_t)own, 4096);
+  munmap(own, 4096);
+
+  // Round-trip cost: HC_N calls of the cheap handler from ring 3 on the
+  // caller's stack (the production path), less the cost of the entry itself.
+  double t0 = now_ns();
+  long acc = gk_run_here_user(hc_bench, NULL);
+  double t1 = now_ns();
+  gk_run_here_user(hc_empty, NULL);
+  double t2 = now_ns();
+  double per_call = ((t1 - t0) - (t2 - t1)) / HC_N;
+  int bench_ok = acc == (long)HC_N * 0x2222 && per_call > 0;
+
+  // Unregistered: the index fails again, the other handler still answers, and
+  // a second unregister reports nothing bound.
+  int unreg = gk_hostcall_unregister(HC_IDX) == 0;
+  struct hc_probe *u = calloc(1, sizeof *u);
+  u->none = p->none;
+  long rund = gk_run_user(hc_guest, u);
+  int after_ok = unreg && rund == 0 && u->r_ok == -ENOSYS && u->r_max == -ENOSYS &&
+                 u->r_two == 0x2222 && seen->calls == calls_after_user + 6 &&
+                 gk_hostcall_unregister(HC_IDX) == -ENOSYS &&
+                 gk_hostcall_unregister(GK_HOSTCALLS) == -EINVAL;
+  gk_hostcall_unregister(HC_IDX2);
+  long cpl = gk_run_user(user_cpl, NULL);
+
+  int ok = none_ok && reg_bad && reg && call_ok && seen_ok && refused_ok && len_ok && here_ok &&
+           ring0_ok && host_ok && stats_ok && walled && bench_ok && after_ok && cpl == 3;
+  printf("hostcalls: nothing registered -> all ENOSYS %s; register: past table/NULL/taken "
+         "refused %s, two bound %s; ring 3: handler %u -> %ld (want 4321), out %s, %u -> %#lx; "
+         "handler saw args %llu/%llu/%llu/%llu in_len %llu bytes %s; unregistered/at/past/"
+         "all-ones/pointer index -> %ld/%ld/%ld/%ld/%ld (want all %d, handler calls unchanged "
+         "%s); in_len %d -> %ld with %llu bytes back, %d -> %ld, ~0 -> %ld (want %d); caller's "
+         "stack %s; ring 0 %s; host side %s; %ld calls counted %s; ring-3 write to table -> %s "
+         "(fault %#lx == %#lx), region unmappable by the guest %s; %.0f ns per round trip "
+         "(%d calls); after unregister -> %ld, other %#lx, re-unregister %s; CPL %ld [%s]\n",
+         none_ok ? "yes" : "NO", reg_bad ? "yes" : "NO", reg ? "yes" : "NO", HC_IDX, p->r_ok,
+         out_ok ? "ok" : "WRONG", HC_IDX2, p->r_two, (unsigned long long)c0->args[0],
+         (unsigned long long)c0->args[1], (unsigned long long)c0->args[2],
+         (unsigned long long)c0->args[3], (unsigned long long)c0->in_len,
+         seen_ok ? "as passed" : "DIFFER", p->r_unreg, p->r_at, p->r_past, p->r_huge,
+         p->r_ptr, -ENOSYS, refused_ok ? "yes" : "NO", GK_HOSTCALL_BYTES, p->r_max,
+         (unsigned long long)p->out_len_max, GK_HOSTCALL_BYTES + 1, p->r_over, p->r_all, -E2BIG,
+         here_ok ? "ok" : "BROKEN", ring0_ok ? "ok" : "BROKEN", host_ok ? "ok" : "BROKEN",
+         s2.hostcalls - s0.hostcalls, stats_ok ? "ok" : "WRONG",
+         w3 == GK_EFAULT ? "FAULT" : "WROTE", fw3, table, walled ? "yes" : "NO", per_call, HC_N,
+         u->r_ok, u->r_two, after_ok ? "ok" : "BROKEN", cpl, ok ? "OK" : "FAIL");
+  free(p); free(q); free(k); free(h); free(u);
+  munmap(none, 4096);
+  gk_host_free(seen, sizeof *seen);
   return ok;
 }
 
@@ -2896,9 +3146,16 @@ int main(void) {
   // host_slot_check).
   int ok29 = host_slot_check() == 1;
 
+  // ---- hostcalls --------------------------------------------------------------
+  // A ring-3 guest calls a registered host handler by index and gets its
+  // result synchronously; an index that names no handler fails with nothing
+  // called; arguments cross through a region gk owns, bounded by gk, and
+  // never as a pointer the handler dereferences (see hostcall_check).
+  int ok30 = hostcall_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
-            ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28 && ok29;
+            ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28 && ok29 && ok30;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }
