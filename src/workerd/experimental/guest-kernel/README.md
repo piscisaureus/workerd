@@ -1061,9 +1061,42 @@ so a crossing a turn makes on every dereference belongs on that path.
   lookup compares that against `CR3`, so another isolate's entry is refused
   (see "Ring-0 resolve" above); what it does not tell apart is two entries
   of the same isolate. Every other object listed above is still in
-  the shared heap. Moving the malloc'd objects into the arena needs a
-  per-isolate allocator arena, which means an allocator with extent hooks;
-  workerd uses tcmalloc, which has none.
+  the shared heap in the default build.
+
+  With jemalloc as the allocator
+  (`--//src/workerd/server:allocator=jemalloc`) the arena also covers the C++
+  objects the runtime allocates for the isolate while its lock is held: each
+  isolate has a jemalloc arena over the upper part of its gk arena's tail
+  (`jsg::HeapArena`), and the isolate lock switches the thread onto it, so
+  JSG wrappers, `IoOwn`'d objects, V8's per-turn malloc'd state and the KJ
+  allocations that carry request data are unaddressable from other isolates'
+  turns too; `src/workerd/jsg/guest-arena-test.c++` checks this. The arena's
+  bookkeeping is shared, so a free from any context touches only shared
+  memory, and jemalloc's thread cache is off process-wide, since it would
+  recycle one isolate's freed blocks into another's allocations. What stays
+  shared, and readable, is what is allocated with no isolate lock held: the
+  isolate object itself and the rest of what V8 allocates while creating it
+  (creation also grows process-wide registries, which must not die with one
+  isolate), and whatever V8's background threads allocate on an isolate's
+  behalf, since they run on their own arenas.
+
+  Three things do not work under this scheme, all because the per-thread
+  arena switch places everything a turn allocates in the isolate's arena.
+  Objects handed from one isolate's turn to another's fault: an in-process
+  service binding faults the callee's first turn on the request objects the
+  caller built. Process-wide state that is lazily initialized during a turn
+  lands in that isolate's arena: a second worker using `Intl` faults on the
+  ICU data the first one loaded, and V8's wasm type canonicalizer grows its
+  tables on whichever isolate first creates a context. And process-wide
+  mutable containers get nodes and backing arrays from whichever isolate's
+  turn grows them, so another isolate's turn faults when it rebalances or
+  resizes past one: two workers using `setTimeout` concurrently fault each
+  other on the event loop's timer set, and a turn abandoned in the middle of
+  such an update leaves the container inconsistent, after which the whole
+  process stops serving. Workers that share nothing of the kind -- no timers,
+  no `Intl`, no calls between them -- serve concurrently without faults. For
+  the second reason a destroyed isolate's arena is retained for the life of
+  the process rather than unmapped.
 - **The memory classification of runtime objects is applied to few of
   them.** Which side of the boundary each runtime C++ class belongs on is
   written down in `memory-classes.md`, together with the rules that decide
