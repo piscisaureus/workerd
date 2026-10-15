@@ -513,6 +513,12 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // `hasCurrent() && tcx == current()`).
   bool isCurrent();
 
+  // The thread-local behind current(), for the host side of a guest turn to save before the turn
+  // and put back after it (see GuestTurnThreadLocals in guest-turn-thread-locals.h). The value is
+  // opaque to the caller: it is only ever stored back.
+  static IoContext* saveThreadLocalForGuestTurn();
+  static void restoreThreadLocalAfterGuestTurn(IoContext* value);
+
   // A process-unique identifier assigned to each IoContext at construction. IDs are monotonically
   // increasing and never reused, so a captured Id can be compared against the current IoContext's
   // Id to determine whether execution is happening in the same context -- without retaining a

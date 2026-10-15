@@ -238,7 +238,7 @@ Each rule has a test that can be applied without reading the class body.
 | R4 | Abstract class of embedder hooks whose implementation lives outside `io/` and `jsg/` (the `observer.h` convention) | **H**, and every in-turn call through its vtable is a message site. Covers `RequestObserver` (`io/observer.h:93`), `LimitEnforcer` (`io/limit-enforcer.h:221`), `IoChannelFactory` and its channels (`io/io-channels.h:119`), `TimerChannel` (`:69`), `CacheClient` (`:44`), `ActorIdFactory` (`io/actor-id.h:41`), the gate hooks (`io/io-gate.h:44`), `jsg::IsolateObserver` (`jsg/observer.h:25`), `Serializer::ExternalHandler` (`jsg/ser.h:73`) |
 | R5 | No path from a `Wrappable` except through `IoOwn`/`IoPtr`/`ReverseIoOwn` or a `kj::Function` captured into a KJ promise | **H**. Promise nodes, `TaskSet` entries, timer tasks, HTTP client objects, `WorkerInterface` instances, capnp RPC state |
 | R6 | Every member is an integer, enum, `bool`, `kj::Date`, `kj::Duration`, or a `kj::String`/`kj::Array<byte>`/`kj::Vector` of the same | Side-neutral; crosses by copying into B. `IoContext::Id` (`io-context.h:521`), `TimeoutId` (`io/io-timers.h:17`), `tracing::SpanId`/`TraceId` (`io/trace.h:45`, `:128`), every event struct in `io/trace.h:373-985`, `Trace` (`:989`, which already has capnp `copyTo`/`mergeFrom` at `:1049`), `jsg::GuestTurnOutcome`. Caveat: a `kj::String` carries an `ArrayDisposer*`, so it crosses as bytes plus length and is re-owned on arrival, never moved as a `kj::String` |
-| R7 | `thread_local`, or a function-local `static` with mutable state | Reachable by the guest; must move to H memory or be re-derived host-side after each turn. `threadLocalRequest` (`io-context.c++:29`), `currentApi` (`worker.c++:557`), `tmpDirStorageScope` (`worker-fs.c++:53`), `inCppgcShimDestructor` (`wrappable.c++:29`), `guestTurnArena` (`guest-run.c++:29`), `CompileCache::get()`'s static (`jsg/compile-cache.h:47`), `AsyncLockQueue::threadCurrentWaiter` (`io/async-lock-scheduler.h:159`) |
+| R7 | `thread_local`, or a function-local `static` with mutable state | Reachable by the guest, so a value the host trusts after a turn, or that a signal handler or a forwarded syscall consumes mid-turn, must not come from it. Two remedies are in use. A value the host reads only *after* the turn is saved on the host stack frame that runs the turn and put back when the guest returns (the frame is read-only to the guest under the host-frame wall): `GuestTurnThreadLocals` (`io/guest-turn-thread-locals.h`) does this for `threadLocalRequest` (`io-context.c++:29`), `currentApi` (`worker.c++:557`, with `Worker::Lock` also restoring it from the stack rather than its heap `Impl` at release), `tmpDirStorageScope` (`worker-fs.c++:57`), `symbolicLinkGuard` (`worker-fs.c++:53`), `SqliteMemoryScope::threadLocalScope` (`sqlite-metering.c++:36`) and the `AllowV8BackgroundThreads`/`WarnAboutIsolateLock` scope depths (`thread-scopes.c++`); `guestTurnDepth` (`guest-run.c++:22`) was the first. A value consumed *during* the turn with host privilege is kept out of the guest's reach instead: `activeProgressCounter` (`thread-scopes.c++:27`), read by the watchdog's signal handler, lives in gk's per-thread supervisor words (`gk_thread_words_*`), and `currentVfsRoot` (`sqlite.c++:1846`), the dirfd of SQLite's forwarded `openat`, is bounded by gk's turn directory (`gk_confine_paths`/`gk_turn_dir_set`). `guestTurnArena` (`guest-run.c++:29`) needs neither: a rewrite only weakens a diagnostic the guest draws at ring 3, and the host never dereferences it. `vfsErrorListener` (`sqlite.c++:191`) needs neither: `SqliteCallScope` clears it unconditionally and it is consumed only at ring 3 within the turn. Still open: `inCppgcShimDestructor` (`wrappable.c++:29`), `CompileCache::get()`'s static (`jsg/compile-cache.h:47`), `AsyncLockQueue::threadCurrentWaiter` (`io/async-lock-scheduler.h:159`) |
 | R8 | Every public method takes `jsg::Lock&` and the class has no R3 member | **I**. `jsg::Serializer`/`Deserializer` (`jsg/ser.h:60`), `MemoryTracker` (`jsg/memory.h:176`), `jsg::Url` and friends, the `TypeWrapper`/`ResourceWrapper` machinery (`jsg/type-wrapper.h:635`), `ModuleRegistryImpl` (`jsg/modules.h:280`), `AsyncContextFrame` (`jsg/async-context.h:70`) |
 | R9 | Process-wide singleton of the V8 embedding | **H**. `V8System` (`jsg/setup.h:53`), `V8PlatformWrapper` (`jsg/v8-platform-wrapper.h:13`), `GuestArena` (`setup.h:194`). `ArenaPageAllocator` (`setup.h:121`) is the exception: V8 calls it from in-arena threads, so its code runs in the guest and its range checks are not a host-side guarantee -- the enforcement for it is the syscall filter's `gk_mapping_syscall_ok` |
 
@@ -341,11 +341,18 @@ at.
 
 ### Other violations
 
-3. **Guest-writable thread-locals the host trusts after the turn.**
-   `threadLocalRequest` (`io-context.c++:29`) is read by `IoContext::current()`
-   from host-side destructors (`io-own.c++:10`); `currentApi`
-   (`worker.c++:557`) backs `Worker::Api::current()`; `guestTurnArena`
-   (`guest-run.c++:29`) decides whether a nested turn is in the same arena.
+3. **Guest-writable thread-locals, closed.** `threadLocalRequest`
+   (`io-context.c++:29`), read by `IoContext::current()` from host-side
+   destructors (`io-own.c++:10`), and `currentApi` (`worker.c++:557`), behind
+   `Worker::Api::current()`, are saved on the host turn frame and restored when
+   the guest returns (`GuestTurnThreadLocals`), with `Worker::Lock` taking
+   `currentApi` from its stack rather than its heap `Impl` at release; the same
+   frame covers the SQLite memory scope and the VFS scopes. `activeProgressCounter`
+   (`thread-scopes.c++:27`), which the watchdog's signal handler dereferences
+   mid-turn, is in gk's per-thread supervisor words instead. `currentVfsRoot`
+   (`sqlite.c++:1846`) has gk's turn directory as its remedy, built but not yet
+   wired into the VFS (see R7). `guestTurnArena` (`guest-run.c++:29`) needs
+   nothing: a rewrite only weakens a ring-3 diagnostic the host never acts on.
 4. **Guest code takes host mutexes**, so corrupting a `kj::Mutex` word
    deadlocks the next host locker: `DeleteQueue::crossThreadDeleteQueue` from
    `~IoOwn` during in-arena GC (`io-own.c++:15`), `IsolateBase::queue` from
@@ -500,10 +507,10 @@ state. These are H by rule 3, and a turn reads or writes them today:
 |---|---|---|
 | `globalAutogate`, a `bool[22]` | `autogate.c++:17`, read by `isEnabled` `autogate.c++:94` | Read on hot paths from a dozen `api/` files inside turns. A write flips code paths for every isolate in the process; `COMPRESSION_RS` (`autogate.h:125`) routes all zlib work. Cheap fix: the bitmap is 22 bytes, so copy it into each arena at isolate creation and have in-turn code read the arena copy |
 | `std::atomic<bool> useZlibRs` | `zlib-router.c++` | Consulted on every zlib call a turn makes; a write switches implementation process-wide mid-stream |
-| `ThreadProgressCounter* activeProgressCounter` | `thread-scopes.c++:27` | Thread-local, and its own comment says it "is read in signal handlers". TLS is guest-writable, so one word hands a signal handler an arbitrary pointer to dereference. Same shape as the `guestTurnDepth` counter in `guest-run.c++:22`, which is fixed by restoring from a host frame; this one needs the pointer out of TLS, in gk's per-thread supervisor record |
+| `ThreadProgressCounter* activeProgressCounter` | `thread-scopes.c++:27` | Read by the watchdog's signal handler while the turn runs, so it cannot use technique A (a host-frame save restores only after the turn): a pointer the handler loaded from TLS, which the turn can write, would be a pointer of the turn's choosing dereferenced with host privilege. **Technique B, done.** With the guest kernel on, the active counter's identity, the address of its `uint64_t` and the saved value live in gk's per-thread supervisor words (`gk_thread_words_set`/`gk_thread_words_get`, three keys the file owns), which ring 3 cannot write; `hasProgress()`/`acknowledgeProgress()` and the handler read them there. A counter constructed inside a turn is always a reentrant no-op (the turn's own lock holds the outer one). Without the guest kernel the thread-local pointer stays. `thread-scopes.h` describes it; `gk_test.c`'s `thread_word_check` shows the words set host-side, read from a `SIGUSR1` handler interrupting a ring-3 turn, and unreachable from ring 3 |
 | `multiTenantProcess`, `predictableMode`, `gcStressMode` | `thread-scopes.c++:20` | File-scope, read from turns |
 | `thread_local BufferState state`, 4 KiB of unconsumed CSPRNG output | `entropy.c++`, behind `getEntropy()` | The buffer is on the thread the turn runs on, so a turn can read the bytes a later draw on that thread returns, or choose them. **Split by caller, not moved.** The host-privileged draws -- the channel token key at startup and the nonce of every RPC token (`channel-token.c++`) -- use `getHostEntropy()` (`host-entropy.h`) instead: its buffer, cursor and lock are one H block reached through a host slot handle, and it refills from the operating system's generator rather than from BoringSSL's in-process DRBG, whose per-thread state is in the shared heap as well and, on a CPU without a fast RDRAND, determines the DRBG's output outright. So neither the bytes a token nonce is drawn from nor the generator state behind them is in memory a guest can reach; `host-memory-test.sh` shows a turn's overwrite of the thread-local buffer reaching the host's next `getEntropy()` draw and not the nonce. `getEntropy()` keeps its thread-local buffer for the draws a turn makes for itself (`crypto.getRandomValues`, multipart boundaries, hyperdrive suffixes, retry seeds), whose bytes go to the isolate anyway, so their confidentiality from it is meaningless and a crossing would buy nothing. The one in-turn draw whose value is *not* only for that turn, the 16 random bytes of a `newUniqueId()` actor id, is no longer made from it: the id is minted by the actor-id hostcall (`server/actor-id-impl.c++`), host-side, and the handler draws the random half from `getHostEntropy()` in the same call that HMACs it, so neither half of an id is a turn's to read or choose. `sentry.c++`'s internal error ids are the remaining in-turn draw whose value leaves the turn; they correlate a log line with a user-visible message and are not a secret, so a chosen id can at worst mislabel a log line |
-| `thread_local int currentVfsRoot` | `sqlite.c++:1846` | It is the directory descriptor for the `openat`, `unlinkat`, `mkdirat` and `readlinkat` that SQLite's VFS issues (`sqlite.c++:1853-1876`). A write redirects where SQLite's file operations land. The root belongs on the `Vfs` object, not in TLS |
+| `thread_local int currentVfsRoot` | `sqlite.c++:1846` | It is the directory descriptor for the `openat`, `unlinkat`, `mkdirat` and `readlinkat` that SQLite's wrapped-native VFS issues (`sqlite.c++:1853-1876`), and `openat` is on the syscall allowlist, so a rewrite would redirect where SQLite's file operations land -- the one thread-local with filesystem reach. It cannot use technique A, because the dirfd is consumed by a forwarded syscall mid-turn. **Technique B, facility done; VFS wiring pending.** gk's turn directory (`gk_confine_paths`/`gk_turn_dir_set`, gk.h) bounds a turn's forwarded path syscalls to a directory the host set, rewriting `openat` as `openat2` with `RESOLVE_BENEATH`, so a rewritten dirfd is refused and the lookup cannot leave the directory; `gk_test.c`'s `turn_dir_check` shows this, and its negative build shows file operations landing at a guest-chosen directory once the confinement is removed. Wiring the wrapped-native VFS to set the turn directory around its native calls is the remaining step; it is reachable only by disk-backed Durable Objects, which do not yet run under the guest kernel (a turn on one faults before reaching SQLite), so the wiring cannot yet be validated end to end |
 | `SqliteObserver DEFAULT` with a mutable `dbWalSize`; `vfsErrorListener` | `sqlite.h:55`, `sqlite.c++:191` | File-scope and thread-local mutable state on a path a turn drives synchronously |
 | `static kj::NullStream nullStream` | `stream-utils.c++:250` | A file-scope object with a vtable, handed out by reference and by `kj::Own` with a null disposer. Must be rodata or supervisor-mapped |
 | `static const MimeType PLAINTEXT` | `mimetype.h:115` | `const`, but its `kj::String` members point at shared-heap buffers that `const` does not protect. The `ConstMimeType` forms below it (`mimetype.h:117`) are the right shape |
@@ -646,15 +653,18 @@ what is waiting on the same facility:
   cases below need: the handler finds its state through gk's per-thread
   supervisor record -- the thread's record by kernel tid, the arena from the
   record -- and never through a thread-local.
-- **Waiting, same remedy:** the provenance violations above, each of which
-  needs the host to read a pointer or a descriptor from memory the guest
-  cannot write -- the `jsg::Lock` data slot (violation 1), the guest-writable
-  thread-locals `threadLocalRequest`, `currentApi` and `guestTurnArena`
-  (violation 3), the `activeProgressCounter` pointer a signal handler
-  dereferences (`thread-scopes.c++:27`). Each of these is a `HostSlot` plus a
-  crossing for the in-turn reader, and the thread-local ones need the host
-  side to find its record without a thread-local, through gk's per-thread
-  supervisor record, as the signal field write does.
+- **In gk's supervisor memory, found by thread:** the watchdog progress
+  counter's state (`thread-scopes.c++:27`), in gk's per-thread supervisor
+  words (`gk_thread_words_*`), read by the watchdog signal handler through
+  gk's record of the thread rather than through a thread-local, as the signal
+  field write is. The thread-locals the host reads only after a turn
+  (`threadLocalRequest`, `currentApi`, the SQLite and VFS scopes) need no
+  supervisor memory: they are saved on the host turn frame and restored when
+  the guest returns (`GuestTurnThreadLocals`, violation 3).
+- **Waiting, same remedy:** the remaining provenance violations above, each
+  of which needs the host to read a pointer or a descriptor from memory the
+  guest cannot write -- the `jsg::Lock` data slot (violation 1). It is a
+  `HostSlot` plus a crossing for the in-turn reader.
 - **Not addressed by H memory alone:** the pointer to an H object is as safe
   as the memory it sits in. A `HostOwn` in a shared-heap object protects the
   object's bytes and lets the guest kernel refuse a swapped pointer at free

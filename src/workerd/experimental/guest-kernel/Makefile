@@ -14,10 +14,15 @@ gk_test_guard: gk.c gk_asm.S gk_test.c gk.h
 		-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc \
 		-o $@ gk.c gk_asm.S gk_test.c
 
+# Negative-test builds (never shipped): each removes one technique-B protection so the
+# corresponding gk_test case fails, confirming the case actually tests the protection.
+gk_test_neg: gk.c gk_asm.S gk_test.c gk.h
+	$(CC) $(CFLAGS) -DGK_NEG_THREAD_WORDS -DGK_NEG_TURN_DIR -o $@ gk.c gk_asm.S gk_test.c
+
 run: gk_test
 	./gk_test
 
 clean:
-	rm -f gk_test gk_test_guard
+	rm -f gk_test gk_test_guard gk_test_neg
 
 .PHONY: run clean

@@ -50,6 +50,12 @@ isolate's JS turn at guest ring 3.
   module whose JS turn runs at guest ring 3, and that a turn overwriting the
   module's heap descriptor with a buffer of its choosing leaves the signal
   landing in the module's real memory and the chosen buffer untouched.
+- `tls-test.sh` / `tls-test.capnp` — end-to-end check against a built workerd
+  that the guest-writable thread-locals the host reads after a JS turn do not
+  carry a turn's value past it: a turn overwrites, from inside itself, the heap
+  slot the isolate lock restores `Worker::Api`'s thread-local from, and the
+  host still leaves the thread-local holding the value it had before the lock,
+  taken from a host stack frame and not the overwritten slot.
 
 ## API
 
@@ -80,6 +86,13 @@ int   gk_signal_field_register(uintptr_t off, size_t len, uint32_t field, unsign
                                gk_signal_handle *h); // a word in the thread's arena a signal handler may write
 int   gk_signal_field_unregister(gk_signal_handle);
 long  gk_signal_field_write(unsigned kind, uint32_t value); // from a signal handler: no lock, no allocation
+
+int   gk_thread_words_set(unsigned first, unsigned n, const uint64_t *v); // per-thread words in supervisor memory
+int   gk_thread_words_get(unsigned first, unsigned n, uint64_t *v);       // for state a signal handler reads
+int   gk_in_guest_hint(void);                // gk's own in-guest flag; a hint, never trusted
+
+void  gk_confine_paths(int on);              // bound a confined turn's path syscalls to its turn directory
+int   gk_turn_dir_set(int dirfd);            // set this thread's turn directory (host-side)
 ```
 
 `gk_run` returns `fn`'s return value, or `GK_EFAULT` if the guest took an
@@ -300,6 +313,41 @@ hardware:
   the writer back to the heap list, which is what the writers walk without
   the guest kernel. `wasm-signal-test.sh` shows the signal reaching a module
   at ring 3 and not reaching a buffer the turn aimed the heap entry at.
+- **Thread words.** Per-thread state the host or a signal handler must read
+  from memory no ring-3 code can write -- the opposite of thread-local
+  storage, which a turn can rewrite -- lives in `GK_THREAD_WORDS` 64-bit words
+  in the thread's record in the supervisor control block.
+  `gk_thread_words_set`/`gk_thread_words_get` address them by a validated key,
+  find the thread's record lock-free (the thread-local index hint checked
+  against the record's kernel tid, scanned for otherwise), and so are usable
+  from a signal handler for about a `gettid` each (~50 ns). A thread with no
+  record reads `-ESRCH`; a fresh record and a guest-created thread read
+  zeroes, never a creator's words. In workerd the watchdog's progress counter
+  (`util/thread-scopes.c++`), which its signal handler dereferences while the
+  turn runs, keeps its state here rather than behind a thread-local pointer.
+  `gk_test.c`'s `thread_word_check` sets words on the host, reads them from a
+  `SIGUSR1` handler interrupting a ring-3 turn, shows the words unreachable
+  from ring 3 and reachable from ring 0, and times the read; its negative
+  build (`gk_test_neg`) places the words in guest memory and the case fails.
+- **Turn directory.** A bound on where the path syscalls a confined turn
+  forwards may land. With `gk_confine_paths` on, a thread with a turn
+  directory (set host-side, from a hostcall handler, by `gk_turn_dir_set`)
+  has its `openat` forwarded as `openat2` with `RESOLVE_BENEATH` and
+  `RESOLVE_NO_MAGICLINKS` and its `newfstatat`/`statx` as an `O_PATH` open
+  under the same rules, so an absolute path, a `..` or a symbolic link that
+  would leave the directory, and a `/proc` magic link are refused by the
+  kernel atomically with the lookup; every other path syscall, and `fchdir`,
+  is refused, and a thread with no directory refuses them all. The descriptor
+  is checked by device and inode on every use, so one the guest closed and
+  reused names nothing. This is the remedy for SQLite's `currentVfsRoot`
+  (`util/sqlite.c++`), the dirfd of its forwarded `openat`, which a turn could
+  otherwise rewrite to redirect a file operation; wiring the VFS to set the
+  turn directory is pending (see memory-classes.md R7). `gk_test.c`'s
+  `turn_dir_check` opens and stats beneath the directory, sees a wrong dirfd,
+  an absolute path, a `..`, a symlink out, a reused descriptor and the rest
+  refused, and times a confined open; its negative build removes the
+  confinement and the case fails with the file landing at a guest-chosen
+  directory.
 - **Threads as vCPUs.** Each host thread that enters the guest gets its own
   vCPU, stack and TLS base, sharing the VM and memory. Four threads run in the
   guest concurrently, and two threads each locked into their own arena run at

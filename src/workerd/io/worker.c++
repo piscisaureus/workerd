@@ -14,6 +14,7 @@
 #include <workerd/io/compatibility-date.h>
 #include <workerd/io/features.h>
 #include <workerd/io/frankenvalue.h>
+#include <workerd/io/guest-turn-thread-locals.h>
 #include <workerd/io/per-isolate-bootstrap.h>
 #include <workerd/io/tracer.h>
 #include <workerd/io/validation.h>
@@ -554,11 +555,23 @@ class Worker::InspectorClient: public v8_inspector::V8InspectorClient {
   kj::MutexGuarded<State> state;
 };
 
+// The Api of the isolate locked on this thread. Thread-local storage is memory a JS turn at guest
+// ring 3 can write, so after a guest turn the host re-establishes this from a copy saved in a
+// host frame (GuestTurnThreadLocals) rather than trusting what the turn left here, and
+// Worker::Lock keeps the value it restores at release on the stack rather than in its heap impl.
 static thread_local const Worker::Api* currentApi = nullptr;
 
 const Worker::Api& Worker::Api::current() {
   KJ_REQUIRE(currentApi != nullptr, "not running JavaScript");
   return *currentApi;
+}
+
+const Worker::Api* Worker::Api::saveThreadLocalForGuestTurn() {
+  return currentApi;
+}
+
+void Worker::Api::restoreThreadLocalAfterGuestTurn(const Api* value) {
+  currentApi = value;
 }
 
 kj::Maybe<const Worker::Api&> Worker::Api::tryCurrent() {
@@ -762,6 +775,8 @@ struct Worker::Isolate::Impl {
     ThreadProgressCounter progressCounter;
     bool shouldReportIsolateMetrics = false;
     const Api* oldCurrentApi;
+
+    friend class Worker::Lock;  // for savedApiStorageForTest()
 
     const IsolateLimitEnforcer& limitEnforcer;  // only so we can call getIsolateStats()
 
@@ -2201,6 +2216,10 @@ Worker::Worker(kj::Own<const Script> scriptParam,
             }
           });
         };
+        // The thread-locals the host reads after the turn are saved in this frame and put back
+        // once the guest has returned (see runJsTurn in io-context.c++).
+        auto threadLocals = GuestTurnThreadLocals::save();
+        KJ_DEFER(threadLocals.restore());
         auto outcome = jsg::runInGuest(js, runTopLevel, [&](const kj::Exception& e) {
           // Top-level execution faulted inside the guest. Condemn the isolate so no JS is ever
           // run on it again (this thread holds the isolate lock, so a thread waiting for it
@@ -2505,6 +2524,7 @@ struct Worker::Lock::Impl {
 Worker::Lock::Lock(const Worker& constWorker, LockType lockType, jsg::V8StackScope& stackScope)
     :  // const_cast OK because we took out a lock.
       worker(const_cast<Worker&>(constWorker)),
+      apiBeforeLock(currentApi),
       impl(kj::heap<Impl>(worker, lockType, stackScope)) {
   kj::requireOnStack(this, "Worker::Lock MUST be allocated on the stack.");
 }
@@ -2515,6 +2535,16 @@ Worker::Lock::~Lock() noexcept(false) {
   if (impl->recordedLock.checkInWithLimitEnforcer(isolate)) {
     isolate.disconnectInspector();
   }
+  if (jsg::isGuestKernelEnabled()) {
+    // Release the isolate now, so that the thread-local's final value comes from this frame
+    // (see apiBeforeLock) rather than from the heap copy ~Impl::Lock puts back.
+    impl = nullptr;
+    currentApi = apiBeforeLock;
+  }
+}
+
+void* Worker::Lock::savedApiStorageForTest() {
+  return &impl->recordedLock.oldCurrentApi;
 }
 
 void Worker::Lock::requireNoPermanentException() {

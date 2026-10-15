@@ -26,6 +26,12 @@ thread_local uint guestTurnDepth = 0;
 // the guest's page-table root from inside the guest is not supported yet, and a nested turn for
 // another isolate would run with that isolate's sandbox unaddressable. Such turns are detected
 // and counted here rather than supported.
+//
+// This is thread-local storage the turn can write, and that is acceptable: the only reader is
+// the comparison below, made at ring 3 inside the turn, and the host never dereferences the
+// value. A turn that rewrites it can at most make a mismatched nested turn go undetected, and
+// such a turn then faults on the sandbox it cannot address -- the turn's own loss. After the
+// outermost turn the host stores a constant here rather than trusting what the turn left.
 thread_local gk_arena* guestTurnArena = nullptr;
 std::atomic<uint> nestedGuestTurnArenaMismatches{0};
 

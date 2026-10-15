@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -2825,6 +2827,322 @@ static long avx512_check(void) {
   return ok;
 }
 
+
+// ---- thread words --------------------------------------------------------------
+// GK_THREAD_WORDS words per thread in the supervisor control block (see
+// gk_thread_words_set in gk.h). Checks: a range is validated before anything
+// is read; words set on the host read back, as a range and from a signal
+// handler interrupting a ring-3 turn; a thread with no record reads -ESRCH
+// and a fresh record reads zeroes; the words are unreachable from ring 3 and
+// reachable from ring 0; the read is timed.
+
+static volatile long tw_sig_r;
+static volatile uint64_t tw_sig_v[2];
+static void tw_sigaction(int sig, siginfo_t *si, void *uc) {
+  (void)sig; (void)si; (void)uc;
+  uint64_t v[2] = {0, 0};
+  tw_sig_r = gk_thread_words_get(1, 2, v);
+  tw_sig_v[0] = v[0]; tw_sig_v[1] = v[1];
+}
+
+// Runs in the guest (ring 3): raises SIGUSR1 at itself; the handler runs
+// host-side on the forwarded tgkill's return and reads the words.
+static long tw_guest_raise(void *arg) {
+  (void)arg;
+  syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGUSR1);
+  return 0;
+}
+
+// Runs in the guest (ring 0): reads the word at the address given.
+static long tw_read_word(void *arg) {
+  return (long)*(volatile uint64_t *)arg;
+}
+
+static void *tw_thread(void *arg) {
+  (void)arg;
+  uint64_t v[1] = {0x1234};
+  long r_none = gk_thread_words_get(0, 1, v);        // no record yet
+  long r_set = gk_thread_words_set(0, 1, v);         // takes one
+  uint64_t w[GK_THREAD_WORDS];
+  memset(w, 0xff, sizeof w);
+  long r_get = gk_thread_words_get(0, GK_THREAD_WORDS, w);
+  int zeroed = w[0] == 0x1234;
+  for (int i = 1; i < GK_THREAD_WORDS; i++) if (w[i] != 0) zeroed = 0;
+  return (void *)(uintptr_t)(r_none == -ESRCH && r_set == 0 && r_get == 0 && zeroed ? 1 : 0);
+}
+
+enum { TW_N = 200000 };
+
+static int thread_word_check(void) {
+  uint64_t v[3] = {0x1111, 0x2222, 0x3333}, r[3] = {0, 0, 0}, one = 0;
+  // Bounds: a range at or past the table, or running past it, is refused unread.
+  int bounds = gk_thread_words_set(GK_THREAD_WORDS, 1, v) == -EINVAL &&
+               gk_thread_words_set(GK_THREAD_WORDS - 1, 2, v) == -EINVAL &&
+               gk_thread_words_set(0, 0, v) == -EINVAL &&
+               gk_thread_words_set(0, 1, NULL) == -EINVAL &&
+               gk_thread_words_get(GK_THREAD_WORDS, 1, r) == -EINVAL &&
+               gk_thread_words_get(1, GK_THREAD_WORDS, r) == -EINVAL &&
+               gk_thread_words_get(0, 1, NULL) == -EINVAL && r[0] == 0;
+  // A range set reads back as a range and one word at a time.
+  int set = gk_thread_words_set(1, 3, v) == 0 && gk_thread_words_get(1, 3, r) == 0 &&
+            r[0] == 0x1111 && r[1] == 0x2222 && r[2] == 0x3333 &&
+            gk_thread_words_get(3, 1, &one) == 0 && one == 0x3333;
+  // From a signal handler interrupting a ring-3 turn.
+  struct sigaction sa = {0}, old;
+  sa.sa_sigaction = tw_sigaction;
+  sa.sa_flags = SA_SIGINFO;
+  sigaction(SIGUSR1, &sa, &old);
+  tw_sig_r = -1; tw_sig_v[0] = tw_sig_v[1] = 0;
+  long rr = gk_run_here_user(tw_guest_raise, NULL);
+  sigaction(SIGUSR1, &old, NULL);
+  int sig_ok = rr == 0 && tw_sig_r == 0 && tw_sig_v[0] == 0x1111 && tw_sig_v[1] == 0x2222;
+  // A fresh thread: no record is -ESRCH, a new record reads zeroes.
+  pthread_t th; void *rv = NULL;
+  pthread_create(&th, NULL, tw_thread, NULL);
+  pthread_join(th, &rv);
+  int fresh_ok = (uintptr_t)rv == 1;
+  // Unreachable from ring 3, both ways; readable from ring 0.
+  unsigned long words = gk_debug_ctl_addr(GK_CTL_THREAD_WORDS);
+  long w3 = gk_run_user(user_write_here, (void *)(words + 8));
+  unsigned long fw3 = gk_fault_addr();
+  long r3 = gk_run_user(read_byte, (void *)(words + 8));
+  unsigned long fr3 = gk_fault_addr();
+  long r0 = gk_run(tw_read_word, (void *)(words + 8));
+  int walled = words != 0 && w3 == GK_EFAULT && fw3 == words + 8 && r3 == GK_EFAULT &&
+               fr3 == words + 8 && r0 == 0x1111 &&
+               gk_thread_words_get(1, 1, &one) == 0 && one == 0x1111;  // the write did not land
+  // Cost of a read on the host.
+  double t0 = now_ns();
+  long acc = 0;
+  for (int i = 0; i < TW_N; i++) { gk_thread_words_get(1, 3, r); acc += (long)r[0]; }
+  double per = (now_ns() - t0) / TW_N;
+  int bench_ok = acc == (long)TW_N * 0x1111 && per > 0;
+  uint64_t zero[3] = {0, 0, 0};
+  gk_thread_words_set(1, 3, zero);
+
+  int ok = bounds && set && sig_ok && fresh_ok && walled && bench_ok;
+  printf("thread words: bad ranges refused %s; set/get %s; from a SIGUSR1 handler under a ring-3 "
+         "turn %s (r=%ld, %#llx %#llx); fresh thread: ESRCH then zeroes %s; ring-3 write -> %ld at "
+         "%#lx, read -> %ld, ring-0 read %#lx %s; get of 3 words %.0f ns [%s]\n",
+         bounds ? "yes" : "NO", set ? "yes" : "NO", sig_ok ? "yes" : "NO", tw_sig_r,
+         (unsigned long long)tw_sig_v[0], (unsigned long long)tw_sig_v[1], fresh_ok ? "yes" : "NO",
+         w3, fw3, r3, (unsigned long)r0, walled ? "walled" : "NOT WALLED", per, ok ? "OK" : "FAIL");
+  return ok;
+}
+
+// ---- the turn directory ---------------------------------------------------------
+// With gk_confine_paths on, a ring-3 turn's path syscalls resolve beneath the
+// directory a hostcall handler set for it, or are refused (see
+// gk_confine_paths in gk.h). Checks: with no directory everything is refused;
+// with one, openat and newfstatat under it work and files land there, while a
+// dirfd for another directory, AT_FDCWD, an absolute path, a "..", a symbolic
+// link out, a direct openat2, unlinkat, mkdirat, access and fchdir are each
+// refused; the directory's descriptor closed and reused for another directory
+// is refused by identity; a second entry starts with no directory; a turn
+// cannot set the directory itself; the policy off forwards as before; the
+// cost of a confined open is measured.
+
+enum { TD_IDX = 11, TD_SET_A = 1, TD_SET_B = 2, TD_SET_NONE = 3, TD_N = 20000 };
+
+// A raw syscall, returning the kernel's value (-errno on failure) rather than
+// glibc's -1 with errno, so the guest code below can record what gk answered.
+static long td_raw(long nr, long a1, long a2, long a3, long a4, long a5) {
+  long ret;
+  register long r10 __asm__("r10") = a4, r8 __asm__("r8") = a5, r9 __asm__("r9") = 0;
+  __asm__ __volatile__("syscall"
+                       : "=a"(ret)
+                       : "a"(nr), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
+                       : "rcx", "r11", "memory");
+  return ret;
+}
+struct td_dirs { int a, b; };
+
+// The handler a runtime would register: the directory comes from the context
+// (host memory), the guest only chooses which.
+static long td_handler(void *ctx, gk_hostcall_frame *f) {
+  struct td_dirs *d = ctx;
+  if (f->args[0] == TD_SET_A) return gk_turn_dir_set(d->a);
+  if (f->args[0] == TD_SET_B) return gk_turn_dir_set(d->b);
+  if (f->args[0] == TD_SET_NONE) return gk_turn_dir_set(GK_TURN_DIR_NONE);
+  return -EINVAL;
+}
+
+struct td_probe {
+  int a, b;
+  long before, open_a, open_b, cwd, abs, dotdot, link, stat_a, stat_b, stat_dir, statx_a,
+      access, unlink, mkdir, openat2, fchdir, swapped, open_b2, none, self_set;
+  long st_size, st_isdir, stx_size;
+};
+
+static long td_hostcall(unsigned op) {
+  gk_hostcall_frame *r = gk_hostcall_region();
+  r->args[0] = op; r->in_len = 0;
+  return gk_hostcall(TD_IDX);
+}
+
+static long td_sys_open(int dir, const char *path, int flags) {
+  return td_raw(SYS_openat, dir, (long)path, flags, 0644, 0);
+}
+
+// Runs in the guest (ring 3).
+static long td_guest(void *arg) {
+  struct td_probe *p = arg;
+  struct stat st;
+  p->before = td_sys_open(p->a, "f0", O_CREAT | O_WRONLY);
+  if (td_hostcall(TD_SET_A) != 0) return -1;
+  p->open_a = td_sys_open(p->a, "f1", O_CREAT | O_WRONLY);
+  if (p->open_a >= 0) { td_raw(SYS_write, p->open_a, (long)"hi", 2, 0, 0); td_raw(SYS_close, p->open_a, 0, 0, 0, 0); }
+  p->open_b = td_sys_open(p->b, "f2", O_CREAT | O_WRONLY);
+  p->cwd = td_sys_open(AT_FDCWD, "/etc/passwd", O_RDONLY);
+  p->abs = td_sys_open(p->a, "/etc/passwd", O_RDONLY);
+  p->dotdot = td_sys_open(p->a, "../escape", O_CREAT | O_WRONLY);
+  p->link = td_sys_open(p->a, "out/passwd", O_RDONLY);
+  p->stat_a = td_raw(SYS_newfstatat, p->a, (long)"f1", (long)&st, 0, 0);
+  p->st_size = st.st_size;
+  p->stat_b = td_raw(SYS_newfstatat, p->b, (long)"f1", (long)&st, 0, 0);
+  p->stat_dir = td_raw(SYS_newfstatat, p->a, (long)"", (long)&st, AT_EMPTY_PATH, 0);
+  p->st_isdir = S_ISDIR(st.st_mode);
+  struct { unsigned char raw[256]; } stx;
+  p->statx_a = td_raw(SYS_statx, p->a, (long)"f1", 0, 0x7ff, (long)&stx);
+  memcpy(&p->stx_size, stx.raw + 40, 8);  // stx_size
+  p->access = td_raw(SYS_access, (long)"/etc/passwd", R_OK, 0, 0, 0);
+  p->unlink = td_raw(SYS_unlinkat, p->a, (long)"f1", 0, 0, 0);
+  p->mkdir = td_raw(SYS_mkdirat, p->a, (long)"d", 0755, 0, 0);
+  struct { uint64_t flags, mode, resolve; } how = {O_RDONLY, 0, 0};
+  p->openat2 = td_raw(437, p->a, (long)"f1", (long)&how, sizeof how, 0);
+  p->fchdir = td_raw(SYS_fchdir, p->a, 0, 0, 0, 0);
+  // The descriptor closed and its number reused for the other directory.
+  int dupb = (int)td_raw(SYS_fcntl, p->b, F_DUPFD, 0, 0, 0);
+  td_raw(SYS_close, p->a, 0, 0, 0, 0);
+  int reused = (int)td_raw(SYS_fcntl, dupb, F_DUPFD, p->a, 0, 0);
+  p->swapped = reused == p->a ? td_sys_open(p->a, "f3", O_CREAT | O_WRONLY) : -9999;
+  td_raw(SYS_close, dupb, 0, 0, 0, 0);
+  // Another directory, chosen by the handler.
+  if (td_hostcall(TD_SET_B) != 0) return -2;
+  p->open_b2 = td_sys_open(p->b, "g1", O_CREAT | O_WRONLY);
+  if (p->open_b2 >= 0) td_raw(SYS_close, p->open_b2, 0, 0, 0, 0);
+  if (td_hostcall(TD_SET_NONE) != 0) return -3;
+  p->none = td_sys_open(p->b, "g2", O_CREAT | O_WRONLY);
+  return 0;
+}
+
+// Runs in the guest (ring 3): a second entry has no directory; and the turn
+// cannot set one itself (the record is supervisor memory).
+static long td_guest_again(void *arg) {
+  struct td_probe *p = arg;
+  p->before = td_sys_open(p->b, "g3", O_CREAT | O_WRONLY);
+  return 0;
+}
+static long td_guest_self_set(void *arg) {
+  struct td_probe *p = arg;
+  return gk_turn_dir_set(p->b);
+}
+
+// Runs in the guest (ring 3): TD_N opens and closes of f1 under the directory.
+static long td_bench(void *arg) {
+  struct td_probe *p = arg;
+  long n = 0;
+  for (int i = 0; i < TD_N; i++) {
+    long fd = td_sys_open(p->a, "f1", O_RDONLY);
+    if (fd >= 0) { td_raw(SYS_close, fd, 0, 0, 0, 0); n++; }
+  }
+  return n;
+}
+static long td_bench_set(void *arg) {
+  if (td_hostcall(TD_SET_A) != 0) return -1;
+  return td_bench(arg);
+}
+
+// Whether `dirpath/name` exists, checked by absolute path so it does not depend on a descriptor
+// the guest may have closed.
+static int exists_in(const char *dirpath, const char *name) {
+  char path[256];
+  snprintf(path, sizeof path, "%s/%s", dirpath, name);
+  struct stat st;
+  return lstat(path, &st) == 0;
+}
+
+static int turn_dir_check(void) {
+  char ta[] = "/tmp/gk-td-a-XXXXXX", tb[] = "/tmp/gk-td-b-XXXXXX";
+  if (!mkdtemp(ta) || !mkdtemp(tb)) { printf("turn directory: mkdtemp failed [FAIL]\n"); return 0; }
+  struct td_dirs *d = gk_host_alloc(sizeof *d);
+  d->a = open(ta, O_RDONLY | O_DIRECTORY);
+  d->b = open(tb, O_RDONLY | O_DIRECTORY);
+  char lnk[64]; snprintf(lnk, sizeof lnk, "%s/out", ta);
+  if (symlink("/etc", lnk) != 0) { printf("turn directory: symlink failed [FAIL]\n"); return 0; }
+  if (d->a < 0 || d->b < 0 || gk_hostcall_register(TD_IDX, td_handler, d) != 0) {
+    printf("turn directory: setup failed [FAIL]\n");
+    return 0;
+  }
+  // Setting a non-directory, or on the host before confinement matters, is
+  // validated.
+  int fdfile = open("/etc/passwd", O_RDONLY);
+  int set_bad = gk_turn_dir_set(fdfile) == -EINVAL && gk_turn_dir_set(-7) == -EINVAL &&
+                gk_turn_dir_set(d->a) == 0 && gk_turn_dir_set(GK_TURN_DIR_NONE) == 0;
+  close(fdfile);
+  gk_stats s0, s1;
+  gk_get_stats(&s0);
+  gk_confine_paths(1);
+  struct td_probe *p = calloc(1, sizeof *p);
+  p->a = d->a; p->b = d->b;
+  long r = gk_run_user(td_guest, p);
+  gk_get_stats(&s1);
+  long first_before = p->before;
+  int before_ok = p->before == -EPERM;
+  int open_ok = p->open_a >= 0 && exists_in(ta, "f1") && p->stat_a == 0 && p->st_size == 2 &&
+                p->stat_dir == 0 && p->st_isdir && p->statx_a == 0 && p->stx_size == 2;
+  int refused = p->open_b == -EPERM && !exists_in(tb, "f2") && p->cwd == -EPERM &&
+                p->abs == -EXDEV && p->dotdot == -EXDEV && !exists_in(tb, "escape") &&
+                p->link == -EXDEV && p->stat_b == -EPERM && p->access == -EPERM &&
+                p->unlink == -EPERM && exists_in(ta, "f1") && p->mkdir == -EPERM &&
+                !exists_in(ta, "d") && p->openat2 == -EPERM && p->fchdir == -EPERM;
+  int swapped_ok = p->swapped == -EPERM && !exists_in(tb, "f3") && !exists_in(ta, "f3");
+  int other_ok = p->open_b2 >= 0 && exists_in(tb, "g1") && p->none == -EPERM &&
+                 !exists_in(tb, "g2");
+  // The descriptor the guest closed: reopen the directory for the rest.
+  d->a = open(ta, O_RDONLY | O_DIRECTORY);
+  p->a = d->a;
+  long r2 = gk_run_user(td_guest_again, p);
+  int again_ok = r2 == 0 && p->before == -EPERM && !exists_in(tb, "g3");
+  long r3 = gk_run_user(td_guest_self_set, p);
+  int self_ok = r3 == GK_EFAULT;
+  long refusals = s1.path_refusals - s0.path_refusals;
+  // Cost: confined opens against unconfined ones.
+  double t0 = now_ns();
+  long nb = gk_run_user(td_bench_set, p);
+  double t1 = now_ns();
+  gk_confine_paths(0);
+  long nu = gk_run_user(td_bench, p);
+  double t2 = now_ns();
+  double per_c = (t1 - t0) / TD_N, per_u = (t2 - t1) / TD_N;
+  int bench_ok = nb == TD_N && nu == TD_N;
+  // Policy off: the other directory is reachable again, as before.
+  long r4 = gk_run_user(td_guest_again, p);
+  int off_ok = r4 == 0 && p->before >= 0 && exists_in(tb, "g3");
+  if (p->before >= 0) close(p->before);
+  gk_hostcall_unregister(TD_IDX);
+
+  int ok = set_bad && r == 0 && before_ok && open_ok && refused && swapped_ok && other_ok &&
+           again_ok && self_ok && refusals == 11 && bench_ok && off_ok;
+  if (!ok)
+    printf("turn directory: set_bad %d r %ld before %d open %d (isdir %ld stx_size %ld) refused %d "
+           "swapped %d other %d again %d self %d bench %d (%ld %ld) off %d\n", set_bad, r,
+           before_ok, open_ok, p->st_isdir, p->stx_size, refused, swapped_ok, other_ok, again_ok,
+           self_ok, bench_ok, nb, nu, off_ok);
+  printf("turn directory: bad descriptors refused %s; no directory -> %ld; under it: open %s stat "
+         "%ld (size %ld) dir %ld statx %ld; other dirfd %ld, AT_FDCWD %ld, absolute %ld, .. %ld, "
+         "symlink out %ld, stat other %ld, access %ld, unlinkat %ld, mkdirat %ld, openat2 %ld, "
+         "fchdir %ld; descriptor reused for another directory %ld; handler-chosen other dir %s, "
+         "none %ld; next entry %ld; set from ring 3 -> %ld; %ld refusals counted; confined open "
+         "%.2f us vs %.2f us; policy off %s [%s]\n",
+         set_bad ? "yes" : "NO", first_before, p->open_a >= 0 ? "ok" : "NO", p->stat_a, p->st_size,
+         p->stat_dir, p->statx_a, p->open_b, p->cwd, p->abs, p->dotdot, p->link, p->stat_b,
+         p->access, p->unlink, p->mkdir, p->openat2, p->fchdir, p->swapped,
+         p->open_b2 >= 0 ? "ok" : "NO", p->none, again_ok ? -EPERM : 0L, r3, refusals,
+         per_c / 1000, per_u / 1000, off_ok ? "forwards" : "NO", ok ? "OK" : "FAIL");
+  return ok;
+}
+
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (gk_init() != 0) {
@@ -3526,9 +3844,24 @@ int main(void) {
   // path takes no lock and allocates nothing (see signal_field_check).
   int ok31 = signal_field_check() == 1;
 
+  // ---- thread words -----------------------------------------------------------
+  // Per-thread words in supervisor memory for state the host or a signal
+  // handler must read from memory the guest cannot write: validated keys, set
+  // and read on the host and from a signal handler interrupting a ring-3
+  // turn, unreachable from ring 3 (see thread_word_check).
+  int ok32 = thread_word_check() == 1;
+
+  // ---- the turn directory ----------------------------------------------------
+  // A ring-3 turn's path syscalls resolve beneath the directory a hostcall
+  // handler set for it, or are refused; a descriptor reused for another
+  // directory is refused by identity; a new entry starts with none (see
+  // turn_dir_check).
+  int ok33 = turn_dir_check() == 1;
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
-            ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28 && ok29 && ok30 && ok31;
+            ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28 && ok29 && ok30 && ok31 &&
+            ok32 && ok33;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

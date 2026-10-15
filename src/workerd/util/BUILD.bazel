@@ -274,10 +274,19 @@ wd_cc_library(
         ":strings",
         "//src/workerd/jsg:exception",
         "@sqlite3",
-    ],
+    ] + select({
+        # The VFS root hostcall handler sets the guest kernel's turn directory; the dep and
+        # its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         ":account-limits",
+        ":host-memory",
+        ":hostcall",
         ":sentry",
         ":sqlite-metering",
         "@capnp-cpp//src/kj:kj-async-core",
@@ -333,6 +342,14 @@ wd_cc_library(
     name = "thread-scopes",
     srcs = ["thread-scopes.c++"],
     hdrs = ["thread-scopes.h"],
+    implementation_deps = select({
+        # The progress counter's state goes to the guest kernel's thread words when it is on;
+        # the dep and its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         "@capnp-cpp//src/kj/compat:kj-http",

@@ -17,6 +17,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -201,6 +202,18 @@ typedef struct gk_thread {
   // pool and kept across its recycling, so the pool's records own at most
   // GK_MAX_VCPUS frames between them.
   gk_hostcall_frame *hostcall_frame;
+  // Thread words (see gk_thread_words_set in gk.h): the embedder's per-thread
+  // state that a signal handler or host code must read from memory the guest
+  // cannot write. Zeroed when the record is taken from the pool.
+  uint64_t words[GK_THREAD_WORDS];
+  // The turn directory (see gk_confine_paths in gk.h): the descriptor a
+  // forwarded path syscall from this thread may resolve beneath, with the
+  // identity of the directory it named when it was set, so a descriptor the
+  // guest has since closed and reused names nothing. turn_dir_set is cleared
+  // at every guest entry, so a turn starts with no directory.
+  int turn_dir;
+  int turn_dir_set;
+  uint64_t turn_dir_dev, turn_dir_ino;
   struct gk_thread *next_free;
 } gk_thread;
 // 1 + the index of this thread's record in G->threads; 0 while it has none.
@@ -472,6 +485,12 @@ struct gk_ctl {
   int signal_field_free;             // free-list head, as index + 1; 0 when empty
   int signal_field_live;             // fields registered and not yet unregistered
   uint64_t signal_field_gen;         // the generation of the last registration
+
+  // The turn-directory policy (see gk_confine_paths in gk.h): when set,
+  // forward_syscall confines every thread's path syscalls to its turn
+  // directory. path_refusals counts the syscalls the policy refused.
+  int confine_paths;
+  atomic_long path_refusals;
 
   // Set at the end of a successful gk_init (see gk_initialized).
   int initialized;
@@ -930,6 +949,7 @@ void gk_host_slot_free(gk_host_handle h) {
 }
 
 int gk_initialized(void) { return G->initialized; }
+int gk_in_guest_hint(void) { return tls_in_guest; }
 
 // ---- hostcalls -------------------------------------------------------------
 // A synchronous call from the guest to a registered host handler (see
@@ -2505,6 +2525,9 @@ void gk_debug_control_addrs(unsigned long *super, unsigned long *refuse) {
 // gk.h for the indices), all of which live in the supervisor control block. A
 // test writes there from ring 3 and expects a fault; from ring 0 the scratch
 // word (index 0) can be written freely.
+#ifdef GK_NEG_THREAD_WORDS
+static __thread uint64_t neg_words[GK_THREAD_WORDS];  // tentative def; see the words functions
+#endif
 unsigned long gk_debug_ctl_addr(int which) {
   switch (which) {
     case GK_CTL_SCRATCH: return (unsigned long)&G->debug_scratch;
@@ -2522,6 +2545,14 @@ unsigned long gk_debug_ctl_addr(int which) {
     case GK_CTL_HOST_SLOTS: return (unsigned long)&G->host_slots[0];
     case GK_CTL_HOSTCALLS: return (unsigned long)&G->hostcalls[0];
     case GK_CTL_SIGNAL_FIELDS: return (unsigned long)&G->signal_fields[0];
+    case GK_CTL_THREAD_WORDS: {
+#ifdef GK_NEG_THREAD_WORDS
+      return (unsigned long)&neg_words[0];
+#else
+      gk_thread *t = thread_cur();
+      return t ? (unsigned long)&t->words[0] : 0;
+#endif
+    }
     default: return 0;
   }
 }
@@ -3083,6 +3114,215 @@ long gk_signal_field_write(unsigned kind, uint32_t value) {
   return n;
 }
 
+// ---- thread words --------------------------------------------------------------
+// GK_THREAD_WORDS 64-bit words per thread record (see gk.h). Both functions
+// find the record lock-free, by the thread-local hint validated against the
+// record's tid with a scan as the fallback (thread_cur_lockfree), so they are
+// usable from a signal handler; a set on a thread that has no record yet takes
+// one, which needs gk's lock, so the first set on a thread is not for a signal
+// handler. The words are the owning thread's: only it and its signal handlers
+// write them, so no lock is taken around the copy.
+#ifdef GK_NEG_THREAD_WORDS
+// Negative-test build only (never shipped): the words live in guest-writable thread-local
+// storage rather than the supervisor record, so gk_test's thread_word_check shows the protection
+// gone -- a ring-3 write of the words no longer faults, and a turn could change what a signal
+// handler reads. The normal build keeps them in the record (below).
+static __thread uint64_t neg_words[GK_THREAD_WORDS];
+static uint64_t *thread_words_of(void) { return neg_words; }
+#else
+static uint64_t *thread_words_of(void) {
+  gk_thread *t = thread_cur_lockfree();
+  if (!t) t = thread_get();
+  return t ? t->words : NULL;
+}
+#endif
+
+int gk_thread_words_set(unsigned first, unsigned n, const uint64_t *values) {
+  if (!values || n == 0 || first >= GK_THREAD_WORDS || n > GK_THREAD_WORDS - first)
+    return -GK_EINVAL;
+  if (!G->initialized) return -GK_ESRCH;
+  uint64_t *w = thread_words_of();
+  if (!w) return -GK_ENOMEM;
+  for (unsigned i = 0; i < n; i++) __atomic_store_n(&w[first + i], values[i], __ATOMIC_RELAXED);
+  atomic_signal_fence(memory_order_release);
+  return 0;
+}
+
+int gk_thread_words_get(unsigned first, unsigned n, uint64_t *values) {
+  if (!values || n == 0 || first >= GK_THREAD_WORDS || n > GK_THREAD_WORDS - first)
+    return -GK_EINVAL;
+  if (!G->initialized) return -GK_ESRCH;
+#ifdef GK_NEG_THREAD_WORDS
+  uint64_t *w = neg_words;
+#else
+  gk_thread *t = thread_cur_lockfree();
+  if (!t) return -GK_ESRCH;
+  uint64_t *w = t->words;
+#endif
+  atomic_signal_fence(memory_order_acquire);
+  for (unsigned i = 0; i < n; i++) values[i] = __atomic_load_n(&w[first + i], __ATOMIC_RELAXED);
+  return 0;
+}
+
+// ---- the turn directory ---------------------------------------------------------
+// The policy gk_confine_paths turns on (see gk.h): a forwarded syscall that
+// names a file by path resolves beneath the calling thread's turn directory
+// or is refused. The directory is set host-side, by gk_turn_dir_set, and
+// cleared at every guest entry (prepare_entry); what the guest passes as the
+// dirfd must be that descriptor, and the descriptor must still name the
+// directory it named when it was set (its device and inode are compared on
+// every use, so a descriptor the guest closed and reused for something else
+// is refused). The path itself is never parsed here: openat becomes openat2
+// with RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS, so the kernel refuses an
+// absolute path, a ".." that would leave the directory, a symbolic link that
+// would, and a /proc magic link, atomically with the lookup; a stat becomes
+// an O_PATH open under the same rules followed by fstat or statx on the
+// result. Every other syscall gk knows to take a path is refused, as is
+// fchdir, which would move the process's working directory. The policy is
+// applied after the embedder's filter, which still decides what is forwarded
+// at all; it never allocates.
+#define GK_SYS_openat2 437
+#define GK_SYS_faccessat2 439
+#define GK_SYS_fchmodat2 452
+#define GK_RESOLVE_NO_MAGICLINKS 0x02
+#define GK_RESOLVE_BENEATH 0x08
+#define GK_O_PATH 010000000
+#define GK_AT_EMPTY_PATH 0x1000
+#define GK_AT_SYMLINK_NOFOLLOW 0x100
+struct gk_open_how { uint64_t flags, mode, resolve; };
+
+void gk_confine_paths(int on) { G->confine_paths = on != 0; }
+
+int gk_turn_dir_set(int dirfd) {
+  if (!G->initialized) return -GK_ESRCH;
+  gk_thread *t = thread_get();
+  if (!t) return -GK_ENOMEM;
+  if (dirfd == GK_TURN_DIR_NONE) {
+    t->turn_dir_set = 1;
+    t->turn_dir = GK_TURN_DIR_NONE;
+    return 0;
+  }
+  if (dirfd < 0) return -GK_EINVAL;
+  struct stat st;
+  if (host_syscall(SYS_fstat, dirfd, (long)&st, 0, 0, 0, 0) != 0) return -GK_EINVAL;
+  if (!S_ISDIR(st.st_mode)) return -GK_EINVAL;
+  t->turn_dir = dirfd;
+  t->turn_dir_dev = st.st_dev;
+  t->turn_dir_ino = st.st_ino;
+  t->turn_dir_set = 1;
+  return 0;
+}
+
+// Whether `nr` is a syscall that names a file by path (or changes the working
+// directory) and that the policy does not rewrite: refused under confinement.
+static int path_syscall_refused(long nr) {
+  switch (nr) {
+    case SYS_open: case SYS_creat: case SYS_access: case SYS_stat: case SYS_lstat:
+    case SYS_readlink: case SYS_rename: case SYS_unlink: case SYS_mkdir: case SYS_rmdir:
+    case SYS_link: case SYS_symlink: case SYS_chmod: case SYS_chown: case SYS_lchown:
+    case SYS_truncate: case SYS_chdir: case SYS_fchdir: case SYS_chroot: case SYS_mknod:
+    case SYS_utime: case SYS_utimes: case SYS_statfs: case SYS_execve: case SYS_uselib:
+    case SYS_acct: case SYS_swapon: case SYS_swapoff: case SYS_mount: case SYS_umount2:
+    case SYS_pivot_root: case SYS_setxattr: case SYS_lsetxattr: case SYS_getxattr:
+    case SYS_lgetxattr: case SYS_listxattr: case SYS_llistxattr: case SYS_removexattr:
+    case SYS_lremovexattr: case SYS_quotactl: case SYS_inotify_add_watch:
+    case SYS_fanotify_mark: case SYS_mkdirat: case SYS_mknodat: case SYS_fchownat:
+    case SYS_futimesat: case SYS_unlinkat: case SYS_renameat: case SYS_linkat:
+    case SYS_symlinkat: case SYS_readlinkat: case SYS_fchmodat: case SYS_faccessat:
+    case SYS_utimensat: case SYS_name_to_handle_at: case SYS_renameat2: case SYS_execveat:
+    case GK_SYS_openat2: case GK_SYS_faccessat2: case GK_SYS_fchmodat2:
+    case 428: case 429: case 430: case 433: case 442:  // open_tree, move_mount, fsopen, fspick, mount_setattr
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+// The calling thread's turn directory if `dirfd` names it and it is still the
+// directory it was when set, else -1 with *err the refusal.
+static int turn_dir_for(gk_thread *t, long dirfd, long *err) {
+  if (!t->turn_dir_set || t->turn_dir == GK_TURN_DIR_NONE || dirfd != t->turn_dir) {
+    *err = -GK_EPERM;
+    return -1;
+  }
+  struct stat st;
+  if (host_syscall(SYS_fstat, t->turn_dir, (long)&st, 0, 0, 0, 0) != 0 || !S_ISDIR(st.st_mode) ||
+      st.st_dev != t->turn_dir_dev || st.st_ino != t->turn_dir_ino) {
+    *err = -GK_EPERM;
+    return -1;
+  }
+  return t->turn_dir;
+}
+
+// openat2 beneath `dir`, retried on the EAGAIN the kernel returns when a
+// concurrent rename or mount made it unable to prove containment.
+static long open_beneath(int dir, long path, uint64_t flags, uint64_t mode) {
+  struct gk_open_how how = {flags, mode, GK_RESOLVE_BENEATH | GK_RESOLVE_NO_MAGICLINKS};
+  long r = -GK_EINVAL;
+  for (int i = 0; i < 8; i++) {
+    r = host_syscall(GK_SYS_openat2, dir, path, (long)&how, sizeof how, 0, 0);
+    if (r != -EAGAIN) break;
+  }
+  return r;
+}
+
+// Applies the policy to one forwarded syscall of a confined thread. Returns 1
+// with *ret the result (a refusal or the rewritten syscall's result) when the
+// policy decided the syscall, 0 when the syscall is not a path syscall and
+// forwards as usual.
+static int confined_path_syscall(gk_thread *t, long nr, long a1, long a2, long a3, long a4,
+                                 long a5, long *ret) {
+  long err;
+  int dir;
+  switch (nr) {
+    case SYS_openat: {
+      dir = turn_dir_for(t, a1, &err);
+      if (dir < 0) break;
+      uint64_t flags = (uint64_t)a3;
+      uint64_t mode = (flags & (O_CREAT | O_TMPFILE)) ? ((uint64_t)a4 & 07777) : 0;
+      *ret = open_beneath(dir, a2, flags, mode);
+      return 1;
+    }
+    case SYS_newfstatat: {
+      dir = turn_dir_for(t, a1, &err);
+      if (dir < 0) break;
+      if (a4 & GK_AT_EMPTY_PATH) {
+        *ret = host_syscall(SYS_fstat, dir, a3, 0, 0, 0, 0);
+        return 1;
+      }
+      uint64_t flags = GK_O_PATH | O_CLOEXEC | ((a4 & GK_AT_SYMLINK_NOFOLLOW) ? O_NOFOLLOW : 0);
+      long fd = open_beneath(dir, a2, flags, 0);
+      if (fd < 0) { *ret = fd; return 1; }
+      *ret = host_syscall(SYS_fstat, fd, a3, 0, 0, 0, 0);
+      host_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+      return 1;
+    }
+    case SYS_statx: {
+      static const char empty[1] = "";
+      dir = turn_dir_for(t, a1, &err);
+      if (dir < 0) break;
+      long sync = a3 & ~(long)(GK_AT_EMPTY_PATH | GK_AT_SYMLINK_NOFOLLOW);
+      if (a3 & GK_AT_EMPTY_PATH) {
+        *ret = host_syscall(SYS_statx, dir, (long)empty, sync | GK_AT_EMPTY_PATH, a4, a5, 0);
+        return 1;
+      }
+      uint64_t flags = GK_O_PATH | O_CLOEXEC | ((a3 & GK_AT_SYMLINK_NOFOLLOW) ? O_NOFOLLOW : 0);
+      long fd = open_beneath(dir, a2, flags, 0);
+      if (fd < 0) { *ret = fd; return 1; }
+      *ret = host_syscall(SYS_statx, fd, (long)empty, sync | GK_AT_EMPTY_PATH, a4, a5, 0);
+      host_syscall(SYS_close, fd, 0, 0, 0, 0, 0);
+      return 1;
+    }
+    default:
+      if (!path_syscall_refused(nr)) return 0;
+      err = -GK_EPERM;
+      break;
+  }
+  atomic_fetch_add_explicit(&G->path_refusals, 1, memory_order_relaxed);
+  *ret = err;
+  return 1;
+}
+
 // ---- syscall forwarding ----------------------------------------------------
 // Every syscall is re-issued on the host; guest and host share memory, so
 // pointer arguments work directly. New mappings (mmap/brk/mprotect) are picked
@@ -3093,6 +3333,20 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
   if (G->filter && !G->filter(nr, a1, a2, a3, a4, a5, a6)) {
     if (G->dbg) fprintf(stderr, "[gk] vcpu %d syscall %ld DENIED\n", t->id, nr);
     return -GK_EPERM;
+  }
+  if (G->confine_paths
+#ifdef GK_NEG_TURN_DIR
+      && 0  // negative-test build: confinement removed, every path syscall forwards unconfined
+#endif
+  ) {
+    long pr;
+    if (confined_path_syscall(t, nr, a1, a2, a3, a4, a5, &pr)) {
+      if (G->dbg)
+        fprintf(stderr, "[gk] vcpu %d syscall %ld(%#lx, %#lx, %#lx, %#lx) under the turn "
+                "directory -> %ld\n", t->id, nr, (unsigned long)a1, (unsigned long)a2,
+                (unsigned long)a3, (unsigned long)a4, pr);
+      return pr;
+    }
   }
   // Thread creation: the child must enter the guest too. Only true threads
   // (CLONE_VM|CLONE_THREAD) are intercepted; fork/vfork-style clones forward.
@@ -3492,6 +3746,7 @@ static int prepare_entry(gk_thread *t, uint64_t *load) {
   t->last_fault = 0;  // fault-repeat tracking is per guest invocation
   t->fault_repeat = 0;
   t->backing_retries = 0;
+  t->turn_dir_set = 0;  // a turn starts with no directory (see gk_confine_paths)
   return 0;
 }
 
@@ -4376,6 +4631,7 @@ void gk_get_stats(gk_stats *s) {
   s->hostcall_handlers = G->hostcall_n;
   s->hostcalls = atomic_load_explicit(&G->hostcall_calls, memory_order_relaxed);
   s->signal_fields = G->signal_field_live;
+  s->path_refusals = atomic_load_explicit(&G->path_refusals, memory_order_relaxed);
   pthread_mutex_unlock(&G->lock);
 }
 

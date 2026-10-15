@@ -5,6 +5,7 @@
 #include "io-context.h"
 
 #include <workerd/io/access-info.h>
+#include <workerd/io/guest-turn-thread-locals.h>
 #include <workerd/io/io-gate.h>
 #include <workerd/io/tracer.h>
 #include <workerd/io/worker.h>
@@ -26,6 +27,10 @@
 
 namespace workerd {
 
+// The IoContext current on this thread. Thread-local storage is memory a JS turn at guest ring 3
+// can write, so after a guest turn the host re-establishes this from a copy saved in a host frame
+// (GuestTurnThreadLocals, used by runJsTurn below) rather than trusting what the turn left here;
+// current() itself stays a plain read, with nothing added on that path.
 static thread_local IoContext* threadLocalRequest = nullptr;
 
 SuppressIoContextScope::SuppressIoContextScope(): cached(threadLocalRequest) {
@@ -1440,6 +1445,12 @@ namespace {
 // and directly otherwise (see jsg::runInGuest).
 template <typename Func>
 void runJsTurn(IoContext& context, Worker::Lock& workerLock, Func&& body) {
+  // The thread-locals the host reads after the turn, saved in this frame -- read-only to the
+  // guest under the host-frame wall -- and put back once the guest has returned, whatever the
+  // turn left in them. A nested turn runs this at ring 3 as well, where it is the turn's own
+  // bookkeeping; the outermost turn's restore runs last.
+  auto threadLocals = GuestTurnThreadLocals::save();
+  KJ_DEFER(threadLocals.restore());
   jsg::runInGuest(workerLock, body, [&](const kj::Exception& e) {
     // The turn faulted inside the guest. Condemn the isolate so no further JS turn is run on it
     // -- while this thread still holds the isolate lock (`workerLock`), so a thread waiting for
@@ -1654,6 +1665,14 @@ kj::Maybe<IoContext&> IoContext::tryCurrent() {
 
 bool IoContext::hasCurrent() {
   return threadLocalRequest != nullptr && threadLocalRequest->isCurrent();
+}
+
+IoContext* IoContext::saveThreadLocalForGuestTurn() {
+  return threadLocalRequest;
+}
+
+void IoContext::restoreThreadLocalAfterGuestTurn(IoContext* value) {
+  threadLocalRequest = value;
 }
 
 bool IoContext::isCurrent() {

@@ -119,26 +119,27 @@ void gk_debug_control_addrs(unsigned long *super, unsigned long *refuse);
 // and the host can use them. GK_CTL_SCRATCH is a word reserved for tests to
 // write; the others are live structures and must only be probed, never written.
 enum {
-  GK_CTL_SCRATCH,      // a scratch word in the control block
-  GK_CTL_ARENAS,       // the arena registry
-  GK_CTL_ARENA_POOL,   // the arena structs (page-table roots, slot entries)
-  GK_CTL_PROT,         // the supervisor/refuse registry
-  GK_CTL_REGIONS,      // the memslot interval tree's root
-  GK_CTL_REGION_POOL,  // its node pool
-  GK_CTL_PT_ALLOC,     // the page-table page allocator's free list
-  GK_CTL_THREADS,      // the per-thread records (active root, arena nesting, vCPU, ring)
-  GK_CTL_VCPU_POOL,    // the parked-vCPU pool
-  GK_CTL_PKEYS,        // the protection-key ranges
-  GK_CTL_ROOT,         // the base page-table root pointer
-  GK_CTL_FILTER,       // the syscall filter
-  GK_CTL_HOST_SLOTS,   // the host slot table
-  GK_CTL_HOSTCALLS,    // the hostcall handler table
+  GK_CTL_SCRATCH,        // a scratch word in the control block
+  GK_CTL_ARENAS,         // the arena registry
+  GK_CTL_ARENA_POOL,     // the arena structs (page-table roots, slot entries)
+  GK_CTL_PROT,           // the supervisor/refuse registry
+  GK_CTL_REGIONS,        // the memslot interval tree's root
+  GK_CTL_REGION_POOL,    // its node pool
+  GK_CTL_PT_ALLOC,       // the page-table page allocator's free list
+  GK_CTL_THREADS,        // the per-thread records (active root, arena nesting, vCPU, ring)
+  GK_CTL_VCPU_POOL,      // the parked-vCPU pool
+  GK_CTL_PKEYS,          // the protection-key ranges
+  GK_CTL_ROOT,           // the base page-table root pointer
+  GK_CTL_FILTER,         // the syscall filter
+  GK_CTL_HOST_SLOTS,     // the host slot table
+  GK_CTL_HOSTCALLS,      // the hostcall handler table
   GK_CTL_SIGNAL_FIELDS,  // the signal field table
+  GK_CTL_THREAD_WORDS,   // the calling thread's thread words (0 if it has no record)
   GK_CTL_COUNT
 };
 unsigned long gk_debug_ctl_addr(int which);
 
-#define GK_EFAULT (-1001)  // guest faulted; see gk_fault_addr()
+#define GK_EFAULT (-1001)     // guest faulted; see gk_fault_addr()
 #define GK_ESHUTDOWN (-1002)  // guest triple-faulted or shut down
 
 // The guest-virtual address of the last fault reported by gk_run.
@@ -223,19 +224,23 @@ typedef struct {
   long demand_faults;   // guest page faults resolved by mapping the page from the host
   long wall_flushed;    // host-frame walls raised with a TLB flush
   long wall_skipped;    // host-frame walls raised without one, the flush being provably unneeded
-  long global_pages;    // PTEs installed as global (shared runtime pages whose TLB entries survive a root switch)
-  long neighbor_pages;  // PTEs installed ahead of a fault, for pages adjacent to a demand-faulted one
-  long root_switches;   // guest entries that loaded a different page-table root (an arena switch)
-  long tlb_flushes;     // full TLB flushes run on a vCPU, on every path: a wall raise that could not
-                        // skip, a reflected mprotect/munmap, freed page tables (wall_flushed is the
-                        // wall's share)
-  int flush_invpcid;    // the flush stub in use: 1 = INVPCID (one VM exit), 0 = CR4.PGE toggle (three)
-  int host_regions;     // host-memory regions mapped (each is one entry in the registry)
-  long host_blocks;     // host-memory blocks allocated and not yet freed
-  int host_slots;       // host slots allocated and not yet freed (see gk_host_slot_alloc)
+  long
+      global_pages;  // PTEs installed as global (shared runtime pages whose TLB entries survive a root switch)
+  long
+      neighbor_pages;  // PTEs installed ahead of a fault, for pages adjacent to a demand-faulted one
+  long root_switches;  // guest entries that loaded a different page-table root (an arena switch)
+  long tlb_flushes;    // full TLB flushes run on a vCPU, on every path: a wall raise that could not
+                       // skip, a reflected mprotect/munmap, freed page tables (wall_flushed is the
+                       // wall's share)
+  int flush_invpcid;  // the flush stub in use: 1 = INVPCID (one VM exit), 0 = CR4.PGE toggle (three)
+  int host_regions;   // host-memory regions mapped (each is one entry in the registry)
+  long host_blocks;   // host-memory blocks allocated and not yet freed
+  int host_slots;     // host slots allocated and not yet freed (see gk_host_slot_alloc)
   int hostcall_handlers;  // hostcall indices with a handler registered (see gk_hostcall_register)
-  long hostcalls;       // hostcalls that reached a handler, from either side
-  int signal_fields;    // signal fields registered and not yet unregistered (see gk_signal_field_register)
+  long hostcalls;         // hostcalls that reached a handler, from either side
+  int signal_fields;  // signal fields registered and not yet unregistered (see gk_signal_field_register)
+  long
+      path_refusals;  // forwarded path syscalls the turn-directory policy refused (see gk_confine_paths)
 } gk_stats;
 void gk_get_stats(gk_stats *s);
 
@@ -432,9 +437,9 @@ void gk_host_slot_free(gk_host_handle handle);
 #define GK_HOSTCALL_BYTES 4096
 #define GK_HOSTCALL_STATE 1024
 typedef struct {
-  uint64_t args[4];    // guest to host: by-value words
-  uint64_t in_len;     // guest to host: bytes of buf that carry arguments (<= GK_HOSTCALL_BYTES)
-  uint64_t out_len;    // host to guest: bytes of buf that carry the result
+  uint64_t args[4];  // guest to host: by-value words
+  uint64_t in_len;   // guest to host: bytes of buf that carry arguments (<= GK_HOSTCALL_BYTES)
+  uint64_t out_len;  // host to guest: bytes of buf that carry the result
   unsigned char buf[GK_HOSTCALL_BYTES];
   unsigned char state[GK_HOSTCALL_STATE];  // host frame only: handler state across calls
 } gk_hostcall_frame;
@@ -521,11 +526,98 @@ long gk_hostcall(unsigned idx);
 #define GK_SIGNAL_KINDS 4
 #define GK_SIGNAL_FIELD_BYTES 4
 typedef uint64_t gk_signal_handle;
-int gk_signal_field_register(uintptr_t buffer_offset, size_t buffer_len,
-                             uint32_t field_offset, unsigned kind,
-                             gk_signal_handle *handle);
+int gk_signal_field_register(uintptr_t buffer_offset,
+    size_t buffer_len,
+    uint32_t field_offset,
+    unsigned kind,
+    gk_signal_handle *handle);
 int gk_signal_field_unregister(gk_signal_handle handle);
 long gk_signal_field_write(unsigned kind, uint32_t value);
+
+// Thread words: GK_THREAD_WORDS 64-bit words per thread, in the thread's
+// record in gk's supervisor control block, for per-thread state of the
+// embedder's that host code or a signal handler must read from memory no
+// ring-3 code can write. Thread-local storage is the wrong place for such
+// state: it is user memory, so a turn can rewrite it, and a pointer the host
+// later loads from it names whatever the turn put there. The words are
+// addressed by a small key, validated against GK_THREAD_WORDS before anything
+// is read: a range that starts at or past the table, or runs past it, is
+// -EINVAL with nothing read or written. The capacity is fixed; a key is an
+// assignment the embedder makes once, not something allocated, so there is
+// nothing to exhaust and nothing to free.
+//
+// gk_thread_words_set stores n words from `values` at keys first..first+n-1
+// for the calling thread, gk_thread_words_get copies them out. Both find the
+// thread's record lock-free -- the thread-local index hint checked against
+// the record's kernel tid, with a scan of the records when the hint is wrong
+// -- and so cost a gettid each (about 50 ns on the test machine); a range is
+// one lookup however many words it spans, so state that is read together is
+// kept adjacent and read in one call. Both are usable from a signal handler
+// on the thread, except the first set on a thread with no record, which takes
+// one (and gk's lock). A thread without a record reads -ESRCH; a record is
+// zeroed when it is taken, so a thread that has one and has set nothing reads
+// zeroes, and a thread the guest creates starts with zeroes too, never its
+// creator's words. Before gk_init both are -ESRCH.
+//
+// Host-side only: the record is supervisor memory, so a call from ring 3
+// faults. A word is only as good as what it holds: a pointer stored here may
+// be dereferenced by the host because the guest cannot have changed it, but
+// the memory it points at is wherever the embedder put it.
+#define GK_THREAD_WORDS 8
+int gk_thread_words_set(unsigned first, unsigned n, const uint64_t *values);
+int gk_thread_words_get(unsigned first, unsigned n, uint64_t *values);
+
+// Whether the calling thread is inside the guest, as gk's own per-thread
+// flag says. The flag is thread-local storage: gk sets it from a constant
+// around every guest entry, so a rewrite by the guest does not outlast the
+// entry, but inside one the guest can say what it likes. For host code that
+// must choose between a path that reads supervisor memory and one that does
+// not when it may be running at ring 3 under a turn: a lie costs only the
+// liar, since the supervisor path faults at ring 3 and ends the turn. Never
+// a basis for anything the host trusts.
+int gk_in_guest_hint(void);
+
+// The turn directory: a bound on where the path syscalls a turn forwards may
+// land. With the policy on (gk_confine_paths(1), process-wide, host-side),
+// every thread starts each guest entry with no directory, and a forwarded
+// syscall that names a file by path is refused with -EPERM unless the thread
+// has one, the syscall is openat, newfstatat or statx, and its dirfd is that
+// directory; the lookup then runs beneath it. The directory is set host-side
+// by gk_turn_dir_set -- from a hostcall handler, in the runtime, so that the
+// value comes from a table the host validates (a host slot) and never from
+// the turn's own argument -- and the descriptor's device and inode are
+// recorded then and compared on every use, so a descriptor the guest has
+// closed and reused for another file names nothing. GK_TURN_DIR_NONE sets no
+// directory; a descriptor that is not a directory is -EINVAL. The guest's own
+// copy of the descriptor, wherever it keeps it, is untrusted bookkeeping: a
+// rewritten copy makes its syscalls fail, nothing else.
+//
+// The path is never parsed by gk. openat is forwarded as openat2 with
+// RESOLVE_BENEATH and RESOLVE_NO_MAGICLINKS, so the kernel refuses, atomically
+// with the lookup, an absolute path (EXDEV), a ".." that would leave the
+// directory, a symbolic link that would, and a /proc magic link; the mode is
+// passed only with O_CREAT or O_TMPFILE, as openat2 requires. newfstatat and
+// statx become an O_PATH open under the same rules (O_NOFOLLOW for
+// AT_SYMLINK_NOFOLLOW) followed by fstat or statx on the descriptor, which is
+// then closed; with AT_EMPTY_PATH they stat the directory itself. Every other
+// syscall gk knows to name a path -- open, access, stat, readlink, rename,
+// unlink, mkdir, the *at family other than the three above, openat2 itself,
+// execve, mount and the rest -- is refused, and so is fchdir, which would
+// move the process's working directory. A thread the guest creates is
+// confined like any other and starts with no directory. The policy is
+// applied after the embedder's filter, which still decides what is forwarded
+// at all; refusals are counted in gk_stats.path_refusals. It costs one fstat
+// per path syscall, and an extra open and close per stat.
+//
+// What it does not bound: the descriptors the turn already holds or can
+// guess. read, pwrite, fcntl, mmap and close take a descriptor by number and
+// are not path syscalls, so a turn can still act on any file the process has
+// open, as the process; confining that needs a per-turn descriptor table,
+// which this is not. Nor does it hide the directory's contents from the turn:
+// what the turn may open beneath its directory, it may read and write.
+#define GK_TURN_DIR_NONE (-1)
+void gk_confine_paths(int on);
+int gk_turn_dir_set(int dirfd);
 
 // Nonzero once gk_init has succeeded in this process.
 int gk_initialized(void);
@@ -554,8 +646,7 @@ void gk_debug_protect_range(unsigned long addr, size_t len, int kind);
 // its six arguments and returns nonzero to allow the syscall or zero to deny
 // it. A denied syscall is not forwarded; the guest sees it return -EPERM, as
 // the kernel would under seccomp. Pass NULL to clear the filter.
-typedef int (*gk_syscall_filter)(long nr, long a1, long a2, long a3, long a4,
-                                 long a5, long a6);
+typedef int (*gk_syscall_filter)(long nr, long a1, long a2, long a3, long a4, long a5, long a6);
 void gk_set_syscall_filter(gk_syscall_filter f);
 
 // Mapping-change policy, for a filter to apply to the memory syscalls it
@@ -586,8 +677,7 @@ void gk_set_syscall_filter(gk_syscall_filter f);
 // is accepted without a range check: neither can touch an existing mapping.
 // Returns nonzero to allow, zero to deny, like a filter.
 int gk_mapping_change_ok(unsigned long addr, unsigned long len);
-int gk_mapping_syscall_ok(long nr, long a1, long a2, long a3, long a4, long a5,
-                          long a6);
+int gk_mapping_syscall_ok(long nr, long a1, long a2, long a3, long a4, long a5, long a6);
 
 #ifdef __cplusplus
 }

@@ -447,6 +447,12 @@ void checkWasmDescriptorsForTest(kj::StringPtr url) {
 // descriptor would do, then arms the timer the same way; the signal must still reach the
 // module's real memory and the chosen buffer must stay untouched, which /__gk_wasm_check reads
 // out and logs before restoring the entries.
+// With the same variable set, a request whose path is /__gk_tls_restore overwrites, from inside
+// the turn, the heap slot the isolate lock restores Worker::Api's thread-local from, with a
+// sentinel; the host puts the real value back from a stack frame when the lock is released (see
+// ~Worker::Lock and GuestTurnThreadLocals in io/), so an event-loop callback observes Worker::Api
+// not holding the sentinel. This is how tls-test.sh shows the guest-writable thread-locals the
+// host reads after a turn do not carry a turn's value past it.
 void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   static const bool faultEnabled =
       jsg::isGuestKernelEnabled() && getenv("WORKERD_GK_TEST_FAULT") != nullptr;
@@ -504,6 +510,35 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
     checkWasmDescriptorsForTest(url);
   }
 #endif
+  if (probeEnabled && url.endsWith("/__gk_tls_restore")) {
+    // A JS turn's guest-writable thread-locals are put back by the host after the turn (see
+    // GuestTurnThreadLocals and ~Worker::Lock), so a value the turn leaves in them does not reach
+    // the host. This exercises the Api case, whose restored value must come from a host stack
+    // frame and not from the heap slot the lock otherwise restores from. From inside the turn,
+    // overwrite that heap slot (Isolate::Impl::Lock::oldCurrentApi, which ~Worker::Lock reads) with
+    // a sentinel, as a write primitive would; ~Worker::Lock must still leave Worker::Api's
+    // thread-local holding the value it had before the lock, which an event-loop callback checks
+    // once the lock is gone -- it must not be the sentinel.
+    auto* apiSlot = static_cast<const Worker::Api**>(lock.savedApiStorageForTest());
+    const auto* sentinel = reinterpret_cast<const Worker::Api*>(0x1);
+    const auto* heapWas = *apiSlot;
+    *apiSlot = sentinel;
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: overwrote the Api restore slot from inside the JS turn",
+        url, kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(apiSlot))),
+        kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(heapWas))));
+    IoContext::current().addTask(kj::evalLater([]() {
+      // On the event loop, no isolate lock held: Worker::Api's thread-local holds whatever the
+      // request's lock left. If the stack restore held, it is not the sentinel.
+      const Worker::Api* cur = nullptr;
+      KJ_IF_SOME(api, Worker::Api::tryCurrent()) {
+        cur = &api;
+      }
+      kj::StringPtr verdict =
+          cur == reinterpret_cast<const Worker::Api*>(0x1) ? "leaked"_kj : "restored"_kj;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: Worker::Api after the turn",
+          kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(cur))), verdict);
+    }));
+  }
   if (probeEnabled && url.endsWith("/__gk_corrupt_handle")) {
     KJ_IF_SOME(probe, hostMemory::handleProbeForTest()) {
       static byte chosenKey[32] = {0x41};

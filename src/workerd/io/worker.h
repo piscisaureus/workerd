@@ -624,6 +624,12 @@ class Worker::Api {
   // Like `current()`, but returns `kj::none` if there is no current Api instance.
   static kj::Maybe<const Api&> tryCurrent();
 
+  // The thread-local behind current(), for the host side of a guest turn to save before the turn
+  // and put back after it (see GuestTurnThreadLocals in guest-turn-thread-locals.h). The value is
+  // opaque to the caller: it is only ever stored back.
+  static const Api* saveThreadLocalForGuestTurn();
+  static void restoreThreadLocalAfterGuestTurn(const Api* value);
+
   // Take a lock on the isolate.
   virtual kj::Own<jsg::Lock> lock(jsg::V8StackScope& stackScope) const = 0;
   // TODO(cleanup): Change all locking to a synchronous callback style rather than RAII style, so
@@ -827,11 +833,23 @@ class Worker::Lock {
   // Get the opaque storage key to use for recording user trace information in async contexts.
   kj::Arc<jsg::AsyncContextFrame::StorageKey> getUserTraceAsyncContextKey();
 
+  // Test-only (see maybeForceGuestFaultForTest in api/global-scope.c++): the heap storage of the
+  // Api pointer that Isolate::Impl::Lock puts back into the thread-local when this lock is
+  // released, which a request overwrites from inside a turn to show that the value restored
+  // after the lock comes from this stack object and not from the heap.
+  void* savedApiStorageForTest();
+
  private:
   explicit Lock(const Worker& worker, LockType lockType, jsg::V8StackScope&);
   struct Impl;
 
   Worker& worker;
+  // The Api current on this thread before this lock, kept here, on the stack (a Lock must be on
+  // the stack), because `impl` is heap memory a guest turn can write: with the guest kernel on,
+  // the destructor puts this value back into the thread-local after `impl` has restored its own
+  // heap copy, so what Worker::Api::current() sees once the lock is gone was decided by a host
+  // frame.
+  const Api* apiBeforeLock;
   kj::Own<Impl> impl;
 
   friend class Worker;
