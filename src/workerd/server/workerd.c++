@@ -110,6 +110,12 @@ namespace {
 // memory, another isolate's arena, the runtime's image or the main thread's
 // stack. Runs on gk's syscall-forward path, so it must not allocate.
 //
+// A disk-backed Durable Object runs SQLite's native VFS inside the turn
+// (util/sqlite.c++), which is what the file syscalls here are for: pread64,
+// pwrite64, fsync, fdatasync, ftruncate and fcntl on the descriptors it holds,
+// geteuid for its root check, and openat, newfstatat, unlinkat and faccessat2
+// by path.
+//
 // Adapted from Deno Deploy's V8 seccomp allowlist (x86_64 set).
 // TODO: see if this can be tightened further.
 int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
@@ -118,6 +124,9 @@ int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a
 #endif
 #ifndef SYS_rseq
   constexpr long SYS_rseq = 334;
+#endif
+#ifndef SYS_faccessat2
+  constexpr long SYS_faccessat2 = 439;
 #endif
   switch (nr) {
     case SYS_madvise:
@@ -144,11 +153,17 @@ int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a
     case SYS_eventfd2:
     case SYS_exit_group:
     case SYS_exit:
+    case SYS_faccessat:
+    case SYS_faccessat2:
     case SYS_fcntl:
+    case SYS_fdatasync:
     case SYS_fstat:
+    case SYS_fsync:
+    case SYS_ftruncate:
     case SYS_futex:
     case SYS_getpeername:
     case SYS_getpid:
+    case SYS_geteuid:
     case SYS_getrandom:
     case SYS_getrusage:
     case SYS_getsockname:
@@ -161,6 +176,7 @@ int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a
     case SYS_poll:
     case SYS_prctl:
     case SYS_prlimit64:
+    case SYS_pread64:
     case SYS_pwrite64:
     case SYS_read:
     case SYS_recvfrom:
@@ -187,6 +203,7 @@ int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a
     case SYS_restart_syscall:
     case SYS_tgkill:
     case SYS_uname:
+    case SYS_unlinkat:
     case SYS_write:
     case SYS_writev:
     case SYS_getcwd:

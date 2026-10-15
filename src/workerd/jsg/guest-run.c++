@@ -42,6 +42,20 @@ gk_arena* guestArenaOf(Lock& js) {
   return nullptr;
 }
 
+// Stack traces stringified inside a turn carry addresses only. KJ's full mode symbolizes a trace
+// by piping it through an llvm-symbolizer child process, which a turn cannot do: the syscall
+// filter (guestKernelSyscallFilter in server/workerd.c++) denies pipe2, fork and execve, so the
+// attempt could only ever fail. The callback lives on the host frame that runs the turn, so
+// a turn cannot outlast it; the thread-local that KJ reaches it through is guest-writable, and a
+// turn that redirects it to the full mode gets the failed attempt that the symbolizer reports
+// as unsymbolized, with the cost borne by that turn alone.
+class GuestTurnExceptionCallback final: public kj::ExceptionCallback {
+ public:
+  StackTraceMode stackTraceMode() override {
+    return StackTraceMode::ADDRESS_ONLY;
+  }
+};
+
 }  // namespace
 
 void runTrampolineInGuest(
@@ -65,6 +79,7 @@ void runTrampolineInGuest(
   KJ_DEFER(guestTurnDepth = depth);
   guestTurnArena = arena;
   KJ_DEFER(guestTurnArena = nullptr);
+  GuestTurnExceptionCallback exceptionCallback;
 
   long result = gk_run_here_user(fn, arg);
   if (result != 0) {

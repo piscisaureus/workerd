@@ -56,6 +56,14 @@ isolate's JS turn at guest ring 3.
   slot the isolate lock restores `Worker::Api`'s thread-local from, and the
   host still leaves the thread-local holding the value it had before the lock,
   taken from a host stack frame and not the overwritten slot.
+- `disk-sqlite-test.sh` / `disk-sqlite-test.capnp` / `disk-sqlite-test.js` —
+  end-to-end check against a built workerd that a SQLite-backed Durable Object
+  stored on local disk works with its JS turns at guest ring 3, where SQLite's
+  native VFS runs inside the turn and its file syscalls pass the syscall
+  filter: rows are written and read back across requests and a restart, and
+  an error raised inside a SQLite turn -- caught in JS, uncaught, or one the
+  runtime logs inside the turn with its stack trace, which would run the
+  symbolizer -- fails only its request rather than faulting the guest.
 
 ## API
 
@@ -365,7 +373,14 @@ hardware:
   corrupt the x86-64 red zone that leaf functions use).
 - **Syscall policy.** A filter can bound what forwarded code may do; a denied
   syscall is not forwarded and the guest sees `-EPERM`. The test denies `write`
-  and confirms the guest gets `-EPERM` while other syscalls still work.
+  and confirms the guest gets `-EPERM` while other syscalls still work. A
+  denial on an error path must not recurse: a JS turn in workerd stringifies
+  its stack traces as addresses only (`jsg/guest-run.c++`, through KJ's
+  `ExceptionCallback::stackTraceMode`), since the symbolizer KJ's full mode
+  runs is a child process the filter denies, and the symbolizer itself
+  (`patches/capnp-cpp`) reports a `pipe` or `fork` it cannot make as an
+  unsymbolized trace rather than throwing out of a `noexcept` launch into
+  `std::terminate`, whose handler would stringify a trace again, without end.
 - **Demand-paged MMU.** The guest's memory is backed lazily. On a guest page
   fault the in-guest `#PF` handler hypercalls; the host checks the faulting
   address against its own address space and, if committed, backs it with a KVM

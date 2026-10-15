@@ -27,6 +27,10 @@ bazel_dep(name = "brotli", version = "1.2.0.bcr.3")
 # capnp-cpp
 http.archive(
     name = "capnp-cpp",
+    patch_strip = 1,
+    patches = [
+        "//:patches/capnp-cpp/0001-Start-the-symbolizer-subprocess-without-throwing.patch",
+    ],
     sha256 = "d24206085fa53789f7395324cd7e3cf97082701ab30b1fd48fd2e1c3f0164385",
     strip_prefix = "capnproto-capnproto-b6147c5/c++",
     type = "tgz",
