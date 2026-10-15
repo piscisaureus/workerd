@@ -144,15 +144,32 @@ void releaseJournaled(
 // to walk its host-side state through a hostcall and must not find what it has already released.
 void flushReleasedInTurn();
 
-// What the host does, after a turn, with the entries the turn registered and released. Both
-// run host-side, with the table already updated for the entry: committed() once the table has
-// taken a registration's pointer, with the words the registration carried, and may refuse it,
-// after which the entry is retired and resolves to nothing; released() for a committed entry
-// the turn released, before the entry is retired. released() may also run inside a hostcall
-// (a turn that outruns its retire list), so it must not take the process heap.
+// In a turn: records `words` for the host to act on once the turn has returned (through
+// ResolveTurnHooks::noted), for an operation on host state that the turn cannot perform itself
+// and that need not be done before the turn ends -- queuing a dropped holder's handle for the
+// context that owns the object, say. The note is the turn's own memory until the host reads it,
+// by position and bounded by the host's count, and what the words mean is for the hook to
+// validate. A turn that outruns its notes hands them over through one hostcall. Returns false
+// outside a turn, where the caller acts on the host state directly, and when the note could
+// not be recorded.
+constexpr size_t NOTE_WORDS = 4;
+bool noteInTurn(const uint64_t (&words)[NOTE_WORDS]);
+
+// What the host does, after a turn, with the entries the turn registered and released and the
+// notes it made. All run host-side, with the table already updated for the entry: committed()
+// once the table has taken a registration's pointer, with the words the registration carried,
+// and may refuse it, after which the entry is retired and resolves to nothing; released() for a
+// committed entry the turn released, before the entry is retired; noted() for each note, after
+// the commits and the releases, so that a note about an entry the turn registered finds it
+// committed and one about an entry the turn released finds it gone. released() and noted() may
+// also run inside a hostcall (a turn that outruns its retire list or its notes), so they must
+// not take the process heap; noted() is told when it does (`inHandler`) and returns whether it
+// consumed the note, and one it could not consume there is handed to it again at the end of the
+// turn, where it must.
 struct ResolveTurnHooks {
   bool (*committed)(ResolveHandle handle, void* ptr, const uint64_t* aux);
   void (*released)(ResolveHandle handle);
+  bool (*noted)(const uint64_t* words, bool inHandler);
 };
 
 // A JS turn's registrations, batched. The table is written only by the host, and the objects
@@ -166,7 +183,8 @@ struct ResolveTurnHooks {
 // Inside the turn, registerResolve() takes the next reserved handle and journals the pointer
 // and words, resolve() falls back to the journal for a handle the table does not yet hold, and
 // unregisterResolve() marks a journaled entry released or lists a committed one for retirement
-// at the end; a turn that outruns its reserved entries, or its retire list, refills or flushes
+// at the end, and noteInTurn() records what the host is to do once the turn has returned; a
+// turn that outruns its reserved entries, its retire list or its notes refills or flushes
 // through one hostcall. Nested in a turn, a ResolveTurn does nothing: the outermost frame
 // commits.
 //

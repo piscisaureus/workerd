@@ -1425,8 +1425,8 @@ Worker::Isolate::Isolate(kj::Own<Api> apiParam,
           auto& js = jsg::Lock::from(isolate);
 
           // The promise tag is generally opaque except for right here. The tag
-          // wraps an instanceof kj::Own<IoCrossContextExecutor>, which wraps an atomically
-          // refcounted pointer to the DeleteQueue for the correct isolate.
+          // wraps an instanceof kj::Own<IoCrossContextExecutor>, which names the DeleteQueue
+          // of the correct IoContext by that context's handle.
           // We simply pass the given callback, reactions, and argument to
           // a function that will be added to the queue inside DeleteQueue.
           // The next time the relevant IoContext is entered, this queue will

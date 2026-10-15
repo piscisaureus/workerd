@@ -1,9 +1,10 @@
 using Workerd = import "/workerd/workerd.capnp";
 
-# Config for ioown-test.sh: "victim" takes the in-turn rewrite of an IoOwn's handle, "other"
-# announces an IoOwn of its own for victim's cross-isolate rewrite, "node" takes the in-turn
-# rewrite of an owned node, which faults and condemns its isolate, and "hello" must keep answering
-# throughout. The socket addresses are placeholders that the script overrides with --socket-addr.
+# Config for ioown-test.sh: "victim" takes the in-turn rewrites of an IoOwn's handles, "other"
+# announces an IoOwn of its own for victim's cross-isolate rewrites, "node" takes the in-turn
+# rewrite of an owned node and "queue" that of a context record, each of which faults and
+# condemns its isolate, and "hello" must keep answering throughout. The socket addresses are
+# placeholders that the script overrides with --socket-addr.
 const config :Workerd.Config = (
   services = [
     (name = "hello", worker = (
@@ -24,11 +25,16 @@ const config :Workerd.Config = (
       modules = [(name = "worker", esModule = "export default { async fetch(req) { return new Response(\"node ok\\n\"); } };")],
       compatibilityDate = "2024-01-01",
     )),
+    (name = "queue", worker = (
+      modules = [(name = "worker", esModule = "export default { async fetch(req) { return new Response(\"queue ok\\n\"); } };")],
+      compatibilityDate = "2024-01-01",
+    )),
   ],
   sockets = [
     (name = "hello", address = "127.0.0.1:8885", http = (), service = "hello"),
     (name = "victim", address = "127.0.0.1:8884", http = (), service = "victim"),
     (name = "other", address = "127.0.0.1:8883", http = (), service = "other"),
     (name = "node", address = "127.0.0.1:8882", http = (), service = "node"),
+    (name = "queue", address = "127.0.0.1:8881", http = (), service = "queue"),
   ],
 );

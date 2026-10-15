@@ -87,11 +87,18 @@ isolate's JS turn at guest ring 3.
   the host's drain of the delete queue refusing the handle rather than
   reaching the buffer, with the isolate still serving; a handle rewritten to
   another isolate's live handle names that isolate's object, the ownership
-  residual the table cannot close, stated as such; and a turn's write into
+  residual the table cannot close, stated as such; a turn's write into
   the owned-list node behind a handle -- the links the host's walk follows
   and the disposer it calls, in host memory -- faults at the node, after
   which the context's teardown, host-side, disposes of the object through
-  the disposer the node recorded and never the one the turn chose.
+  the disposer the node recorded and never the one the turn chose; a turn's
+  write into the context record behind an `IoOwn`'s other handle -- the
+  delete queue, with its lock and the fulfiller the host calls through --
+  faults at the record, after which the teardown locks the record and the
+  host's later lockers are unaffected; and an `IoOwn`'s context handle
+  rewritten to another isolate's live context, or to a buffer the turn
+  chose, queues nothing when the holder is dropped, with the object left to
+  its own context's teardown.
 
 ## API
 
@@ -346,7 +353,16 @@ hardware:
   context's owned list, with the links the host's walk follows and the
   disposer the host calls -- is in host memory, found through the entry's
   companion (`hostMemory::resolveCompanion`), a host-side record per entry
-  that the host alone writes. The objects are created inside turns, where
+  that the host alone writes. The context that owns the object has an entry
+  of its own, whose handle is the holder's other word (`DeleteQueue`) and
+  whose companion is the context's record in host memory: the list's head
+  and the delete queue -- the handles of holders dropped off their context,
+  the actions other contexts send it, the signal that wakes it, and the
+  lock over them -- so that no refcount or mutex of the queue's is in
+  memory a turn can write; a turn that drops a holder off its context, or
+  sends another context an action, leaves a note in its journal
+  (`hostMemory::noteInTurn`) that the host validates and queues after the
+  turn. The objects are created inside turns, where
   neither the table nor host memory can be written, so the host reserves
   entries for the thread before each turn and commits them after it from
   the turn's journal (`gk_resolve_reserve`, `gk_resolve_commit`;
@@ -682,10 +698,11 @@ so a crossing a turn makes on every dereference belongs on that path.
   the use rather than redirecting it, and the context's record of the
   object -- the owned-list node whose links the host follows at teardown
   and on the delete-queue drain, and whose disposer the host calls -- is in
-  host memory, written by the host; the object it names is still in the
-  shared heap, as is the delete-queue reference beside the handle, and the
-  disposer the node records is the one the turn journaled when it created
-  the object.
+  host memory, written by the host, as is the context's record -- the delete
+  queue, its lock and its signal -- which the holder names by the context's
+  handle beside the object's; the object it names is still in the shared
+  heap, and the disposer the node records is the one the turn journaled
+  when it created the object.
   What a rewritten handle can still do is name another live host slot, or
   another isolate's live resolve entry: the
   table turns "any address" into "one of the live tenants", and telling a
@@ -703,10 +720,11 @@ so a crossing a turn makes on every dereference belongs on that path.
   (`src/workerd/util/memory-class.h`), which is a handful so far; every other
   class is unchecked. Placement by class exists for H only, as an explicit
   choice per object (`HostOwn<T>` and `HostSlot<T>`, `util/host-memory.h`)
-  rather than something the allocator decides, and five kinds of object have
+  rather than something the allocator decides, and six kinds of object have
   been placed: the channel token key, the host entropy buffer, the actor-id
-  namespace key, the Wasm signal descriptors and the owned-list nodes
-  behind `IoOwn` handles.
+  namespace key, the Wasm signal descriptors, the owned-list nodes behind
+  `IoOwn` handles and the context records that hold each context's list
+  head and delete queue.
 - **The host acts on data a ring-3 turn can write.** The runtime's heap is in
   the guest's address space, so every host-side structure the guest can reach
   is attacker-controlled input to the host, and the dangerous cases are the
@@ -739,9 +757,11 @@ so a crossing a turn makes on every dereference belongs on that path.
   name a different isolate's arena and cost that isolate its memory, or name
   another tenant's host-memory block. Nor does it help with the objects a turn hands back --
   the non-void results of `IoContext::run`, which are mostly `kj::Promise`,
-  and the `kj::Own` graph the delete queue walks -- which are heap objects
-  carrying their own vtables and disposers. Those become safe when the
-  runtime's mutable memory is out of ring 3's reach, not by marshalling them.
+  and the actions one context queues for another, closures the host moves
+  by pointer and destroys when their context has ended -- which are heap
+  objects carrying their own vtables and disposers. Those become safe when
+  the runtime's mutable memory is out of ring 3's reach, not by marshalling
+  them.
 - **No cross-vCPU TLB shootdown IPIs yet.** Adding mappings needs none (a
   not-present entry has nothing stale to flush), which is why dynamic `mmap`
   and per-thread stacks work across vCPUs. Removing or shrinking a mapping

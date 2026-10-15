@@ -138,11 +138,22 @@ the object -- the owned-list node, with the links its teardown walk and its
 delete-queue drain follow and the disposer it calls -- is in H memory,
 reached from the entry's companion (`hostMemory::resolveCompanion`, a
 host-side record per entry) and built by the host after the turn from the
-words the turn journaled with the registration. What the handle and the
-node do not protect is the object: the `T` is still in the shared heap, the
-disposer the node records is the one the turn journaled, and the
-`kj::Arc<DeleteQueue>` beside the handle is still a host refcount the turn
-can write (violation 4).
+words the turn journaled with the registration. The context the object
+belongs to is named the same way: the `IoOwn`'s other word is the handle of
+the context's own entry (`DeleteQueue`), compared with the current context's
+on every use, and the context's delete queue -- the handles of holders
+dropped off their context, the actions other contexts send it, the signal
+that wakes it, and the lock over them -- is in the context's record in H
+memory behind that entry's companion, together with the owned list's head,
+so no refcount and no mutex of the queue's is in memory a turn can write.
+A turn that drops a holder of another context's object, or sends another
+context an action, notes it in the turn's journal (`hostMemory::noteInTurn`)
+for the host to queue after the turn, having first asked the ring-0 table
+whether the context still exists; the host validates the note -- the
+context must be live, and the handle must name an object of that context's
+own list -- before it queues anything. What the handle and the node do not
+protect is the object: the `T` is still in the shared heap, and the
+disposer the node records is the one the turn journaled.
 
 **A returned object becomes a message.** A turn that produces a value for the
 host writes it into the boundary region in a form with no pointers and no
@@ -354,8 +365,8 @@ The splits, with the half each member goes to:
 |---|---|
 | `IoContext` (`io-context.h:277`) | H keeps the event-loop state: `tasks`/`waitUntilTasks` (`:1235`, `:1245`), `abortFulfiller`/`abortPromise` (`:1210`), `canceler` (`:1250`), `ownedObjects` (`:1221`), `localCapSet` (`:1187`), `thread` (`:1172`), `limitEnforcer` (`:1180`). I gets a mirror: the `Id`, the JsRefs (`:1269`), the invocation span context, the policy constants, and the handle tables. `IoContext::current()` becomes a read of the mirror through a slot the host writes before each turn |
 | `IoContext::Runnable`/`RunnableImpl` (`:1272`, `:1450`) | Becomes a B message `{closure handle, input descriptors, result slot}`. This is where the non-void result problem lives |
-| `IoOwn`/`IoPtr`/`ReverseIoOwn` (`io-own.h`) | **All three hold a handle, and the owned list is H: done.** `IoOwn`'s I side is `{kj::Arc<DeleteQueue>, hostMemory::ResolveHandle, OwnedDisposal}`: the handle names the object through `gk_resolve`'s table, resolved on every dereference, destruction and release, registered by `addObject` through the turn's reserved batch; the disposal record is the turn's own way of disposing of the object when it drops the holder inside a turn, which the host never reads. The context's record of the object, `OwnedObjectList`'s node -- links and disposer -- is in H memory, reached from the entry's companion, built by the host at commit and freed by the host on release, teardown or drain; the list's head is the companion of an entry of its own, and the context keeps only that handle. `ReverseIoOwn` has the same shape with the validity token in place of the `Arc`. `IoPtr` is `{kj::Arc<DeleteQueue>, ResolveHandle}` with an entry tied to its own lifetime and no node. What is still to split: the `Arc<DeleteQueue>` is a host refcount in I memory (violation 4), the `T` behind every handle is in the shared heap, and the disposer the node records is journaled by the turn that created the object, so the host's disposal of a `T` is a call the turn chose, as `T`'s own vtable already is |
-| `DeleteQueue` (`io-own.h`) | `State::queue` carries `ResolveHandle`s, resolved host-side when the owning context drains it, so a holder dropped on another thread names its object by handle rather than by pointer. `actions` becomes a B ring of `{closure handle}` records, and `~IoOwn` still takes the host mutex from inside the arena during GC (violation 4). The cross-thread wakeup stays H |
+| `IoOwn`/`IoPtr`/`ReverseIoOwn` (`io-own.h`) | **All three hold handles, and the owned list and the delete queue are H: done.** `IoOwn`'s I side is `{DeleteQueue, hostMemory::ResolveHandle, OwnedDisposal}`, where `DeleteQueue` is the handle of the context's own entry and nothing else: the object's handle names the object through `gk_resolve`'s table, resolved on every dereference, destruction and release, registered by `addObject` through the turn's reserved batch; the context's handle is compared with the current context's on every use and resolved by the host when the holder is dropped off its context; the disposal record is the turn's own way of disposing of the object when it drops the holder inside a turn, which the host never reads. The context's record of the object, `OwnedObjectList`'s node -- links, disposer and the context's handle -- is in H memory, reached from the entry's companion, built by the host at commit and freed by the host on release, teardown or drain; the list's head is in the context's record (below), and the context keeps only its handle. `ReverseIoOwn` has the same shape with the validity token in place of the context handle: that token is still a `kj::Arc` to an `AtomicRefcounted` in the shared heap, whose refcount a turn that drops a `ReverseIoOwn` writes (the one refcount of this family still in guest reach; its holders are KJ I/O objects, dropped in turns only when the context's list disposes of them). `IoPtr` is `{DeleteQueue, ResolveHandle}` with an entry tied to its own lifetime and no node. What is still to split: the `T` behind every handle is in the shared heap, and the disposer the node records is journaled by the turn that created the object, so the host's disposal of a `T` is a call the turn chose, as `T`'s own vtable already is |
+| `DeleteQueue` (`io-own.h`) | **H: done.** The queue is the context's record in H memory, behind the context's entry's companion (`DeleteQueueOwner`): the owned list's head, a `kj::MutexGuarded` over the deletion handles and the action boxes, in chunks from `gk_host_alloc`, and the cross-thread fulfiller. Holders name it by the entry's handle; the record lives as long as the context, and a stale handle resolves to nothing, which is the "defunct" answer. In a turn, `~IoOwn` off its context and `tryScheduleAction` write a journal note (`hostMemory::noteInTurn`) after a ring-0 check that the context's entry is live, and the host queues from the notes after the turn, validating each; outside a turn the host queues directly, on any thread, under a process-wide H registry lock (shared) that a teardown takes exclusive, which is what keeps a record alive for a pusher that has found it. The context drains host-side before entering the guest, and its signal task takes the actions out host-side and hands them to the turn that runs them. An action is a `kj::Function` boxed on the heap, which the host moves by pointer and never calls through; the turn that runs it, or the context's teardown, destroys it, and a host-side teardown or a note whose context ended before the turn did destroys it host-side, a call through the closure's own vtable, which is the same exposure as disposing of a `T`. A context torn down inside a turn tears its record down through the `IO_CONTEXT` hostcall, which hands the turn the fulfiller and the actions to destroy and retires the entry; the turn still destroys the fulfiller, whose destructor takes the event loop's executor lock, as it did before the record moved |
 | `jsg::Lock` (`jsg.h:2746`) | H: the `v8::Locker` and `GuestArenaScope`. I: `v8Isolate`, `isolateScope`, `warningsLogged` and the wrap/alloc methods. The lock slot `Lock::from` reads is neither: it is written by the host and put back from the host frame that entered the guest (violation 1, closed). The object itself is still one heap allocation holding both halves (`server/workerd-api.c++:305`), reached from the stack `Worker::Lock` through its heap `Impl` |
 | `jsg::IsolateBase` (`setup.h:244`) | I: `ptr`, the behaviour flags, `typeHandlerRegistry`, the V8 global templates, `heapTracer`. H: `v8System`, `observer`, the external-memory target. B: the deferred-destruction queue becomes a ring of `{kind, handle}` records rather than `kj::OneOf<GlobalToDelete, RefToDelete, kj::Own<void>>` (`setup.h:584`), and `codeMap` (`:739`) becomes a B array of `{start, size, name offset}` the host signal handler bounds-checks |
 | `Worker` / `Script` / `Isolate` / `Actor` (`worker.h:104`, `:246`, `:333`, `:887`) | Each splits along `X` versus `X::Impl`: the `Impl`s are I (contexts, `env`, `ctxExports`, `namedHandlers` of `jsg::Function`, `classInstance`, `transient`), the outer objects keep scheduling, metrics, limits, the inspector transport, condemnation, the actor cache and the gates |
@@ -498,18 +509,24 @@ at.
    R7). `guestTurnArena` (`guest-run.c++:35`) needs nothing: a rewrite only
    weakens a ring-3 diagnostic the host never acts on.
 4. **Guest code takes host mutexes**, so corrupting a `kj::Mutex` word
-   deadlocks the next host locker: `DeleteQueue::crossThreadDeleteQueue` from
-   `~IoOwn` during in-arena GC (`io-own.c++`, `scheduleDeletion`, which
-   queues a handle that the host later resolves to an H node, but still
-   takes the mutex to do it, through the `kj::Arc<DeleteQueue>` the `IoOwn`
-   holds beside its handle),
+   deadlocks the next host locker. The `IoOwn` case is closed: the delete
+   queue's lock, refcount and state are in the context's record in H memory
+   (`DeleteQueueOwner`, `io-own.h`), a holder names the context by its
+   entry's handle rather than by an `Arc`, and a holder dropped off its
+   context during in-arena GC, or an action sent to another context from a
+   turn, writes a journal note (`hostMemory::noteInTurn`) that the host
+   validates and queues after the turn, so no in-arena code takes the lock
+   or writes the refcount; `ioown-test.sh` shows a turn's write into the
+   record faulting at the record, with the host's later lockers unaffected.
+   What in-arena code still touches of this family: `ReverseIoOwnValidity`'s
+   refcount when a `ReverseIoOwn` is dropped in a turn, and the event loop's
+   executor lock when a context torn down inside a turn destroys its
+   cross-thread fulfiller there (both as before). Still open elsewhere:
    `IsolateBase::queue` from `Data::destroy` (`setup.h:755`), the module
    registry on every lookup (`modules-new.h:801`), `CompileCache`
-   (`compile-cache.h:54`), the actor cache LRU (`actor-cache.h:1084`). Open.
-   Closing the `IoOwn` case needs the `Arc<DeleteQueue>` to become an id the
-   host validates and the cross-thread queue to become a B ring the host
-   drains, so that a holder dropped during in-arena GC writes a record
-   rather than taking a lock.
+   (`compile-cache.h:54`), the actor cache LRU (`actor-cache.h:1084`), and
+   the `AbortSignal` registration cells (`api/basics.h:804`), which are
+   `kj::Arc` + `MutexGuarded` in the shared heap taken from turns.
 5. **Guest-built KJ objects with vtables are consumed by the event loop.**
    `awaitIoImpl` builds promise nodes in-turn and hands them to `addTask`
    (`io-context.h:1600`); `IoContext::abort` stores a guest-built
@@ -726,7 +743,7 @@ constantly, and most of them cannot be given a class as they stand.
 
 | Type | Why it resists classification | Minimum change |
 |---|---|---|
-| `kj::Own<T>` | A disposer pointer plus an object pointer. Across the boundary the disposer is an attacker-controlled indirect call. `IoOwn<T>` is `{kj::Arc<DeleteQueue>, hostMemory::ResolveHandle, OwnedDisposal}` (`io-own.h`): the handle is validated against `gk_resolve`'s table on every use (liveness, generation; see Cost), the disposer the host calls is in the H node rather than in guest memory, and the refcount is still a pointer to a host `AtomicRefcounted` | `deleteQueue` becomes an arena id rather than an `Arc`. The disposer in the H node is the one the turn journaled at registration, so it is attacker-chosen once rather than attacker-rewritable; closing that needs the `T` and its disposer placed by the host. I-internal owns should use a disposer baked into the type so no disposer pointer exists in guest memory |
+| `kj::Own<T>` | A disposer pointer plus an object pointer. Across the boundary the disposer is an attacker-controlled indirect call. `IoOwn<T>` is `{DeleteQueue, hostMemory::ResolveHandle, OwnedDisposal}` (`io-own.h`): both handles are validated against `gk_resolve`'s table on use (liveness, generation; see Cost), the disposer the host calls is in the H node rather than in guest memory, and the context is named by its entry's handle, with no refcount | The disposer in the H node is the one the turn journaled at registration, so it is attacker-chosen once rather than attacker-rewritable; closing that needs the `T` and its disposer placed by the host. I-internal owns should use a disposer baked into the type so no disposer pointer exists in guest memory |
 | `kj::Promise<T>` and its nodes | One heap object owned by the host `kj::TaskSet` (`io-context.h:1245`), carrying a vtable and event-loop queue links the guest wrote, and embedding guest state (a `jsg::Promise::Resolver`) the host must not touch | The turn emits a request record into B; the host builds the real promise on its side; on completion it writes `{resolver handle, result or exception record}` into B and schedules a turn. The body of the `run(...)` lambda at `io-context.h:1593` already does only that |
 | `kj::Exception` | Owns strings with their own disposers, a context chain and a details array | B after a copy -- it is only data. `GuestTurnOutcome::setException` (`guest-run.c++:78`) already does this for the turn's own outcome; generalize it to carry the detail list, since the ids in `util/exception.h:4` are load-bearing for `decodeTunneledException`, and use it for every rejection that crosses |
 | `kj::String`, `kj::Array<T>` | Pointer, size, and a disposer with a virtual `disposeImpl`. Worse, `jsg::asBytes` returns an `Array` aliasing a V8 backing store (`jsg/util.c++:655`), i.e. arena memory, which is then handed to host network code (`server.c++:4393`) | A B descriptor `{offset, length}` over copied bytes, or for large bodies a host-side read-only mapping of the arena range for the duration of the write |
@@ -771,9 +788,10 @@ handle, which retires the largest single family of raw cross-boundary
 pointers (done, see below); then the promise channel, which retires the
 `IoContext::run` result problem and the event-loop touches together.
 
-What the `IoOwn` handle gives, and what remains. `IoOwn<T>` is
-`{kj::Arc<DeleteQueue>, hostMemory::ResolveHandle, OwnedDisposal}`
-(`io-own.h`): the handle names the object through `gk_resolve`'s table,
+What the `IoOwn` handles give, and what remains. `IoOwn<T>` is
+`{DeleteQueue, hostMemory::ResolveHandle, OwnedDisposal}` (`io-own.h`),
+where the `DeleteQueue` is the handle of the context's own entry: the
+object's handle names the object through `gk_resolve`'s table,
 `addObject` registers it through the turn's reserved batch, and
 `operator->`, the destructor and the delete-queue drain resolve it for each
 use, failing the use when it names nothing (`ioown-test.sh` shows a handle
@@ -782,16 +800,28 @@ next turn's dereference and by the host's drain, and the isolate still
 serving). The context's record of the object is in H memory: the owned-list
 node, with the links the host's teardown walk and delete-queue drain follow
 and the disposer the host calls, is allocated by the host at the
-reserved-batch commit from the words the turn journaled (disposer, list
+reserved-batch commit from the words the turn journaled (disposer, context
 handle, disposal pointer), reached through the entry's companion, and freed
 by the host when the holder releases the entry, when the queue is drained
 or when the list is torn down; a turn that drops a holder disposes of the
 object itself, through the disposal record the holder carries, and journals
 the release; a context torn down inside another context's turn drains its
-list through the `OWNED_LIST` hostcall, which hands the turn each object
+list through the `IO_CONTEXT` hostcall, which hands the turn each object
 with its disposer and frees the nodes host-side (`ioown-test.sh` shows a
 turn's write into a node faulting at the node, and the teardown walk
-reaching the node's own disposer). What the node does not protect is the
+reaching the node's own disposer). The delete queue is in the same record,
+behind the context's entry: a holder dropped off its context, or an action
+sent to another context, is a journal note from inside a turn and a direct
+push under the record's lock from outside one, with the host validating
+the note's context and handle before queuing, and the record is torn down
+with the context, so a holder that outlives its context resolves the
+context's handle to nothing and drops its object to the list that already
+disposed of it (`ioown-test.sh` shows a turn's write into the record
+faulting at the record and a context handle rewritten to another isolate's
+or to a chosen buffer queuing nothing, with the host's later lockers
+unaffected; `io-own-test` shows a holder dropped on another thread
+disposed of on its context's thread, and one dropped after its context has
+ended releasing nothing). What the node does not protect is the
 `T`: it is H by rule C and still placed in the shared heap, so a turn with a
 read primitive can read it through the pointer the resolve returns, and the
 host's disposal of it runs a destructor over memory the turn can write; and
@@ -799,19 +829,19 @@ the disposer the node records is the one the turn journaled, admitted by
 the commit unvalidated, so a turn that lies about its own object's disposer
 sends the host's disposal of that object to a function of its choosing --
 the same exposure the `T`'s vtable and members carry until the `T` is
-placed by the host. Placing the `T` is the next step there. The
-`Arc<DeleteQueue>` beside the handle is the other half: a refcount on a host
-object the arena's GC touches (violation 4), which becomes an id the host
-validates, with the cross-thread queue a B ring. And the table cannot tell
-one tenant's handle from another's: a handle rewritten to another isolate's
-live handle names that isolate's object (the cross-isolate form in
-`ioown-test.sh`, stated there as the residual), because `checkFarGet`
-compares the `IoOwn`'s own `Arc<DeleteQueue>` -- as writable as the handle
--- with the current context, and the ring-0 lookup has no host-decided
-notion of the calling isolate: closing it needs an owner tag in the table
-entry compared, at ring 0, against the thread's arena read from a per-vCPU
-record (a `GS` base gk does not set today), or the host-decided context id
-once the `Arc` has become one.
+placed by the host, and the same one a queued action's closure carries when
+the host destroys it. Placing the `T` is the next step there. And the table
+cannot tell one tenant's handle from another's: a handle rewritten to
+another isolate's live handle names that isolate's object (the
+cross-isolate form in `ioown-test.sh`, stated there as the residual),
+because `checkFarGet` compares the `IoOwn`'s own context handle -- as
+writable as the object's -- with the current context's, and the ring-0
+lookup has no host-decided notion of the calling isolate: closing it needs
+an owner tag in the table entry compared, at ring 0, against the thread's
+arena read from a per-vCPU record (a `GS` base gk does not set today). The
+delete queue's side of that residual is closed: a dropped handle is queued
+only for the context whose list holds its node, whatever context handle
+the holder carries.
 
 ## What is in H memory
 
@@ -861,10 +891,16 @@ what is waiting on the same facility:
   mapped as entries come into use, reached through a host slot handle, and
   what they point at for `IoOwn`'s entries: the owned-list nodes
   (`OwnedObjectList` in `io/io-own.h`), each with its links, its disposer
-  and its entry's handle, and the head word of each context's list, which
-  is the companion of the list's own entry. `ioown-test.sh` shows a turn's
-  write into a node faulting at the node and the context's teardown walk
-  disposing of the object through the node's own disposer.
+  and its entry's and context's handles, and each context's record
+  (`DeleteQueueOwner`), behind the context's own entry, holding the list's
+  head and the delete queue -- its lock, the deletion handles and action
+  boxes in chunks, and the cross-thread fulfiller -- with the registry lock
+  that serializes a pusher's lookup against a teardown reached through a
+  host slot handle. `ioown-test.sh` shows a turn's write into a node
+  faulting at the node and the context's teardown walk disposing of the
+  object through the node's own disposer, and a turn's write into a record
+  faulting at the record with the host's teardown and later lockers
+  unaffected.
 - **In gk's supervisor memory, found by thread:** the watchdog progress
   counter's state (`thread-scopes.c++:27`), in gk's per-thread supervisor
   words (`gk_thread_words_*`), read by the watchdog signal handler through

@@ -1,7 +1,10 @@
 #include <workerd/io/io-context.h>
 #include <workerd/tests/test-fixture.h>
 
+#include <pthread.h>
+
 #include <kj/test.h>
+#include <kj/thread.h>
 
 namespace workerd {
 namespace {
@@ -100,6 +103,12 @@ struct NodeCounts {
     auto after = OwnedObjectList::statsForTest();
     KJ_EXPECT(after.nodesAllocated - before.nodesAllocated == after.nodesFreed - before.nodesFreed,
         after.nodesAllocated - before.nodesAllocated, after.nodesFreed - before.nodesFreed);
+    KJ_EXPECT(after.recordsAllocated - before.recordsAllocated ==
+            after.recordsFreed - before.recordsFreed,
+        after.recordsAllocated - before.recordsAllocated, after.recordsFreed - before.recordsFreed);
+    KJ_EXPECT(
+        after.chunksAllocated - before.chunksAllocated == after.chunksFreed - before.chunksFreed,
+        after.chunksAllocated - before.chunksAllocated, after.chunksFreed - before.chunksFreed);
   }
 };
 
@@ -297,6 +306,196 @@ KJ_TEST("IoPtr names its object by an entry of its own and can be copied") {
   // Both entries are retired: the live count (which includes the thread's reserved entries, two
   // of which the IoPtrs took) is no higher than before they existed.
   KJ_EXPECT(hostMemory::liveResolveEntries() <= liveBefore);
+}
+
+// An object that records the thread its destructor ran on.
+class ThreadTrackedObject {
+ public:
+  ThreadTrackedObject(uint& destructionCount, pthread_t& destroyedOn)
+      : destructionCount(destructionCount),
+        destroyedOn(destroyedOn) {}
+  ~ThreadTrackedObject() noexcept(false) {
+    ++destructionCount;
+    destroyedOn = pthread_self();
+  }
+
+ private:
+  uint& destructionCount;
+  pthread_t& destroyedOn;
+};
+
+KJ_TEST("IoOwn dropped on another thread is disposed of on its context's thread") {
+  NodeCounts counts;
+  {
+    TestFixture fixture;
+    uint destructionCount = 0;
+    pthread_t destroyedOn = 0;
+    auto request = fixture.newIncomingRequest();
+    kj::Maybe<IoOwn<ThreadTrackedObject>> own;
+    fixture.enterContext(*request, [&](const TestFixture::Environment& env) {
+      own = env.context.addObject(kj::heap<ThreadTrackedObject>(destructionCount, destroyedOn));
+    });
+    {
+      // Dropped on a thread that is not the context's, with no current context and no turn: the
+      // handle goes to the context's queue, host-side, and the object is untouched.
+      kj::Thread thread([&]() { own = kj::none; });
+    }
+    KJ_EXPECT(destructionCount == 0);
+    // The context's next turn drains the queue on its own thread, before entering the turn.
+    fixture.enterContext(
+        *request, [&](const TestFixture::Environment& env) { KJ_EXPECT(destructionCount == 1); });
+    KJ_EXPECT(pthread_equal(destroyedOn, pthread_self()));
+  }
+  counts.expectBalanced();
+}
+
+KJ_TEST("IoOwn dropped on another thread after its context has ended releases nothing") {
+  NodeCounts counts;
+  {
+    TestFixture fixture;
+    uint destructionCount = 0;
+    pthread_t destroyedOn = 0;
+    kj::Maybe<IoOwn<ThreadTrackedObject>> own;
+    kj::Maybe<IoCrossContextExecutor> executor;
+    {
+      auto request = fixture.newIncomingRequest();
+      fixture.enterContext(*request, [&](const TestFixture::Environment& env) {
+        own = env.context.addObject(kj::heap<ThreadTrackedObject>(destructionCount, destroyedOn));
+        executor = env.context.getCrossContextExecutor();
+      });
+      KJ_EXPECT(!KJ_ASSERT_NONNULL(executor).isTargetDestroyed());
+    }
+    // The context is gone, and its list disposed of the object on this thread.
+    KJ_EXPECT(destructionCount == 1);
+    KJ_EXPECT(pthread_equal(destroyedOn, pthread_self()));
+    KJ_EXPECT(KJ_ASSERT_NONNULL(executor).isTargetDestroyed());
+    // Another context takes the thread's reserved entries and, possibly, the record's place.
+    auto later = fixture.newIncomingRequest();
+    fixture.enterContext(*later, [&](const TestFixture::Environment& env) {});
+    {
+      // The holder, and an action for the context, dropped on another thread: the context's
+      // handle names nothing, so neither reaches anything.
+      kj::Thread thread([&]() {
+        own = kj::none;
+        KJ_EXPECT(!KJ_ASSERT_NONNULL(executor).tryExecute([](jsg::Lock&) {}));
+      });
+    }
+    KJ_EXPECT(destructionCount == 1);
+    fixture.enterContext(
+        *later, [&](const TestFixture::Environment& env) { KJ_EXPECT(destructionCount == 1); });
+  }
+  counts.expectBalanced();
+}
+
+KJ_TEST("an action queued from another thread runs in its context on the context's thread") {
+  NodeCounts counts;
+  {
+    TestFixture fixture;
+    auto request = fixture.newIncomingRequest();
+    auto& context = request->getContext();
+    auto executor = context.getCrossContextExecutor();
+    // One turn first, so that the signal task has installed its signal from the event loop.
+    fixture.enterContext(*request, [&](const TestFixture::Environment& env) {});
+    auto paf = kj::newPromiseAndCrossThreadFulfiller<void>();
+    pthread_t ranOn = 0;
+    bool ranInContext = false;
+    {
+      kj::Thread thread([&, fulfiller = kj::mv(paf.fulfiller)]() mutable {
+        KJ_EXPECT(!executor.isCurrent());
+        bool queued = executor.tryExecute([&, fulfiller = kj::mv(fulfiller)](jsg::Lock&) mutable {
+          ranOn = pthread_self();
+          ranInContext = IoContext::hasCurrent() && &IoContext::current() == &context;
+          fulfiller->fulfill();
+        });
+        KJ_EXPECT(queued);
+      });
+    }
+    // The signal wakes this loop, and the context runs the action in a turn of its own.
+    paf.promise.wait(fixture.getWaitScope());
+    KJ_EXPECT(pthread_equal(ranOn, pthread_self()));
+    KJ_EXPECT(ranInContext);
+  }
+  counts.expectBalanced();
+}
+
+KJ_TEST("an action queued inside another context's turn runs in its context") {
+  NodeCounts counts;
+  {
+    TestFixture fixture;
+    auto target = fixture.newIncomingRequest();
+    auto& targetContext = target->getContext();
+    auto executor = targetContext.getCrossContextExecutor();
+    fixture.enterContext(*target, [&](const TestFixture::Environment& env) {});
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    bool ranInTarget = false;
+    fixture.runInIoContext([&](const TestFixture::Environment& env) {
+      // Inside a turn of another context: the action is noted for the host to queue after the
+      // turn, and the target is found live.
+      KJ_EXPECT(!executor.isCurrent());
+      KJ_EXPECT(!executor.isTargetDestroyed());
+      KJ_EXPECT(executor.tryExecute([&](jsg::Lock&) {
+        ranInTarget = IoContext::hasCurrent() && &IoContext::current() == &targetContext;
+        paf.fulfiller->fulfill();
+      }));
+      KJ_EXPECT(!ranInTarget);
+    });
+    paf.promise.wait(fixture.getWaitScope());
+    KJ_EXPECT(ranInTarget);
+  }
+  counts.expectBalanced();
+}
+
+KJ_TEST("a holder of a live context dropped inside another context's turn is released later") {
+  NodeCounts counts;
+  {
+    TestFixture fixture;
+    uint destructionCount = 0;
+    pthread_t destroyedOn = 0;
+    auto owner = fixture.newIncomingRequest();
+    kj::Maybe<IoOwn<ThreadTrackedObject>> own;
+    fixture.enterContext(*owner, [&](const TestFixture::Environment& env) {
+      own = env.context.addObject(kj::heap<ThreadTrackedObject>(destructionCount, destroyedOn));
+    });
+    fixture.runInIoContext([&](const TestFixture::Environment& env) {
+      // Inside a turn of another context: noted, with the object untouched until the owner's
+      // next turn.
+      own = kj::none;
+      KJ_EXPECT(destructionCount == 0);
+    });
+    KJ_EXPECT(destructionCount == 0);
+    fixture.enterContext(
+        *owner, [&](const TestFixture::Environment& env) { KJ_EXPECT(destructionCount == 1); });
+  }
+  counts.expectBalanced();
+}
+
+KJ_TEST("a context torn down inside a turn takes its queued actions with it") {
+  NodeCounts counts;
+  {
+    TestFixture fixture;
+    auto other = fixture.newIoContext();
+    auto executor = other->getCrossContextExecutor();
+    uint actionsDestroyed = 0;
+    struct Tracker {
+      uint& count;
+      ~Tracker() noexcept(false) {
+        ++count;
+      }
+    };
+    fixture.runInIoContext([&](const TestFixture::Environment& env) {
+      KJ_EXPECT(executor.tryExecute(
+          [tracker = kj::heap<Tracker>(actionsDestroyed)](jsg::Lock&) { KJ_FAIL_ASSERT("ran"); }));
+      KJ_EXPECT(!executor.isTargetDestroyed());
+      // Torn down here, where its record cannot be reached: the hostcall hands the turn what
+      // the record held, and the entry is retired at once.
+      other = nullptr;
+      KJ_EXPECT(executor.isTargetDestroyed());
+      KJ_EXPECT(!executor.tryExecute([](jsg::Lock&) {}));
+    });
+    // The action noted above found the context gone when the turn ended, and was dropped.
+    KJ_EXPECT(actionsDestroyed == 1);
+  }
+  counts.expectBalanced();
 }
 
 }  // namespace

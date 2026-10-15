@@ -448,6 +448,7 @@ void clearCompanion(ResolveHandle handle) {
 constexpr uint32_t POOL_CAPACITY = 256;    // entries reserved ahead for a thread
 constexpr uint32_t POOL_LOW = 64;          // a turn starts with at least this many
 constexpr uint32_t RETIRE_CAPACITY = 256;  // committed entries a turn retires before a flush
+constexpr uint32_t NOTE_CAPACITY = 512;    // notes a turn makes before handing them over
 
 struct TurnJournal {
   enum State : uint8_t { UNUSED = 0, USED = 1, RETIRED = 2 };
@@ -459,6 +460,8 @@ struct TurnJournal {
   uint32_t next = 0;                      // positions handed out
   ResolveHandle retire[RETIRE_CAPACITY];  // committed entries unlinked during the turn
   uint32_t retireCount = 0;
+  uint64_t notes[NOTE_CAPACITY][NOTE_WORDS];  // what the turn noted for the host (noteInTurn)
+  uint32_t noteCount = 0;
   bool active = false;  // a turn is running on this thread
 };
 
@@ -466,7 +469,8 @@ struct ThreadPool {
   ResolveHandle handles[POOL_CAPACITY];
   uint32_t count = 0;
   kj::Own<TurnJournal> journal;
-  ResolveTurnHooks hooks = {nullptr, nullptr};  // the current turn's, written by the host at entry
+  ResolveTurnHooks hooks = {
+    nullptr, nullptr, nullptr};  // the current turn's, written by the host at entry
 };
 
 // The turn's way to its journal. Guest-writable, and a lie costs only the liar: the host
@@ -551,10 +555,32 @@ void flushRetired(TurnJournal& journal, const ResolveTurnHooks& hooks) {
   journal.retireCount = 0;
 }
 
+// Hands the journal's notes to the noted hook, in order, and keeps the ones it did not consume
+// (only possible inside a handler), compacted to the front. Host-side; bounded by the capacity
+// whatever the journal says.
+void replayNotes(TurnJournal& journal, const ResolveTurnHooks& hooks, bool inHandler) {
+  uint32_t n = kj::min(journal.noteCount, NOTE_CAPACITY);
+  uint32_t kept = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    uint64_t words[NOTE_WORDS];
+    for (size_t w = 0; w < NOTE_WORDS; w++) words[w] = journal.notes[i][w];
+    bool consumed = hooks.noted == nullptr || hooks.noted(words, inHandler);
+    if (consumed) continue;
+    if (!inHandler) {
+      KJ_LOG(
+          ERROR, "a turn's note was not consumed at the end of the turn; it is dropped", words[0]);
+      continue;
+    }
+    for (size_t w = 0; w < NOTE_WORDS; w++) journal.notes[kept][w] = words[w];
+    kept++;
+  }
+  journal.noteCount = kept;
+}
+
 // The RESOLVE hostcall: a turn whose journal has run out of reserved entries, or whose retire
-// list is full, asks the host to refill or flush it. The handler finds the thread's pool and
-// journal through the host's own record, never through the frame.
-enum class ResolveOp : uint64_t { REFILL = 1, RETIRE = 2 };
+// list or notes are full, asks the host to refill or flush it. The handler finds the thread's
+// pool and journal through the host's own record, never through the frame.
+enum class ResolveOp : uint64_t { REFILL = 1, RETIRE = 2, NOTES = 3 };
 
 long resolveHostcall(hostcall::Frame& frame) {
   ThreadPool* pool = poolOfThread();
@@ -565,6 +591,9 @@ long resolveHostcall(hostcall::Frame& frame) {
     case ResolveOp::RETIRE:
       flushRetired(*pool->journal, pool->hooks);
       return 0;
+    case ResolveOp::NOTES:
+      replayNotes(*pool->journal, pool->hooks, true);
+      return static_cast<long>(pool->journal->noteCount);
   }
   return -EINVAL;
 }
@@ -669,6 +698,20 @@ void flushReleasedInTurn() {
   callResolveHostcall(ResolveOp::RETIRE);
 }
 
+bool noteInTurn(const uint64_t (&words)[NOTE_WORDS]) {
+  TurnJournal* journal = activeJournal();
+  if (journal == nullptr) return false;
+  if (journal->noteCount >= NOTE_CAPACITY) {
+    // The notes are spent: one exit to hand them over, which a turn making more than
+    // NOTE_CAPACITY notes pays once per NOTE_CAPACITY.
+    callResolveHostcall(ResolveOp::NOTES);
+    if (journal->noteCount >= NOTE_CAPACITY) return false;
+  }
+  uint32_t i = journal->noteCount++;
+  for (size_t w = 0; w < NOTE_WORDS; w++) journal->notes[i][w] = words[w];
+  return true;
+}
+
 size_t liveResolveEntries() {
 #ifdef WORKERD_HAS_GUEST_KERNEL
   if (guestKernelActive()) {
@@ -712,6 +755,7 @@ ResolveTurn::ResolveTurn(ResolveTurnHooks hooks): pool(nullptr) {
   journal.count = threadPool.count;
   journal.next = 0;
   journal.retireCount = 0;
+  journal.noteCount = 0;
   journal.active = true;
   currentJournal = &journal;
   pool = &threadPool;
@@ -748,7 +792,10 @@ ResolveTurn::~ResolveTurn() noexcept(false) {
   }
   threadPool.count -= next;
   flushRetired(journal, hooks);
-  threadPool.hooks = {nullptr, nullptr};
+  // The notes last: one about an entry registered above finds it committed, one about an entry
+  // released above finds it gone.
+  replayNotes(journal, hooks, false);
+  threadPool.hooks = {nullptr, nullptr, nullptr};
   journal.active = false;
   journal.next = 0;
   journal.count = 0;

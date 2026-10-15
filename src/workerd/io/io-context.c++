@@ -166,8 +166,9 @@ IoContext::IoContext(ThreadContext& thread,
       limitEnforcer(kj::mv(limitEnforcerParam)),
       id(nextId()),
       threadId(getThreadId()),
-      deleteQueue(kj::arc<DeleteQueue>()),
+      deleteQueue(),
       reverseIoOwnValidity(kj::arc<ReverseIoOwnValidity>()),
+      ownedObjects(deleteQueue.queue.getContext()),
       timeoutManager(kj::heap<TimeoutManagerImpl>()),
       waitUntilTasks(*this),
       tasks(*this),
@@ -1388,7 +1389,7 @@ void IoContext::requireCurrent() {
 void IoContext::checkFarGet(const DeleteQueue& expectedQueue, const std::type_info& type) {
   requireCurrent();
 
-  if (&expectedQueue == deleteQueue.queue.get()) {
+  if (expectedQueue == deleteQueue.queue) {
     // same request or same actor, success
   } else {
     throwNotCurrentJsError(type);
@@ -1423,16 +1424,10 @@ void IoContext::runInContextScope(Worker::LockType lockType,
       v8::Isolate::PromiseContextScope promiseContextScope(
           lock.getIsolate(), getPromiseContextTag(lock));
 
-      {
-        // Handle any pending deletions that arrived while the worker was processing a different
-        // request.
-        auto l = deleteQueue.queue->crossThreadDeleteQueue.lockExclusive();
-        auto& state = KJ_ASSERT_NONNULL(*l);
-        for (auto handle: state.queue) {
-          OwnedObjectList::release(handle, DestroyOwnedObject::YES);
-        }
-        state.queue.clear();
-      }
+      // Handle any pending deletions that arrived while the worker was processing a different
+      // request. Host-side: the queue is in host memory, and this runs before the turn enters
+      // the guest.
+      deleteQueue.drainDeletions();
 
       func(lock);
     });
@@ -1801,7 +1796,7 @@ void IoContext::throwNotCurrentJsError(kj::Maybe<const std::type_info&> maybeTyp
 
 jsg::JsObject IoContext::getPromiseContextTag(jsg::Lock& js) {
   if (promiseContextTag == kj::none) {
-    auto deferral = kj::heap<IoCrossContextExecutor>(deleteQueue.queue.addRef());
+    auto deferral = kj::heap<IoCrossContextExecutor>(deleteQueue.queue);
     promiseContextTag = jsg::JsRef(js, js.opaque(kj::mv(deferral)));
   }
   return KJ_REQUIRE_NONNULL(promiseContextTag).getHandle(js);
@@ -1812,19 +1807,22 @@ kj::Promise<void> IoContext::startDeleteQueueSignalTask(IoContext* context) {
   // IoContext is destroyed, the promise will be canceled and the loop will
   // end. On each iteration of the loop we want to reset the cross thread
   // signal in the delete queue, then wait on the promise. Once the promise
-  // is fulfilled, we will run an empty task to prompt the IoContext to drain
-  // the DeleteQueue.
+  // is fulfilled, we take the queued actions out of the queue, host-side, and
+  // run a turn that runs them.
   try {
+    // The task starts in the constructor, which may run inside a JS turn, where the queue --
+    // in host memory -- cannot be reached; the first signal is installed from the event loop.
+    co_await kj::evalLater([]() {});
     for (;;) {
-      co_await context->deleteQueue.queue->resetCrossThreadSignal();
-      co_await context->run([](auto& lock) {
-        auto& context = IoContext::current();
-        auto l = context.deleteQueue.queue->crossThreadDeleteQueue.lockExclusive();
-        auto& state = KJ_ASSERT_NONNULL(*l);
-        for (auto& action: state.actions) {
-          action(lock);
+      co_await context->deleteQueue.resetCrossThreadSignal();
+      auto actions = context->deleteQueue.takeActions();
+      if (actions.size() == 0) continue;
+      co_await context->run([&actions](Worker::Lock& lock) {
+        for (auto& action: actions) {
+          (*action)(lock);
         }
-        state.actions.clear();
+        // Destroyed inside the turn, as the actions were built inside one.
+        actions.clear();
       });
     }
   } catch (...) {

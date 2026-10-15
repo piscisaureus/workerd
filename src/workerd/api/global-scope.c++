@@ -649,18 +649,31 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   constexpr uint64_t IOOWN_CHOSEN_MAGIC = 0xbadbadbadbadbad0;
   constexpr uint64_t IOOWN_OTHER_MAGIC = 0x0e7e70e7e70e7e70;
   constexpr uint64_t IOOWN_NODE_MAGIC = 0x0de0de0de0de0de0;
-  // The handle is the IoOwn's second word, after the delete queue reference and before the
-  // disposal record; a write primitive aiming at it writes exactly there.
-  static_assert(sizeof(IoOwn<IoOwnProbe>) ==
-      sizeof(kj::Arc<DeleteQueue>) + sizeof(uint64_t) + sizeof(OwnedDisposal));
-  constexpr size_t IOOWN_HANDLE_OFFSET = sizeof(kj::Arc<DeleteQueue>);
-  auto ioOwnHandle = [](IoOwnProbeHolder& holder) {
-    uint64_t handle;
-    memcpy(&handle, reinterpret_cast<byte*>(&holder.own) + IOOWN_HANDLE_OFFSET, sizeof(handle));
-    return handle;
+  // The IoOwn's first word is the context's handle (its DeleteQueue) and its second the object's
+  // handle, before the disposal record; a write primitive aiming at either writes exactly there.
+  static_assert(
+      sizeof(IoOwn<IoOwnProbe>) == sizeof(DeleteQueue) + sizeof(uint64_t) + sizeof(OwnedDisposal));
+  constexpr size_t IOOWN_CONTEXT_OFFSET = 0;
+  constexpr size_t IOOWN_HANDLE_OFFSET = sizeof(DeleteQueue);
+  auto ioOwnWord = [](IoOwnProbeHolder& holder, size_t offset) {
+    uint64_t word;
+    memcpy(&word, reinterpret_cast<byte*>(&holder.own) + offset, sizeof(word));
+    return word;
   };
-  auto setIoOwnHandle = [](IoOwnProbeHolder& holder, uint64_t handle) {
-    memcpy(reinterpret_cast<byte*>(&holder.own) + IOOWN_HANDLE_OFFSET, &handle, sizeof(handle));
+  auto setIoOwnWord = [](IoOwnProbeHolder& holder, size_t offset, uint64_t word) {
+    memcpy(reinterpret_cast<byte*>(&holder.own) + offset, &word, sizeof(word));
+  };
+  auto ioOwnHandle = [ioOwnWord](IoOwnProbeHolder& holder) {
+    return ioOwnWord(holder, IOOWN_HANDLE_OFFSET);
+  };
+  auto setIoOwnHandle = [setIoOwnWord](IoOwnProbeHolder& holder, uint64_t handle) {
+    setIoOwnWord(holder, IOOWN_HANDLE_OFFSET, handle);
+  };
+  auto ioOwnContext = [ioOwnWord](IoOwnProbeHolder& holder) {
+    return ioOwnWord(holder, IOOWN_CONTEXT_OFFSET);
+  };
+  auto setIoOwnContext = [setIoOwnWord](IoOwnProbeHolder& holder, uint64_t context) {
+    setIoOwnWord(holder, IOOWN_CONTEXT_OFFSET, context);
   };
   // A later turn of the same request uses the IoOwn, as an API call on the wrapper would, and
   // reports what it reached: the magic it read, or the refusal.
@@ -677,6 +690,7 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
     });
   };
   static uint64_t announcedIoOwnHandle = 0;
+  static uint64_t announcedIoOwnContext = 0;
   if (probeEnabled && url.endsWith("/__gk_ioown_corrupt")) {
     auto& context = IoContext::current();
     auto holder = kj::heap<IoOwnProbeHolder>(
@@ -728,9 +742,11 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
     auto holder = kj::heap<IoOwnProbeHolder>(
         IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_OTHER_MAGIC))});
     announcedIoOwnHandle = ioOwnHandle(*holder);
+    announcedIoOwnContext = ioOwnContext(*holder);
     KJ_LOG(WARNING,
         "WORKERD_GK_TEST_PROBE: announced this isolate's IoOwn for another worker's turn", url,
-        kj::str("0x", kj::hex(announcedIoOwnHandle)), addr(holder->own.operator->()));
+        kj::str("0x", kj::hex(announcedIoOwnHandle)), addr(holder->own.operator->()),
+        kj::str("0x", kj::hex(announcedIoOwnContext)));
     IoOwnProbeHolder& announcedHolder = *holder;
     announced = kj::mv(holder);
     context.addWaitUntil(useIoOwnLater(context, "announced-own", announcedHolder));
@@ -830,13 +846,181 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
       });
     }));
   }
+  // The delete queue (see DeleteQueue in io/io-own.h): a holder names its context by the
+  // context's handle, and the queue is in the context's record in host memory.
+  //
+  // /__gk_queue_corrupt aims at the record. The turn creates an IoOwn; after the turn the host
+  // finds the record behind the IoOwn's context handle and announces its address and the word
+  // holding the cross-thread signal's fulfiller, which the host calls through when it queues an
+  // action; a later turn writes a fulfiller of its choosing into that word, as a write primitive
+  // would. Under the guest kernel the write faults at the record, the isolate is condemned and
+  // the context is torn down host-side, which locks the record and disposes of the object. Where
+  // the write lands (no guest kernel, or the WORKERD_GK_NEG_DELETE_QUEUE build), the host then
+  // queues an action for the context from the event loop and calls the chosen fulfiller, which
+  // logs that it was reached.
+  //
+  // /__gk_queue_rewrite aims at the handle: a later turn overwrites the IoOwn's context handle
+  // with the address of a buffer the turn chose, laid out as a record would be, which is what the
+  // delete queue pointer was; the holder is then destroyed on the event loop. The host must
+  // refuse the handle and queue nothing, leaving the object to the context's list, and must not
+  // read or write the buffer. /__gk_queue_steal overwrites it with another isolate's live context
+  // handle instead (announced by /__gk_ioown_announce): the host finds that context, but the
+  // handle the holder drops names an object of this context's list, so nothing is queued there
+  // either. /__gk_queue_after queues an action for this context from the event loop, the
+  // host-side path through the record's lock and the fulfiller, and reports when the action has
+  // run in a turn.
+  struct ChosenFulfiller final: public kj::CrossThreadPromiseFulfiller<void> {
+    void fulfill(kj::_::Void&& value) const override {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the chosen fulfiller was called by the host");
+    }
+    void reject(kj::Exception&& exception) const override {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the chosen fulfiller was called by the host");
+    }
+    bool isWaiting() const override {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the chosen fulfiller was called by the host");
+      return true;
+    }
+  };
+  static const ChosenFulfiller chosenFulfiller;
+  constexpr uint64_t IOOWN_QUEUE_MAGIC = 0x0bab0bab0bab0bab;
+  constexpr uint64_t IOOWN_REWRITE_MAGIC = 0x0cab0cab0cab0cab;
+  constexpr uint64_t IOOWN_STEAL_MAGIC = 0x0dab0dab0dab0dab;
+  if (probeEnabled && url.endsWith("/__gk_queue_corrupt")) {
+    auto& context = IoContext::current();
+    static kj::Maybe<kj::Own<IoOwnProbeHolder>> queueHolder;
+    static DeleteQueue::RecordForTest probedRecord = {nullptr, 0, nullptr};
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_QUEUE_MAGIC))});
+    uint64_t ctx = ioOwnContext(*holder);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: created an IoOwn for the queue probe inside the JS turn", url,
+        kj::str("0x", kj::hex(ctx)), addr(holder->own.operator->()));
+    queueHolder = kj::mv(holder);
+    context.addWaitUntil(kj::evalLater([&context, ctx, addr, url = kj::str(url)]() mutable {
+      // On the event loop, after the turn: the record exists in host memory, with the signal
+      // task's fulfiller installed.
+      probedRecord = DeleteQueue::recordForTest(ctx);
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the context record behind the IoOwn, found host-side",
+          kj::str("0x", kj::hex(ctx)), addr(probedRecord.record), probedRecord.size,
+          addr(probedRecord.fulfiller),
+          addr(probedRecord.fulfiller == nullptr ? nullptr : *probedRecord.fulfiller));
+      return context
+          .run([addr, url = kj::mv(url)](Worker::Lock&) {
+        auto record = probedRecord;
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: rewriting the context record from inside the JS turn", url,
+            addr(record.record), addr(&chosenFulfiller));
+        // The write: under the guest kernel this faults at the record and nothing below runs.
+        *record.fulfiller = const_cast<ChosenFulfiller*>(&chosenFulfiller);
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: the context record was rewritten from inside the JS turn; "
+            "the write landed",
+            addr(record.record));
+      })
+          .then([&context]() {
+        return kj::evalLater([&context]() {
+          // Host-side: queuing an action calls the fulfiller the record holds.
+          bool queued = context.getCrossContextExecutor().tryExecute([](jsg::Lock&) {});
+          KJ_LOG(
+              WARNING, "WORKERD_GK_TEST_PROBE: queued an action for the context host-side", queued);
+        });
+      }).then([&context]() {
+        return context.run([](Worker::Lock&) {
+          KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the turn after the record rewrite ran");
+        });
+      });
+    }));
+  }
+  // The buffer /__gk_queue_rewrite aims the context handle at: a chosen fulfiller where a record
+  // keeps its own, and a mutex-sized word of zeroes before it, checked afterwards for a host
+  // write.
+  static uint64_t chosenRecord[8] = {
+    0, 0, 0, 0, 0, 0, 0, reinterpret_cast<uintptr_t>(&chosenFulfiller)};
+  if (probeEnabled && url.endsWith("/__gk_queue_rewrite")) {
+    auto& context = IoContext::current();
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_REWRITE_MAGIC))});
+    IoOwnProbeHolder& h = *holder;
+    uint64_t ctx = ioOwnContext(h);
+    uint64_t handle = ioOwnHandle(h);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: created an IoOwn for the rewrite probe inside the JS turn", url,
+        kj::str("0x", kj::hex(ctx)), kj::str("0x", kj::hex(handle)), addr(h.own.operator->()));
+    context.addWaitUntil(
+        context
+            .run([&h, url = kj::str(url), addr, ctx, setIoOwnContext](Worker::Lock&) {
+      setIoOwnContext(h, reinterpret_cast<uintptr_t>(chosenRecord));
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: overwrote the IoOwn's context handle from inside the JS turn",
+          url, kj::str("0x", kj::hex(ctx)), addr(chosenRecord));
+    })
+            .then([holder = kj::mv(holder)]() mutable {
+      return kj::evalLater([holder = kj::mv(holder)]() mutable {
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: destroying the rewrite probe's holder on the event loop");
+        holder = nullptr;
+      });
+    }).then([&context]() {
+      return context.run([](Worker::Lock&) {
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: the turn after the rewrite probe holder's destruction ran",
+            kj::str("0x", kj::hex(chosenRecord[0])), kj::str("0x", kj::hex(chosenRecord[7])));
+      });
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_queue_steal")) {
+    KJ_REQUIRE(announcedIoOwnContext != 0, "no IoOwn announced");
+    auto& context = IoContext::current();
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_STEAL_MAGIC))});
+    IoOwnProbeHolder& h = *holder;
+    uint64_t ctx = ioOwnContext(h);
+    uint64_t handle = ioOwnHandle(h);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: created an IoOwn for the queue steal probe inside the JS turn", url,
+        kj::str("0x", kj::hex(ctx)), kj::str("0x", kj::hex(handle)), addr(h.own.operator->()));
+    context.addWaitUntil(context
+                             .run([&h, url = kj::str(url), ctx, setIoOwnContext](Worker::Lock&) {
+      setIoOwnContext(h, announcedIoOwnContext);
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: overwrote the IoOwn's context handle from inside the JS turn "
+          "with another isolate's",
+          url, kj::str("0x", kj::hex(ctx)), kj::str("0x", kj::hex(announcedIoOwnContext)));
+    })
+                             .then([holder = kj::mv(holder)]() mutable {
+      return kj::evalLater([holder = kj::mv(holder)]() mutable {
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: destroying the queue steal probe's holder on the event loop");
+        holder = nullptr;
+      });
+    }).then([&context]() {
+      return context.run([](Worker::Lock&) {
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: the turn after the queue steal probe holder's destruction "
+            "ran");
+      });
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_queue_after")) {
+    auto& context = IoContext::current();
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    context.addWaitUntil(kj::evalLater([&context, fulfiller = kj::mv(paf.fulfiller)]() mutable {
+      bool queued = context.getCrossContextExecutor().tryExecute(
+          [fulfiller = kj::mv(fulfiller)](jsg::Lock&) mutable {
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: a host-side queued action ran in its context");
+        fulfiller->fulfill();
+      });
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: queued an action for the context host-side", queued);
+    }).then([promise = kj::mv(paf.promise)]() mutable { return kj::mv(promise); }));
+  }
   if (probeEnabled && url.endsWith("/__gk_ioown_counts")) {
-    // The owned-node and resolve-entry counts, for a leak check across a load: read on the
-    // event loop, since the entry count is the guest kernel's, which a turn cannot read.
+    // The host-memory block and resolve-entry counts, for a leak check across a load: read on
+    // the event loop, since the entry count is the guest kernel's, which a turn cannot read.
     IoContext::current().addTask(kj::evalLater([]() {
       auto stats = OwnedObjectList::statsForTest();
       KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: owned-node counts", stats.nodesAllocated,
-          stats.nodesFreed, hostMemory::liveResolveEntries());
+          stats.nodesFreed, stats.recordsAllocated, stats.recordsFreed, stats.chunksAllocated,
+          stats.chunksFreed, hostMemory::liveResolveEntries());
     }));
   }
   if (probeEnabled && url.endsWith("/__gk_corrupt_handle")) {

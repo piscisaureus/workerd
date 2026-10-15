@@ -567,7 +567,7 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // IoContext) can later check whether this context is current, still alive, or defer work
   // into it. Safe to retain beyond this context's lifetime.
   IoCrossContextExecutor getCrossContextExecutor() {
-    return IoCrossContextExecutor(deleteQueue.queue.addRef());
+    return IoCrossContextExecutor(deleteQueue.queue);
   }
 
   // A WeakRef is a weak reference to a IoContext. Note that because IoContext is not
@@ -1209,7 +1209,7 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   kj::Maybe<Worker::Lock&> currentLock;
   kj::Maybe<InputGate::Lock> currentInputLock;
 
-  DeleteQueuePtr deleteQueue;
+  DeleteQueueOwner deleteQueue;
   kj::Arc<ReverseIoOwnValidity> reverseIoOwnValidity;
 
   kj::Maybe<kj::Exception> abortException;
@@ -1223,7 +1223,8 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
 
   // Objects pointed to by IoOwn<T>s.
   // NOTE: This must live below `deleteQueue`, as some of these OwnedObjects may own attachctx()'ed
-  //   objects which reference `deleteQueue` in their destructors.
+  //   objects which reference `deleteQueue` in their destructors, and the list's head is in the
+  //   record `deleteQueue` owns.
   OwnedObjectList ownedObjects;
 
   kj::Maybe<kj::Rc<ExternalPusherImpl>> externalPusher;
@@ -1846,13 +1847,13 @@ auto IoContext::makeReentryCallbackImpl(Func func, kj::Own<void> attachment) {
 template <typename T>
 inline IoOwn<T> IoContext::addObject(kj::Own<T> obj) {
   requireCurrent();
-  return deleteQueue.queue->addObject(kj::mv(obj), ownedObjects);
+  return deleteQueue.queue.addObject(kj::mv(obj), ownedObjects);
 }
 
 template <typename T>
 inline IoPtr<T> IoContext::addObject(T& obj) {
   requireCurrent();
-  return IoPtr<T>(deleteQueue.queue.addRef(), &obj);
+  return IoPtr<T>(deleteQueue.queue, &obj);
 }
 
 template <typename T>
@@ -1915,7 +1916,7 @@ template <typename T>
 inline ReverseIoOwn<T> IoContext::addObjectReverse(kj::Own<T> obj) {
   // We intentionally don't requireCurrent() -- the only requirement is that the caller is in the
   // same thread.
-  return deleteQueue.queue->addObjectReverse(
+  return deleteQueue.queue.addObjectReverse(
       reverseIoOwnValidity.addRef(), kj::mv(obj), ownedObjects);
 }
 
