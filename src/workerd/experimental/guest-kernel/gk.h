@@ -243,6 +243,8 @@ typedef struct {
   int resolve_entries;  // ring-0 resolve entries registered or reserved and not yet unregistered (see gk_resolve_register)
   long
       path_refusals;  // forwarded path syscalls the turn-directory policy refused (see gk_confine_paths)
+  int runners;        // vCPU runner threads started (GK_RUNNER=1; see the runner section in gk.c)
+  long runner_runs;   // KVM_RUNs a runner executed on an owning thread's behalf
 } gk_stats;
 void gk_get_stats(gk_stats *s);
 

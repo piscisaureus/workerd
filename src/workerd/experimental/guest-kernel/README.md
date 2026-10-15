@@ -21,7 +21,12 @@ isolate's JS turn at guest ring 3.
 - `Makefile` — `make run` builds and runs the test.
 - `measure/` — the density measurements against a process per isolate:
   marginal memory per isolate, cross-isolate dispatch cost and cold start,
-  each with the guest kernel off, on, and with one process per isolate.
+  each with the guest kernel off, on, and with one process per isolate; and
+  the attribution of the guest kernel's per-request CPU cost (`stall.py`
+  counts cycles, mispredicts, instruction fills and page walks per request
+  on the event-loop thread, split into guest and host mode; `walk-cost.c`
+  prices a nested page walk against a native one; `after-exit.c` prices what
+  one `KVM_RUN` round trip does to the host code that follows it).
   `measure/findings.md` reports them and `measure/run-all.sh` reproduces
   them.
 - `fault-test.sh` / `fault-test.capnp` — end-to-end check against a built
@@ -575,6 +580,42 @@ hardware:
   shows that an arena page's translation is re-walked after a switch away and
   back while a shared page's survives it, and that gk's own flush drops global
   entries too.
+- **The return from a turn, and vCPU runners.** Every turn ends in a VM exit
+  that returns to userspace, and on a CPU where the kernel mitigates VMSCAPE
+  ("IBPB before exit to userspace", the default; see
+  `/sys/devices/system/cpu/vulnerabilities/vmscape`) that return issues an
+  IBPB, which discards the CPU's branch predictions; on an EPYC 9255 the exit
+  path discards its return predictions as well. The code after the return --
+  the host side that finishes the request and dispatches the next turn --
+  then runs on a cold front end, as does the next turn's guest code, whose
+  predictions were on that CPU too: the event-loop thread retires a
+  hello-world request's instructions at a quarter of its native rate, with
+  30 times the mispredicts and 18 times the instruction fills from beyond
+  L2, and a hello-world request costs 139 us instead of 24. That
+  is where the guest kernel's CPU cost goes; nested paging's page walks are
+  about 3% of it (`measure/findings.md`, section 4).
+
+  `GK_RUNNER=1` gives each vCPU a runner: a host thread whose only work is
+  the `KVM_RUN` ioctl, to which the thread that owns the vCPU hands every run
+  and from which it takes the result back (KVM runs a vCPU for whichever
+  thread of the process asks; the guest's registers, stack and TLS are the
+  owner's regardless, and the owner still handles every exit). The IBPB then
+  lands on the runner's CPU, where it costs a few dozen handoff instructions,
+  and the owner keeps its predictions across the turn. The guest still
+  enters cold, so the runner recovers the host side's share. The runner has
+  to be on another core: `GK_RUNNER_PIN=other` pins the owner where it is
+  and the runner to the next CPU on a different core, and hello world then
+  costs 68 us with both sides sleeping on a futex through the handoff
+  (`GK_RUNNER_SPIN=0`, the default; two wakeups per turn, one logical CPU
+  busy, 83 us of CPU per request against 118 to 144 with the guest kernel
+  on and 74 with it off) or 59 us with both spinning (`GK_RUNNER_SPIN=-1`,
+  which keeps a second logical CPU busy for the whole turn). Unpinned, the
+  scheduler usually separates the two threads and hello world costs 93 us.
+  On the owner's SMT sibling (`GK_RUNNER_PIN=sibling`) the runner recovers
+  nothing: the flush empties predictor state the core's two hyperthreads
+  share. `gk_stats.runners` and `runner_runs` count the runners and their
+  runs. What the runner leaves, and what taking it would need, is in the
+  findings.
 - **W^X.** Pages are mapped with their host protection: executable pages are not
   writable and writable pages are not executable (NX is enabled in the guest,
   and `CR0.WP` is set so the ring-0 guest cannot write a read-only page either).

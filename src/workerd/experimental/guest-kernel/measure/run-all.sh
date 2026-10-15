@@ -55,6 +55,22 @@ for m in shared gk procs; do
 done
 python3 "$here/diag.py" "$out/diag.json"
 
+echo "== where the cycles go =="
+# The counter attribution (stall.py) needs sudo for perf. walk-cost prices a
+# nested page walk against a native one; after-exit prices what one KVM_RUN
+# round trip does to the host code that follows it, against a plain syscall
+# (its ibpb mode needs the msr module and root, and is not run here).
+cc -O2 -fno-stack-protector -fcf-protection=none -pthread -I"$here/.." -o "$here/walk-cost" \
+  "$here/walk-cost.c" "$here/../gk.c" "$here/../gk_asm.S"
+cc -O1 -o "$here/after-exit" "$here/after-exit.c"
+taskset -c 7 "$here/walk-cost" | tee "$out/walk-cost.log"
+for m in none syscall kvm; do taskset -c 7 "$here/after-exit" $m; done | tee "$out/after-exit.log"
+if have_sudo; then
+  python3 "$here/stall.py" "$out/stall.json" 3
+else
+  echo "skipping the counter attribution: it needs sudo for perf"
+fi
+
 echo "== 3. cold start =="
 for m in shared gk; do
   python3 "$here/coldstart.py" loader $m "$out/cs-loader-$m-opt.json" 40

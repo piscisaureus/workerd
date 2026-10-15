@@ -218,8 +218,233 @@ more cycles to do it; IPC falls from 0.89 to 0.55. It makes **fewer than two VM
 exits per request**, and the library's own figures price an exit at 5.9 us and
 an empty guest turn at 6.8 us, so crossings account for at most about 10 us of
 the 68 us of extra CPU and the 109 us of extra latency. The rest is the same
-code running slower inside the guest: a stall profile, which is what nested
-paging does to a workload whose page walks now cost two dimensions.
+code running slower, on both sides of the exit: a stall profile. Section 4
+attributes it. It is not nested paging, whose page walks are priced at about
+3% of the extra cycles, and not the arena root switch, which a single tenant
+never makes; it is the kernel's return to userspace after the exit, after
+which the code that finishes the request runs with cold branch predictors.
+(These figures count the whole process; section 4 counts the event-loop
+thread alone, where the request runs, and finds 9% more instructions for 3.7
+times the cycles. The difference is V8's background threads, whose cycles the
+guest kernel does not change and which dilute the per-process figure.)
+
+## 4. Where the guest kernel's CPU goes
+
+One workerd, one tenant, two handlers: hello, and a heavier one that builds,
+serializes and parses a 200-key object. For each, the latency one connection
+sees, then under a four-connection load the hardware counters of the
+event-loop thread alone, split into guest mode and host mode and divided by
+the requests served in the window; medians of three rounds (`stall.py`,
+`stall.json`). The VMSCAPE mitigation was on throughout, as recorded in
+`stall.json` by the script.
+
+The split is the attribution. Host-mode code is native: no nested paging, no
+arena root, nothing the guest kernel changes about its page walks. Cycles the
+host side loses over the same instructions with the guest kernel off are
+therefore not page-walk or TLB cost, and the counters say what they are.
+
+| per request, event-loop thread   | off hello | on hello, guest | on hello, host | on hello, total | off heavy | on heavy, guest | on heavy, host | on heavy, total |
+| -------------------------------- | --------- | --------------- | -------------- | --------------- | --------- | --------------- | -------------- | --------------- |
+| cycles                           | 124.8k    | 209.9k          | 254.7k         | 464.5k          | 554.6k    | 798.4k          | 264.8k         | 1,063k          |
+| instructions                     | 237.5k    | 125.6k          | 134.1k         | 259.7k          | 2,273k    | 2,489k          | 134.5k         | 2,623k          |
+| IPC                              | 1.90      | 0.60            | 0.53           | 0.56            | 4.10      | 3.12            | 0.51           | 2.47            |
+| branch mispredicts               | 145       | 1,640           | 3,034          | 4,674           | 1,203     | 4,632           | 3,217          | 7,849           |
+| of which returns                 | 43        | 9               | 1,279          | 1,288           | 53        | 26              | 1,356          | 1,382           |
+| instruction fills from beyond L2 | 356       | 2,568           | 3,951          | 6,519           | 2,657     | 7,401           | 5,747          | 13,148          |
+| op-cache misses                  | 24.4k     | 51.0k           | 55.0k          | 106k            | 59.0k     | 107k            | 58.9k          | 166k            |
+| dispatch slots empty, front end  | 380k      | 1,141k          | 1,620k         | 2,761k          | 827k      | 2,278k          | 1,684k         | 3,962k          |
+| dispatch slots stalled, back end | 390k      | 320k            | 249k           | 569k            | 1,335k    | 1,428k          | 247k           | 1,675k          |
+| page walks (data and instruction) | 35       | 78              | 43             | 121             | 79        | 121             | 67             | 188             |
+| L1 ITLB misses that hit the L2 TLB | 3,030   | 4,822           | 2,797          | 7,619           | 3,336     | 5,754           | 2,687          | 8,441           |
+| root switches                    | 0         | 0               |                | 0               | 0         | 0               |                | 0               |
+| VM exits to userspace            | 0         |                 |                | 1.03            | 0         |                 |                | 1.09            |
+| VM exits, all                    | 0         |                 |                | 1.29            | 0         |                 |                | 1.36            |
+| p50, one connection              | 23.7 us   |                 |                | 139.4 us        | 123.7 us  |                 |                | 273.8 us        |
+
+The core dispatches up to eight ops per cycle, so the slot counts are read as
+cycles by dividing by eight. With the guest kernel on, the front end delivers
+nothing to dispatch in 74% of all slots, against 38% without it; the back end
+stalls 15% against 39%.
+
+**The breakdown, hello.** The request costs 340k more cycles on this thread
+(3.7 times), of which:
+
+- **87% is front-end starvation**: the extra 2.38M empty dispatch slots are
+  297k cycles. The front end has nothing because its branch predictions are
+  gone: 4,674 mispredicts per request against 145, among them 1,279
+  mispredicted returns on the host side against 43, and 18 times the
+  instruction fills from beyond L2.
+- **7% is back-end stall** (22k cycles), and the page walks are inside that.
+  `walk-cost.c` prices a 4 KiB walk at 23.7 ns natively and 30.9 ns inside the
+  guest, where it resolves through the host's nested tables at every level
+  (20.5 ns when the host backs the memory with 2 MiB pages; `walk-cost.log`,
+  and a repeat agreed to within 2 ns); at the 4.3 GHz the thread ran at, 102
+  against 133 cycles. The guest side's 78 nested walks and the host side's 8
+  extra native ones are then **11k cycles, 3.3%** of the extra, and that is
+  an upper bound: the pointer chase that prices a walk serializes them,
+  while an instruction stream overlaps them with other work.
+- **0% is TLB refill after a root switch**, because there is none: a single
+  tenant's vCPU already holds its arena's root and `sync_cr3` loads nothing.
+  With two tenants whose requests alternate ("Two tenants alternating",
+  below), every turn switches and the guest side walks 95 more times per
+  request: about 12k cycles, 3.6% of the single-tenant extra.
+- the remaining 6% is the 22k extra instructions at the native rate, and
+  noise.
+
+**Why the front end is cold.** The host side of the request is the evidence,
+because nothing about it is virtualized: the same code at IPC 0.53 instead of
+1.90, with 21 times the mispredicts. What happened to it is the kernel's
+return to userspace after the VM exit that ended the turn. With the VMSCAPE
+mitigation active, that return issues an IBPB, which discards the CPU's
+indirect branch predictions, and on this CPU the exit path discards every
+return prediction as well. `after-exit.c` isolates it: a fixed, fully
+predictable 350k-instruction workload, run repeatedly on a pinned CPU with
+one event between runs.
+
+| between runs             | TSC ticks per run | mispredicts per run | of which returns | L1i fills from L2 per run |
+| ------------------------ | ----------------- | ------------------- | ---------------- | ------------------------- |
+| nothing                  | 422k              | 8,180               | 0                | 44k                       |
+| one trivial syscall      | 440k              | 8,710               | 0                | 46k                       |
+| one IBPB                 | 973k              | 23,500              | 12               | 150k                      |
+| one `KVM_RUN` round trip | 1,402k            | 35,550              | 8,170 (all)      | 206k                      |
+
+A syscall costs the code after it 4%. An IBPB alone (one `wrmsr` of
+`PRED_CMD` through the msr driver, no VM involved) costs it 2.3 times. The
+round trip through a guest whose first instruction exits -- one VM exit, one
+return to userspace -- costs it 3.3 times (3.0 in the repeat recorded in
+`after-exit.log`), mispredicts every one of its 8,000
+returns and fetches 4.7 times as many instruction lines, because a front end
+that does not know where the branches are fetches past them. The guest side
+of a turn enters in the same state: its predictions were on that CPU at the
+previous turn's return, and the flush took them too, which is why hello's
+125.6k guest instructions run at IPC 0.60.
+
+The instruction fills from beyond L2 are a consequence, not a second cause.
+`after-exit` with a 535 KiB code footprint (more than the L1i, less than the
+1 MiB L2) shows no loss of L2 contents across the round trip, 28 against 50
+fills from beyond L2 per run, so the L2 keeps the code; the cold front end's
+wrong-path fetches are what push the request's own code out of it.
+
+**The exits.** 1.03 exits to userspace per request, which is the end of the
+turn, plus 0.25 nested page faults the kernel handles without returning to
+userspace (a host page the arena lost to V8's background sweeper, faulted
+back) and a few timer interrupts. Nothing mid-turn remains to batch away.
+
+**What this says about the other levers.** Huge pages on the guest's tables
+would shorten each nested walk by a level, and on the host's backing would
+take it from 30.9 to 20.5 ns: on 78 walks per request that is under 1 us,
+against an excess of 109 us. PCID, which would let an arena's translations
+survive the root switch, addresses a cost of about 12k cycles per request
+that a single tenant does not pay at all. Pre-faulting addresses the
+0.25 in-kernel faults, about 1 us. None of them is worth its memory.
+
+### What a runner thread recovers
+
+The thread that returns from `KVM_RUN` takes the flush. `GK_RUNNER=1` gives
+the vCPU a runner, a host thread that does nothing but that ioctl: the
+event-loop thread hands it each run and takes the result back, and
+everything else -- the guest's registers, stack and TLS, the handling of
+every exit -- stays as it was (see the runner section in `gk.c`). The flush
+then lands on the runner's CPU, where it costs a few dozen handoff
+instructions, and the event loop keeps its predictions across the turn. The
+guest still enters cold, because its predictions were on the runner's CPU at
+the previous return.
+
+Where the runner sits decides what this is worth, and whether the two sides
+spin through the handoff or sleep on a futex decides what it costs. Same
+method as above, the counters now summed over both threads, with the
+event-loop thread's own host-mode figures beside them; medians of three
+rounds, and the spinning arrangement agrees to within 2 us with a separate
+three-round run.
+
+| hello                                   | p50       | rps, one connection | CPU per request   | logical CPUs busy | event loop's host cycles | its mispredicts | guest cycles | both threads' cycles |
+| --------------------------------------- | --------- | ------------------- | ----------------- | ----------------- | ------------------------ | --------------- | ------------ | -------------------- |
+| guest kernel off                        | 24.4 us   | 27,314              | 73.6 us           | 2.11              | 128k                     | 145             | 0            | 128k                 |
+| guest kernel on                         | 138.9 us  | 6,814               | 118 to 144 us     | 1.0 to 1.3        | 252k                     | 3,128           | 217k         | 470k                 |
+| runner on another core, both spinning   | 59.3 us   | 14,796              | 131 us, 2 CPUs    | 2.00              | 281k, mostly spin        | 94              | 196k         | 566k                 |
+| runner on another core, both sleeping   | 68.0 us   | 13,013              | 82.8 us           | 1.00              | 63k                      | 125             | 204k         | 323k                 |
+| runner unpinned, both sleeping          | 92.9 us   | 9,804               | 91 to 135 us      | 1.01              | 81k                      | 126             | 220k         | 359k                 |
+| runner on the SMT sibling, spinning     | 137.6 us  | 6,716               | 214 us, 2 CPUs    | 2.00              | 457k, mostly spin        | 1,967           | 229k         | 919k                 |
+
+| heavy                                   | p50       | rps, one connection | CPU per request   | logical CPUs busy | event loop's host cycles | its mispredicts | guest cycles | both threads' cycles |
+| --------------------------------------- | --------- | ------------------- | ----------------- | ----------------- | ------------------------ | --------------- | ------------ | -------------------- |
+| guest kernel off                        | 140.1 us  | 6,551               | 199.9 us          | 1.33              | 628k                     | 1,729           | 0            | 628k                 |
+| guest kernel on                         | 271.0 us  | 3,509               | 295.9 us          | 1.18              | 260k                     | 3,228           | 800k         | 1,060k               |
+| runner on another core, both spinning   | 174.6 us  | 5,460               | 366 us, 2 CPUs    | 2.00              | 780k, mostly spin        | 94              | 684k         | 1,570k               |
+| runner on another core, both sleeping   | 207.2 us  | 4,553               | 226.7 us          | 1.00              | 123k                     | 125             | 732k         | 931k                 |
+
+The event loop's host side is native again: 126k instructions in 63k cycles
+(IPC 2.0, against 0.54) with 125 mispredicts (against 3,128, and 145 with
+the guest kernel off). What it recovers, of hello's excess of 114.5 us of
+latency over the guest kernel off:
+
+- **70%** with the runner on another core and both sides spinning (59.3 us;
+  2.2 times the requests per second on one connection) -- at the cost of a
+  second logical CPU busy for the whole turn, so the CPU per request does
+  not fall;
+- **62%** with the runner on another core and both sides sleeping (68.0 us;
+  1.9 times the rate), and **about 80% of the excess CPU per request**: 82.8
+  us against 118 to 144 us, with 73.6 us the floor, on one logical CPU. Each
+  turn costs two scheduler wakeups (1.99 context switches per request), which
+  is the 9 us between this and the spinning arrangement;
+- **40%** with the runner unpinned and sleeping (92.9 us): the scheduler
+  usually keeps the two threads on different cores, but not always, and
+  its wakeups are slower when it does not.
+- **nothing** with the runner on the event loop's SMT sibling (137.6 us):
+  the event loop keeps only part of its predictions (1,967 mispredicts),
+  so the flush empties state the two hyperthreads of a core share, and the
+  spinning sibling takes the core's front end from the guest besides.
+
+For the heavier worker, 74% of the excess latency spinning and 49%
+sleeping, and 72% of the excess CPU per request sleeping (226.7 us against
+295.9 us, with 199.9 us the floor). The guest's share is larger there (its
+2.5M instructions enter cold and run at IPC 3.1 against 4.1), and the runner
+does not touch it.
+
+What the sleeping runner leaves, per hello request, is 195k cycles over the
+guest kernel off: the guest's cold entry (204k cycles for 120k instructions,
+about 134k over the native rate, 31 us) and the runner's own return from the
+run (57k host-mode cycles for 16k instructions: the kernel's exit path with
+the IBPB, cold, and the futex handoff). Both are the one return to userspace
+per turn, now on the runner's thread; the lever that removes them is the
+runner that never returns (see "What would sharpen it").
+
+The runner's memory is per vCPU, not per tenant: a 256 KiB stack mapping of
+which a few pages are touched, a 64-byte record, and a kernel thread. The
+marginal memory per tenant in section 1 is unaffected, and no page size or
+mapping granularity changed.
+
+### Two tenants alternating
+
+Two tenants in one process and a client whose requests alternate between
+them, one in flight at a time, so that every turn runs under a different
+arena root than the turn before and loads a new CR3 (`httpbench` with a
+second port; `stall-tenants.json`). The counter window keeps the one
+connection, so the event-loop thread idles between requests and its
+host-mode cycles include the wake-up path and are not comparable to the
+single-tenant window above; the guest-mode figures and the latencies are.
+
+| hello                                 | p50      | p50, one tenant | guest cycles | guest page walks | root switches |
+| ------------------------------------- | -------- | --------------- | ------------ | ---------------- | ------------- |
+| guest kernel off                      | 24.4 us  | 24.4 us         | 0            | 0                | 0             |
+| guest kernel on                       | 153.9 us | 138.9 us        | 234k         | 172              | 1.11          |
+| runner on another core, both spinning | 61.1 us  | 59.3 us         | 202k         | 108              | 1.00          |
+
+| heavy            | p50      | p50, one tenant | guest cycles | guest page walks | root switches |
+| ---------------- | -------- | --------------- | ------------ | ---------------- | ------------- |
+| guest kernel off | 142.3 us | 140.1 us        | 0            | 0                | 0             |
+| guest kernel on  | 290.9 us | 271.0 us        | 811k         | 214              | 1.01          |
+
+The switch costs the guest side 95 more page walks per hello request (172
+against 77), the arena's translations having been dropped with the root:
+about 12k cycles, 3 us, which is what PCID could save and 3.6% of the
+single-tenant excess. The request costs 15 us more than with one tenant,
+though, and almost all of it is on the host side, where the second tenant's
+connection and isolate add code and data that the cold front end then
+misses on as well; with the guest kernel off the second tenant costs
+nothing, and with the runner it costs 1.8 us. With the runner the guest
+also walks less after a switch (108 against 172): its translations live in
+the runner's core's TLB, where the host side's never displace them.
 
 ## The answer against the criterion
 
@@ -253,8 +478,13 @@ the process model holds up to 3.4 times more.
 
 **The decision this supports.** The guest kernel is worth continuing only for a
 fleet whose tenants are nearly idle and whose binding constraint is memory
-rather than CPU, and only if the per-turn stall cost can be brought down. It is
-not worth continuing on the strength of the dispatch argument, which is the
+rather than CPU, and only if the per-turn stall cost can be brought down.
+Section 4 says what that cost is (the branch-predictor flush the kernel's
+VMSCAPE mitigation puts on every return from a turn), that a runner thread
+recovers 62% of the excess latency and about 80% of the excess CPU per
+request on this machine (70% of the latency with a second CPU spinning), and what recovering the rest
+would take. It is not worth continuing on the strength of the dispatch
+argument, which is the
 argument the design is built around, because that argument measures backwards.
 This does not reduce to "the guest kernel is better" or "processes win": the
 guest kernel wins on memory, loses on dispatch and on CPU, and roughly ties on
@@ -291,14 +521,19 @@ cold start.
 
 ## What would sharpen it
 
-1. **Attribute the stall.** The IPC collapse points at nested paging. The
-   parked `guest-kernel-huge-pages` branch is the direct test, and its own note
-   -- that the benchmarked workloads were not TLB-bound -- was reached on
-   different hardware and a build whose baseline was twenty times slower, which
-   is exactly the condition that would hide a stall. Re-run it against an
-   optimized build with `GK_HUGE_COLLAPSE`, measuring cycles, instructions and
-   page-walk counters. If huge pages on both levels recover most of the 72%
-   cycle increase, the CPU argument changes and with it the answer.
+1. **Keep the vCPU thread out of userspace between turns.** Section 4 puts
+   the stall on the post-exit return to userspace and the runner recovers
+   the host side's share of it; the guest's share remains because the runner
+   still returns once per turn, and the flush that return brings is on the
+   CPU the next turn runs on. A runner that never returns -- the turn ends
+   with the guest signalling an `ioeventfd` and halting in the kernel
+   (`KVM_CAP_X86_DISABLE_EXITS`), and the next turn starts with the owner
+   writing an `irqfd` that an in-kernel LAPIC delivers to a guest dispatcher
+   -- takes no IBPB at all, with the mitigation on, and would recover the
+   guest's 31 us of the excess as well as the exit round trip
+   itself. It needs a ring-0 dispatcher in the guest, an interrupt vector,
+   and the register exchange moved out of `kvm_run` into gk's own frame,
+   since the host cannot read `kvm_run` while the run is in flight.
 2. **Build the pre-forked process model.** Fork a warmed workerd per tenant
    after V8 is initialized and before the tenant's script is known. It settles
    the memory comparison within 20% instead of within a bracket, and it is

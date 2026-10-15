@@ -7,8 +7,11 @@
 
 #include <fcntl.h>
 #include <link.h>
+#include <linux/futex.h>
 #include <linux/kvm.h>
 #include <pthread.h>
+#include <sched.h>
+#include <sys/prctl.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -145,6 +148,7 @@ typedef struct {
   uint64_t stack_top;   // 0 if the vCPU has no private guest stack
   uint64_t ist;         // its exception stack + TSS region (see vcpu_init)
   void *side_stack;     // NULL if the vCPU has no gk_run_here side stack
+  struct gk_runner *runner;  // the thread that runs its KVM_RUN, if any (see the runner section)
 } gk_parked_vcpu;
 
 // Per-thread guest state: each host thread that enters the guest is a vCPU. A
@@ -160,6 +164,7 @@ typedef struct gk_thread {
   uint64_t stack_top;
   uint64_t ist;            // exception stack + TSS region of this vCPU
   void *side_stack;        // host stack for gk_run_here's gk loop (see there)
+  struct gk_runner *runner;  // the thread that runs this vCPU's KVM_RUN, or NULL (see the runner section)
   unsigned root_gen;       // G->root_gen as of this vCPU's last TLB flush (0: never)
   uint64_t last_fault;
   int fault_repeat;
@@ -449,6 +454,15 @@ struct gk_ctl {
   atomic_long root_switches;        // guest entries that loaded another root (enter_guest)
   atomic_long tlb_flushes;          // full flushes run on a vCPU, on any path (see flush_run)
   void (*flush_stub)(void);         // the flush stub for this CPU (see flush_stub_select)
+  // vCPU runners (see the runner section): whether new vCPUs get one, how
+  // long a waiting side spins before it sleeps, where the runner is pinned,
+  // the pool of runner records and the count of KVM_RUNs they have executed.
+  int runner_mode;
+  long runner_spin;
+  int runner_pin;                   // GK_RUNNER_PIN_NONE, _SIBLING or a CPU number + GK_RUNNER_PIN_CPU
+  struct gk_runner *runner_pool;    // GK_MAX_VCPUS records, in supervisor memory (see gk_init)
+  int runner_n;
+  atomic_long runner_runs;
   // Bumped whenever page-table pages are returned to the allocator (an arena
   // was destroyed). A vCPU whose root is unchanged since it last entered the
   // guest may still hold TLB and paging-structure-cache entries derived from
@@ -2038,6 +2052,8 @@ static int arena_live_locked(const gk_arena *a) {
   return a->registered;
 }
 
+static void runner_stop(struct gk_runner *r);
+
 // Return the thread's vCPU (and guest stack, if any) to the pool.
 static void vcpu_park(gk_thread *t) {
   if (!t->inited) return;
@@ -2050,13 +2066,16 @@ static void vcpu_park(gk_thread *t) {
     p->stack_top = t->stack_top;
     p->ist = t->ist;
     p->side_stack = t->side_stack;
+    p->runner = t->runner;
   } else {  // cannot happen with KVM_CAP_MAX_VCPUS <= GK_MAX_VCPUS; be safe
+    if (t->runner) runner_stop(t->runner);
     munmap(t->run, G->run_size);
     close(t->fd);
   }
   pthread_mutex_unlock(&G->lock);
   if (G->dbg) fprintf(stderr, "[gk] vcpu %d parked\n", t->id);
   t->inited = 0;
+  t->runner = NULL;
 }
 
 // The thread `t` belongs to is ending: park its vCPU, drop it from its active
@@ -2089,6 +2108,230 @@ static void thread_key_dtor(void *p) {
   if (t) thread_release(t);
 }
 
+// ---- vCPU runners ----------------------------------------------------------
+// The thread that returns from KVM_RUN pays for the return. The kernel's
+// VMSCAPE mitigation ("IBPB before exit to userspace", the default on an
+// affected CPU) issues an IBPB on the first return to userspace after a VM
+// exit on that CPU, which drops the CPU's branch predictions: every branch
+// site the code after it runs through mispredicts until it is trained again,
+// and with the predictor cold the front end fetches past taken branches and
+// misses the instruction caches as well. A turn ends in exactly such a
+// return, so on the thread that enters the guest the host side of a request
+// (the response, the next request, the dispatch into the next turn) runs on
+// a cold front end every time: measured on an EPYC 9255, at a quarter of its
+// native instruction rate (see measure/findings.md).
+//
+// A runner takes the return. It is a host thread that does nothing but the
+// KVM_RUN ioctl for one vCPU: the thread that owns the vCPU hands it the run,
+// waits, and gets the result and errno back, exactly as if it had made the
+// ioctl itself (KVM lets any thread of the process run a vCPU; the guest's
+// registers, stack and TLS are the owning thread's whatever thread issues
+// the ioctl, and the exit is handled by the owner as before). The IBPB then
+// lands on the runner's CPU, after the exit, where it costs the runner's few
+// dozen handoff instructions; the owner, on its own CPU, keeps its
+// predictions across the turn. The guest itself still enters cold -- its
+// predictions were on the runner's CPU, flushed at the previous return --
+// so the runner recovers the host side's share of the cost, not the guest's.
+//
+// The handoff is a pair of sequence words: the owner bumps `go`, the runner
+// echoes it in `done` when the ioctl has returned. Each side waits for the
+// other's word to change by spinning G->runner_spin iterations and then
+// sleeping on the word's futex; the other side wakes it only if it said it
+// was sleeping (the flag and the word are both sequentially consistent, so
+// a sleeper that checked the word after setting its flag is seen by a waker
+// that checked the flag after writing the word). With an unbounded spin the
+// owner's CPU is busy for the whole turn, and the runner's between turns;
+// with none, each handoff costs a scheduler wakeup.
+//
+// GK_RUNNER=1 in the environment gives every vCPU a runner (GK_RUNNER_SPIN:
+// the spin budget per wait, -1 for unbounded, default 0; GK_RUNNER_PIN:
+// "sibling" pins the owner to the CPU it is on when its vCPU is created and
+// the runner to that CPU's SMT sibling, "other" pins the owner likewise and
+// the runner to the next CPU on another core, a number pins the runner to
+// that CPU). The runner and its record follow the vCPU through the pool, and
+// stop when the vCPU is closed. The records live in refused memory, which
+// no root maps, so a turn cannot rewrite the words its owner waits on.
+#define GK_RUNNER_STACK (256UL << 10)
+#define GK_RUNNER_PIN_NONE (-1)
+#define GK_RUNNER_PIN_SIBLING (-2)
+#define GK_RUNNER_PIN_OTHER (-3)
+#define GK_RUNNER_PIN_CPU 0  // + the CPU number
+typedef struct gk_runner {
+  pthread_t thread;
+  int fd;                      // the vCPU it runs
+  int cpu;                     // the CPU it is pinned to, or -1
+  _Atomic uint32_t go, done;   // the owner bumps go; the runner echoes it in done after the ioctl
+  _Atomic int owner_sleeping, runner_sleeping;
+  _Atomic int stop;
+  int ret, err;                // the ioctl's result and errno, valid once done == go
+  void *stack;
+} gk_runner;
+
+static void futex_wait32(_Atomic uint32_t *w, uint32_t val) {
+  host_syscall(SYS_futex, (long)w, FUTEX_WAIT_PRIVATE, (long)val, 0, 0, 0);
+}
+
+static void futex_wake32(_Atomic uint32_t *w) {
+  host_syscall(SYS_futex, (long)w, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+}
+
+// Wait until *w differs from `val`: spin the configured budget, then sleep on
+// the word with `sleeping` raised for the waker to see.
+static void runner_wait_change(_Atomic uint32_t *w, uint32_t val, _Atomic int *sleeping) {
+  long spin = G->runner_spin;
+  for (;;) {
+    if (atomic_load_explicit(w, memory_order_seq_cst) != val) return;
+    if (spin != 0) {
+      if (spin > 0) spin--;
+      __builtin_ia32_pause();
+      continue;
+    }
+    atomic_store_explicit(sleeping, 1, memory_order_seq_cst);
+    if (atomic_load_explicit(w, memory_order_seq_cst) == val) futex_wait32(w, val);
+    atomic_store_explicit(sleeping, 0, memory_order_seq_cst);
+  }
+}
+
+// Publish a new value of *w and wake the other side if it sleeps on it.
+static void runner_signal(_Atomic uint32_t *w, uint32_t val, _Atomic int *sleeping) {
+  atomic_store_explicit(w, val, memory_order_seq_cst);
+  if (atomic_load_explicit(sleeping, memory_order_seq_cst)) futex_wake32(w);
+}
+
+static void host_pkru_allow_all(void);
+
+static void *runner_main(void *arg) {
+  gk_runner *r = arg;
+  host_syscall(SYS_prctl, PR_SET_NAME, (long)"gk-vcpu-run", 0, 0, 0, 0);
+  // KVM backs a guest page through the page tables of the thread that issues
+  // KVM_RUN, under that thread's protection keys: a key the owner holds open
+  // for its runs (see prepare_entry) must be open here too, or the first
+  // touch of a keyed arena page fails the run with EFAULT.
+  host_pkru_allow_all();
+  if (r->cpu >= 0) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(r->cpu, &set);
+    if (sched_setaffinity(0, sizeof set, &set) != 0 && G->dbg)
+      fprintf(stderr, "[gk] runner for vcpu fd %d: cannot pin to CPU %d: %s\n", r->fd, r->cpu,
+              strerror(errno));
+  }
+  uint32_t seen = 0;
+  for (;;) {
+    runner_wait_change(&r->go, seen, &r->runner_sleeping);
+    seen = atomic_load_explicit(&r->go, memory_order_seq_cst);
+    if (atomic_load_explicit(&r->stop, memory_order_seq_cst)) break;
+    long ret = ioctl(r->fd, KVM_RUN, 0);
+    r->err = ret < 0 ? errno : 0;
+    r->ret = (int)ret;
+    runner_signal(&r->done, seen, &r->owner_sleeping);
+  }
+  return NULL;
+}
+
+// The SMT sibling of `cpu` from sysfs, or -1 if it has none that can be read.
+static int sibling_cpu(int cpu) {
+  char path[96], buf[64];
+  snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  ssize_t n = read(fd, buf, sizeof buf - 1);
+  close(fd);
+  if (n <= 0) return -1;
+  buf[n] = 0;
+  // "a,b", "a-b" or a single "a": take the first listed CPU that is not `cpu`.
+  for (char *p = buf; *p;) {
+    char *end;
+    long a = strtol(p, &end, 10);
+    if (end == p) break;
+    long b = a;
+    if (*end == '-') b = strtol(end + 1, &end, 10);
+    for (long c = a; c <= b; c++)
+      if (c != cpu) return (int)c;
+    p = (*end == ',') ? end + 1 : end;
+  }
+  return -1;
+}
+
+// Start a runner for the vCPU `fd`, on the calling (owning) thread's behalf.
+// NULL, with G->err set, if it cannot be started.
+static gk_runner *runner_start(int fd) {
+  pthread_mutex_lock(&G->lock);
+  gk_runner *r = G->runner_n < GK_MAX_VCPUS ? &G->runner_pool[G->runner_n++] : NULL;
+  pthread_mutex_unlock(&G->lock);
+  if (!r) { G->err = "runner pool exhausted"; return NULL; }
+  memset(r, 0, sizeof *r);
+  r->fd = fd;
+  r->cpu = -1;
+  if (G->runner_pin == GK_RUNNER_PIN_SIBLING) {
+    int here = sched_getcpu();
+    if (here >= 0) {
+      cpu_set_t set;
+      CPU_ZERO(&set);
+      CPU_SET(here, &set);
+      sched_setaffinity(0, sizeof set, &set);  // the owner stays where it is
+      r->cpu = sibling_cpu(here);
+    }
+  } else if (G->runner_pin == GK_RUNNER_PIN_OTHER) {
+    int here = sched_getcpu();
+    if (here >= 0) {
+      cpu_set_t set;
+      CPU_ZERO(&set);
+      CPU_SET(here, &set);
+      sched_setaffinity(0, sizeof set, &set);
+      // The next CPU up that is not on this core (wrapping at the top).
+      int n = (int)sysconf(_SC_NPROCESSORS_ONLN), sib = sibling_cpu(here);
+      for (int c = (here + 1) % n; c != here; c = (c + 1) % n)
+        if (c != sib) { r->cpu = c; break; }
+    }
+  } else if (G->runner_pin >= GK_RUNNER_PIN_CPU) {
+    r->cpu = G->runner_pin - GK_RUNNER_PIN_CPU;
+  }
+  // The runner's stack is host-only, like the gk-loop side stack: refused
+  // while still PROT_NONE, so no vCPU can fault it in as user memory.
+  void *stack = mmap(NULL, GK_RUNNER_STACK, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+  if (stack == MAP_FAILED) { G->err = "mmap runner stack"; return NULL; }
+  pthread_mutex_lock(&G->lock);
+  prot_add((uintptr_t)stack, (uintptr_t)stack + GK_RUNNER_STACK, GK_PROT_REFUSE);
+  pthread_mutex_unlock(&G->lock);
+  if (mprotect(stack, GK_RUNNER_STACK, PROT_READ | PROT_WRITE) != 0) {
+    G->err = "mprotect runner stack";
+    return NULL;
+  }
+  r->stack = stack;
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstack(&attr, stack, GK_RUNNER_STACK);
+  int rc = pthread_create(&r->thread, &attr, runner_main, r);
+  pthread_attr_destroy(&attr);
+  if (rc != 0) { G->err = "pthread_create runner"; return NULL; }
+  if (G->dbg)
+    fprintf(stderr, "[gk] runner for vcpu fd %d started (pinned to CPU %d, spin %ld)\n", fd, r->cpu,
+            G->runner_spin);
+  return r;
+}
+
+// Stop and join the runner `r`. Its stack stays registered and mapped: the
+// record is not recycled.
+static void runner_stop(gk_runner *r) {
+  atomic_store_explicit(&r->stop, 1, memory_order_seq_cst);
+  runner_signal(&r->go, atomic_load_explicit(&r->go, memory_order_seq_cst) + 1, &r->runner_sleeping);
+  pthread_join(r->thread, NULL);
+}
+
+// KVM_RUN on this thread's vCPU: by its runner when it has one, else here.
+// Returns the ioctl's result with errno set as the ioctl would have left it.
+static int vcpu_run_ioctl(gk_thread *t) {
+  gk_runner *r = t->runner;
+  if (!r) return ioctl(t->fd, KVM_RUN, 0);
+  uint32_t seq = atomic_load_explicit(&r->go, memory_order_seq_cst) + 1;
+  runner_signal(&r->go, seq, &r->runner_sleeping);
+  runner_wait_change(&r->done, seq - 1, &r->owner_sleeping);
+  atomic_fetch_add_explicit(&G->runner_runs, 1, memory_order_relaxed);
+  if (r->ret < 0) errno = r->err;
+  return r->ret;
+}
+
 // Bring the calling thread's vCPU up. Each thread has its own vCPU, stack and
 // TLS base, but they share the VM, memslots and page tables. A parked vCPU is
 // reused when one is available (see the vCPU pool); otherwise a new one is
@@ -2118,11 +2361,13 @@ static int vcpu_init(gk_thread *t, int flags) {
   struct kvm_run *run = NULL;
   uint64_t stack_top = 0, ist = 0;
   void *side_stack = NULL;
+  gk_runner *runner = NULL;
   pthread_mutex_lock(&G->lock);
   if (G->parked_n > 0) {
     gk_parked_vcpu *p = &G->parked[--G->parked_n];
     fd = p->fd; id = p->id; run = p->run; stack_top = p->stack_top; ist = p->ist;
     side_stack = p->side_stack;
+    runner = p->runner;
     reused = 1;
   }
   pthread_mutex_unlock(&G->lock);
@@ -2133,6 +2378,7 @@ static int vcpu_init(gk_thread *t, int flags) {
     if (ioctl(fd, KVM_SET_CPUID2, GK_CPUID) < 0) { G->err = "KVM_SET_CPUID2"; return -1; }
     run = mmap(NULL, G->run_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (run == MAP_FAILED) { G->err = "mmap kvm_run"; return -1; }
+    if (G->runner_mode && !(runner = runner_start(fd))) return -1;
 
     // Exception stack. The guest runs ordinary user-mode code, which keeps
     // locals in the 128-byte red zone below rsp; the ABI promises that zone
@@ -2270,6 +2516,7 @@ ready:
   t->stack_top = stack_top;
   t->ist = ist;
   t->side_stack = side_stack;
+  t->runner = runner;
   t->root_gen = 0;    // a fresh or reused vCPU flushes its TLB at first entry
   t->last_fault = 0;
   t->fault_repeat = 0;
@@ -2471,6 +2718,26 @@ int gk_init(void) {
   prot_add(GK_RESOLVE_START, GK_RESOLVE_END, GK_PROT_SUPER);
   G->dbg = getenv("GK_DEBUG") != NULL;
   G->thp = getenv("GK_NO_THP") == NULL;
+  // vCPU runners (see the runner section). The pool of records is host memory
+  // the guest never needs: refused, like the gk-loop side stacks.
+  {
+    const char *v = getenv("GK_RUNNER");
+    G->runner_mode = v && *v && strcmp(v, "0") != 0;
+    v = getenv("GK_RUNNER_SPIN");
+    G->runner_spin = v ? atol(v) : 0;
+    v = getenv("GK_RUNNER_PIN");
+    G->runner_pin = GK_RUNNER_PIN_NONE;
+    if (v && strcmp(v, "sibling") == 0) G->runner_pin = GK_RUNNER_PIN_SIBLING;
+    else if (v && strcmp(v, "other") == 0) G->runner_pin = GK_RUNNER_PIN_OTHER;
+    else if (v && *v >= '0' && *v <= '9') G->runner_pin = GK_RUNNER_PIN_CPU + atoi(v);
+    if (G->runner_mode) {
+      size_t bytes = (sizeof(gk_runner) * GK_MAX_VCPUS + 0xfff) & ~(size_t)0xfff;
+      void *pool = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (pool == MAP_FAILED) { G->err = "mmap runner pool"; return -1; }
+      prot_add((uintptr_t)pool, (uintptr_t)pool + bytes, GK_PROT_REFUSE);
+      G->runner_pool = pool;
+    }
+  }
   *(void **)&G->tls_static_info = dlsym(RTLD_DEFAULT, "_dl_get_tls_static_info");
   if (!G->tls_static_info)
     fprintf(stderr, "[gk] _dl_get_tls_static_info not found: gk_run_here_user builds no "
@@ -2713,7 +2980,7 @@ static int run_stub(gk_thread *t, void (*stub)(void), uint64_t rdi, uint64_t rsi
   regs_set(t, &regs);
   for (;;) {
     t->tlb_touched = 1;  // the vCPU runs: its TLB is no longer known (see wall_raise)
-    if (ioctl(t->fd, KVM_RUN, 0) < 0) {
+    if (vcpu_run_ioctl(t) < 0) {
       if (errno == EINTR) continue;
       if (G->dbg) fprintf(stderr, "[gk] vcpu %d: %s stub KVM_RUN: %s\n", t->id, what, strerror(errno));
       return -1;
@@ -4507,7 +4774,7 @@ static long host_backing_fail(gk_thread *t, int err) {
 static long run_vcpu(gk_thread *t) {
   for (;;) {
     t->tlb_touched = 1;  // the vCPU runs: its TLB is no longer known (see wall_raise)
-    if (ioctl(t->fd, KVM_RUN, 0) < 0) {
+    if (vcpu_run_ioctl(t) < 0) {
       int err = errno;
       if (err == EINTR) continue;
       if (err == EFAULT && host_backing_retry(t)) continue;
@@ -4959,6 +5226,8 @@ void gk_get_stats(gk_stats *s) {
   s->signal_fields = G->signal_field_live;
   s->resolve_entries = G->resolve_live;
   s->path_refusals = atomic_load_explicit(&G->path_refusals, memory_order_relaxed);
+  s->runners = G->runner_n;
+  s->runner_runs = atomic_load_explicit(&G->runner_runs, memory_order_relaxed);
   pthread_mutex_unlock(&G->lock);
 }
 

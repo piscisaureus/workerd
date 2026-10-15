@@ -6,8 +6,11 @@
 // and the aggregate rate, so a single connection measures latency and several
 // measure throughput.
 //
-// Usage: httpbench <host> <port> <path> <connections> <seconds> [warmup-seconds]
+// Usage: httpbench <host> <port> <path> <connections> <seconds> [warmup-seconds [port2]]
 // Output: one line of "count p50 p90 p99 mean rps errors", times in us.
+// With port2, each connection is a pair of persistent connections, one to each
+// port, and its requests alternate between them, one in flight at a time: the
+// server sees every request arrive at a different tenant than the one before.
 //
 // cc -O2 -pthread -o httpbench httpbench.c
 
@@ -27,7 +30,7 @@
 #define MAX_SAMPLES (40 * 1000 * 1000)
 
 static const char *g_host;
-static int g_port;
+static int g_port, g_port2;
 static const char *g_path;
 static double g_seconds, g_warmup;
 
@@ -43,7 +46,7 @@ static double now_s(void) {
   return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-static int dial(void) {
+static int dial_port(int port) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) return -1;
   int one = 1;
@@ -51,11 +54,20 @@ static int dial(void) {
   struct sockaddr_in a;
   memset(&a, 0, sizeof a);
   a.sin_family = AF_INET;
-  a.sin_port = htons(g_port);
+  a.sin_port = htons(port);
   inet_pton(AF_INET, g_host, &a.sin_addr);
   if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
     close(fd);
     return -1;
+  }
+  return fd;
+}
+
+static int dial_retry(int port) {
+  int fd = -1;
+  for (int tries = 0; tries < 2000 && fd < 0; tries++) {
+    fd = dial_port(port);
+    if (fd < 0) usleep(1000);
   }
   return fd;
 }
@@ -90,34 +102,32 @@ static void *worker(void *arg) {
   char req[512];
   int reqlen = snprintf(req, sizeof req, "GET %s HTTP/1.1\r\nHost: b\r\n\r\n", g_path);
   char buf[65536];
-  int fd = -1;
-  for (int tries = 0; tries < 2000 && fd < 0; tries++) {
-    fd = dial();
-    if (fd < 0) {
+  int ports[2] = {g_port, g_port2 ? g_port2 : g_port}, nports = g_port2 ? 2 : 1;
+  int fds[2] = {-1, -1};
+  for (int i = 0; i < nports; i++) {
+    fds[i] = dial_retry(ports[i]);
+    if (fds[i] < 0) {
       res->errors++;
-      usleep(1000);
+      return NULL;
     }
   }
-  if (fd < 0) return NULL;
   double t_end = now_s() + g_warmup + g_seconds;
   double t_record = now_s() + g_warmup;
-  while (now_s() < t_end) {
+  for (long turn = 0; now_s() < t_end; turn++) {
+    int i = (int)(turn % nports), fd = fds[i];
     double t0 = now_s();
     if (write(fd, req, reqlen) != reqlen || read_response(fd, buf, sizeof buf) != 0) {
       res->errors++;
       close(fd);
-      fd = -1;
-      for (int tries = 0; tries < 2000 && fd < 0; tries++) {
-        fd = dial();
-        if (fd < 0) usleep(1000);
-      }
-      if (fd < 0) break;
+      fds[i] = dial_retry(ports[i]);
+      if (fds[i] < 0) break;
       continue;
     }
     double dt = now_s() - t0;
     if (t0 >= t_record && res->n < cap) res->samples[res->n++] = dt;
   }
-  if (fd >= 0) close(fd);
+  for (int i = 0; i < nports; i++)
+    if (fds[i] >= 0) close(fds[i]);
   return NULL;
 }
 
@@ -128,7 +138,7 @@ static int cmpd(const void *a, const void *b) {
 
 int main(int argc, char **argv) {
   if (argc < 6) {
-    fprintf(stderr, "usage: %s host port path conns seconds [warmup]\n", argv[0]);
+    fprintf(stderr, "usage: %s host port path conns seconds [warmup [port2]]\n", argv[0]);
     return 2;
   }
   g_host = argv[1];
@@ -137,6 +147,7 @@ int main(int argc, char **argv) {
   int conns = atoi(argv[4]);
   g_seconds = atof(argv[5]);
   g_warmup = argc > 6 ? atof(argv[6]) : 1.0;
+  g_port2 = argc > 7 ? atoi(argv[7]) : 0;
 
   pthread_t *th = calloc(conns, sizeof *th);
   result *res = calloc(conns, sizeof *res);

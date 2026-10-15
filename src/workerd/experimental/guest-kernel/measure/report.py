@@ -145,6 +145,23 @@ if j:
             r["instructions_per_req"], ("%.2f" % r["ipc"]) if r["ipc"] else "-",
             r["kvm_exits_per_req"], r["minflt_per_req"]))
 
+for path in sorted(glob.glob(os.path.join(D, "stall*.json"))):
+    j = load(os.path.basename(path))
+    print("\n## Where the cycles go, per request on the event-loop thread and its runner: %s (%s)\n"
+          % (os.path.basename(path), j["vmscape"]))
+    print("| arrangement | p50 | rps | CPU us/req | CPUs busy | cycles/req | guest | host | instructions/req | IPC guest | IPC host | mispredicts | i-fills past L2 | page walks | root switches |")
+    print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    for k, v in j["summary"].items():
+        c = v["per_req"]
+        tot = lambda e: c.get(e + ":G", 0) + c.get(e + ":H", 0)
+        ipc = lambda s: (c["instructions:" + s] / c["cycles:" + s]) if c.get("cycles:" + s) else 0.0
+        print("| %s | %.1f us | %.0f | %.1f | %.2f | %.0f | %.0f | %.0f | %.0f | %.2f | %.2f | %.0f | %.0f | %.0f | %.2f |" % (
+            k, v["p50_us"], v["rps1"], v.get("cpu_us", 0), v.get("cpus_busy", 0),
+            tot("cycles"), c["cycles:G"], c["cycles:H"], tot("instructions"), ipc("G"), ipc("H"),
+            tot("ex_ret_brn_misp"), tot("ic_cache_fill_sys"),
+            tot("ls_l1_d_tlb_miss.all_l2_miss") + tot("bp_l1_tlb_miss_l2_tlb_miss.all"),
+            c.get("ls_tlb_flush.all:G", 0)))
+
 print("\n## The published figures, re-run here\n")
 for mode in ("shared", "gk"):
     j = load("disp-%s-fastbuild.json" % mode)

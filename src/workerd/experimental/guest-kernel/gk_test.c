@@ -4199,6 +4199,21 @@ int main(void) {
   // unreachable from ring 3 and its capacity bound holds (see resolve_check).
   int ok34 = resolve_check() == 1;
 
+  // ---- vCPU runners -----------------------------------------------------------
+  // With GK_RUNNER set, every KVM_RUN above went through a runner thread and
+  // nothing above could tell the difference; without it, no runner exists.
+  // The gk_stats counts say which happened.
+  {
+    gk_stats st;
+    gk_get_stats(&st);
+    const char *rv = getenv("GK_RUNNER");
+    int want = rv && *rv && strcmp(rv, "0") != 0;
+    int ok35 = want ? (st.runners >= 1 && st.runner_runs > 0) : (st.runners == 0 && st.runner_runs == 0);
+    printf("vCPU runners: %s, %d started, %ld KVM_RUNs through them [%s]\n",
+           want ? "requested" : "not requested", st.runners, st.runner_runs, ok35 ? "OK" : "FAIL");
+    ok34 = ok34 && ok35;
+  }
+
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
             ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28 && ok29 && ok30 && ok31 &&
