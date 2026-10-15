@@ -1,0 +1,10 @@
+=== gk ceiling ===
+lo n=128 -> True 
+n=192   FAIL [Errno 104] Connection reset by peer | bin/workerd-opt@5be1897 /work/gkmeasure/bin/workerd-opt@5be6f1e /work/gkmeasure/bin/workerd-opt@5bdf1ce /work/gkmeasure/bin/workerd-opt@5bdefae /work/gkmeasure/bin/workerd-opt@21dcf77 /lib/x86_64-linu
+n=160   ok 
+n=176   ok 
+n=184   FAIL [Errno 104] Connection reset by peer | bin/workerd-opt@5be1897 /work/gkmeasure/bin/workerd-opt@5be6f1e /work/gkmeasure/bin/workerd-opt@5bdf1ce /work/gkmeasure/bin/workerd-opt@5bdefae /work/gkmeasure/bin/workerd-opt@21dcf77 /lib/x86_64-linu
+n=180   ok 
+n=182   ok 
+n=183   ok 
+CEILING gk = 183 tenants in one process

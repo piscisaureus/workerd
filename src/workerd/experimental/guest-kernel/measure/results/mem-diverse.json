@@ -1,0 +1,185 @@
+{
+ "hi": 64,
+ "kind": "diverse",
+ "lo": 1,
+ "marginal_kb": {
+  "gk": {
+   "Pss": 2932.8253968253966,
+   "Rss": 2933.2698412698414,
+   "Uss": 2933.0793650793653,
+   "sys_used_delta": 4351.3650793650795
+  },
+  "procs": {
+   "Pss": 9827.904761904761,
+   "Rss": 50150.47619047619,
+   "Uss": 9116.190476190477,
+   "sys_used_delta": 9375.492063492064
+  },
+  "procs-ksm": {
+   "Pss": 5463.444444444444,
+   "Rss": 50328.95238095238,
+   "Uss": 4653.714285714285,
+   "sys_used_delta": 8511.238095238095
+  },
+  "shared": {
+   "Pss": 1899.5079365079366,
+   "Rss": 1899.4285714285713,
+   "Uss": 1899.4285714285713,
+   "sys_used_delta": 1797.7777777777778
+  }
+ },
+ "rows": {
+  "gk": {
+   "hi": {
+    "Private_Clean": 38260,
+    "Private_Dirty": 195288,
+    "Pss": 233737,
+    "Pss_Anon": 191000,
+    "Pss_File": 38453,
+    "Rss": 236188,
+    "Shared_Clean": 2640,
+    "Shared_Dirty": 0,
+    "Swap": 0,
+    "Threads": 18,
+    "Uss": 233548,
+    "VmPTE": 4124,
+    "VmRSS": 236188,
+    "VmSize": 34871956732,
+    "n": 64,
+    "sys_used_delta": 169360
+   },
+   "lo": {
+    "Private_Clean": 38228,
+    "Private_Dirty": 10536,
+    "Pss": 48969,
+    "Pss_Anon": 10212,
+    "Pss_File": 38437,
+    "Rss": 51392,
+    "Shared_Clean": 2628,
+    "Shared_Dirty": 0,
+    "Swap": 0,
+    "Threads": 18,
+    "Uss": 48764,
+    "VmPTE": 384,
+    "VmRSS": 51392,
+    "VmSize": 1049089084,
+    "n": 1,
+    "sys_used_delta": -104776
+   }
+  },
+  "procs": {
+   "hi": {
+    "Private_Clean": 512,
+    "Private_Dirty": 621816,
+    "Pss": 667345,
+    "Pss_Anon": 621816,
+    "Pss_File": 45529,
+    "Rss": 3210084,
+    "Shared_Clean": 2587756,
+    "Shared_Dirty": 0,
+    "Swap": 0,
+    "Threads": 1088,
+    "Uss": 622328,
+    "VmPTE": 24376,
+    "VmRSS": 3210084,
+    "VmSize": 32923106112,
+    "n": 64,
+    "sys_used_delta": 576540
+   },
+   "lo": {
+    "Private_Clean": 38324,
+    "Private_Dirty": 9684,
+    "Pss": 48187,
+    "Pss_Anon": 9684,
+    "Pss_File": 38503,
+    "Rss": 50604,
+    "Shared_Clean": 2596,
+    "Shared_Dirty": 0,
+    "Swap": 0,
+    "Threads": 17,
+    "Uss": 48008,
+    "VmPTE": 392,
+    "VmRSS": 50604,
+    "VmSize": 514603880,
+    "n": 1,
+    "sys_used_delta": -14116
+   }
+  },
+  "procs-ksm": {
+   "hi": {
+    "Private_Clean": 384,
+    "Private_Dirty": 337648,
+    "Pss": 389367,
+    "Pss_Anon": 343606,
+    "Pss_File": 45725,
+    "Rss": 3221540,
+    "Shared_Clean": 2599008,
+    "Shared_Dirty": 284500,
+    "Swap": 0,
+    "Threads": 1088,
+    "Uss": 338032,
+    "VmPTE": 24432,
+    "VmRSS": 3221540,
+    "VmSize": 32921010752,
+    "n": 64,
+    "sys_used_delta": 542676
+   },
+   "lo": {
+    "Private_Clean": 38472,
+    "Private_Dirty": 6376,
+    "Pss": 45170,
+    "Pss_Anon": 6507,
+    "Pss_File": 38662,
+    "Rss": 50816,
+    "Shared_Clean": 2616,
+    "Shared_Dirty": 3352,
+    "Swap": 0,
+    "Threads": 17,
+    "Uss": 44848,
+    "VmPTE": 376,
+    "VmRSS": 50816,
+    "VmSize": 514603780,
+    "n": 1,
+    "sys_used_delta": 6468
+   }
+  },
+  "shared": {
+   "hi": {
+    "Private_Clean": 37832,
+    "Private_Dirty": 129496,
+    "Pss": 167533,
+    "Pss_Anon": 129496,
+    "Pss_File": 38037,
+    "Rss": 169956,
+    "Shared_Clean": 2628,
+    "Shared_Dirty": 0,
+    "Swap": 0,
+    "Threads": 17,
+    "Uss": 167328,
+    "VmPTE": 2404,
+    "VmRSS": 169956,
+    "VmSize": 638482920,
+    "n": 64,
+    "sys_used_delta": -144184
+   },
+   "lo": {
+    "Private_Clean": 37940,
+    "Private_Dirty": 9724,
+    "Pss": 47864,
+    "Pss_Anon": 9724,
+    "Pss_File": 38140,
+    "Rss": 50292,
+    "Shared_Clean": 2628,
+    "Shared_Dirty": 0,
+    "Swap": 0,
+    "Threads": 17,
+    "Uss": 47664,
+    "VmPTE": 388,
+    "VmRSS": 50292,
+    "VmSize": 514603752,
+    "n": 1,
+    "sys_used_delta": -257444
+   }
+  }
+ }
+}

@@ -19,6 +19,11 @@ isolate's JS turn at guest ring 3.
 - `gk_asm.S` — the in-guest trampolines and exception handlers.
 - `gk_test.c` — the test/example.
 - `Makefile` — `make run` builds and runs the test.
+- `measure/` — the density measurements against a process per isolate:
+  marginal memory per isolate, cross-isolate dispatch cost and cold start,
+  each with the guest kernel off, on, and with one process per isolate.
+  `measure/findings.md` reports them and `measure/run-all.sh` reproduces
+  them.
 - `fault-test.sh` / `fault-test.capnp` — end-to-end check against a built
   workerd that a fault inside the guest during a JS turn fails only that
   request and condemns only that isolate, and the process keeps serving.

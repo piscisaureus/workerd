@@ -1,0 +1,137 @@
+./gk_test
+gk_init ok: process is now a guest-capable VM
+compute in guest: got 332833500, want 332833500 [OK]
+raw syscall write from inside gk guest
+raw write in guest returned 39 [OK]
+hello from libc running inside the guest (heap ptr 0x5ad8267fda10)
+libc in guest: checksum 5820 [OK]
+arenas: A = [0x200000000000, +1099578736640) over 3 slots, B = [0x218000000000, +1048576)
+  under A: commit+write A -> 0xa1, A's 2nd slot -> 0xa2, 3rd slot -> 0xa4, read B -> FAULT (fault 0x218000000000)
+  under B: commit+write B -> 0xb1, read A -> FAULT (fault 0x200000000000)
+  base root: read A -> FAULT (fault 0x200000000000), read B -> FAULT (fault 0x218000000000)
+  back in A: read A -> 0xa1, 2nd slot -> 0xa2, 3rd slot -> 0xa4, decommit+read -> FAULT (fault 0x200000000000), recommit+write -> 0xa3, host sees same bytes
+arena isolation, demand-paged, multi-slot [OK]
+multi-vCPU: 4 threads ran in the guest concurrently [OK]
+per-thread arenas: two threads, each isolated from the other [OK]
+syscall policy: denied write returned -1 (want -1/-EPERM) [OK]
+guest thread 1 ran in ring 0
+guest thread 2 ran in ring 0
+guest thread 3 ran in ring 0
+guest-created threads (ring-0 creator): 3 threads spawned in the guest ran in ring 0 (gk_run=1, cr0=0x80010011) [OK]
+vCPU pooling: 600 guest threads churned, vCPUs 5 -> 5, registry ranges 17 -> 17; 20 host threads churned, vCPUs -> 5 [OK]
+protection keys: key 1 rights after alloc=2, read=0x5a, write->FAULT, read with access disabled->FAULT, re-enabled rw=0x77, child inherits=2, teardown=0x77 [OK]
+guest on the caller's stack: frame 0x7fffcd7a92e0, deep=28253
+gk_run_here (main thread): thread stack [0x7fffccfad000,0x7fffcd7ac000), caller local 0x7fffcd7aa40f, guest frame 0x7fffcd7a92e0 (4399 bytes below caller, on the caller's stack), deep recursion ok, checksum 5139 ok [OK]
+guest on the caller's stack: frame 0x798fe77fcc40, deep=28253
+gk_run_here (pthread): thread stack [0x798fe6fff000,0x798fe77ff000), caller local 0x798fe77fdd6f, guest frame 0x798fe77fcc40 (4399 bytes below caller, on the caller's stack), deep recursion ok, checksum 5052 ok [OK]
+guest on the caller's stack: frame 0x798fe81ffff0, deep=28253
+gk_run: guest frame 0x798fe81ffff0 is outside the thread stack [0x7fffccfad000,0x7fffcd7ac000) [OK]
+arena churn: 100 arenas created+destroyed, fresh arenas ran 50/50, freed spans faulted 100/100, slot reused 100/100, bystander reads 0x33; memslots 29 -> 29, memslot ids 33 -> 33, page-table pages 67 -> 67 (free 12, total 74 -> 79) [OK]
+(expected gk message follows: destroying an arena a thread still uses)
+[gk] gk_arena_destroy: arena [0x238000000000,0x240000000000) is still active on 1 thread(s); its page tables and slots are leaked
+arena destroyed while another thread uses it: tables kept (73 -> 73), arenas 6 -> 5, next arena runs -> 308 [OK]
+  1. ring-3 execution: fn ran at CPL 3 (CS 0x2b) [OK]
+  2. ring-3 privileged mov %cr3: #GP -> GK_EFAULT (faulting rip 0x5ad80aeed240), process survived [OK]
+  3. ring-3 supervisor write @0x798feea02000 -> FAULT (fault 0x798feea02000); refused write @0x798fea600000 -> FAULT (fault 0x798fea600000); own user page -> 0x5a [OK]
+  4. ring-3 forwarded getpid: guest saw 2686147, host getpid 2686147 [OK]
+guest ring-3 privilege split [OK]
+ring-3 under arena: commit+write arena page -> 0xc7, touch gk page tables -> FAULT (fault 0x798fea600000) [OK]
+guest thread 1 ran at CPL 3
+guest thread 2 ran at CPL 3
+guest thread 3 ran at CPL 3
+  1. ring-3 spawned threads: spawn -> 1, CS 0x2b/0x2b/0x2b, grandchildren CS 0x2b/0x2b/0x2b, user-page writes 0x51/0x52/0x53 [OK]
+[gk] vcpu 4: guest thread tid 2686788 (ring 3) died: r=-1001 fault=0x5ad80aeed2a2; thread terminated
+  2. ring-3 thread mov %cr3 @0x5ad80aeed2a2: #GP, thread ended (fault 0x5ad80aeed2a2), spawner joined -> 1, process survived [OK]
+  3. ring-3 thread forwarded getpid: 2686147/2686147/2686147, host 2686147 [OK]
+guest thread 7 ran at CPL 3
+[gk] vcpu 4: guest thread tid 2686791 (ring 3) died: r=-1001 fault=0x798fea600000; thread terminated
+[gk] vcpu 4: guest thread tid 2686792 (ring 3) died: r=-1001 fault=0x240000000000; thread terminated
+  4. ring-3 thread under arena: own page write -> 0x57 (join 1); gk page tables @0x798fea600000 -> FAULT, thread ended (fault 0x798fea600000, join 1); other arena @0x240000000000 -> FAULT, thread ended (fault 0x240000000000, join 1); arena slot released after destroy [OK]
+guest-created threads (ring-3 creator): run at ring 3, faults end the thread only; afterwards ring 3 at CPL 3, ring-0 threads ok [OK]
+gk control data: ring-3 writes faulted 17/17 (base root), under arena -> FAULT (fault 0x5ad80c17c538 == arena structs 0x5ad80c17c538); ring-0 write -> 0x5a, host sees 0x5a, ring-0 read -> 0x5a; ring 3 afterwards at CPL 3 [OK]
+host-frame wall (main thread): guest frame 0x7fffcd7a5e90, wall from 0x7fffcd7a6000, host caller frame 0x7fffcd7a6fb8; ring-3 store at wall -> FAULT (fault 0x7fffcd7a6000), into host caller frame -> FAULT (fault 0x7fffcd7a6fb8, local intact), reads/TLS/recursion ok; ring-0 store above entry -> 0x4b1d; ring 3 after at CPL 3 [OK]
+host-frame wall (pthread): guest frame 0x798fe67f77f0, wall from 0x798fe67f8000, host caller frame 0x798fe67f8918; ring-3 store at wall -> FAULT (fault 0x798fe67f8000), into host caller frame -> FAULT (fault 0x798fe67f8918, local intact), reads/TLS/recursion ok; ring-0 store above entry -> 0x4b1d; ring 3 after at CPL 3 [OK]
+wall flush skip (main thread, flush stub invpcid): warm-up ok; skipped raise: host-frame store -> FAULT (fault 0x7fffcd7a6e38, local intact, skipped 1 flushed 0), wall-page store -> FAULT (fault 0x7fffcd7a6000) [OK]; deeper turn (wall from 0x7fffcd7a4000 < 0x7fffcd7a6000) flushed, store -> FAULT (fault 0x7fffcd7a4000) [OK]; shallower again skipped, store -> FAULT [OK]; ring-0 turn between (wrote 0x4b1d) -> next raise flushed, store -> FAULT (local intact) [OK]; skipping resumed [OK] [OK]
+wall flush skip (pthread, flush stub invpcid): warm-up ok; skipped raise: host-frame store -> FAULT (fault 0x798fe67f8798, local intact, skipped 1 flushed 0), wall-page store -> FAULT (fault 0x798fe67f8000) [OK]; deeper turn (wall from 0x798fe67f6000 < 0x798fe67f8000) flushed, store -> FAULT (fault 0x798fe67f6000) [OK]; shallower again skipped, store -> FAULT [OK]; ring-0 turn between (wrote 0x4b1d) -> next raise flushed, store -> FAULT (local intact) [OK]; skipping resumed [OK] [OK]
+host-side decommit (main thread): arena page at ring 3 -> FAULT (fault 0x230000000000, page 0x230000000000), next turn 328350; at ring 0 -> FAULT (fault 0x230000001000, page 0x230000001000), next turn 328350; page outside arenas -> FAULT (fault 0x5ad80aeed0a0, read_byte 0x5ad80aeed0a0), next turn 328350; want next 328350 [OK]
+host-side decommit (pthread): arena page at ring 3 -> FAULT (fault 0x230000000000, page 0x230000000000), next turn 328350; at ring 0 -> FAULT (fault 0x230000001000, page 0x230000001000), next turn 328350; page outside arenas -> FAULT (fault 0x5ad80aeed0a0, read_byte 0x5ad80aeed0a0), next turn 328350; want next 328350 [OK]
+mprotect in place: RW->RW 90 (0 faults), RW->R read 90 (0 faults), write to R -> -1001 at 0x230000000000, R->RW write 60 (0 faults) [OK]
+global pages: 8/8 alternating turns isolated (8 root switches); arena page cached on the same root ok, after a switch away and back re-walked (1 fault, unreachable in between faults); shared page after a switch survived (0 faults, 1 attempt); after gk's flush dropped (1 fault, warm-up 0); 26 global PTEs installed [OK]
+neighborhood: fault at page 5 -> 1 fault, 63 neighbors; pages 0, 6, 63 read and 7 written with 0 faults; page 64 -> 1 fault (63 neighbors), page -1 -> 1 fault [OK]
+neighborhood, protection boundary: fault at page 1 -> 1 fault, 7 neighbors; page 3 0 faults; read-only page 8 -> 1 fault, 7 neighbors; page 12 0 faults, write -> FAULT (fault 0x798fe7c4c000); page 16 -> 1 fault [OK]
+neighborhood, arena: fault at page 17 of 24 committed -> 1 fault, 23 neighbors; pages 16, 23 0 faults; page 24 -> FAULT (fault 0x230000018000); page 20 from the base root -> FAULT (fault 0x230000014000), from another arena -> FAULT (fault 0x230000014000), back in the arena -> 0 (0 faults) [OK]
+neighborhood, class boundary: ring-3 fault at page 1 -> 1 fault, 61 neighbors; REFUSE page 8 -> FAULT (fault 0x798fe7a48000); SUPER page 9 from ring 0 -> 0 (1 fault), from ring 3 -> FAULT (fault 0x798fe7a49000); page 10 from ring 3 -> 0 (0 faults) [OK]
+host-allocated key: key 1, pkey_mprotect from the guest -> 0, read=0x42, read with access disabled->FAULT, re-enabled=0x42, keys outside 0..15 -> ENOMEM yes [OK]
+arena huge pages: 4MB committed and touched from ring 3 -> 1024 pages, AnonHugePages 4096 kB, advised yes; its first 2MB decommitted by a guest fixed mmap -> 0, 0 kB, recommitted and touched -> 512 pages, 2048 kB; a 2MB apart touched -> 512 pages, 2048 kB, decommitted by a host fixed mmap -> 0, 0 kB, recommitted and touched -> 512 pages, 2048 kB; a 256KB commit touched -> 64 pages, 0 kB, advised no [OK]
+avx512 in guest: host XCR0 0x2e7; ring 3: XCR0 0x2e7, masked zmm16+zmm17 -> 0 lanes wrong (lanes 0/7/8: 1000 1056 0); ring 0: XCR0 0x2e7, -> 0 lanes wrong [OK]
+[gk] gk_arena_enter: 0x5ad8267fe3c0 is not a live arena; the thread stays on its current root
+[gk] gk_arena_enter: 0x5ad80c17c8b8 is not a live arena; the thread stays on its current root
+[gk] gk_arena_destroy: 0x5ad8267fe3c0 is not a live arena; nothing is destroyed
+[gk] gk_arena_destroy: 0x5ad80c17c8b8 is not a live arena; nothing is destroyed
+[gk] gk_arena_leave: no arena is entered on this thread; the base root is selected
+[gk] gk_arena_enter: arenas nested more than 16 deep on this thread; the thread stays on its current root
+arena nesting: A/B nest+leave OK; bogus heap pointer -> -22 (root kept yes, memory untouched yes), destroyed pool struct -> -22 (root kept yes); destroyed-in-history (struct recycled: yes) leave -> base root yes; underflow -> -22 (base root yes); overflow at 16 -> -12 (root kept yes, unwinds yes); destroy refuses bogus yes, self-destroy -> base root yes [OK]
+mapping policy: ring 3 in arena A: own text, arena B page, control block, page tables, main stack: mprotect/munmap/mremap/madvise/pkey_mprotect -> all EPERM; afterwards text runs yes, B byte 0xb7, control word intact, stack local 0x3c; A's own page: mprotect 0 write 0x5a, fixed mmap 0 write 0x6b, madvise 0, munmap 0, re-reserve 0, kernel-placed mmap 0, run 0; no arena active: mprotect A page -> -1 [OK]
+mremap reflection: old range read 126, 126 before the move; moved yes (guest read 126, errno 0); old range after -> -1001 at 0x798fee81e000 and -1001 at 0x798fee81f000; new range -> 126 [OK]
+host memory: block @0x798fe820c000 zero-filled yes, host r/w ok, owned yes, +0 registry range(s) for 1 region(s); ring-3 read -> FAULT (fault 0x798fe820c007 == 0x798fe820c007), ring-3 write -> FAULT (fault 0x798fe820c009 == 0x798fe820c009), ring 3 in arena -> FAULT (fault 0x798fe820c00b == 0x798fe820c00b), ring 0 -> FAULT (fault 0x798fe820c00d == 0x798fe820c00d), ring 0 on caller stack -> FAULT (fault 0x798fe820c00f == 0x798fe820c00f); host bytes intact, ring 3 at CPL 3; 20000 cycles + 5x6 MiB bursts: regions 2 -> 2, registry 20 -> 20 (bounded); recycled block same address, zero; limits ok; after frees 6 live blocks [OK]
+[gk] gk_host_slot_get: 0x11000 is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0x1ffff is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0x20000 is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0x1000010000 is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0x10001 is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0x798fe820c000 is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0x5ad8267fe370 is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0x798fee81f000 is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0x798fee81f000 is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0xffffffffffffffff is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0x1 is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0x7fff0000 is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0x8000000000010000 is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_free: 0x20000 is not the handle of a live host slot; nothing is freed
+[gk] gk_host_slot_free: 0x5ad8267fe370 is not the handle of a live host slot; nothing is freed
+[gk] gk_host_slot_get: 0x10000 is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_free: 0x10000 is not the handle of a live host slot; nothing is freed
+[gk] gk_host_slot_get: 0x10000 is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0x30000 is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0x10020fff is not the handle of a live host slot; it resolves to nothing
+[gk] gk_host_slot_get: 0x10000 is not the handle of a live host slot; it resolves to nothing
+host slots: handle 0x10000 -> block @0x798fe820c000 (zero-filled yes, host r/w ok); ring-3 read of the block -> FAULT (fault 0x798fe820c007 == 0x798fe820c007), ring-3 write to the table -> FAULT (fault 0x5ad80c263408 == 0x5ad80c263408); 13 garbage handles -> nothing (yes, caller's memory untouched yes, block intact yes); freed -> nothing yes; recycled as 0x20000 (same slot yes, same block yes, old handle -> nothing yes, zeroed yes); capacity 4096: filled 4096, next -> 0, all distinct yes, registry +1 for +1 region(s), emptied yes; reusable yes; ring 3 at CPL 3 [OK]
+hostcalls: nothing registered -> all ENOSYS yes; register: past table/NULL/taken refused yes, two bound yes; ring 3: handler 5 -> 4321 (want 4321), out ok, 63 -> 0x2222; handler saw args 1/20/300/4000 in_len 16 bytes as passed; unregistered/at/past/all-ones/pointer index -> -38/-38/-38/-38/-38 (want all -38, handler calls unchanged yes); in_len 4096 -> 534636355108864 with 4096 bytes back, 4097 -> -7, ~0 -> -7 (want -7); caller's stack ok; ring 0 ok; host side ok; 12 calls counted ok; ring-3 write to table -> FAULT (fault 0x5ad80c283420 == 0x5ad80c283420), region unmappable by the guest yes; 5948 ns per round trip (20000 calls); after unregister -> -38, other 0x2222, re-unregister ok; CPL 3 [OK]
+[gk] gk_signal_field_unregister: 0x10000 is not the handle of a signal field of the calling thread's arena; nothing is unregistered
+[gk] gk_signal_field_unregister: 0x10001 is not the handle of a signal field of the calling thread's arena; nothing is unregistered
+[gk] gk_signal_field_unregister: 0x20000 is not the handle of a signal field of the calling thread's arena; nothing is unregistered
+[gk] gk_signal_field_unregister: 0x230000003000 is not the handle of a signal field of the calling thread's arena; nothing is unregistered
+[gk] gk_signal_field_unregister: 0xffffffffffffffff is not the handle of a signal field of the calling thread's arena; nothing is unregistered
+[gk] gk_signal_field_unregister: 0 is not the handle of a signal field of the calling thread's arena; nothing is unregistered
+[gk] gk_signal_field_unregister: 0x20000000 is not the handle of a signal field of the calling thread's arena; nothing is unregistered
+[gk] gk_signal_field_unregister: 0x10000 is not the handle of a signal field of the calling thread's arena; nothing is unregistered
+signal fields: registered from ring 3 -> handle 0x10000 (field at 0x230000001064, arena offset 0x1000+100), host write -> 1 field(s), word 24 (want 24), other kind -> 0, rest of buffer intact yes [ok]; from a signal handler interrupting the turn: before 0, after 24, 1 signal(s) wrote 1 [ok]; refused host-side: outside arena -22, past its end -22, field at end -22, 3 bytes left -22, length wraps -22, too short -22, kind -22 (want all -22; count unchanged yes) [ok]; unregister from other arena -22, from no arena -3, 6 garbage handles refused yes, by owner 0 then write -> 0 word 0, again -22 [ok]; write with no arena -3, bad kind -22 [ok]; ring-3 read of the table -> FAULT (fault 0x5ad80c283838 == 0x5ad80c283838), write -> FAULT (fault 0x5ad80c283838) [ok]; capacity 8192: filled, next -> -12, write hit 8192, emptied yes [ok]; destroyed arena dropped its field yes [ok]; 62 ns per write with 8 fields, 48 with 1 (200000 writes each) [ok]; under a 100 us CPU timer, 20000 register/read/unregister rounds from ring 3 through the hostcall: 545 signals landed, 0 inconsistent reads, and 20000 rounds from the host: 5 signals landed, consistent yes [ok]; CPL 3 [OK]
+thread words: bad ranges refused yes; set/get yes; from a SIGUSR1 handler under a ring-3 turn yes (r=0, 0x1111 0x2222); fresh thread: ESRCH then zeroes yes; ring-3 write -> -1001 at 0x5ad80bf2c710, read -> -1001, ring-0 read 0x1111 walled; get of 3 words 45 ns [OK]
+turn directory: bad descriptors refused yes; no directory -> -1; under it: open ok stat 0 (size 2) dir 0 statx 0; other dirfd -1, AT_FDCWD -1, absolute -18, .. -18, symlink out -18, stat other -1, access -1, openat2 -1, fchdir -1; by name under it: unlinkat 0 mkdirat 0 rmdir 0 readlinkat 4 ("/etc") faccessat2 0, on the link itself 0; other dirfd: unlinkat -1 readlinkat -1; through the link: unlinkat -18 mkdirat -18 faccessat2 -18; .. -18, absolute -18, on .. itself -1; descriptor reused for another directory -1; handler-chosen other dir ok, none -1; next entry -1; set from ring 3 -> -1001; 12 refusals counted; confined open 18.56 us vs 17.35 us; policy off forwards [OK]
+[gk] gk_resolve_unregister: 0x100000 is not the handle of a live resolve entry; nothing is unregistered
+[gk] gk_resolve_unregister: 0x20000100000 is not the handle of a live resolve entry; nothing is unregistered
+[gk] gk_resolve_unregister: 0x200001fffff is not the handle of a live resolve entry; nothing is unregistered
+[gk] gk_resolve_unregister: 0x200000 is not the handle of a live resolve entry; nothing is unregistered
+[gk] gk_resolve_unregister: 0x10000100000 is not the handle of a live resolve entry; nothing is unregistered
+[gk] gk_resolve_unregister: 0x100001 is not the handle of a live resolve entry; nothing is unregistered
+[gk] gk_resolve_unregister: 0x5ad80d66c280 is not the handle of a live resolve entry; nothing is unregistered
+[gk] gk_resolve_unregister: 0x5ad8267fe370 is not the handle of a live resolve entry; nothing is unregistered
+[gk] gk_resolve_unregister: 0x798fee81f000 is not the handle of a live resolve entry; nothing is unregistered
+[gk] gk_resolve_unregister: 0x798fee81f000 is not the handle of a live resolve entry; nothing is unregistered
+[gk] gk_resolve_unregister: 0xffffffffffffffff is not the handle of a live resolve entry; nothing is unregistered
+[gk] gk_resolve_unregister: 0x1 is not the handle of a live resolve entry; nothing is unregistered
+[gk] gk_resolve_unregister: 0x7fff0000 is not the handle of a live resolve entry; nothing is unregistered
+[gk] gk_resolve_unregister: 0x8000000000100000 is not the handle of a live resolve entry; nothing is unregistered
+[gk] gk_resolve_commit: 0x10000400001 is not the handle of a reserved resolve entry; nothing is committed
+[gk] gk_resolve_commit: (nil) is not ordinary user memory; 0x10000500003 stays unresolvable
+[gk] gk_resolve_commit: 0x798feea02000 is not ordinary user memory; 0x10000500003 stays unresolvable
+[gk] gk_resolve_commit: 0x798fea600000 is not ordinary user memory; 0x10000500003 stays unresolvable
+[gk] gk_resolve_commit: 0x230000000000 is not ordinary user memory; 0x10000500003 stays unresolvable
+[gk] gk_resolve_commit: 0x10000300001 is not the handle of a reserved resolve entry; nothing is committed
+[gk] gk_resolve_commit: 0x10000100000 is not the handle of a reserved resolve entry; nothing is committed
+[gk] gk_resolve_register: 0x798feea02000 is not ordinary user memory; nothing is registered
+[gk] gk_resolve_register: 0x798fea600000 is not ordinary user memory; nothing is registered
+[gk] gk_resolve_register: 0x230000000000 is not ordinary user memory; nothing is registered
+ring-0 resolve: NULL refused yes; handle 0x100000 -> 0x5ad80d66c280 (host ok); ring 3 ok, caller's stack ok, ring 0 ok, host ok; 13 garbage handles and 0 -> nothing at every ring (yes, caller's memory untouched yes); ring-3 read of the table -> FAULT (fault 0x5ad80af03000 == 0x5ad80af03000), write -> FAULT (fault 0x5ad80af03000 == 0x5ad80af03000); 64 sub-runs of 8000 ring-3 resolves: 52 kept with exactly the 1 exit(s) of an empty turn, 12 discarded (12 extra exits, 12 of all irq_exits in the period), 0 answered wrong; 20.3 ns per resolve (median of kept, empty turn 6768 ns subtracted); unregistered -> nothing yes; recycled as 0x200000 (same slot yes, old handle -> nothing yes, new -> 0x5ad80d66c064 ok); capacity 1048576: filled 1048576, next -> 0, 0 mismatched from ring 3, emptied yes; reusable yes; reserved 3 -> nothing until committed yes, commits once and refuses NULL, supervisor, refused and arena pointers yes (0 wrong from ring 3), released yes; CPL 3 [OK]
+
+PASS
