@@ -44,8 +44,9 @@ class HeapArena;
 // purge hooks refuse, and decay is off, so jemalloc keeps freed extents retained for reuse
 // instead of calling the hooks on them at arbitrary times from arbitrary threads, where the
 // arena may not be mapped. jemalloc calls the hooks with its own locks held, so they allocate
-// nothing. Destroying the HeapArena discards every allocation still in it, which is why a
-// GuestArena that held one is retained rather than destroyed (see setup.h).
+// nothing. Destroying the HeapArena discards every allocation still in it, and a later free()
+// of one of them is undefined: nothing that outlives the isolate may be allocated under its
+// lock without a SharedHeapScope (below).
 class HeapArena final {
  public:
   // Creates an arena over [begin, end), page-aligned, reserved as inaccessible anonymous memory
@@ -109,6 +110,39 @@ class HeapArenaScope final {
   explicit HeapArenaScope(kj::Maybe<HeapArena&> arena);
   ~HeapArenaScope() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(HeapArenaScope);
+
+ private:
+  bool switched = false;
+  unsigned previousIndex = 0;
+};
+
+// Makes jemalloc's shared arena the calling thread's arena for the scope's lifetime and restores
+// the thread's previous arena afterwards, so that it nests inside a HeapArenaScope: a thread
+// that holds an isolate's lock allocates from the isolate's arena, and inside this scope from the
+// shared heap. It is for memory that is not the isolate's although a turn of that isolate
+// allocates it: process-wide state that is initialized or grown lazily while a turn runs (ICU's
+// caches, the thread's timer queue), and objects handed from one isolate's turn to another's.
+// Left in the isolate's arena, such memory is unaddressable from every other isolate's turn,
+// which faults on it and is condemned.
+//
+// The shared arena is a compile-time constant -- jemalloc's arena 0, which exists from the
+// allocator's initialization on and is one of the automatic arenas that every thread allocates
+// from when no HeapArenaScope is active -- rather than a value read from memory, so that nothing
+// guest execution can write selects what "shared" means. The arena to return to is kept in the
+// scope object, with the same consequences as for HeapArenaScope.
+//
+// This is a correctness tool, and every use of it is a deliberate confidentiality concession:
+// whatever is allocated under it lies in the shared heap, which every isolate's ring-3 execution
+// can read (see the Limitations in experimental/guest-kernel/README.md). Keep its extent to what
+// must be shared.
+//
+// A no-op where heap arenas are not built in, and where the allocator is not set up for them
+// (heapArenasAvailable()), in which case every allocation is in the shared heap already.
+class SharedHeapScope final {
+ public:
+  SharedHeapScope();
+  ~SharedHeapScope() noexcept(false);
+  KJ_DISALLOW_COPY_AND_MOVE(SharedHeapScope);
 
  private:
   bool switched = false;

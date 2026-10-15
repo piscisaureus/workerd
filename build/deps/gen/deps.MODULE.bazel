@@ -31,6 +31,7 @@ http.archive(
     patches = [
         "//:patches/capnp-cpp/0001-Start-the-symbolizer-subprocess-without-throwing.patch",
         "//:patches/capnp-cpp/0002-Expose-the-disposer-of-an-Own.patch",
+        "//:patches/capnp-cpp/0003-Add-EventLoop-GuardedArmScope.patch",
     ],
     sha256 = "d24206085fa53789f7395324cd7e3cf97082701ab30b1fd48fd2e1c3f0164385",
     strip_prefix = "capnproto-capnproto-b6147c5/c++",

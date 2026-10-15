@@ -344,6 +344,12 @@ struct HeapTurn {
     return 0;
   }
 
+  // As allocate(), inside a SharedHeapScope.
+  static long allocateShared(void* arg) {
+    SharedHeapScope sharedHeap;
+    return allocate(arg);
+  }
+
   // Frees what allocate() recorded, under whatever arena is active at the time.
   static long release(void* arg) {
     auto& self = *reinterpret_cast<HeapTurn*>(arg);
@@ -364,10 +370,9 @@ bool inHeap(GuestArena& arena, const void* p) {
 }
 #endif  // WORKERD_HAS_HEAP_ARENA
 
-// A single case with a single pair of isolates: gk supports one round of arenas per process
-// (a guest entry after arenas were destroyed and new ones created spins in KVM), so every check
-// shares these two. Natives syntax lets a script force optimization, so that an isolate's code
-// range holds JIT code.
+// A single case with a single pair of isolates that every check up to part 6 shares; part 7
+// creates and destroys more. Natives syntax lets a script force optimization, so that an
+// isolate's code range holds JIT code.
 KJ_TEST("each isolate's memory lives in its own guest-kernel arena") {
   if (!enableGuestKernel()) return;
 
@@ -758,7 +763,77 @@ KJ_TEST("each isolate's memory lives in its own guest-kernel arena") {
   hostTurn->forEach(
       [&](void* p, size_t size) { KJ_EXPECT(!inHeap(arenaA, p) && !inHeap(arenaB, p), p, size); });
   KJ_EXPECT(HeapTurn::release(hostTurn.get()) == 0);
+
+  // Part 6: the shared heap from under a lock. A SharedHeapScope inside A's lock puts the
+  // thread's allocations in the shared heap for its lifetime, whether entered on the host side
+  // of the lock or at guest ring 3 inside a turn: what it allocates lies in neither isolate's
+  // arena, and B's ring-3 turn reads and writes it. The scope nests: A's heap arena is the
+  // thread's again once it ends.
+  auto sharedHostTurn = kj::heap<HeapTurn>();
+  auto sharedGuestTurn = kj::heap<HeapTurn>();
+  a.runInLockScope([&](ArenaIsolate::Lock& lock) {
+    KJ_EXPECT(currentHeapArenaIndex() == heapA.getIndex());
+    {
+      SharedHeapScope sharedHeap;
+      KJ_EXPECT(isAutomaticHeapArena(currentHeapArenaIndex()));
+      KJ_EXPECT(HeapTurn::allocate(sharedHostTurn.get()) == 0);
+    }
+    KJ_EXPECT(currentHeapArenaIndex() == heapA.getIndex());
+    KJ_EXPECT(gk_run_here_user(&HeapTurn::allocateShared, sharedGuestTurn.get()) == 0);
+    KJ_EXPECT(currentHeapArenaIndex() == heapA.getIndex());
+    for (HeapTurn* turn: {sharedHostTurn.get(), sharedGuestTurn.get()}) {
+      KJ_EXPECT(isAutomaticHeapArena(turn->arenaIndex), turn->arenaIndex);
+      turn->forEach([&](void* p, size_t size) {
+        KJ_EXPECT(!inHeap(arenaA, p) && !inHeap(arenaB, p), p, size);
+        KJ_EXPECT(!contains(arenaA, p) && !inTail(arenaA, p), p, size);
+        KJ_EXPECT(!contains(arenaB, p) && !inTail(arenaB, p), p, size);
+      });
+    }
+    // Still A's: an allocation after the scopes is in A's heap region again.
+    KJ_EXPECT(HeapTurn::allocate(hostTurn.get()) == 0);
+    hostTurn->forEach([&](void* p, size_t size) { KJ_EXPECT(inHeap(arenaA, p), p, size); });
+    KJ_EXPECT(HeapTurn::release(hostTurn.get()) == 0);
+  });
+  // Under B's lock, from ring 3: readable and writable at both ends of every block, and freed.
+  b.runInLockScope([&](ArenaIsolate::Lock& lock) {
+    for (HeapTurn* turn: {sharedHostTurn.get(), sharedGuestTurn.get()}) {
+      turn->forEach([&](void* p, size_t size) {
+        KJ_EXPECT(gk_run_here_user(&touchByte, p) == BUFFER_FILL, p, size);
+        KJ_EXPECT(gk_run_here_user(&touchByte, static_cast<kj::byte*>(p) + size - 1) == BUFFER_FILL,
+            p, size);
+      });
+      KJ_EXPECT(gk_run_here_user(&HeapTurn::release, turn) == 0);
+    }
+  });
 #endif  // WORKERD_HAS_HEAP_ARENA
+
+  // Part 7: isolates come and go. A destroyed isolate's arena is destroyed with it, heap arena
+  // and page-table slot included, and the next isolate is placed in a fresh arena, in which
+  // ring-3 JS turns run as before. Three isolates created and destroyed in turn do not take
+  // three new slots: a released slot is reused.
+  kj::Vector<void*> bases;
+  for (int i = 0; i < 3; i++) {
+    // On the heap, as in production: the turn writes the isolate's own state and its record,
+    // and a local would be behind the host-frame wall (see runInGuest()). The isolate goes in
+    // the shared heap, as no lock is held, and the record in the isolate's arena.
+    auto c =
+        kj::heap<ArenaIsolate>(v8System, newIsolateGroup(), nullptr, kj::heap<IsolateObserver>());
+    auto& arenaC = KJ_ASSERT_NONNULL(c->getGuestArena());
+    bases.add(arenaC.base());
+    c->runInLockScope([&](ArenaIsolate::Lock& lock) {
+      auto turn = kj::heap<JsTurn>(lock);
+      KJ_EXPECT(gk_run_here_user(&JsTurn::run, turn.get()) == 0, i);
+      KJ_EXPECT(!turn->threw, i);
+      KJ_EXPECT(turn->result == 1024 * 7 + 10000 + 511.5, i, turn->result);
+    });
+  }
+  KJ_LOG(INFO, "arenas of isolates created and destroyed in turn", bases[0], bases[1], bases[2]);
+  KJ_EXPECT(bases[1] == bases[0] || bases[2] == bases[0] || bases[2] == bases[1], bases[0],
+      bases[1], bases[2]);
+  // And the two isolates of the parts above still run turns after all that.
+  a.runInLockScope([&](ArenaIsolate::Lock& lock) {
+    KJ_EXPECT(gk_run_here_user(&touchByte, bufA) == BUFFER_FILL);
+  });
 }
 
 // The host reads the turn record as bytes. A description length past the buffer is clamped to
