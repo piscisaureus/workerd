@@ -672,9 +672,10 @@ struct Worker::Isolate::Impl {
 
     void gcPrologue() {
       metrics.gcPrologue();
-      // Filter out tracked WASM instance entries where the instance has been
-      // garbage-collected (weak instanceRef is empty), allowing the linear memory
-      // to be reclaimed.
+      // Point tracked WASM instance entries at linear memory that a grow has moved, then
+      // filter out entries where the instance has been garbage-collected (weak instanceRef
+      // is empty), allowing the linear memory to be reclaimed.
+      limitEnforcer.getTrackedWasmInstances().refresh(*lock);
       limitEnforcer.getTrackedWasmInstances().filter(*lock);
     }
     void gcEpilogue() {
@@ -1680,18 +1681,27 @@ void Worker::Isolate::setCpuLimitNearlyExceededCallback(kj::Function<void()> cb)
 
 void Worker::Isolate::registerTrackedWasmInstance(jsg::Lock& js,
     v8::Local<v8::Object> instance,
-    kj::Array<kj::byte> memory,
+    v8::Local<v8::WasmMemoryObject> memory,
     kj::Maybe<uint32_t> signalOffset,
     kj::Maybe<uint32_t> terminatedOffset) const {
+  auto backingStore = memory->Buffer()->GetBackingStore();
+  auto linearMemory =
+      kj::arrayPtr(static_cast<kj::byte*>(backingStore->Data()), backingStore->ByteLength())
+          .attach(kj::mv(backingStore));
+
   // Register the WASM module for receiving shutdown signals. The signal handler will
   // iterate the list unconditionally when CPU time is nearly exhausted.
   KJ_IF_SOME(entry,
       limitEnforcer->getTrackedWasmInstances().registerSignal(
-          js, kj::mv(memory), signalOffset, terminatedOffset)) {
-    // Set up a weak reference to the instance. When V8 collects it, the handle becomes
-    // empty and the GC prologue filter removes the entry, releasing the strong memory ref.
+          js, kj::mv(linearMemory), signalOffset, terminatedOffset)) {
+    // Set up weak references to the instance and its memory. When V8 collects the instance, the
+    // handle becomes empty and the GC prologue filter removes the entry, releasing the strong
+    // memory ref. Through the memory handle, the GC prologue follows the linear memory when a
+    // grow moves it.
     entry.instanceRef.Reset(js.v8Isolate, instance);
     entry.instanceRef.SetWeak();
+    entry.memoryRef.Reset(js.v8Isolate, memory);
+    entry.memoryRef.SetWeak();
   }
 }
 
@@ -1755,13 +1765,9 @@ void shimWebAssemblyInstantiate(jsg::Lock& lock, v8::Local<v8::Context> context)
       if (terminatedRaw >= 0) {
         terminatedOffset = static_cast<uint32_t>(terminatedRaw);
       }
-      auto backingStore = memory->Buffer()->GetBackingStore();
-      auto wasmMemory =
-          kj::arrayPtr(static_cast<kj::byte*>(backingStore->Data()), backingStore->ByteLength())
-              .attach(kj::mv(backingStore));
       KJ_IF_SOME(e, kj::runCatchingExceptions([&] {
         Worker::Isolate::from(js).registerTrackedWasmInstance(
-            js, instance, kj::mv(wasmMemory), signalOffset, terminatedOffset);
+            js, instance, memory, signalOffset, terminatedOffset);
       })) {
         js.v8Isolate->ThrowException(js.exceptionToJs(kj::mv(e)).getHandle(js));
       }

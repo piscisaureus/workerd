@@ -4,6 +4,11 @@
 
 #include "tracked-wasm-instance.h"
 
+#include <workerd/jsg/jsg.h>
+
+#include <v8-array-buffer.h>
+#include <v8-wasm.h>
+
 namespace workerd {
 
 kj::Maybe<TrackedWasmInstance&> TrackedWasmInstanceList::registerSignal(jsg::Lock&,
@@ -49,6 +54,50 @@ void TrackedWasmInstanceList::filter(jsg::Lock&) const {
 void TrackedWasmInstanceList::clear(jsg::Lock&) const {
   // Safe to const_cast: the jsg::Lock& parameter proves we hold the isolate lock.
   const_cast<SignalSafeList<TrackedWasmInstance>&>(list).clear();
+}
+
+void TrackedWasmInstanceList::refresh(jsg::Lock& js) const {
+  js.withinHandleScope([&] {
+    // Safe to const_cast: the jsg::Lock& parameter proves we hold the isolate lock.
+    refreshWith(const_cast<SignalSafeList<TrackedWasmInstance>&>(list),
+        [&](TrackedWasmInstance& entry) -> kj::Maybe<kj::Array<kj::byte>> {
+      // An entry whose instance has been collected is about to be removed by filter().
+      if (!entry.shouldRetain() || entry.memoryRef.IsEmpty()) return kj::none;
+      auto backingStore = entry.memoryRef.Get(js.v8Isolate)->Buffer()->GetBackingStore();
+      if (backingStore->Data() == entry.memory.begin()) return kj::none;
+      return kj::arrayPtr(static_cast<kj::byte*>(backingStore->Data()), backingStore->ByteLength())
+          .attach(kj::mv(backingStore));
+    });
+  });
+}
+
+void TrackedWasmInstanceList::refreshWith(
+    SignalSafeList<TrackedWasmInstance>& list, CurrentMemory currentMemory) {
+  // A replacement goes to the front of the list, ahead of the node this traversal started from,
+  // so it is not visited again. The replaced node keeps its (stale but still allocated) memory
+  // until filter() removes it, so a signal handler that interrupts this at any point only ever
+  // sees complete entries with live memory.
+  list.iterate([&](TrackedWasmInstance& entry) {
+    KJ_IF_SOME(memory, currentMemory(entry)) {
+      // Linear memory never shrinks, so offsets validated at registration still fit. Check
+      // anyway rather than ever let a signal handler write out of bounds.
+      auto fits = [&](kj::Maybe<uint32_t> offset) {
+        KJ_IF_SOME(o, offset) {
+          return static_cast<size_t>(o) + WASM_SIGNAL_FIELD_BYTES <= memory.size();
+        }
+        return true;
+      };
+      if (!fits(entry.signalByteOffset) || !fits(entry.terminatedByteOffset)) return;
+
+      list.pushFront(TrackedWasmInstance{
+        .memory = kj::mv(memory),
+        .signalByteOffset = entry.signalByteOffset,
+        .terminatedByteOffset = entry.terminatedByteOffset,
+        .instanceRef = kj::mv(entry.instanceRef),
+        .memoryRef = kj::mv(entry.memoryRef),
+      });
+    }
+  });
 }
 
 void TrackedWasmInstanceList::writeShutdownSignal() const {

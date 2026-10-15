@@ -5,6 +5,7 @@
 #include "tracked-wasm-instance.h"
 
 #include <kj/test.h>
+#include <kj/vector.h>
 
 #include <cstring>
 
@@ -869,6 +870,156 @@ KJ_TEST("TrackedWasmInstanceList methods are no-ops on an empty list") {
   list.writeTerminatedSignal();
 
   KJ_EXPECT(list.signals().isEmpty());
+}
+
+// ---------------------------------------------------------------------------
+// refreshWith() tests
+//
+// refresh() asks V8 where each entry's linear memory is now; refreshWith() is the part that
+// swaps an entry for one aliasing the memory a grow moved it to. These tests drive the latter
+// with a callback standing in for the V8 lookup.
+// ---------------------------------------------------------------------------
+
+// Helper: count the entries in a list.
+size_t countEntries(SignalSafeList<TrackedWasmInstance>& list) {
+  size_t count = 0;
+  list.iterate([&](TrackedWasmInstance&) { ++count; });
+  return count;
+}
+
+// Helper: a FakeBackingStore-backed memory of `size` bytes, with its data pointer in `begin`.
+kj::Array<kj::byte> makeMemory(bool& destroyed, size_t size, kj::byte*& begin) {
+  auto store = kj::heap<FakeBackingStore>(destroyed, size);
+  begin = store->data.begin();
+  return store->data.asPtr().attach(kj::mv(store));
+}
+
+KJ_TEST("refreshWith replaces an entry whose memory moved") {
+  SignalSafeList<TrackedWasmInstance> list;
+  bool oldDestroyed = false;
+  pushSignal(list, oldDestroyed, static_cast<uint32_t>(0), static_cast<uint32_t>(4));
+
+  // The memory a grow moved the module to, twice the size of the old one.
+  bool newDestroyed = false;
+  kj::byte* newBegin = nullptr;
+  auto newMemory = makeMemory(newDestroyed, 128, newBegin);
+
+  size_t calls = 0;
+  TrackedWasmInstanceList::refreshWith(
+      list, [&](TrackedWasmInstance& entry) -> kj::Maybe<kj::Array<kj::byte>> {
+    ++calls;
+    return kj::mv(newMemory);
+  });
+
+  // Only the original entry was offered a new memory, not the replacement pushed in front of it.
+  KJ_EXPECT(calls == 1);
+  KJ_EXPECT(countEntries(list) == 2);
+
+  // The replacement is at the front, aliases the new memory and keeps the offsets.
+  bool first = true;
+  list.iterate([&](TrackedWasmInstance& entry) {
+    if (first) {
+      KJ_EXPECT(entry.memory.begin() == newBegin);
+      KJ_EXPECT(entry.memory.size() == 128);
+      KJ_EXPECT(KJ_ASSERT_NONNULL(entry.signalByteOffset) == 0);
+      KJ_EXPECT(KJ_ASSERT_NONNULL(entry.terminatedByteOffset) == 4);
+      first = false;
+    }
+  });
+
+  // Signals now land in the new memory.
+  writeShutdownSignals(list);
+  writeTerminatedFlags(list);
+  KJ_EXPECT(readU32(list, 0) == WASM_SIGNAL_SIGXCPU);
+  KJ_EXPECT(readU32(list, 4) == 1);
+
+  // The old memory stays allocated until filter() removes the replaced entry: a signal handler
+  // may still be writing through it.
+  KJ_EXPECT(!oldDestroyed);
+  list.filter([&](TrackedWasmInstance& entry) { return entry.memory.begin() == newBegin; });
+  KJ_EXPECT(oldDestroyed);
+  KJ_EXPECT(!newDestroyed);
+  KJ_EXPECT(countEntries(list) == 1);
+}
+
+KJ_TEST("refreshWith leaves entries alone when no new memory is offered") {
+  SignalSafeList<TrackedWasmInstance> list;
+  bool destroyed = false;
+  pushSignal(list, destroyed, static_cast<uint32_t>(0), static_cast<uint32_t>(4));
+
+  TrackedWasmInstanceList::refreshWith(
+      list, [](TrackedWasmInstance&) -> kj::Maybe<kj::Array<kj::byte>> { return kj::none; });
+
+  KJ_EXPECT(countEntries(list) == 1);
+  KJ_EXPECT(!destroyed);
+  writeShutdownSignals(list);
+  KJ_EXPECT(readU32(list, 0) == WASM_SIGNAL_SIGXCPU);
+}
+
+KJ_TEST("refreshWith keeps an entry whose offsets do not fit the offered memory") {
+  SignalSafeList<TrackedWasmInstance> list;
+  bool destroyed = false;
+  pushSignal(list, destroyed, static_cast<uint32_t>(0), static_cast<uint32_t>(60));
+
+  bool newDestroyed = false;
+  kj::byte* newBegin = nullptr;
+  auto newMemory = makeMemory(newDestroyed, 32, newBegin);
+
+  TrackedWasmInstanceList::refreshWith(list,
+      [&](TrackedWasmInstance&) -> kj::Maybe<kj::Array<kj::byte>> { return kj::mv(newMemory); });
+
+  // Not replaced: the terminated field would lie past the end of the offered memory.
+  KJ_EXPECT(countEntries(list) == 1);
+  list.iterate([&](TrackedWasmInstance& entry) { KJ_EXPECT(entry.memory.begin() != newBegin); });
+  KJ_EXPECT(!destroyed);
+  writeTerminatedFlags(list);
+  KJ_EXPECT(readU32(list, 60) == 1);
+}
+
+KJ_TEST("refreshWith replaces only the entries that moved in a mixed list") {
+  SignalSafeList<TrackedWasmInstance> list;
+  bool destroyed[3] = {};
+  pushSignal(list, destroyed[0], static_cast<uint32_t>(0), kj::none);
+  pushSignal(list, destroyed[1], static_cast<uint32_t>(0), kj::none);
+  pushSignal(list, destroyed[2], static_cast<uint32_t>(0), kj::none);
+
+  // Remember the original entries in list order (most recently pushed first).
+  kj::Vector<kj::byte*> original;
+  list.iterate([&](TrackedWasmInstance& entry) { original.add(entry.memory.begin()); });
+  KJ_EXPECT(original.size() == 3);
+
+  // Only the middle one moved.
+  bool newDestroyed = false;
+  kj::byte* newBegin = nullptr;
+  auto newMemory = makeMemory(newDestroyed, 64, newBegin);
+
+  size_t calls = 0;
+  TrackedWasmInstanceList::refreshWith(
+      list, [&](TrackedWasmInstance& entry) -> kj::Maybe<kj::Array<kj::byte>> {
+    ++calls;
+    if (entry.memory.begin() == original[1]) return kj::mv(newMemory);
+    return kj::none;
+  });
+
+  KJ_EXPECT(calls == 3);
+  KJ_EXPECT(countEntries(list) == 4);
+
+  // The replacement is at the front; the originals follow in their old order.
+  kj::Vector<kj::byte*> after;
+  list.iterate([&](TrackedWasmInstance& entry) { after.add(entry.memory.begin()); });
+  KJ_EXPECT(after.size() == 4);
+  KJ_EXPECT(after[0] == newBegin);
+  KJ_EXPECT(after[1] == original[0]);
+  KJ_EXPECT(after[2] == original[1]);
+  KJ_EXPECT(after[3] == original[2]);
+
+  // Every entry, old and new, gets the signal.
+  writeShutdownSignals(list);
+  list.iterate([&](TrackedWasmInstance& entry) {
+    uint32_t value = 0;
+    memcpy(&value, entry.memory.begin(), sizeof(value));
+    KJ_EXPECT(value == WASM_SIGNAL_SIGXCPU);
+  });
 }
 
 // ---------------------------------------------------------------------------
