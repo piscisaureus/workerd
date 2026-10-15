@@ -370,12 +370,12 @@ class Worker::Isolate: public kj::AtomicRefcounted {
   kj::Maybe<kj::Function<void(void)>> getCpuLimitNearlyExceededCallback() const;
 
   // Registers a WASM module's linear memory and offsets for receiving the "shut down" signal.
-  // At least one of signalOffset or terminatedOffset must be provided. The instance handle is
-  // used to create a weak reference for GC-based cleanup. See
-  // TrackedWasmInstanceList::registerSignal().
+  // At least one of signalOffset or terminatedOffset must be provided. The instance and memory
+  // handles become weak references, used for GC-based cleanup and for following the linear
+  // memory when a grow moves it. See TrackedWasmInstanceList::registerSignal() and refresh().
   void registerTrackedWasmInstance(jsg::Lock& js,
       v8::Local<v8::Object> instance,
-      kj::Array<kj::byte> memory,
+      v8::Local<v8::WasmMemoryObject> memory,
       kj::Maybe<uint32_t> signalOffset,
       kj::Maybe<uint32_t> terminatedOffset) const;
 

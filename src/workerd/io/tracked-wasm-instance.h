@@ -9,6 +9,7 @@
 
 #include <kj/array.h>
 #include <kj/common.h>
+#include <kj/function.h>
 
 #include <cstdint>
 
@@ -41,12 +42,17 @@ struct TrackedWasmInstance {
   // while we still need to read/write signal addresses. This gets cleaned up in a V8 GC prologue
   // hook where we atomically remove the entry from the signal list before releasing the memory.
   //
-  // TODO: If a user were to grow a 64 bit linear memory >16GB, relocation will happen and this
-  // array will point to stale (but not free'd) memory. The impact is that the user will see a
-  // spike in memory usage and no longer receive the signal in that module instance. In practice this
-  // should almost never happen since they would hit a memory limit well before 16GB,
-  // and 64 bit WASM is currently used very infrequently anyways. Regardless, we should address this
-  // soon.
+  // A grow can move linear memory to a new allocation: V8 reserves address space for the
+  // declared (or engine) maximum up front, less under address space pressure, and copies the
+  // memory elsewhere when it grows past that reservation. The old allocation stays alive through
+  // this reference, so writes through it remain in bounds, but they land in a copy the module no
+  // longer reads. TrackedWasmInstanceList::refresh() replaces such entries.
+  //
+  // refresh() runs in the GC prologue, so an instance that grows its memory and then burns CPU
+  // with no GC in between still has the signal written to the old copy. There is nowhere better
+  // to put it: the grow a module does itself is a WASM instruction that never enters JS, so
+  // shimming WebAssembly.Memory.prototype.grow would miss it, and the signal handler cannot ask
+  // V8 for the current memory, which is why the reference is cached in the first place.
   kj::Array<kj::byte> memory;
 
   // Offset into `memory` of the uint32 the runtime writes SIGXCPU (24) to (__instance_signal).
@@ -67,6 +73,11 @@ struct TrackedWasmInstance {
   // `signalByteOffset`. The Global's destructor is safe to call during filter() (under isolate
   // lock) or clear() (during isolate teardown with V8 still alive).
   v8::Global<v8::Object> instanceRef;
+
+  // Weak handle to the WebAssembly.Memory that `memory` aliases, through which refresh() finds
+  // the linear memory again after a grow has moved it. Like instanceRef, it is set at
+  // registration time and never accessed from signal handlers.
+  v8::Global<v8::WasmMemoryObject> memoryRef;
 
   // Returns true if the entry should be kept in the list, false if it should be removed.
   // An entry is removed when V8 garbage-collects the WASM instance, which resets the weak
@@ -195,6 +206,18 @@ class TrackedWasmInstanceList {
   // Filters out entries where the instance has been garbage-collected (instanceRef is empty).
   // Call from a GC prologue hook to allow linear memory to be reclaimed.
   void filter(jsg::Lock&) const;
+
+  // Replaces every entry whose linear memory has moved since it was registered with one that
+  // aliases the memory its instance uses now. A replaced entry gives up its handles, so the next
+  // filter() removes it and releases the old allocation. Call from a GC prologue hook, before
+  // filter().
+  void refresh(jsg::Lock&) const;
+
+  // The part of refresh() that does not need V8, so that it can be exercised without an isolate.
+  // `currentMemory(entry)` returns the memory `entry` should alias from now on, or kj::none to
+  // leave the entry as it is. Requires the isolate lock, like every other mutation of the list.
+  using CurrentMemory = kj::FunctionParam<kj::Maybe<kj::Array<kj::byte>>(TrackedWasmInstance&)>;
+  static void refreshWith(SignalSafeList<TrackedWasmInstance>& list, CurrentMemory currentMemory);
 
   // Removes all entries unconditionally. Call before the V8 isolate is disposed, since each
   // entry holds a shared_ptr<v8::BackingStore> (via the memory array) and a v8::Global whose
