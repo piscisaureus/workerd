@@ -218,12 +218,15 @@ then calls virtuals through a vtable pointer read from memory the guest chose.
 This is on the normal path: every lock teardown restores the word.
 
 Fixing `previousData` alone is not enough, and this is the clearest
-illustration of the provenance rule. The V8 data slots live in the isolate's
-own memory, which is I, so `GetData(SET_DATA_LOCK)` reads a pointer out of
-guest-writable memory however it got there. `Lock::from` cannot be made safe
-by validation at the call site; host-side code must obtain a `Lock&` from an H
-source instead, which means `jsg::Lock` has to be reachable from H memory and
-`Lock::from` has to go.
+illustration of the provenance rule. The slot `GetData(SET_DATA_LOCK)` reads
+is in `IsolateData`, a member of the C++ isolate object, which is not in the
+isolate's arena at all: it is in the shared runtime heap, and gk maps that
+writable into every arena. So the pointer comes out of memory *any* isolate's
+turn can write, not just the owning one -- one isolate can aim another
+isolate's next `Lock::from` at an object of its choosing. `Lock::from` cannot
+be made safe by validating at the call site; host-side code has to obtain a
+`Lock&` from an H source instead, which means `jsg::Lock` must be reachable
+from H memory and `Lock::from` has to go.
 
 **2. A signal handler writes through a guest-supplied buffer descriptor.**
 `TrackedWasmInstance` (`io/tracked-wasm-instance.h:38`) holds a
