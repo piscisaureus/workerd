@@ -164,34 +164,41 @@ GuestArenaScope::~GuestArenaScope() noexcept(false) {
 #endif
 }
 
-Lock::Lock(v8::Isolate* v8Isolate)
-    : v8Isolate(v8Isolate),
-      locker(v8Isolate),
-      isolateScope(v8Isolate),
-      guestArenaScope(v8Isolate),
-      previousData(v8Isolate->GetData(SET_DATA_LOCK)),
-      warningsLogged(IsolateBase::from(v8Isolate).areWarningsLogged()) {
-  if (previousData != nullptr) {
-    // Hmm, there's already a current lock. It must be a recursive lock (i.e. a second lock taken
-    // on the same isolate in the same thread), otherwise `locker`'s constructor would have blocked
-    // waiting for the other thread to release the lock. We don't want to support this, but
-    // historically we have.
+namespace {
+
+// A Lock on an isolate this thread already holds locked would be a recursive isolate lock, which
+// is not supported: the lock slot (SET_DATA_LOCK) names one Lock, and releasing the inner one
+// would leave the outer one unnamed. Whether this thread holds the isolate's lock is V8's thread
+// manager's to say, so the check runs before `locker` is constructed and does not consult the
+// lock slot, which is memory a guest turn can write (see Lock::from).
+v8::Isolate* requireNotLockedByThisThread(v8::Isolate* isolate) {
+  if (v8::Locker::IsLocked(isolate)) {
 #ifdef KJ_DEBUG
     // In debug mode, abort immediately. This makes it a little easier to debug than if we threw
     // an exception.
     ([]() noexcept { KJ_FAIL_REQUIRE("attempt to take recursive isolate lock"); })();
 #else
-    // In release mode, log the error.
-    // TODO(soon): This shouldn't happen but we know it does in at least one case. Once things
-    // are cleaned up and we know this no longer happens in production, change this to throw.
-    // Then we can stop storing `previousData`.
-    KJ_LOG(ERROR, "took recursive isolate lock", kj::getStackTrace());
+    KJ_FAIL_REQUIRE("attempt to take recursive isolate lock");
 #endif
   }
+  return isolate;
+}
+
+}  // namespace
+
+Lock::Lock(v8::Isolate* v8Isolate)
+    : v8Isolate(requireNotLockedByThisThread(v8Isolate)),
+      locker(v8Isolate),
+      isolateScope(v8Isolate),
+      guestArenaScope(v8Isolate),
+      warningsLogged(IsolateBase::from(v8Isolate).areWarningsLogged()) {
   v8Isolate->SetData(SET_DATA_LOCK, this);
 }
 Lock::~Lock() noexcept(false) {
-  v8Isolate->SetData(SET_DATA_LOCK, previousData);
+  // The slot is cleared rather than restored: with no recursive locks there is nothing to put
+  // back, and a value kept for that in this object would be a pointer the host writes into the
+  // slot from heap memory a guest turn can write.
+  v8Isolate->SetData(SET_DATA_LOCK, nullptr);
 }
 
 #ifdef WORKERD_ASAN

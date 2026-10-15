@@ -36,6 +36,11 @@ namespace workerd {
 // here (see thread-scopes.c++ for the watchdog progress counter, which uses the guest kernel's
 // per-thread supervisor words, and the turn directory in gk.h for SQLite's VFS root).
 //
+// The isolate's jsg data slots -- the V8 embedder slots behind jsg::Lock::from and its siblings,
+// in the C++ isolate object in the shared heap rather than in thread-local storage -- get the
+// same treatment from jsg itself, in the frame that enters the guest (runTrampolineInGuest in
+// jsg/guest-run.c++), since the lock slot is jsg's to keep.
+//
 // IoContext::current() itself is unchanged and adds nothing: this save/restore runs once per
 // turn, not on that path.
 class GuestTurnThreadLocals {

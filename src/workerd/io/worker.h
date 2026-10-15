@@ -839,6 +839,11 @@ class Worker::Lock {
   // after the lock comes from this stack object and not from the heap.
   void* savedApiStorageForTest();
 
+  // Test-only (same hook): runs `probe` once, host-side, with the next Worker::Lock to be
+  // released on this process -- after its JS turn, while the isolate is still locked -- so a
+  // request can observe what host code holding the lock sees once the guest has returned.
+  static void runAtNextReleaseForTest(kj::Function<void(Lock&)> probe);
+
  private:
   explicit Lock(const Worker& worker, LockType lockType, jsg::V8StackScope&);
   struct Impl;

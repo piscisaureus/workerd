@@ -2529,7 +2529,16 @@ Worker::Lock::Lock(const Worker& constWorker, LockType lockType, jsg::V8StackSco
   kj::requireOnStack(this, "Worker::Lock MUST be allocated on the stack.");
 }
 
+// Test-only (see Worker::Lock::runAtNextReleaseForTest): the probe the next released lock runs.
+static kj::Function<void(Worker::Lock&)>* lockReleaseProbeForTest = nullptr;
+
 Worker::Lock::~Lock() noexcept(false) {
+  if (lockReleaseProbeForTest != nullptr) {
+    auto probe = kj::mv(*lockReleaseProbeForTest);
+    delete lockReleaseProbeForTest;
+    lockReleaseProbeForTest = nullptr;
+    probe(*this);
+  }
   // const_cast OK because we hold -- nay, we *are* -- a lock on the script.
   auto& isolate = const_cast<Isolate&>(worker.getIsolate());
   if (impl->recordedLock.checkInWithLimitEnforcer(isolate)) {
@@ -2545,6 +2554,11 @@ Worker::Lock::~Lock() noexcept(false) {
 
 void* Worker::Lock::savedApiStorageForTest() {
   return &impl->recordedLock.oldCurrentApi;
+}
+
+void Worker::Lock::runAtNextReleaseForTest(kj::Function<void(Lock&)> probe) {
+  KJ_REQUIRE(lockReleaseProbeForTest == nullptr);
+  lockReleaseProbeForTest = new kj::Function<void(Lock&)>(kj::mv(probe));
 }
 
 void Worker::Lock::requireNoPermanentException() {

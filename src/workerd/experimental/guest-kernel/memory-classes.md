@@ -262,7 +262,7 @@ The splits, with the half each member goes to:
 | `IoContext::Runnable`/`RunnableImpl` (`:1272`, `:1450`) | Becomes a B message `{closure handle, input descriptors, result slot}`. This is where the non-void result problem lives |
 | `IoOwn`/`IoPtr`/`ReverseIoOwn` (`io-own.h:245`, `:290`, `:322`) | I side becomes `{context slot, object index}`; `operator->` is deleted for an H `T`, so every use becomes a message keyed by the handle. H keeps `OwnedObjectList`, split by `T`: it owns H objects outright and holds an arena handle for I ones (the functors from `addFunctor`, the `SpanBuilder` tuple at `:629`) |
 | `DeleteQueue` (`io-own.h:89`) | `State::queue`/`actions` become a B ring of `{release handle}` and `{closure handle}` records, so `~IoOwn` stops taking a host mutex from inside the arena during GC (`io-own.c++:15`). The cross-thread wakeup stays H |
-| `jsg::Lock` (`jsg.h:2746`) | H: the `v8::Locker`, `GuestArenaScope`, and the data-slot save/restore. I: `v8Isolate`, `isolateScope`, `warningsLogged` and the wrap/alloc methods. See violation 1 -- this one is not optional |
+| `jsg::Lock` (`jsg.h:2746`) | H: the `v8::Locker` and `GuestArenaScope`. I: `v8Isolate`, `isolateScope`, `warningsLogged` and the wrap/alloc methods. The lock slot `Lock::from` reads is neither: it is written by the host and put back from the host frame that entered the guest (violation 1, closed). The object itself is still one heap allocation holding both halves (`server/workerd-api.c++:305`), reached from the stack `Worker::Lock` through its heap `Impl` |
 | `jsg::IsolateBase` (`setup.h:244`) | I: `ptr`, the behaviour flags, `typeHandlerRegistry`, the V8 global templates, `heapTracer`. H: `v8System`, `observer`, the external-memory target. B: the deferred-destruction queue becomes a ring of `{kind, handle}` records rather than `kj::OneOf<GlobalToDelete, RefToDelete, kj::Own<void>>` (`setup.h:584`), and `codeMap` (`:739`) becomes a B array of `{start, size, name offset}` the host signal handler bounds-checks |
 | `Worker` / `Script` / `Isolate` / `Actor` (`worker.h:104`, `:246`, `:333`, `:887`) | Each splits along `X` versus `X::Impl`: the `Impl`s are I (contexts, `env`, `ctxExports`, `namedHandlers` of `jsg::Function`, `classInstance`, `transient`), the outer objects keep scheduling, metrics, limits, the inspector transport, condemnation, the actor cache and the gates |
 | `Worker::Lock` (`worker.h:732`) | The object is on the host stack but `impl` is heap (`worker.c++:2508`) and `~Lock` calls `checkInWithLimitEnforcer` through it (`:2512`). H keeps the lock record and the limit check-in; in-turn users move to the I mirror |
@@ -277,27 +277,76 @@ The splits, with the half each member goes to:
 | `AsyncContextFrame::StorageKey` (`jsg/async-context.h:73`) | Identity is `this` (`:101`) and H holds it for identity only (`worker.h:605`, `setup.h:669`); replace with a 64-bit key the host mints |
 | `V8PlatformWrapper::JobTaskWrapper` (`jsg/v8-platform-wrapper.h:86`) | H, but it needs a per-job `gk_arena_enter`, and the job must carry the arena id -- which V8's `JobTask` does not currently expose |
 
-### Two violations that are full escapes, the second closed
+### Two violations that were full escapes, both closed
 
-**1. The host installs a guest-chosen pointer as the isolate's `jsg::Lock`.**
-`jsg::Lock` is heap-allocated (`server/workerd-api.c++:305`), so its
-`previousData` member (`jsg.h:3365`) is guest-writable. `Lock::~Lock()` does
-`v8Isolate->SetData(SET_DATA_LOCK, previousData)` (`jsg.c++:193`), and
-`Lock::from()` does `*reinterpret_cast<Lock*>(v8Isolate->GetData(...))`
-(`jsg.h:2789`) with no validation. `jsg::Lock` is polymorphic, so the host
-then calls virtuals through a vtable pointer read from memory the guest chose.
-This is on the normal path: every lock teardown restores the word.
+**1. The isolate's lock slot, closed.** `Lock::from()` does
+`*reinterpret_cast<Lock*>(v8Isolate->GetData(SET_DATA_LOCK))` (`jsg.h`) with
+no validation, and `jsg::Lock` is polymorphic, so whoever calls it then calls
+virtuals through a vtable pointer read from the slot. The slot is in
+`IsolateData`, a member of the C++ isolate object, which is not in the
+isolate's arena at all: it is in the shared runtime heap, which gk maps
+writable into every arena, so the value comes out of memory *any* isolate's
+turn can write, not just the owning one. What made this an escape was host
+code acting on it: host code holding the lock after a turn calls `Lock::from`
+(V8 callbacks, GC callbacks, the lock's own teardown) and `jsg::Lock` is
+heap-allocated (`server/workerd-api.c++:305`), so a destructor that restored
+the slot from a member of that object wrote a pointer the turn chose into the
+slot, and a constructor that decided from the slot whether the lock was
+recursive could be made to refuse (release) or abort (debug) the next lock
+on the isolate.
 
-Fixing `previousData` alone is not enough, and this is the clearest
-illustration of the provenance rule. The slot `GetData(SET_DATA_LOCK)` reads
-is in `IsolateData`, a member of the C++ isolate object, which is not in the
-isolate's arena at all: it is in the shared runtime heap, and gk maps that
-writable into every arena. So the pointer comes out of memory *any* isolate's
-turn can write, not just the owning one -- one isolate can aim another
-isolate's next `Lock::from` at an object of its choosing. `Lock::from` cannot
-be made safe by validating at the call site; host-side code has to obtain a
-`Lock&` from an H source instead, which means `jsg::Lock` must be reachable
-from H memory and `Lock::from` has to go.
+What closes it is that the host never reads the slot to decide anything, so
+the value in it when host code calls `Lock::from` was put there by the host:
+
+- The frame that enters the guest (`runTrampolineInGuest`,
+  `jsg/guest-run.c++`) saves the isolate's jsg data slots -- the lock, the
+  `IsolateBase`, the type wrapper, the `Worker::Isolate`, the cage base and
+  the Rust realm -- on the host stack before `gk_run_here_user` and puts them
+  back when it returns, whatever the turn left in them, on the fault path
+  too. This is the same remedy as `GuestTurnThreadLocals` (R7): the frame is
+  read-only to the turn under the host-frame wall. The value restored is the
+  one the host read before the turn, which is the `jsg::Lock` the host frames
+  hold.
+- `Lock::~Lock()` clears the slot. There is no `previousData`: a recursive
+  lock on the same isolate and thread is refused instead, in release as well
+  as debug, and whether a lock is recursive is decided from
+  `v8::Locker::IsLocked` -- V8's thread manager -- not from the slot.
+- `Lock::Lock()` writes the slot and reads nothing from it.
+
+`lock-slot-test.sh` shows a turn overwriting its own isolate's slot, and
+another isolate's turn overwriting it, with host code holding the lock after
+each turn getting its own lock from `Lock::from`, the slot clear once each
+lock is released, and no lock refused as recursive.
+
+What remains, stated precisely. *In-turn*, `Lock::from` still reads the slot,
+so a turn with a write primitive makes its own in-turn callers of `Lock::from`
+call through a vtable at an address it chose. That call happens at the turn's
+guest ring 3, in the turn's own arena: it can only reach code already mapped
+executable there -- the runtime image, which gk maps executable and not
+writable (`map4k_root` in `gk.c`), and the isolate's own JIT pages -- and
+it runs with the reach ring 3 already has (the shared heap, this thread's
+stack below the wall, other threads' stacks, the allowlisted syscalls), not
+with host privilege; every heap vtable and `kj::Own` disposer the turn calls
+through offers the same, so this is no more than an escape with a write
+primitive has anyway. *Cross-isolate*, the slot is one shared-heap word among
+all the others: isolate A's turn can write isolate B's slot at any moment,
+including while B's turn runs on another thread, or after B's host frame has
+restored it and before B's host code calls `Lock::from` -- the host-frame
+wall holds only against the thread's own turn (gk.h). The host-frame restore
+therefore closes the sequential case, where the write precedes B's restore,
+and leaves the concurrent one, which is the shared-heap limitation itself (A
+can rewrite any heap object B's turn or B's host code uses) and is closed by
+moving the shared heap out of ring 3's reach, not by anything specific to
+this slot. `Lock::from` does not have to go for that: it reads a word the
+host wrote, and what has to change is who can write the word.
+
+The lock object itself stays on the heap. Putting it on the stack means the
+callback-style locking noted at `worker.h:635`, and buys the same-thread
+case only -- the host-side chain from the stack `Worker::Lock` to the
+`jsg::Lock` runs through the heap `Worker::Lock::Impl` (its `inner` reference
+and the `kj::Own<jsg::Lock>` whose disposer the host calls through at
+release), which is the general `kj::Own`-across-the-boundary problem of the
+KJ types inventory below, not something this slot's fix changes.
 
 **2. The Wasm signal descriptor, closed.** `TrackedWasmInstanceList::writeShutdownSignal`
 (`io/tracked-wasm-instance.c++`) runs in a signal handler, deliberately
@@ -661,11 +710,13 @@ what is waiting on the same facility:
   field write is. The thread-locals the host reads only after a turn
   (`threadLocalRequest`, `currentApi`, the SQLite and VFS scopes) need no
   supervisor memory: they are saved on the host turn frame and restored when
-  the guest returns (`GuestTurnThreadLocals`, violation 3).
-- **Waiting, same remedy:** the remaining provenance violations above, each
-  of which needs the host to read a pointer or a descriptor from memory the
-  guest cannot write -- the `jsg::Lock` data slot (violation 1). It is a
-  `HostSlot` plus a crossing for the in-turn reader.
+  the guest returns (`GuestTurnThreadLocals`, violation 3), and so are the
+  isolate's jsg data slots, the lock slot among them (violation 1), by the
+  frame that enters the guest. What that leaves for the lock slot is the
+  write from another thread, which no host-frame save catches and which H
+  memory would: a slot in H memory, keyed by isolate and read by an in-turn
+  `Lock::from` through a crossing, is the shape of that further step, and it
+  is the shared-heap limitation in general rather than this slot's own.
 - **Not addressed by H memory alone:** the pointer to an H object is as safe
   as the memory it sits in. A `HostOwn` in a shared-heap object protects the
   object's bytes and lets the guest kernel refuse a swapped pointer at free

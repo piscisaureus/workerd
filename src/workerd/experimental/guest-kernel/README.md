@@ -56,6 +56,14 @@ isolate's JS turn at guest ring 3.
   slot the isolate lock restores `Worker::Api`'s thread-local from, and the
   host still leaves the thread-local holding the value it had before the lock,
   taken from a host stack frame and not the overwritten slot.
+- `lock-slot-test.sh` / `lock-slot-test.capnp` — end-to-end check against a
+  built workerd that the isolate's lock slot, the V8 data slot `jsg::Lock::from`
+  reads, which is in the C++ isolate object in the shared heap and so writable
+  from any isolate's turn, does not hand the host a lock of a turn's choosing:
+  a turn overwrites its own isolate's slot from inside itself, and another
+  isolate's turn overwrites it from inside its own, and in both cases host code
+  holding the lock after the turn gets its own lock from `jsg::Lock::from`, the
+  slot is clear once the lock is released, and no lock is refused as recursive.
 - `disk-sqlite-test.sh` / `disk-sqlite-test.capnp` / `disk-sqlite-test.js` —
   end-to-end check against a built workerd that a SQLite-backed Durable Object
   stored on local disk works with its JS turns at guest ring 3, where SQLite's
@@ -597,9 +605,13 @@ rare enough to pay for an exit each time.
   validates against its own table rather than through a pointer the host
   loads from the heap, a hostcall's handler is selected by an index gk
   checks against its table and sees a host-memory copy of the arguments,
-  never the guest's memory, and the Wasm signal handler writes through a
+  never the guest's memory, the Wasm signal handler writes through a
   descriptor gk validated against the thread's arena and keeps in its own
-  table. What validation cannot settle is ownership: a pointer
+  table, and the isolate's jsg data slots -- among them the lock slot
+  `jsg::Lock::from` reads, which is in the C++ isolate object in the shared
+  heap and so writable from any isolate's turn -- are put back from the host
+  frame that entered the guest once the turn returns, with the lock's
+  constructor and destructor writing the slot and never reading it. What validation cannot settle is ownership: a pointer
   swapped for another live arena's, or a handle swapped for another live
   slot's, is indistinguishable from a legitimate call, so a turn can still
   name a different isolate's arena and cost that isolate its memory, or name

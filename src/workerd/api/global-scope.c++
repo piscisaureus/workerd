@@ -29,6 +29,7 @@
 #include <workerd/io/io-context.h>
 #include <workerd/io/tracer.h>
 #include <workerd/jsg/async-context.h>
+#include <workerd/jsg/guest-run.h>
 #include <workerd/jsg/ser.h>
 #include <workerd/jsg/setup.h>
 #include <workerd/jsg/util.h>
@@ -453,6 +454,21 @@ void checkWasmDescriptorsForTest(kj::StringPtr url) {
 // ~Worker::Lock and GuestTurnThreadLocals in io/), so an event-loop callback observes Worker::Api
 // not holding the sentinel. This is how tls-test.sh shows the guest-writable thread-locals the
 // host reads after a turn do not carry a turn's value past it.
+//
+// With the same variable set, four request paths exercise the isolate's lock slot, the V8 data
+// slot jsg::Lock::from reads, which is in the C++ isolate object in the shared heap and so
+// writable from any isolate's turn (lock-slot-test.sh). /__gk_lock_slot overwrites this isolate's
+// own slot from inside the turn with a sentinel (0x1), as the turn's last act in the guest
+// (jsg::setGuestTurnTailHookForTest), and arranges for the host to report, once
+// the turn is over but while it still holds the lock (Worker::Lock::runAtNextReleaseForTest),
+// what jsg::Lock::from returns against the lock it holds, and for an event-loop callback to
+// report the slot once the lock is gone. /__gk_lock_announce records this isolate for another
+// worker's turn; /__gk_lock_poison_other, on that other worker, overwrites the announced
+// isolate's slot from inside its own turn and has an event-loop callback report the slot, to
+// show the write landed; /__gk_lock_check on the announced worker then reports the same two
+// things as /__gk_lock_slot without writing anything. The host must find its own lock in the
+// slot in every case and must not act on the sentinel, including by refusing the lock as
+// recursive.
 void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   static const bool faultEnabled =
       jsg::isGuestKernelEnabled() && getenv("WORKERD_GK_TEST_FAULT") != nullptr;
@@ -537,6 +553,62 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
           cur == reinterpret_cast<const Worker::Api*>(0x1) ? "leaked"_kj : "restored"_kj;
       KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: Worker::Api after the turn",
           kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(cur))), verdict);
+    }));
+  }
+  // The isolate's lock slot (see the comment above and jsg::Lock::from).
+  static v8::Isolate* announcedIsolate = nullptr;
+  auto addr = [](const void* p) { return kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(p))); };
+  static void* const LOCK_SENTINEL = reinterpret_cast<void*>(0x1);
+  if (probeEnabled && url.endsWith("/__gk_lock_announce")) {
+    jsg::Lock& js = lock;
+    announcedIsolate = js.v8Isolate;
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: announced this isolate for another worker's turn", url,
+        addr(js.v8Isolate), addr(js.v8Isolate->GetData(jsg::SET_DATA_LOCK)));
+  }
+  if (probeEnabled && url.endsWith("/__gk_lock_poison_other")) {
+    jsg::Lock& js = lock;
+    v8::Isolate* other = announcedIsolate;
+    KJ_REQUIRE(other != nullptr, "no isolate announced");
+    KJ_REQUIRE(other != js.v8Isolate, "the announced isolate is this one");
+    void* was = other->GetData(jsg::SET_DATA_LOCK);
+    other->SetData(jsg::SET_DATA_LOCK, LOCK_SENTINEL);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: overwrote another isolate's lock slot from inside the JS turn", url,
+        addr(other), addr(was), addr(LOCK_SENTINEL));
+    IoContext::current().addTask(kj::evalLater([other, addr]() {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the other isolate's lock slot on the event loop",
+          addr(other), addr(other->GetData(jsg::SET_DATA_LOCK)));
+    }));
+  }
+  if (probeEnabled && (url.endsWith("/__gk_lock_slot") || url.endsWith("/__gk_lock_check"))) {
+    jsg::Lock& js = lock;
+    if (url.endsWith("/__gk_lock_slot")) {
+      // As the turn's last act, in the guest: the rest of this turn calls jsg::Lock::from itself,
+      // at ring 3, and a sentinel there would fault the turn before the host got to read it.
+      v8::Isolate* isolate = js.v8Isolate;
+      jsg::Lock* held = &js;
+      jsg::setGuestTurnTailHookForTest([isolate, held, addr, url = kj::str(url)]() {
+        isolate->SetData(jsg::SET_DATA_LOCK, LOCK_SENTINEL);
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: overwrote this isolate's lock slot from inside the JS turn",
+            url, addr(isolate), addr(held), addr(LOCK_SENTINEL));
+      });
+    }
+    Worker::Lock::runAtNextReleaseForTest([addr](Worker::Lock& released) {
+      // Host-side, after the turn, with the isolate still locked: what jsg::Lock::from hands host
+      // code now, against the lock this frame holds.
+      jsg::Lock& held = released;
+      jsg::Lock* from = &jsg::Lock::from(held.v8Isolate);
+      kj::StringPtr verdict = from == &held ? "restored"_kj
+          : from == LOCK_SENTINEL           ? "leaked"_kj
+                                            : "other"_kj;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: jsg::Lock::from on the host after the turn",
+          addr(from), addr(&held), verdict);
+    });
+    v8::Isolate* isolate = js.v8Isolate;
+    IoContext::current().addTask(kj::evalLater([isolate, addr]() {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the lock slot on the event loop after the lock",
+          addr(isolate), addr(isolate->GetData(jsg::SET_DATA_LOCK)));
     }));
   }
   if (probeEnabled && url.endsWith("/__gk_vfs_rewrite")) {

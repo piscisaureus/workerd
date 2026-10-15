@@ -81,7 +81,28 @@ void runTrampolineInGuest(
   KJ_DEFER(guestTurnArena = nullptr);
   GuestTurnExceptionCallback exceptionCallback;
 
+  // The isolate's jsg data slots (SetDataIndex in jsg.h): the current jsg::Lock, which Lock::from
+  // returns, the IsolateBase, the type wrapper, the Worker::Isolate, the cage base and the Rust
+  // realm. They are embedder slots in the C++ isolate object, in the shared runtime heap, so a
+  // turn can write them, while host code holding the lock reads them after the turn through
+  // Lock::from and its siblings and calls through what it finds. So they are saved here, in this
+  // host frame (read-only to the turn under the host-frame wall), and put back once the guest has
+  // returned, whatever the turn left in them -- the same remedy the host-side thread-locals get
+  // (GuestTurnThreadLocals in io/). A nested turn (above) is at ring 3 and does not do this; the
+  // outermost turn's restore runs last. This holds against this thread's turn; a turn on another
+  // thread can write the slots at any time, including after this restore, as it can any shared
+  // heap memory (see gk.h).
+  v8::Isolate* isolate = js.v8Isolate;
+  void* dataSlots[SET_DATA_SLOTS_IN_USE];
+  for (uint i = 0; i < SET_DATA_SLOTS_IN_USE; i++) {
+    dataSlots[i] = isolate->GetData(i);
+  }
+
   long result = gk_run_here_user(fn, arg);
+
+  for (uint i = 0; i < SET_DATA_SLOTS_IN_USE; i++) {
+    isolate->SetData(i, dataSlots[i]);
+  }
   if (result != 0) {
     // The guest faulted (or gk otherwise could not complete the turn) and control is back here
     // without the turn's frames ever returning. gk_run_here_user() is an ordinary host-side call
@@ -127,3 +148,28 @@ void throwIfGuestTurnFailed(const GuestTurnOutcome& outcome) {
 
 }  // namespace workerd::jsg::_
 #endif  // WORKERD_HAS_GUEST_KERNEL
+
+namespace workerd::jsg {
+namespace {
+
+// Test-only (see setGuestTurnTailHookForTest). The hook object is on the heap: it is set from
+// inside a turn and runs inside the next turn, and nothing host-side reads it.
+kj::Function<void()>* guestTurnTailHookForTest = nullptr;
+
+}  // namespace
+
+void setGuestTurnTailHookForTest(kj::Function<void()> hook) {
+  KJ_REQUIRE(guestTurnTailHookForTest == nullptr);
+  guestTurnTailHookForTest = new kj::Function<void()>(kj::mv(hook));
+}
+
+void _::runGuestTurnTailHookForTest() {
+  if (guestTurnTailHookForTest != nullptr) {
+    auto hook = kj::mv(*guestTurnTailHookForTest);
+    delete guestTurnTailHookForTest;
+    guestTurnTailHookForTest = nullptr;
+    hook();
+  }
+}
+
+}  // namespace workerd::jsg

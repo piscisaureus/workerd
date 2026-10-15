@@ -77,6 +77,20 @@ auto runInGuest(Lock& js,
     Func&& body,
     kj::FunctionParam<void(const kj::Exception&)> onFault) -> decltype(body());
 
+// Test-only (see maybeForceGuestFaultForTest in api/global-scope.c++): `hook` runs once, inside
+// the guest, as the next turn's last act -- after `body` has returned and its outcome has been
+// recorded, before control returns to the host -- so a test can leave something in memory the
+// host reads after the turn with nothing of the turn's own left to read it first. Without the
+// guest kernel nothing runs it.
+void setGuestTurnTailHookForTest(kj::Function<void()> hook);
+
+namespace _ {  // private
+
+// Runs, and clears, the hook set by setGuestTurnTailHookForTest, if any. In-guest.
+void runGuestTurnTailHookForTest();
+
+}  // namespace _
+
 #ifdef WORKERD_HAS_GUEST_KERNEL
 namespace _ {  // private
 
@@ -145,6 +159,7 @@ struct GuestTurn: public GuestTurnOutcome {
     } catch (...) {
       turn.setException(kj::getCaughtExceptionAsKj());
     }
+    runGuestTurnTailHookForTest();
     return 0;
   }
 };

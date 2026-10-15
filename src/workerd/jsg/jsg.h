@@ -2786,6 +2786,15 @@ class Lock {
   //
   // This method is intended to be used in callbacks from V8 that pass an isolate pointer but
   // don't provide any further context. Most code should rely on the caller passing in a `Lock&`.
+  //
+  // The slot this reads (SET_DATA_LOCK) is in the C++ isolate object, which is in the shared
+  // runtime heap: with the experimental guest kernel on, that is memory every isolate's JS turn
+  // can write at guest ring 3, so during a turn the slot holds whatever a turn last put there,
+  // and a call from inside a turn runs at that turn's privilege whatever it finds. Host code
+  // calling this after a turn, with the isolate still locked, sees the value the host put back
+  // from its own stack frame when the guest returned (see runTrampolineInGuest in guest-run.c++),
+  // not what the turn left; the Lock constructor writes the slot and the destructor clears it,
+  // and neither reads it.
   static Lock& from(v8::Isolate* v8Isolate) {
     return *reinterpret_cast<Lock*>(v8Isolate->GetData(SET_DATA_LOCK));
   }
@@ -3361,8 +3370,6 @@ class Lock {
   // Declared after the V8 lock so that the isolate's guest-kernel arena is entered once the
   // isolate is locked and left before it is unlocked.
   GuestArenaScope guestArenaScope;
-
-  void* previousData;
 
   bool warningsLogged;
 
