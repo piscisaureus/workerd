@@ -429,6 +429,25 @@ KJ_TEST("each isolate's memory lives in its own guest-kernel arena") {
   KJ_EXPECT(!inTail(arenaB, memoryA.jitCode));
   KJ_EXPECT(!inTail(arenaA, memoryB.jitCode));
 
+  // The allocator refuses an address outside the tail it manages. V8 asks it to map, protect
+  // and discard pages by address, and those addresses come from V8's own state, which lives in
+  // the arena and is therefore writable by guest execution; letting one through would hand
+  // guest-chosen addresses to mprotect() and MAP_FIXED. The end of the tail is the interesting
+  // case: it is page-aligned and above every address the tail holds.
+  constexpr size_t pageSize = 4096;
+  auto refusesOutside = [](ArenaPageAllocator& tail, uintptr_t address) {
+    auto* p = reinterpret_cast<void*>(address);
+    KJ_EXPECT_THROW_MESSAGE("not in the arena tail",
+        tail.SetPermissions(p, pageSize, v8::PageAllocator::kNoAccess));
+    KJ_EXPECT_THROW_MESSAGE(
+        "not in the arena tail", tail.DiscardSystemPages(p, pageSize));
+    KJ_EXPECT_THROW_MESSAGE("not in the arena tail", tail.DecommitPages(p, pageSize));
+  };
+  refusesOutside(tailA, tailA.end());
+  refusesOutside(tailA, tailA.begin() - pageSize);
+  refusesOutside(tailA, tailB.begin());
+  refusesOutside(tailB, tailA.begin());
+
   // Under A's lock (arena A active): A's code, bytecode and cppgc object are reachable from
   // the guest, B's fault. Mirror under B's lock.
   a.runInLockScope([&](ArenaIsolate::Lock& lock) {

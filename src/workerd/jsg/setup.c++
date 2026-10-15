@@ -533,8 +533,10 @@ void* ArenaPageAllocator::GetRandomMmapAddr() {
 
 void ArenaPageAllocator::checkRange(const void* address, size_t length) const {
   auto addr = reinterpret_cast<uintptr_t>(address);
+  // The `addr <= rangeEnd` term is what keeps `rangeEnd - addr` from wrapping, which would let
+  // any address above the tail through.
   KJ_REQUIRE(addr % GUEST_ARENA_PAGE_SIZE == 0 && length % GUEST_ARENA_PAGE_SIZE == 0 &&
-          addr >= rangeBegin && length <= rangeEnd - addr,
+          addr >= rangeBegin && addr <= rangeEnd && length <= rangeEnd - addr,
       "address range is not in the arena tail", addr, length, rangeBegin, rangeEnd);
 }
 
@@ -543,6 +545,11 @@ uintptr_t ArenaPageAllocator::take(size_t length, size_t alignment) {
   auto& ranges = *lock;
   for (size_t i = 0; i < ranges.size(); i++) {
     Range& range = ranges[i];
+    // The free list is an ordinary heap object, so guest execution can write it (see the
+    // GuestArena comment in setup.h). Skipping a range that is not a sub-range of the tail keeps
+    // a rewritten entry from turning into an address outside it, which the caller hands to
+    // mprotect(); the result is checked again there.
+    if (range.begin < rangeBegin || range.end > rangeEnd || range.begin >= range.end) continue;
     uintptr_t start = (range.begin + alignment - 1) & ~(alignment - 1);
     if (start < range.begin || start > range.end || range.end - start < length) continue;
     uintptr_t stop = start + length;
@@ -616,6 +623,7 @@ void* ArenaPageAllocator::AllocatePages(
   uintptr_t start = take(length, alignment);
   if (start == 0) return nullptr;
   void* address = reinterpret_cast<void*>(start);
+  checkRange(address, length);
   // Free pages are inaccessible already, so only a request for access needs a syscall.
   int prot = protectionFor(permissions);
   if (prot != PROT_NONE && mprotect(address, length, prot) != 0) {
