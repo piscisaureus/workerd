@@ -991,6 +991,15 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
 #endif
 
   void enableInspector(kj::StringPtr param) {
+    // The inspector executes JavaScript outside the guest: Worker::Isolate's
+    // dispatchProtocolMessage() runs it under the isolate lock with no
+    // jsg::runInGuest() around it, so an isolate's JS would run with the
+    // runtime's own privileges. Rather than quietly removing the isolation,
+    // refuse the combination.
+    if (jsg::isGuestKernelEnabled()) {
+      CLI_ERROR("The inspector cannot be used with guest-kernel isolation "
+                "(WORKERD_EXPERIMENTAL_GUEST_KERNEL): it runs JavaScript outside the guest.");
+    }
     server->enableInspector(kj::str(param));
   }
 
