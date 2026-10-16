@@ -16,6 +16,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -244,7 +245,10 @@ typedef struct {
   long
       path_refusals;  // forwarded path syscalls the turn-directory policy refused (see gk_confine_paths)
   int runners;        // vCPU runner threads started (GK_RUNNER=1; see the runner section in gk.c)
-  long runner_runs;   // KVM_RUNs a runner executed on an owning thread's behalf
+  long runner_runs;    // KVM_RUNs a runner executed on an owning thread's behalf
+  int resident_vcpus;  // vCPUs that park inside KVM_RUN between turns (GK_RUNNER=resident; see gk.c)
+  long park_turns;     // turns that ended in a vCPU's park loop, with no return to userspace
+  long park_kicks;     // halted resident vCPUs kicked with an NMI to start a turn (see gk.c)
 } gk_stats;
 void gk_get_stats(gk_stats *s);
 
@@ -769,6 +773,23 @@ int gk_turn_dir_set(int dirfd);
 
 // Nonzero once gk_init has succeeded in this process.
 int gk_initialized(void);
+
+// The CPU-time clock a turn on the calling thread is charged to, for a timer
+// that bounds a turn's CPU (a per-thread CPU-time timer whose signal goes to
+// the calling thread, as the Wasm shutdown signal's does). Without a runner
+// that is the calling thread's own clock, CLOCK_THREAD_CPUTIME_ID; with one
+// (GK_RUNNER, see the runner section in gk.c) the guest's instructions run on
+// the runner's thread and are charged to its clock, so a timer on the calling
+// thread's clock would not advance while it waits, and this names the
+// runner's thread clock instead. The timer's signal still goes to the calling
+// thread (SIGEV_THREAD_ID with its tid), which is what the signal-field write
+// needs. A resident runner's clock also carries KVM's halt polling between
+// turns, so under load it runs ahead of the turns' own CPU by up to the poll
+// budget per gap. The runner is the vCPU's, so this is answered as of the
+// thread's current vCPU: a thread that has not entered the guest yet names its
+// own clock, and should ask again after its first turn. Returns 0, or -ESRCH
+// before gk_init. Host-side; allocates nothing.
+int gk_turn_cpu_clockid(clockid_t *id);
 
 // Test/diagnostic: the value of the named per-vCPU statistic of the calling
 // thread's vCPU, read from KVM's own statistics file (KVM_GET_STATS_FD), or

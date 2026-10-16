@@ -1,6 +1,7 @@
 // Tests for the gk library.
 #define _GNU_SOURCE
 #include "gk.h"
+extern void gk_user_exit_tramp(void), gk_syscall_tramp(void);
 
 #include <stdint.h>
 
@@ -2518,7 +2519,15 @@ static int resolve_check(void) {
   // host interrupt or a demand fault and is discarded, so a kept sub-run
   // provably ran its RS_N resolves with no VM exit. The empty turn's exits
   // and time are measured the same way, and subtracted. Timing is the
-  // median over kept sub-runs.
+  // median over kept sub-runs. A resident vCPU (GK_RUNNER=resident) ends a
+  // turn with up to two exits the kernel services without returning to
+  // gk, an ioeventfd OUT when the owner has gone to sleep and the HLT after
+  // it, and a turn long enough for the owner to sleep takes both where the
+  // empty turn takes neither, so a sub-run is allowed that many more; the
+  // proof then bounds the resolves' own exits at two per sub-run of RS_N.
+  gk_stats rs_st;
+  gk_get_stats(&rs_st);
+  long e_allow = rs_st.resident_vcpus > 0 ? 2 : 0;
   struct rs_bench b = {h, &obj};
   gk_run_here_user(rs_bench, &b);  // warm up: pages, the vCPU's TLB
   long e_empty = -1;
@@ -2545,7 +2554,7 @@ static int resolve_check(void) {
     double t1 = now_ns();
     long e1 = gk_debug_vcpu_stat("exits");
     if (acc != RS_N) wrong++;
-    if (e0 >= 0 && e1 >= 0 && e1 - e0 == e_empty) kept_ns[kept++] = (t1 - t0 - t_empty) / RS_N;
+    if (e0 >= 0 && e1 >= 0 && e1 - e0 <= e_empty + e_allow) kept_ns[kept++] = (t1 - t0 - t_empty) / RS_N;
     else { discarded++; extra_exits += (e1 - e0) - e_empty; }
   }
   long irq_delta = gk_debug_vcpu_stat("irq_exits") - irq0;
@@ -2651,7 +2660,7 @@ static int resolve_check(void) {
          "stack %s, ring 0 %s, host %s; %d garbage handles and 0 -> nothing at every ring (%s, "
          "caller's memory untouched %s); ring-3 read of the table -> %s (fault %#lx == %#lx), "
          "write -> %s (fault %#lx == %#lx); %d sub-runs of %d ring-3 resolves: %d kept with "
-         "exactly the %ld exit(s) of an empty turn, %d discarded (%ld extra exits, %ld of all "
+         "at most the %ld exit(s) of an empty turn plus %ld allowed, %d discarded (%ld extra exits, %ld of all "
          "irq_exits in the period), %d answered wrong; %.1f ns per resolve (median of kept, "
          "empty turn %.0f ns subtracted); unregistered -> nothing %s; recycled as %#llx (same "
          "slot %s, old handle -> nothing %s, new -> %p %s); capacity %d: filled %d, next -> "
@@ -2663,7 +2672,7 @@ static int resolve_check(void) {
          host_ok ? "ok" : "BROKEN", RS_BAD, garbage_ok && user_ok && host_ok ? "yes" : "NO",
          heap_intact ? "yes" : "NO", r3 == GK_EFAULT ? "FAULT" : "READ", fr3, table,
          w3 == GK_EFAULT ? "FAULT" : "WROTE", fw3, table, RS_SUBRUNS, RS_N, kept, e_empty,
-         discarded, extra_exits, irq_delta, wrong, per_call, t_empty, freed ? "yes" : "NO",
+         e_allow, discarded, extra_exits, irq_delta, wrong, per_call, t_empty, freed ? "yes" : "NO",
          (unsigned long long)h2, (h2 & 0xfffff) == idx ? "yes" : "no",
          p->r_h == NULL ? "yes" : "NO", p->r_h2, p->r_h2 == &obj2 ? "ok" : "WRONG",
          GK_RESOLVE_SLOTS, n, (unsigned long long)over, mismatched,
@@ -2914,7 +2923,25 @@ static int signal_field_check(void) {
                wall == n - 1;
   for (int i = 0; i < n - 1; i++) {
     if (all[i].r != 0 || all[i].h == 0) cap_ok = 0;
-    if (gk_run_here_user(sf_guest_unregister, &all[i].h) != 0) cap_ok = 0;
+    long ur = gk_run_here_user(sf_guest_unregister, &all[i].h);
+    if (ur != 0) {
+      if (cap_ok) {
+        unsigned long fa = gk_fault_addr();
+        fprintf(stderr, "signal fields: unregister of handle %d (%#llx) from ring 3 -> %ld (fault %#lx; "
+                "region %p; exit tramp %p, syscall tramp %p, stack %p)\n",
+                i, (unsigned long long)all[i].h, ur, fa, (void *)gk_hostcall_region(),
+                (void *)&gk_user_exit_tramp, (void *)&gk_syscall_tramp, (void *)&i);
+        FILE *m = fopen("/proc/self/maps", "r");
+        char line[512];
+        while (m && fgets(line, sizeof line, m)) {
+          unsigned long lo, hi;
+          if (sscanf(line, "%lx-%lx", &lo, &hi) == 2 && fa >= lo - 0x1000000 && fa < hi + 0x1000000)
+            fprintf(stderr, "  maps near the fault: %s", line);
+        }
+        if (m) fclose(m);
+      }
+      cap_ok = 0;
+    }
   }
   gk_stats s6;
   gk_get_stats(&s6);
@@ -3623,7 +3650,10 @@ int main(void) {
   // sequential host threads entering via gk_run may add at most 1.
   // Each guest thread's host stack is registered in the supervisor/refuse
   // registry while it lives, so the registry must not grow with the churn
-  // either: at most two ranges (kvm_run, exception stack) per vCPU added.
+  // either: at most two ranges (kvm_run, exception stack) per vCPU added,
+  // three when each vCPU has a runner (its stack is registered too).
+  const char *runner_env = getenv("GK_RUNNER");
+  int ranges_per_vcpu = runner_env && *runner_env && strcmp(runner_env, "0") != 0 ? 3 : 2;
   int before = gk_vcpu_count();
   gk_stats sp1 = {0}, sp2 = {0};
   gk_get_stats(&sp1);
@@ -3631,7 +3661,7 @@ int main(void) {
   long churned = gk_run(churn_in_guest, &ch);
   int after_guest = gk_vcpu_count();
   gk_get_stats(&sp2);
-  int prot_bounded = sp2.prot_ranges - sp1.prot_ranges <= 2 * (after_guest - before);
+  int prot_bounded = sp2.prot_ranges - sp1.prot_ranges <= ranges_per_vcpu * (after_guest - before);
   int ok8_host = 1;
   for (int i = 0; i < 20; i++) {
     pthread_t t;
@@ -4208,9 +4238,19 @@ int main(void) {
     gk_get_stats(&st);
     const char *rv = getenv("GK_RUNNER");
     int want = rv && *rv && strcmp(rv, "0") != 0;
+    int resident = rv && strcmp(rv, "resident") == 0;
     int ok35 = want ? (st.runners >= 1 && st.runner_runs > 0) : (st.runners == 0 && st.runner_runs == 0);
-    printf("vCPU runners: %s, %d started, %ld KVM_RUNs through them [%s]\n",
-           want ? "requested" : "not requested", st.runners, st.runner_runs, ok35 ? "OK" : "FAIL");
+    // GK_RUNNER=resident: the vCPUs parked inside KVM_RUN between turns and
+    // turns ended there rather than through a return to userspace (the ones
+    // that faulted had to return, and so did every demand fault and
+    // forwarded syscall inside a turn, which is where most of the KVM_RUNs
+    // above come from); without it, no turn parked.
+    if (resident) ok35 = ok35 && st.resident_vcpus >= 1 && st.park_turns > 1000;
+    else ok35 = ok35 && st.resident_vcpus == 0 && st.park_turns == 0 && st.park_kicks == 0;
+    printf("vCPU runners: %s, %d started, %ld KVM_RUNs through them; %d resident vCPUs, %ld turns "
+           "ended in a park loop, %ld kicks [%s]\n",
+           want ? (resident ? "resident" : "requested") : "not requested", st.runners,
+           st.runner_runs, st.resident_vcpus, st.park_turns, st.park_kicks, ok35 ? "OK" : "FAIL");
     ok34 = ok34 && ok35;
   }
 

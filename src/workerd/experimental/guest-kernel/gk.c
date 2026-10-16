@@ -22,6 +22,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/eventfd.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -65,6 +66,7 @@
 #define PORT_DEMAND 0xFC
 #define PORT_PKRU 0xFB
 #define PORT_FLUSH 0xFA
+#define PORT_PARK_LEAVE 0xF8  // a resident vCPU's park loop leaving KVM_RUN on request
 
 // Reserved syscall number a ring-3 guest issues to leave the guest (see
 // gk_user_exit_tramp in gk_asm.S). Ring-3 code cannot execute OUT, so it cannot
@@ -149,6 +151,9 @@ typedef struct {
   uint64_t ist;         // its exception stack + TSS region (see vcpu_init)
   void *side_stack;     // NULL if the vCPU has no gk_run_here side stack
   struct gk_runner *runner;  // the thread that runs its KVM_RUN, if any (see the runner section)
+  struct gk_park *park; // its park frame, if it is resident (see the runner section)
+  int efd;              // the eventfd its park loop and runner wake the owner through, or -1
+  int stats_fd;         // KVM_GET_STATS_FD, taken at creation (see gk_debug_vcpu_stat), or -1
 } gk_parked_vcpu;
 
 // Per-thread guest state: each host thread that enters the guest is a vCPU. A
@@ -165,6 +170,18 @@ typedef struct gk_thread {
   uint64_t ist;            // exception stack + TSS region of this vCPU
   void *side_stack;        // host stack for gk_run_here's gk loop (see there)
   struct gk_runner *runner;  // the thread that runs this vCPU's KVM_RUN, or NULL (see the runner section)
+  // A resident vCPU (see the runner section): its park frame, whether it is
+  // inside KVM_RUN in the park loop right now, the sequence word of the turn
+  // the owner last handed it and of the KVM_RUN it last handed the runner,
+  // the root the host knows it holds while parked (sync_cr3), the eventfd
+  // the owner sleeps on, and the vCPU's KVM stats descriptor.
+  struct gk_park *park;
+  int parked;
+  uint64_t turn_seq;
+  uint32_t run_seq;
+  uint64_t cr3_shadow;
+  int efd;
+  int stats_fd;
   unsigned root_gen;       // G->root_gen as of this vCPU's last TLB flush (0: never)
   uint64_t last_fault;
   int fault_repeat;
@@ -463,6 +480,14 @@ struct gk_ctl {
   struct gk_runner *runner_pool;    // GK_MAX_VCPUS records, in supervisor memory (see gk_init)
   int runner_n;
   atomic_long runner_runs;
+  // Resident vCPUs (see the runner section): whether new vCPUs are resident,
+  // the flush kind their park loop runs (1: INVPCID, 2: the CR4.PGE toggle,
+  // as flush_stub_select chose), how many vCPUs are resident, how many turns
+  // ended in a park loop and how many halted vCPUs were kicked.
+  int resident_mode;
+  int resident_n;
+  long park_flush_kind;
+  atomic_long park_turns, park_kicks;
   // Bumped whenever page-table pages are returned to the allocator (an arena
   // was destroyed). A vCPU whose root is unchanged since it last entered the
   // guest may still hold TLB and paging-structure-cache entries derived from
@@ -612,6 +637,8 @@ extern void gk_user_launch_cr3(void);
 extern void gk_user_child_launch(void);
 extern void gk_exit_tramp(void);
 extern void gk_user_exit_tramp(void);
+extern void gk_park_entry(void), gk_park_exit_tramp(void), gk_park_syscall_tramp(void),
+    gk_park_exit(void), gk_park_loop(void), gk_exc_nmi(void);
 extern void gk_exc_de(void), gk_exc_ud(void), gk_exc_df(void), gk_exc_gp(void),
     gk_exc_pf(void);
 extern void gk_pkru_stub(void);
@@ -1954,11 +1981,11 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
 
 // Every gate runs its handler on IST1, the vCPU's exception stack (see
 // vcpu_init), never on the interrupted code's stack.
-static void set_idt_gate(uint8_t *idt, int vec, uint64_t h) {
+static void set_idt_gate(uint8_t *idt, int vec, uint64_t h, int ist) {
   uint8_t *e = idt + vec * 16;
   *(uint16_t *)(e + 0) = h & 0xffff;
   *(uint16_t *)(e + 2) = 0x08;
-  e[4] = 1;  // IST index
+  e[4] = (uint8_t)ist;  // IST index
   e[5] = 0x8e;
   *(uint16_t *)(e + 6) = (h >> 16) & 0xffff;
   *(uint32_t *)(e + 8) = (h >> 32);
@@ -2055,8 +2082,12 @@ static int arena_live_locked(const gk_arena *a) {
 static void runner_stop(struct gk_runner *r);
 
 // Return the thread's vCPU (and guest stack, if any) to the pool.
+static void park_leave(gk_thread *t);
 static void vcpu_park(gk_thread *t) {
   if (!t->inited) return;
+  // A pooled vCPU is out of KVM_RUN: the next thread to take it programs it
+  // by ioctl, which would wait behind a run in progress.
+  park_leave(t);
   pthread_mutex_lock(&G->lock);
   if (G->parked_n < GK_MAX_VCPUS) {
     gk_parked_vcpu *p = &G->parked[G->parked_n++];
@@ -2067,8 +2098,13 @@ static void vcpu_park(gk_thread *t) {
     p->ist = t->ist;
     p->side_stack = t->side_stack;
     p->runner = t->runner;
+    p->park = t->park;
+    p->efd = t->efd;
+    p->stats_fd = t->stats_fd;
   } else {  // cannot happen with KVM_CAP_MAX_VCPUS <= GK_MAX_VCPUS; be safe
     if (t->runner) runner_stop(t->runner);
+    if (t->efd >= 0) close(t->efd);
+    if (t->stats_fd >= 0) close(t->stats_fd);
     munmap(t->run, G->run_size);
     close(t->fd);
   }
@@ -2076,6 +2112,8 @@ static void vcpu_park(gk_thread *t) {
   if (G->dbg) fprintf(stderr, "[gk] vcpu %d parked\n", t->id);
   t->inited = 0;
   t->runner = NULL;
+  t->park = NULL;
+  t->efd = t->stats_fd = -1;
 }
 
 // The thread `t` belongs to is ending: park its vCPU, drop it from its active
@@ -2151,6 +2189,72 @@ static void thread_key_dtor(void *p) {
 // that CPU). The runner and its record follow the vCPU through the pool, and
 // stop when the vCPU is closed. The records live in refused memory, which
 // no root maps, so a turn cannot rewrite the words its owner waits on.
+//
+// Resident vCPUs. GK_RUNNER=resident keeps the runner inside KVM_RUN across
+// turns, so that no return to userspace, and so no IBPB, happens on the
+// vCPU's CPU at all on the turn's own path; the guest's predictions survive
+// from one turn to the next as the owner's do. Between turns the vCPU runs
+// gk's park loop (gk_park_loop in gk_asm.S) at ring 0, with GS pointing at
+// its park frame: a gk_park in supervisor memory (the first page of the
+// vCPU's IST region) that the host writes and ring 3 cannot reach. A turn
+// starts with the owner writing the frame -- the root to load, the entry
+// stack, function, argument and ring, exactly the values enter_guest puts
+// in kvm_run otherwise -- and bumping `go`; the loop sees the change,
+// loads the root, and SYSRETs (or jumps) into the turn. A turn ends with
+// the exit sentinel reaching the vCPU's own SYSCALL entry
+// (gk_park_syscall_tramp), which stores the result in the frame and echoes
+// `go` into `done` instead of leaving the VM; a ring-0 turn returns into
+// gk_park_exit_tramp, which does the same. The register exchange that
+// kvm_run carried is therefore the frame's, and kvm_run is only read and
+// written when a run has returned (regs_get and sregs_get stay correct: they
+// are reached only from exit handling, with the vCPU out).
+//
+// Waiting. Each side spins G->runner_spin iterations before it sleeps. The
+// loop sleeps with STI;HLT, which KVM services in the kernel (the VM has an
+// in-kernel LAPIC for this, a split irqchip enabled at init), and raises
+// `halted` first with a locked exchange; the owner, having bumped `go`,
+// kicks a vCPU that says it halted with KVM_SIGNAL_MSI in NMI delivery mode
+// -- an NMI wakes HLT whatever IF is, needs no EOI and leaves no interrupt
+// priority state behind, and gk_exc_nmi is a bare IRETQ, so a kick that
+// lands after the loop already launched (the two sides race, and either
+// may win) costs the turn one return and nothing else. The owner sleeps on
+// the vCPU's eventfd, and raises `owner_sleeping` first the same way; the
+// loop ends a turn with an OUT to the frame's port when it sees the flag,
+// which an ioeventfd turns into a signal on that eventfd without leaving
+// the kernel, and the runner writes the eventfd when a run returns. So on a
+// turn that makes no forwarded syscall, hostcall or demand fault, nothing
+// returns to userspace on the vCPU's CPU; the exits that remain are those,
+// one per event, and they are served exactly as before: the runner's ioctl
+// returns, the owner handles it, the runner runs the vCPU again.
+//
+// What leaves the loop. A fault that ends the turn returns to userspace as
+// ever (the handlers report by port), and the vCPU is then out of KVM_RUN
+// with nothing parked; the next entry enters it through gk_park_entry, which
+// resets GS from a register and parks from a fresh state, with the root
+// the turn wants loaded through kvm_run first. A run that returns while the
+// vCPU is parked (a signal) leaves it the same way: parked means the loop
+// is running inside KVM_RUN, and a vCPU found returned is treated as out.
+// A pooled vCPU must be out too (the next thread programs it by ioctl), as
+// must one a stub is to run on: park_leave asks the loop to exit (`leave`,
+// port 0xF8) and waits for the run to return. A between-turn TLB flush does
+// not: it is deferred to the loop's launch path through `flush`, where it
+// runs before the root load. CR3 cannot be read back from kvm_run while the
+// vCPU is parked, so the host keeps the root it last had the loop load
+// (cr3_shadow).
+//
+// The loop runs under the last turn's root, and walks it on every TLB
+// miss, so that root must stay valid while the loop runs: gk_arena_destroy
+// asks every parked vCPU still on the arena's root to load the base root
+// before it frees the tables (`reload`, see park_reload_root), and waits
+// for the loop to say it has. A vCPU out of KVM_RUN walks nothing, and is
+// given its root afresh at its next entry.
+//
+// Limits. A vCPU whose id is above 254 gets no NMI by xAPIC physical
+// address (255 is the broadcast id), and KVM's PIO bus holds at most 1000
+// ioeventfds; such a vCPU falls back to a plain runner. The frame is host-written supervisor
+// memory and the loop trusts it as enter_guest's register values are
+// trusted today: ring-0 guest code could rewrite it, and could also load
+// CR3 directly, so the loop adds no capability ring 0 does not have.
 #define GK_RUNNER_STACK (256UL << 10)
 #define GK_RUNNER_PIN_NONE (-1)
 #define GK_RUNNER_PIN_SIBLING (-2)
@@ -2165,7 +2269,49 @@ typedef struct gk_runner {
   _Atomic int stop;
   int ret, err;                // the ioctl's result and errno, valid once done == go
   void *stack;
+  struct gk_park *park;        // the vCPU's park frame, if it is resident
+  int efd;                     // its eventfd (see resident_wait)
+  _Atomic long tid;            // the runner's kernel tid, set by the runner as it starts
 } gk_runner;
+
+// A resident vCPU's park frame (see above). The layout is gk_park_loop's in
+// gk_asm.S; the asserts below pin it. All words are 8 bytes so that the loop
+// reads and writes whole words.
+typedef struct gk_park {
+  _Atomic uint64_t go;              // host: bumped to launch the turn described below
+  _Atomic uint64_t done;            // guest: go, echoed when that turn has ended
+  uint64_t result;                  // guest: the turn's result
+  uint64_t cr3;                     // host: the root to load first, or 0
+  uint64_t rsp, fn, arg, user;      // host: the turn's entry (see enter_guest)
+  uint64_t flush;                   // host: a full TLB flush to run before the turn (see flush_run)
+  int64_t spin;                     // host: the loop's spin budget before it halts (G->runner_spin)
+  _Atomic uint64_t halted;          // guest: about to HLT; a kick is needed
+  _Atomic uint64_t owner_sleeping;  // host: sleeping on the eventfd; signal the port
+  _Atomic uint64_t leave;           // host: exit KVM_RUN through PORT_PARK_LEAVE
+  uint64_t port;                    // host: the ioeventfd port
+  uint64_t user_gs;                 // host: the turn's GS base
+  uint64_t stack;                   // host: the loop's ring-0 stack top
+  _Atomic uint64_t reload;          // host: a root to load at once (see park_reload_root); guest: cleared when done
+  _Atomic uint64_t cur_cr3;         // guest: the root the loop is under, written at every load it makes
+  _Atomic uint64_t in_turn;         // guest: set at a launch, cleared before `done` is echoed
+} gk_park;
+_Static_assert(offsetof(gk_park, done) == 8 && offsetof(gk_park, result) == 16 &&
+               offsetof(gk_park, cr3) == 24 && offsetof(gk_park, rsp) == 32 &&
+               offsetof(gk_park, fn) == 40 && offsetof(gk_park, arg) == 48 &&
+               offsetof(gk_park, user) == 56 && offsetof(gk_park, flush) == 64 &&
+               offsetof(gk_park, spin) == 72 && offsetof(gk_park, halted) == 80 &&
+               offsetof(gk_park, owner_sleeping) == 88 && offsetof(gk_park, leave) == 96 &&
+               offsetof(gk_park, port) == 104 && offsetof(gk_park, user_gs) == 112 &&
+               offsetof(gk_park, stack) == 120 && offsetof(gk_park, reload) == 128 &&
+               offsetof(gk_park, cur_cr3) == 136 && offsetof(gk_park, in_turn) == 144,
+               "gk_park layout is gk_park_loop's");
+#define GK_PARK_PORT_BASE 0x1000  // ioeventfd ports: this + the vCPU id
+#define GK_PARK_MAX_ID 254        // the largest vCPU id an xAPIC NMI can address (255 is the broadcast id)
+// The IST region's layout for a resident vCPU (see vcpu_init): the frame in
+// its first page, the loop's stack in the second, IST2 (the NMI) in the
+// pages below the middle, IST1 (exceptions) in the pages below the TSS.
+#define GK_PARK_STACK_TOP 0x2000
+#define GK_IST2_TOP (32UL << 10)
 
 static void futex_wait32(_Atomic uint32_t *w, uint32_t val) {
   host_syscall(SYS_futex, (long)w, FUTEX_WAIT_PRIVATE, (long)val, 0, 0, 0);
@@ -2202,6 +2348,7 @@ static void host_pkru_allow_all(void);
 
 static void *runner_main(void *arg) {
   gk_runner *r = arg;
+  atomic_store_explicit(&r->tid, host_syscall(SYS_gettid, 0, 0, 0, 0, 0, 0), memory_order_seq_cst);
   host_syscall(SYS_prctl, PR_SET_NAME, (long)"gk-vcpu-run", 0, 0, 0, 0);
   // KVM backs a guest page through the page tables of the thread that issues
   // KVM_RUN, under that thread's protection keys: a key the owner holds open
@@ -2225,6 +2372,11 @@ static void *runner_main(void *arg) {
     r->err = ret < 0 ? errno : 0;
     r->ret = (int)ret;
     runner_signal(&r->done, seen, &r->owner_sleeping);
+    // A resident vCPU's owner sleeps on the eventfd (see resident_wait).
+    if (r->park && atomic_load_explicit(&r->park->owner_sleeping, memory_order_seq_cst)) {
+      uint64_t one = 1;
+      host_syscall(SYS_write, r->efd, (long)&one, sizeof one, 0, 0, 0);
+    }
   }
   return NULL;
 }
@@ -2305,6 +2457,8 @@ static gk_runner *runner_start(int fd) {
   int rc = pthread_create(&r->thread, &attr, runner_main, r);
   pthread_attr_destroy(&attr);
   if (rc != 0) { G->err = "pthread_create runner"; return NULL; }
+  // Its tid, for gk_turn_cpu_clockid: published by the runner as it starts.
+  while (atomic_load_explicit(&r->tid, memory_order_seq_cst) == 0) __builtin_ia32_pause();
   if (G->dbg)
     fprintf(stderr, "[gk] runner for vcpu fd %d started (pinned to CPU %d, spin %ld)\n", fd, r->cpu,
             G->runner_spin);
@@ -2330,6 +2484,112 @@ static int vcpu_run_ioctl(gk_thread *t) {
   atomic_fetch_add_explicit(&G->runner_runs, 1, memory_order_relaxed);
   if (r->ret < 0) errno = r->err;
   return r->ret;
+}
+
+// ---- resident vCPUs (see the runner section) --------------------------------
+// Hand the runner a KVM_RUN without waiting for it: the owner then waits in
+// resident_wait for whichever comes first, the run's return or the turn's
+// end in the park loop.
+static void resident_run_start(gk_thread *t) {
+  gk_runner *r = t->runner;
+  t->run_seq = atomic_load_explicit(&r->go, memory_order_seq_cst) + 1;
+  runner_signal(&r->go, t->run_seq, &r->runner_sleeping);
+  atomic_fetch_add_explicit(&G->runner_runs, 1, memory_order_relaxed);
+}
+
+// Whether the run the owner last handed the runner has returned.
+static int resident_run_returned(const gk_thread *t) {
+  return atomic_load_explicit(&t->runner->done, memory_order_seq_cst) == t->run_seq;
+}
+
+// Kick a halted resident vCPU: an NMI through the in-kernel LAPIC, by the
+// vCPU's xAPIC id. KVM_SIGNAL_MSI is a VM ioctl, so it does not wait behind
+// the run in progress as a vCPU ioctl would.
+static void park_kick(gk_thread *t) {
+  struct kvm_msi m = {0};
+  m.address_lo = 0xFEE00000u | ((uint32_t)t->id << 12);
+  m.data = 4u << 8;  // delivery mode NMI
+  long rc = ioctl(G->vmfd, KVM_SIGNAL_MSI, &m);
+  atomic_fetch_add_explicit(&G->park_kicks, 1, memory_order_relaxed);
+  // Never expected once the vCPU is a destination (see vcpu_init); a kick
+  // that is not delivered leaves the vCPU halted and its owner waiting, so
+  // it is reported whatever the debug setting.
+  if (rc != 1)
+    fprintf(stderr, "[gk] vcpu %d: KVM_SIGNAL_MSI (NMI kick) -> %ld: %s\n", t->id, rc,
+            rc < 0 ? strerror(errno) : "not delivered");
+}
+
+enum { GK_EV_RUN_RETURNED, GK_EV_TURN_ENDED };
+
+// Wait for the park loop to end the turn (`done` reaches turn_seq) or for
+// the runner's ioctl to return (a userspace exit, which the caller handles),
+// whichever is first. Spins the budget, then sleeps on the eventfd with
+// `owner_sleeping` raised: the loop and the runner both check the flag after
+// their own store (the stores are locked exchanges, so neither side's store
+// can be reordered past its load of the other's), so a sleeper that found
+// nothing after raising the flag is signalled by whichever of them writes
+// next. A signal that arrives after the flag goes down again stays in the
+// eventfd and only ends the next sleep early.
+static int resident_wait(gk_thread *t) {
+  gk_park *p = t->park;
+  long spin = G->runner_spin;
+  for (;;) {
+    if (atomic_load_explicit(&p->done, memory_order_seq_cst) == t->turn_seq) return GK_EV_TURN_ENDED;
+    if (resident_run_returned(t)) return GK_EV_RUN_RETURNED;
+    if (spin != 0) {
+      if (spin > 0) spin--;
+      __builtin_ia32_pause();
+      continue;
+    }
+    atomic_store_explicit(&p->owner_sleeping, 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&p->done, memory_order_seq_cst) != t->turn_seq && !resident_run_returned(t)) {
+      uint64_t v;
+      host_syscall(SYS_read, t->efd, (long)&v, sizeof v, 0, 0, 0);
+    }
+    atomic_store_explicit(&p->owner_sleeping, 0, memory_order_seq_cst);
+  }
+}
+
+// Take a parked vCPU out of KVM_RUN: ask the loop to leave and wait for the
+// run to return. The vCPU is then stopped after the loop's OUT, and the next
+// use programs its registers (every entry does). No-op unless parked.
+static void park_leave(gk_thread *t) {
+  if (!t->parked) return;
+  gk_park *p = t->park;
+  if (!resident_run_returned(t)) {
+    atomic_store_explicit(&p->leave, 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&p->halted, memory_order_seq_cst)) park_kick(t);
+    runner_wait_change(&t->runner->done, t->run_seq - 1, &t->runner->owner_sleeping);
+    atomic_store_explicit(&p->leave, 0, memory_order_seq_cst);
+  }
+  t->parked = 0;
+  if (G->dbg) {
+    unsigned reason = t->run->exit_reason;
+    int port = reason == KVM_EXIT_IO ? t->run->io.port : -1;
+    fprintf(stderr, "[gk] vcpu %d: left the park loop (exit reason %u, port %#x)\n", t->id, reason,
+            port);
+  }
+}
+
+// Have the park loop of `t`'s vCPU load `root` now, from any thread, and
+// wait until it has: the loop takes the request at its next iteration, or
+// its next launch supersedes it (a launch loads the root its turn wants and
+// clears the request), and neither needs a lock, so the wait is a few
+// microseconds at most and may be made with G->lock held. A run that has
+// returned (a signal) is not waited for: that vCPU executes nothing until
+// its owner runs it again, which gives it its root afresh (see
+// enter_guest). The owner's record of the root (cr3_shadow) is set to a
+// value no root has, so its next sync_cr3 loads whatever it wants rather
+// than finding it already loaded; that word is the owner's, and 0 is the
+// one value safe to write under it from here, since the owner only ever
+// compares it with a live root.
+static void park_reload_root(gk_thread *t, uint64_t root) {
+  gk_park *p = t->park;
+  atomic_store_explicit(&p->reload, root, memory_order_seq_cst);
+  if (atomic_load_explicit(&p->halted, memory_order_seq_cst)) park_kick(t);
+  while (atomic_load_explicit(&p->reload, memory_order_seq_cst) != 0 && !resident_run_returned(t))
+    __builtin_ia32_pause();
+  t->cr3_shadow = 0;
 }
 
 // Bring the calling thread's vCPU up. Each thread has its own vCPU, stack and
@@ -2362,12 +2622,17 @@ static int vcpu_init(gk_thread *t, int flags) {
   uint64_t stack_top = 0, ist = 0;
   void *side_stack = NULL;
   gk_runner *runner = NULL;
+  gk_park *park = NULL;
+  int efd = -1, stats_fd = -1;
   pthread_mutex_lock(&G->lock);
   if (G->parked_n > 0) {
     gk_parked_vcpu *p = &G->parked[--G->parked_n];
     fd = p->fd; id = p->id; run = p->run; stack_top = p->stack_top; ist = p->ist;
     side_stack = p->side_stack;
     runner = p->runner;
+    park = p->park;
+    efd = p->efd;
+    stats_fd = p->stats_fd;
     reused = 1;
   }
   pthread_mutex_unlock(&G->lock);
@@ -2378,6 +2643,11 @@ static int vcpu_init(gk_thread *t, int flags) {
     if (ioctl(fd, KVM_SET_CPUID2, GK_CPUID) < 0) { G->err = "KVM_SET_CPUID2"; return -1; }
     run = mmap(NULL, G->run_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (run == MAP_FAILED) { G->err = "mmap kvm_run"; return -1; }
+#ifdef KVM_GET_STATS_FD
+    // Taken now and kept: a vCPU ioctl waits behind a run in progress, and a
+    // resident vCPU is in one between turns (see gk_debug_vcpu_stat).
+    stats_fd = ioctl(fd, KVM_GET_STATS_FD, NULL);
+#endif
     if (G->runner_mode && !(runner = runner_start(fd))) return -1;
 
     // Exception stack. The guest runs ordinary user-mode code, which keeps
@@ -2401,12 +2671,60 @@ static int vcpu_init(gk_thread *t, int flags) {
     ist = (uint64_t)(uintptr_t)ir;
     uint8_t *tss = ir + GK_IST_BYTES - 0x1000;
     *(uint64_t *)(tss + 36) = (uint64_t)(uintptr_t)tss;  // IST1: stack top is just below the TSS
+    *(uint64_t *)(tss + 44) = (uint64_t)(uintptr_t)ir + GK_IST2_TOP;  // IST2: the NMI's
     // RSP0: the ring-0 stack the CPU switches to on a ring-3 -> ring-0 gate that
-    // does not use an IST (all gk gates use IST1, so this is defensive). A
-    // dedicated page at the bottom of the region, disjoint from IST1's downward
-    // growth from just below the TSS.
-    *(uint64_t *)(tss + 4) = (uint64_t)(uintptr_t)ir + 0x1000;
+    // does not use an IST (all gk gates use an IST, so this is defensive). The
+    // second page of the region, disjoint from the ISTs' downward growth; a
+    // resident vCPU's park loop runs on it too (the loop pushes nothing).
+    *(uint64_t *)(tss + 4) = (uint64_t)(uintptr_t)ir + GK_PARK_STACK_TOP;
     *(uint16_t *)(tss + 102) = 0x68;                     // I/O map base past the limit
+    // A resident vCPU (see the runner section): its park frame in the
+    // region's first page, its eventfd and the ioeventfd that signals it from
+    // the park loop, and its own SYSCALL entry. The ids an xAPIC NMI cannot
+    // address, and a failed ioeventfd registration (KVM's PIO bus is full),
+    // leave the vCPU with a plain runner.
+    if (G->resident_mode && id <= GK_PARK_MAX_ID) {
+      efd = eventfd(0, EFD_CLOEXEC);
+      struct kvm_ioeventfd ie = {0};
+      ie.addr = GK_PARK_PORT_BASE + (uint64_t)id;
+      ie.len = 1;
+      ie.fd = efd;
+      ie.flags = KVM_IOEVENTFD_FLAG_PIO;
+      // The LAPIC KVM gave the vCPU is hardware-enabled but KVM's map of
+      // APIC ids, which an MSI is matched against, does not list it until
+      // its state is set; this sets it as it is, software-enabled (SVR bit
+      // 8), and makes the vCPU a destination.
+      // With a LAPIC, KVM also starts every vCPU but the first as an
+      // application processor waiting for INIT and SIPI, in which state
+      // KVM_RUN blocks; this makes it runnable as the first one is.
+      struct kvm_lapic_state lapic;
+      struct kvm_mp_state mp = {.mp_state = KVM_MP_STATE_RUNNABLE};
+      int lapic_ok = ioctl(fd, KVM_GET_LAPIC, &lapic) == 0;
+      if (lapic_ok) {
+        *(uint32_t *)(lapic.regs + 0xf0) |= 0x100;
+        lapic_ok = ioctl(fd, KVM_SET_LAPIC, &lapic) == 0 && ioctl(fd, KVM_SET_MP_STATE, &mp) == 0;
+      }
+      if (efd >= 0 && lapic_ok && ioctl(G->vmfd, KVM_IOEVENTFD, &ie) == 0) {
+        park = (gk_park *)ir;
+        park->spin = G->runner_spin;
+        park->port = ie.addr;
+        park->stack = (uint64_t)(uintptr_t)ir + GK_PARK_STACK_TOP;
+        runner->park = park;
+        runner->efd = efd;
+        pthread_mutex_lock(&G->lock);
+        G->resident_n++;
+        pthread_mutex_unlock(&G->lock);
+      } else {
+        if (G->dbg)
+          fprintf(stderr, "[gk] vcpu %d: not resident: %s failed: %s\n", id,
+                  efd < 0 ? "eventfd" : !lapic_ok ? "KVM_SET_LAPIC" : "KVM_IOEVENTFD",
+                  strerror(errno));
+        if (efd >= 0) close(efd);
+        efd = -1;
+      }
+    } else if (G->resident_mode && G->dbg) {
+      fprintf(stderr, "[gk] vcpu %d: not resident: id past %d\n", id, GK_PARK_MAX_ID);
+    }
   }
 
   // A private guest stack for this vCPU, eager-mapped so interrupt delivery
@@ -2443,6 +2761,7 @@ static int vcpu_init(gk_thread *t, int flags) {
   host_syscall(SYS_arch_prctl, 0x1004, (long)&gsbase, 0, 0, 0, 0);  // ARCH_GET_GS
   s.fs = s.ds; s.fs.base = fsbase;
   s.gs = s.ds; s.gs.base = gsbase;
+  if (park) park->user_gs = gsbase;  // what the park loop swaps back in for the turn
   // TR comes from the vCPU's cached descriptor, set here; the GDT has no TSS
   // entry because the guest never executes ltr (iretq reloads only CS and SS).
   struct kvm_segment tr = {.base = ist + GK_IST_BYTES - 0x1000, .limit = 0x67,
@@ -2505,7 +2824,8 @@ static int vcpu_init(gk_thread *t, int flags) {
   // (GDT index 5, ring-3 code). A base of 0x18 (RPL 0) would return ring 3 with
   // RPL-0 selectors, and the IRETQ off a ring-3 fault would then #GP on SS.
   m.e[1].index = MSR_STAR; m.e[1].data = ((uint64_t)0x08 << 32) | ((uint64_t)0x1b << 48);
-  m.e[2].index = MSR_LSTAR; m.e[2].data = (uintptr_t)&gk_syscall_tramp;
+  m.e[2].index = MSR_LSTAR;
+  m.e[2].data = park ? (uintptr_t)&gk_park_syscall_tramp : (uintptr_t)&gk_syscall_tramp;
   m.e[3].index = MSR_SYSCALL_MASK; m.e[3].data = 0x3f7fd5;
   if (ioctl(fd, KVM_SET_MSRS, &m) < 4) { G->err = "KVM_SET_MSRS"; return -1; }
 
@@ -2517,6 +2837,13 @@ ready:
   t->ist = ist;
   t->side_stack = side_stack;
   t->runner = runner;
+  t->park = park;
+  t->parked = 0;      // a fresh or pooled vCPU is out of KVM_RUN (see vcpu_park)
+  t->turn_seq = park ? atomic_load_explicit(&park->go, memory_order_seq_cst) : 0;
+  t->run_seq = runner ? atomic_load_explicit(&runner->go, memory_order_seq_cst) : 0;
+  t->cr3_shadow = 0;
+  t->efd = efd;
+  t->stats_fd = stats_fd;
   t->root_gen = 0;    // a fresh or reused vCPU flushes its TLB at first entry
   t->last_fault = 0;
   t->fault_repeat = 0;
@@ -2723,6 +3050,7 @@ int gk_init(void) {
   {
     const char *v = getenv("GK_RUNNER");
     G->runner_mode = v && *v && strcmp(v, "0") != 0;
+    G->resident_mode = v && strcmp(v, "resident") == 0;
     v = getenv("GK_RUNNER_SPIN");
     G->runner_spin = v ? atol(v) : 0;
     v = getenv("GK_RUNNER_PIN");
@@ -2747,6 +3075,19 @@ int gk_init(void) {
   if (ioctl(G->kvm, KVM_GET_API_VERSION, 0) != 12) { G->err = "KVM API != 12"; return -1; }
   G->vmfd = ioctl(G->kvm, KVM_CREATE_VM, 0);
   if (G->vmfd < 0) { G->err = "KVM_CREATE_VM"; return -1; }
+  // Resident vCPUs halt inside KVM_RUN and are woken by an NMI, both of
+  // which need an in-kernel LAPIC: a split irqchip (LAPICs in the kernel,
+  // no PIC or IOAPIC), enabled before any vCPU exists. Without it the
+  // runners return to userspace after every turn as GK_RUNNER=1 does.
+  if (G->resident_mode) {
+    struct kvm_enable_cap cap = {.cap = KVM_CAP_SPLIT_IRQCHIP};
+    cap.args[0] = 24;
+    if (ioctl(G->vmfd, KVM_ENABLE_CAP, &cap) != 0) {
+      fprintf(stderr, "[gk] GK_RUNNER=resident: KVM_CAP_SPLIT_IRQCHIP: %s; runners will return "
+                      "to userspace after every turn\n", strerror(errno));
+      G->resident_mode = 0;
+    }
+  }
 
   G->pt_bytes = 64 * 1024 * 1024;
   uint8_t *pt = mmap(NULL, G->pt_bytes, PROT_READ | PROT_WRITE,
@@ -2786,11 +3127,14 @@ int gk_init(void) {
   gdt[5] = 0x00AFFA000000FFFFULL;  // ring-3 code64 (DPL 3, L=1)
   uint8_t *idt = (uint8_t *)(uintptr_t)G->idt_va;
   memset(idt, 0, 0x1000);
-  set_idt_gate(idt, 0, (uintptr_t)&gk_exc_de);
-  set_idt_gate(idt, 6, (uintptr_t)&gk_exc_ud);
-  set_idt_gate(idt, 8, (uintptr_t)&gk_exc_df);
-  set_idt_gate(idt, 13, (uintptr_t)&gk_exc_gp);
-  set_idt_gate(idt, 14, (uintptr_t)&gk_exc_pf);
+  set_idt_gate(idt, 0, (uintptr_t)&gk_exc_de, 1);
+  // The NMI a halted resident vCPU is kicked with (see the runner section),
+  // on its own stack: it can arrive while an exception handler is on IST1.
+  set_idt_gate(idt, 2, (uintptr_t)&gk_exc_nmi, 2);
+  set_idt_gate(idt, 6, (uintptr_t)&gk_exc_ud, 1);
+  set_idt_gate(idt, 8, (uintptr_t)&gk_exc_df, 1);
+  set_idt_gate(idt, 13, (uintptr_t)&gk_exc_gp, 1);
+  set_idt_gate(idt, 14, (uintptr_t)&gk_exc_pf, 1);
 
   // The page-table arena is read by the CPU page walker via guest-physical
   // addresses, so it needs memslots (but no PTEs of its own).
@@ -2806,6 +3150,7 @@ int gk_init(void) {
   GK_CPUID->nent = GK_CPUID_ENTRIES;
   if (ioctl(G->kvm, KVM_GET_SUPPORTED_CPUID, GK_CPUID) < 0) { G->err = "GET_SUPPORTED_CPUID"; return -1; }
   flush_stub_select();
+  G->park_flush_kind = G->flush_stub == gk_flush_stub_invpcid ? 1 : 2;
   xcr0_select();
   G->run_size = ioctl(G->kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
   // Register exchange through kvm_run (see regs_get) when KVM offers it for
@@ -2888,7 +3233,7 @@ long gk_debug_vcpu_stat(const char *name) {
 #ifdef KVM_GET_STATS_FD
   gk_thread *t = thread_cur();
   if (!t || !t->inited) return -1;
-  int fd = ioctl(t->fd, KVM_GET_STATS_FD, NULL);
+  int fd = t->stats_fd;  // taken at creation (see vcpu_init); never a vCPU ioctl here
   if (fd < 0) return -1;
   long v = -1;
   struct kvm_stats_header hdr;
@@ -2906,7 +3251,6 @@ long gk_debug_vcpu_stat(const char *name) {
       break;
     }
   }
-  close(fd);
   return v;
 #else
   (void)name;
@@ -2972,6 +3316,7 @@ static int sregs_set_now(gk_thread *t, const struct kvm_sregs *s) {
 // unchanged, points RIP at gk_syscall_tramp_resume). Sregs are untouched.
 static int run_stub(gk_thread *t, void (*stub)(void), uint64_t rdi, uint64_t rsi,
                     uint16_t port, const char *what) {
+  park_leave(t);  // a resident vCPU between turns is inside KVM_RUN
   struct kvm_regs regs = {0};
   regs.rip = (uintptr_t)stub;
   regs.rdi = rdi;
@@ -3002,6 +3347,12 @@ static int run_stub(gk_thread *t, void (*stub)(void), uint64_t rdi, uint64_t rsi
 // changes a control register, and re-setting the same values is a no-op.
 static int flush_run(gk_thread *t) {
   atomic_fetch_add_explicit(&G->tlb_flushes, 1, memory_order_relaxed);
+  if (t->parked) {
+    // The park loop flushes at its launch, before the turn's first
+    // instruction, which is when every between-turn caller wants it.
+    t->park->flush = G->park_flush_kind;
+    return 0;
+  }
   return run_stub(t, G->flush_stub, 0, 0, PORT_FLUSH, "flush");
 }
 
@@ -3120,6 +3471,15 @@ static long child_entry(void *arg) {
     // contract wants RCX = the start RIP, which is that same return address.
     regs.rip = (uintptr_t)&gk_user_child_launch;
     regs.rcx = t->start.regs.rip;
+  }
+  if (t->park) {
+    // A resident vCPU (see the runner section). The thread is not a turn,
+    // but an exit sentinel it issues parks the vCPU as a turn's end would,
+    // and run_vcpu reports that as it reports a turn's end; so the frame
+    // gets the sequence word it would then echo, and nothing is reported
+    // before it does.
+    t->turn_seq++;
+    atomic_store_explicit(&t->park->go, t->turn_seq, memory_order_seq_cst);
   }
   regs_set(t, &regs);
   if (G->dbg)
@@ -4293,13 +4653,18 @@ static int sync_cr3(gk_thread *t, uint64_t *load) {
   unsigned gen = __atomic_load_n(&G->root_gen, __ATOMIC_ACQUIRE);
   uint64_t want_cr3 = (uint64_t)(uintptr_t)t->active_pml4;
   struct kvm_sregs s;
-  sregs_get(t, &s);
+  // kvm_run's copy is as of the last return from KVM_RUN. A parked vCPU
+  // has not returned since its last launch, which loaded cr3_shadow (or
+  // left it), and its CR3 has changed only through launches since.
+  if (t->parked) s.cr3 = t->cr3_shadow;
+  else sregs_get(t, &s);
   *load = 0;
   if (s.cr3 != want_cr3) {
     *load = want_cr3;
   } else if (t->root_gen != gen) {
     if (flush_run(t) < 0) return -1;
   }
+  t->cr3_shadow = *load ? *load : s.cr3;
   t->root_gen = gen;
   return 0;
 }
@@ -4320,6 +4685,10 @@ static int cr3_load_host(gk_thread *t, uint64_t cr3) {
 // sync_cr3), its PKRU on first entry, and the per-invocation fault-repeat
 // tracking.
 static int prepare_entry(gk_thread *t, uint64_t *load) {
+  // A resident vCPU whose run returned while it was parked (a signal) is
+  // out of KVM_RUN: it is entered afresh, like one that faulted (see
+  // enter_guest), and its root is read from kvm_run below, not shadowed.
+  if (t->parked && resident_run_returned(t)) t->parked = 0;
   if (sync_cr3(t, load) < 0) return -1;
   uint32_t hp = host_pkru();
   host_pkru_allow_all();
@@ -4359,6 +4728,68 @@ static int prepare_entry(gk_thread *t, uint64_t *load) {
 static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t stack_top,
                         int user, uint64_t cr3) {
   uint64_t sp = stack_top - 8;
+  if (cr3) {
+    atomic_fetch_add_explicit(&G->root_switches, 1, memory_order_relaxed);
+    if (G->dbg)
+      fprintf(stderr, "[gk] vcpu %d: root switch to %#llx (%s)\n", t->id,
+              (unsigned long long)cr3, t->active_arena ? "arena" : "base");
+  }
+  if (t->park) {
+    // A resident vCPU (see the runner section): the entry goes through the
+    // park frame, and the park loop loads the root and the registers. A
+    // ring-0 turn returns into the parking exit stub; a ring-3 turn's exit
+    // sentinel reaches the vCPU's own SYSCALL entry, which parks. A vCPU
+    // that is not in the loop (fresh, or out of KVM_RUN since a fault ended
+    // its last turn) is started at gk_park_entry, which parks and launches.
+    *(uint64_t *)sp = user ? (uintptr_t)&gk_user_exit_tramp : (uintptr_t)&gk_park_exit_tramp;
+    // Everything the turn reads goes before `go`: the loop launches the
+    // instant it sees the word move, and a hostcall early in the turn
+    // reads tls_in_guest to decide whether it is in the guest at all.
+    t->user_mode = user;
+    tls_in_guest = 1;
+    gk_park *p = t->park;
+    p->cr3 = cr3;
+    p->rsp = sp;
+    p->fn = (uintptr_t)fn;
+    p->arg = (uintptr_t)arg;
+    p->user = (uint64_t)user;
+    t->turn_seq++;
+    atomic_store_explicit(&p->go, t->turn_seq, memory_order_seq_cst);
+    if (t->parked) {
+      if (atomic_load_explicit(&p->halted, memory_order_seq_cst)) park_kick(t);
+    } else {
+      // The loop starts afresh, and walks its root from its first
+      // instruction: the turn's root goes in through kvm_run, where KVM
+      // loads it before the guest runs, rather than through the loop's
+      // launch path, which would run under whatever root the vCPU last
+      // had (gone, possibly, with its arena). KVM flushes the TLB for it.
+      if (cr3) {
+        struct kvm_sregs s;
+        sregs_get(t, &s);
+        s.cr3 = cr3;
+        sregs_set(t, &s);
+        t->tlb_touched = 1;
+        p->cr3 = 0;
+      }
+      atomic_store_explicit(&p->reload, 0, memory_order_seq_cst);
+      atomic_store_explicit(&p->cur_cr3, t->cr3_shadow, memory_order_seq_cst);
+      // A run that returned on a signal while the loop was halted leaves
+      // the vCPU halted as far as KVM knows, and a halted vCPU's KVM_RUN
+      // blocks until an event; it is runnable from the loop's first
+      // instruction here.
+      struct kvm_mp_state mp = {.mp_state = KVM_MP_STATE_RUNNABLE};
+      ioctl(t->fd, KVM_SET_MP_STATE, &mp);
+      struct kvm_regs regs = {0};
+      regs.rip = (uintptr_t)&gk_park_entry;
+      regs.rdi = (uintptr_t)p;
+      regs.rsp = p->stack;
+      regs.rflags = 0x2;
+      regs_set(t, &regs);
+    }
+    long r = run_vcpu(t);
+    tls_in_guest = 0;
+    return r;
+  }
   *(uint64_t *)sp = user ? (uintptr_t)&gk_user_exit_tramp : (uintptr_t)&gk_exit_tramp;
 
   struct kvm_regs regs = {0};
@@ -4375,12 +4806,6 @@ static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t st
     regs.rax = (uintptr_t)fn;
   } else {
     regs.rip = (uintptr_t)fn;
-  }
-  if (cr3) {
-    atomic_fetch_add_explicit(&G->root_switches, 1, memory_order_relaxed);
-    if (G->dbg)
-      fprintf(stderr, "[gk] vcpu %d: root switch to %#llx (%s)\n", t->id,
-              (unsigned long long)cr3, t->active_arena ? "arena" : "base");
   }
   regs_set(t, &regs);
   t->user_mode = user;
@@ -4769,17 +5194,19 @@ static long host_backing_fail(gk_thread *t, int err) {
   return GK_EFAULT;
 }
 
-// Run this thread's vCPU from its current register state until the guest exits
-// (via gk_exit_tramp) or faults.
-static long run_vcpu(gk_thread *t) {
-  for (;;) {
-    t->tlb_touched = 1;  // the vCPU runs: its TLB is no longer known (see wall_raise)
-    if (vcpu_run_ioctl(t) < 0) {
-      int err = errno;
-      if (err == EINTR) continue;
-      if (err == EFAULT && host_backing_retry(t)) continue;
-      return host_backing_fail(t, err);
-    }
+// A KVM_RUN that failed with errno `err`: whether that ends the turn, with
+// *result set, or the run is to be retried.
+static int run_failed(gk_thread *t, int err, long *result) {
+  if (err == EINTR) return 0;
+  if (err == EFAULT && host_backing_retry(t)) return 0;
+  *result = host_backing_fail(t, err);
+  return 1;
+}
+
+// Handle the exit a returned KVM_RUN reports: whether it ends the turn, with
+// *result set, or the vCPU is to be run again from where it stopped.
+static int handle_exit(gk_thread *t, long *result) {
+#define TURN_ENDS(v) do { *result = (v); return 1; } while (0)
     switch (t->run->exit_reason) {
       case KVM_EXIT_IO: {
         if (t->run->io.direction != KVM_EXIT_IO_OUT) break;
@@ -4789,7 +5216,7 @@ static long run_vcpu(gk_thread *t) {
           regs_get(t, &r);
           // A ring-3 guest leaves through the sentinel exit syscall (ring 3
           // cannot use PORT_EXIT's OUT): its result is in RDI.
-          if (r.rax == GK_EXIT_SYSCALL) return (long)r.rdi;
+          if (r.rax == GK_EXIT_SYSCALL) TURN_ENDS((long)r.rdi);
           // A hostcall (see the hostcalls section) is answered here, never
           // forwarded and never shown to the filter.
           if (r.rax == GK_HOSTCALL_SYSCALL) {
@@ -4810,20 +5237,20 @@ static long run_vcpu(gk_thread *t) {
         } else if (port == PORT_EXIT) {
           struct kvm_regs r;
           regs_get(t, &r);
-          return (long)r.rax;
+          TURN_ENDS((long)r.rax);
         } else if (port == PORT_UDRIP) {
           struct kvm_regs r;
           regs_get(t, &r);
           G->fault_addr = r.rax;
           if (G->dbg) fprintf(stderr, "[gk] #UD at rip=%#llx\n", (unsigned long long)r.rax);
-          return GK_EFAULT;
+          TURN_ENDS(GK_EFAULT);
         } else if (port == PORT_DEMAND) {
           struct kvm_sregs s;
           sregs_get(t, &s);
           uint64_t cr2 = s.cr2;
           int repeat = (cr2 == t->last_fault);
           if (repeat) {
-            if (++t->fault_repeat > 2) { G->fault_addr = cr2; return GK_EFAULT; }
+            if (++t->fault_repeat > 2) { G->fault_addr = cr2; TURN_ENDS(GK_EFAULT); }
           } else { t->last_fault = cr2; t->fault_repeat = 0; }
           // A protection-key violation is the guest CPU enforcing the page's
           // key against this vCPU's PKRU: a genuine fault, unless the entry
@@ -4845,7 +5272,7 @@ static long run_vcpu(gk_thread *t) {
               db_flush(&d);
             }
             G->fault_addr = cr2;
-            return GK_EFAULT;
+            TURN_ENDS(GK_EFAULT);
           }
           // A write into this turn's host-frame wall (see run_here) is the wall
           // holding: genuine, whatever the host protection of the page. Reads
@@ -4873,7 +5300,7 @@ static long run_vcpu(gk_thread *t) {
               }
             }
             G->fault_addr = cr2;
-            return GK_EFAULT;
+            TURN_ENDS(GK_EFAULT);
           }
           GK_HANDLER_ENTER();
           int dm = demand_map(t, (uintptr_t)cr2, (uintptr_t)pf_sp);
@@ -4905,10 +5332,14 @@ static long run_vcpu(gk_thread *t) {
               }
             }
             G->fault_addr = cr2;
-            return GK_EFAULT;
+            TURN_ENDS(GK_EFAULT);
           }
           // The retry re-walks the page tables: a page fault invalidates the
           // TLB entry it was taken through, so no explicit flush is needed.
+        } else if (port == PORT_PARK_LEAVE) {
+          // The park loop left KVM_RUN at park_leave's request between
+          // turns; inside a turn it cannot, so this is only ever seen by a
+          // run_vcpu that found the run returned (see above) and resumes.
         } else if (port == PORT_FAULT) {
           struct kvm_regs rr; struct kvm_sregs sr;
           regs_get(t, &rr);
@@ -4920,20 +5351,79 @@ static long run_vcpu(gk_thread *t) {
             db_flush(&d);
           }
           G->fault_addr = rr.rax;
-          return GK_EFAULT;
+          TURN_ENDS(GK_EFAULT);
         }
         break;
       }
       case KVM_EXIT_HLT:
-        return 0;
+        TURN_ENDS(0);
       case KVM_EXIT_SHUTDOWN:
-        return GK_ESHUTDOWN;
+        TURN_ENDS(GK_ESHUTDOWN);
       default:
         if (G->dbg) fprintf(stderr, "[gk] unexpected exit reason=%u\n", t->run->exit_reason);
-        return -1;
+        TURN_ENDS(-1);
+    }
+    return 0;
+#undef TURN_ENDS
+}
+
+// Run this thread's vCPU from its current register state until the guest exits
+// (via gk_exit_tramp, or the park loop for a resident vCPU) or faults.
+static long run_vcpu(gk_thread *t) {
+  long result;
+  if (!t->park) {
+    for (;;) {
+      t->tlb_touched = 1;  // the vCPU runs: its TLB is no longer known (see wall_raise)
+      if (vcpu_run_ioctl(t) < 0) {
+        if (run_failed(t, errno, &result)) return result;
+        continue;
+      }
+      if (handle_exit(t, &result)) return result;
     }
   }
+  // Resident (see the runner section). A parked vCPU is inside KVM_RUN
+  // already, launching the turn enter_guest wrote to its frame, unless its
+  // run returned meanwhile (a signal), which is looked at before anything
+  // else; a vCPU that is not parked is handed a run with the registers
+  // enter_guest set. Then: the turn ends in the park loop, which leaves the
+  // vCPU parked, or the run returns with an exit, which is handled as ever
+  // and leaves the vCPU out of KVM_RUN until it is run again.
+  int in_run = t->parked && !resident_run_returned(t);
+  for (;;) {
+    t->tlb_touched = 1;
+    if (!in_run && !t->parked) resident_run_start(t);
+    if (in_run || !t->parked) {
+      if (resident_wait(t) == GK_EV_TURN_ENDED) {
+        gk_park *p = t->park;
+        if (atomic_load_explicit(&p->in_turn, memory_order_seq_cst)) {
+          gk_dbuf d = {.n = 0};
+          db_str(&d, "[gk] BUG: vcpu "); db_dec(&d, t->id);
+          db_str(&d, ": turn "); db_dec(&d, (long)t->turn_seq);
+          db_str(&d, " reported ended while the guest is in a turn (go ");
+          db_dec(&d, (long)atomic_load_explicit(&p->go, memory_order_seq_cst));
+          db_str(&d, ", done "); db_dec(&d, (long)atomic_load_explicit(&p->done, memory_order_seq_cst));
+          db_str(&d, ", run "); db_dec(&d, (long)t->run_seq);
+          db_str(&d, ", runner done "); db_dec(&d, (long)atomic_load_explicit(&t->runner->done, memory_order_seq_cst));
+          db_str(&d, ", parked "); db_dec(&d, t->parked);
+          db_str(&d, ", in_run "); db_dec(&d, in_run); db_str(&d, ")");
+          db_flush(&d);
+        }
+        t->parked = 1;
+        atomic_fetch_add_explicit(&G->park_turns, 1, memory_order_relaxed);
+        return (long)p->result;
+      }
+    }
+    in_run = 0;
+    t->parked = 0;
+    gk_runner *r = t->runner;
+    if (r->ret < 0) {
+      if (run_failed(t, r->err, &result)) return result;
+      continue;
+    }
+    if (handle_exit(t, &result)) return result;
+  }
 }
+
 
 // ---- arenas ----------------------------------------------------------------
 // The reservation must own whole PML4 slots: an arena root's private entry for
@@ -5178,6 +5668,20 @@ void gk_arena_destroy(gk_arena *a) {
             "its page tables and slots are leaked\n", (unsigned long)a->base,
             (unsigned long)a->end, in_use);
   } else {
+    // A resident vCPU parked under this root keeps walking it from its
+    // park loop (see the runner section): move each such vCPU to the base
+    // root before the tables go. Which root a loop is under is the loop's
+    // own word (cur_cr3): the owner's record runs ahead of the loop while
+    // it prepares an entry. The owner of one may be preparing its next
+    // entry meanwhile; the root that entry wants is not this one (the arena
+    // is active on no thread), so its launch and this reload agree.
+    uint64_t dying = (uint64_t)(uintptr_t)a->pml4;
+    for (int i = 0; i < G->thread_n; i++) {
+      gk_thread *o = &G->threads[i];
+      if (o->tid && o->inited && o->park && o->parked &&
+          atomic_load_explicit(&o->park->cur_cr3, memory_order_seq_cst) == dying)
+        park_reload_root(o, (uint64_t)(uintptr_t)G->pml4);
+    }
     for (int i = 0; i < a->nslots; i++) {
       free_subtree((uint64_t *)(uintptr_t)(a->slot_entry[i] & ~0xfffULL), 3);
       a->slot_entry[i] = 0;
@@ -5228,7 +5732,23 @@ void gk_get_stats(gk_stats *s) {
   s->path_refusals = atomic_load_explicit(&G->path_refusals, memory_order_relaxed);
   s->runners = G->runner_n;
   s->runner_runs = atomic_load_explicit(&G->runner_runs, memory_order_relaxed);
+  s->resident_vcpus = G->resident_n;
+  s->park_turns = atomic_load_explicit(&G->park_turns, memory_order_relaxed);
+  s->park_kicks = atomic_load_explicit(&G->park_kicks, memory_order_relaxed);
   pthread_mutex_unlock(&G->lock);
+}
+int gk_turn_cpu_clockid(clockid_t *id) {
+  if (!G->initialized) return -GK_ESRCH;
+  gk_thread *t = thread_cur();
+  if (!t || !t->inited || !t->runner) {
+    *id = CLOCK_THREAD_CPUTIME_ID;
+    return 0;
+  }
+  // The kernel's encoding of a thread's CPU clock (CPUCLOCK_SCHED, per
+  // thread), as glibc's pthread_getcpuclockid builds it from a tid.
+  long tid = atomic_load_explicit(&t->runner->tid, memory_order_seq_cst);
+  *id = (clockid_t)(((~tid) << 3) | 6);
+  return 0;
 }
 
 // Test/diagnostic hook (see gk.h): drop the PTE of the page holding `addr`

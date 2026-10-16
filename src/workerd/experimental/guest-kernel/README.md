@@ -614,8 +614,61 @@ hardware:
   On the owner's SMT sibling (`GK_RUNNER_PIN=sibling`) the runner recovers
   nothing: the flush empties predictor state the core's two hyperthreads
   share. `gk_stats.runners` and `runner_runs` count the runners and their
-  runs. What the runner leaves, and what taking it would need, is in the
-  findings.
+  runs.
+
+  `GK_RUNNER=resident` keeps the runner inside `KVM_RUN` across turns, so
+  that on a turn's own path nothing returns to userspace on the vCPU's CPU
+  and no IBPB is issued there: the guest's predictions survive from one turn
+  to the next as the owner's do. Between turns the vCPU runs gk's park loop
+  (`gk_park_loop` in `gk_asm.S`) at ring 0, with GS pointing at its park
+  frame, a `gk_park` in supervisor memory that the host writes and ring 3
+  cannot reach. The owner starts a turn by writing the frame -- the root to
+  load, the entry stack, function, argument and ring, the values
+  `enter_guest` otherwise puts in `kvm_run` -- and bumping a sequence word;
+  the loop loads the root and `SYSRET`s into the turn. The turn ends with
+  the exit sentinel reaching the vCPU's own `SYSCALL` entry
+  (`gk_park_syscall_tramp`), which stores the result in the frame and echoes
+  the sequence word instead of leaving the VM (a ring-0 turn returns into
+  `gk_park_exit_tramp`, which does the same). The loop spins its budget
+  (`GK_RUNNER_SPIN`, the same knob) and then halts with `STI;HLT`, which
+  KVM services inside the kernel because the VM has an in-kernel LAPIC (a
+  split irqchip, enabled at init); the owner kicks a halted vCPU with
+  `KVM_SIGNAL_MSI` in NMI delivery mode, which wakes `HLT` whatever IF is
+  and needs no EOI; the handler returns where it landed, so a kick that
+  arrives after the loop already launched costs the turn one return, and
+  when it landed between the loop's last check and its `HLT` (an NMI is not
+  held back by the `STI` shadow) the handler returns past the `HLT`, so no
+  wakeup is lost.
+  The owner spins the same budget and then sleeps on the vCPU's eventfd,
+  which the loop signals through an `ioeventfd` (an `OUT` the kernel turns
+  into the signal without leaving `KVM_RUN`) and the runner writes when a
+  run does return. A forwarded syscall, a hostcall, a demand fault and a
+  fatal fault still return to userspace, one per event, and are served as
+  before: the runner's ioctl returns, the owner handles the exit, the runner
+  runs the vCPU again; a fault that ends the turn leaves the vCPU out of
+  `KVM_RUN`, and the next entry starts it through `gk_park_entry`, which
+  parks from a fresh state, with the turn's root loaded through `kvm_run`
+  first. A between-turn TLB flush is deferred to the loop's launch path; a
+  vCPU that goes to the pool, or that a stub must run on, is first asked to
+  leave the loop (`park_leave`). The loop runs under the last turn's root
+  and walks it on every TLB miss, so `gk_arena_destroy` first moves every
+  parked vCPU still under the arena's root (the loop publishes its root in
+  the frame) to the base root, and waits for the loop to say it has, before
+  it frees the tables. The frame is trusted
+  as `enter_guest`'s register values are trusted: ring-0 guest code could
+  rewrite it, and could load CR3 directly, so the loop adds no capability
+  ring 0 lacks. A vCPU whose id is above 254 (an xAPIC NMI cannot address
+  it; 255 is the broadcast id) or that cannot get an `ioeventfd` (KVM's PIO
+  bus holds 1000) gets a plain runner. `gk_stats.resident_vcpus`, `park_turns` and `park_kicks`
+  count the resident vCPUs, the turns that ended in a park loop and the
+  kicks. On the EPYC 9255 with the mitigation on, hello world then costs
+  25.4 us with both sides spinning (`GK_RUNNER_SPIN=-1`; two logical CPUs
+  per event loop) and 28.5 us with both sleeping (the default), against
+  24.1 us with the guest kernel off and 138.0 us with it on, at 0.01
+  returns to userspace per request; the heavier worker runs at native
+  speed. The sleeping arrangement's CPU per request is dominated by KVM's
+  halt polling between turns (`measure/findings.md`, section 4, "What a
+  resident runner recovers").
 - **W^X.** Pages are mapped with their host protection: executable pages are not
   writable and writable pages are not executable (NX is enabled in the guest,
   and `CR0.WP` is set so the ring-0 guest cannot write a read-only page either).

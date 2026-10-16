@@ -54,6 +54,10 @@
 
 #include <cstring>
 
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <workerd/experimental/guest-kernel/gk.h>
+#endif
+
 namespace workerd::api {
 
 namespace {
@@ -345,15 +349,22 @@ void armWasmSignalTimerForTest(const TrackedWasmInstanceList& list) {
   sev.sigev_notify = SIGEV_THREAD_ID;
   sev.sigev_signo = SIGXCPU;
   sev._sigev_un._tid = static_cast<int>(syscall(SYS_gettid));
-  KJ_SYSCALL(timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &wasmSignalProbeTimer));
+  // The clock is the one the turn's CPU is charged to: this thread's, unless the guest kernel
+  // runs the turn's instructions on a vCPU runner thread (GK_RUNNER), whose clock gk names
+  // then. The signal still comes to this thread, where the handler's write belongs.
+  clockid_t clock = CLOCK_THREAD_CPUTIME_ID;
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (gk_initialized()) gk_turn_cpu_clockid(&clock);
+#endif
+  KJ_SYSCALL(timer_create(clock, &sev, &wasmSignalProbeTimer));
   wasmSignalProbeTimerArmed = true;
   struct itimerspec its {};
   its.it_value.tv_nsec = WASM_SIGNAL_PROBE_MS * 1000000;
   KJ_SYSCALL(timer_settime(wasmSignalProbeTimer, 0, &its, nullptr));
   KJ_LOG(WARNING,
-      "WORKERD_GK_TEST_PROBE: armed a CPU-time timer on this thread whose signal handler writes "
-      "the Wasm shutdown signal",
-      WASM_SIGNAL_PROBE_MS);
+      "WORKERD_GK_TEST_PROBE: armed a CPU-time timer on the clock the turn is charged to, whose "
+      "signal handler on this thread writes the Wasm shutdown signal",
+      WASM_SIGNAL_PROBE_MS, clock);
 }
 
 // The buffer a write primitive would aim the old descriptor at, and the descriptors as they

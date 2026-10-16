@@ -66,7 +66,7 @@ export default {
 # counters and take no counter slot.
 GROUPS = [
     "cycles:G,cycles:H,instructions:G,instructions:H,kvm:kvm_exit,kvm:kvm_userspace_exit,"
-    "context-switches,cpu-migrations",
+    "kvm:kvm_halt_poll_ns,kvm:kvm_msi_set_irq,kvm:kvm_vcpu_wakeup,context-switches,cpu-migrations",
     "ex_ret_brn_misp:G,ex_ret_brn_misp:H,ex_ret_brn_ind_misp:G,ex_ret_brn_ind_misp:H,"
     "ex_ret_near_ret_mispred:G,ex_ret_near_ret_mispred:H",
     "ex_ret_brn:G,ex_ret_brn:H,ic_cache_fill_sys:G,ic_cache_fill_sys:H,"
@@ -92,6 +92,11 @@ RUNNER_SIBLING = {"GK_RUNNER": "1", "GK_RUNNER_SPIN": "-1", "GK_RUNNER_PIN": "si
 RUNNER_OTHER = {"GK_RUNNER": "1", "GK_RUNNER_SPIN": "-1", "GK_RUNNER_PIN": "other"}
 RUNNER_OTHER_SLEEP = {"GK_RUNNER": "1", "GK_RUNNER_PIN": "other"}
 RUNNER_FREE_SLEEP = {"GK_RUNNER": "1"}
+# The resident ones keep the runner inside KVM_RUN across turns (GK_RUNNER=
+# resident, see gk.c): the guest parks in a ring-0 loop, spinning or halted,
+# and the owner spins or sleeps on an eventfd, with the same budget.
+RESIDENT_OTHER = {"GK_RUNNER": "resident", "GK_RUNNER_SPIN": "-1", "GK_RUNNER_PIN": "other"}
+RESIDENT_OTHER_SLEEP = {"GK_RUNNER": "resident", "GK_RUNNER_PIN": "other"}
 ARRANGEMENTS = [
     ("off hello", False, 1, "/", {}),
     ("on hello", True, 1, "/", {}),
@@ -99,13 +104,19 @@ ARRANGEMENTS = [
     ("on hello runner-other", True, 1, "/", RUNNER_OTHER),
     ("on hello runner-other-sleep", True, 1, "/", RUNNER_OTHER_SLEEP),
     ("on hello runner-free-sleep", True, 1, "/", RUNNER_FREE_SLEEP),
+    ("on hello resident-other", True, 1, "/", RESIDENT_OTHER),
+    ("on hello resident-other-sleep", True, 1, "/", RESIDENT_OTHER_SLEEP),
     ("off hello x2", False, 2, "/", {}),
     ("on hello x2", True, 2, "/", {}),
     ("on hello x2 runner-other", True, 2, "/", RUNNER_OTHER),
+    ("on hello x2 resident-other", True, 2, "/", RESIDENT_OTHER),
+    ("on hello x2 resident-other-sleep", True, 2, "/", RESIDENT_OTHER_SLEEP),
     ("off heavy", False, 1, "/heavy", {}),
     ("on heavy", True, 1, "/heavy", {}),
     ("on heavy runner-other", True, 1, "/heavy", RUNNER_OTHER),
     ("on heavy runner-other-sleep", True, 1, "/heavy", RUNNER_OTHER_SLEEP),
+    ("on heavy resident-other", True, 1, "/heavy", RESIDENT_OTHER),
+    ("on heavy resident-other-sleep", True, 1, "/heavy", RESIDENT_OTHER_SLEEP),
     ("off heavy x2", False, 2, "/heavy", {}),
     ("on heavy x2", True, 2, "/heavy", {}),
 ]
@@ -248,7 +259,8 @@ def line(name, rnd, row):
                tot(c, "ls_l1_d_tlb_miss.all_l2_miss"), tot(c, "bp_l1_tlb_miss_l2_tlb_miss.all"),
                c["ls_l1_d_tlb_miss.all_l2_miss:G"], c["bp_l1_tlb_miss_l2_tlb_miss.all:G"],
                tot(c, "ls_tlb_flush.all"), c.get("kvm:kvm_exit", 0), c.get("kvm:kvm_userspace_exit", 0),
-               c.get("context-switches", 0), c.get("cpu-migrations", 0), owner))
+               c.get("context-switches", 0), c.get("cpu-migrations", 0), owner) +
+            "  halts %.2f kicks %.2f wakeups %.2f" % (c.get("kvm:kvm_halt_poll_ns", 0), c.get("kvm:kvm_msi_set_irq", 0), c.get("kvm:kvm_vcpu_wakeup", 0)))
 
 
 def main():

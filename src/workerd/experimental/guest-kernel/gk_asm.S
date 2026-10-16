@@ -144,6 +144,243 @@ gk_exit_tramp:
     outb %al, $0xFF
     hlt
 
+// ---- resident vCPUs: the park loop ------------------------------------------
+// A resident vCPU (GK_RUNNER=resident; see the runner section in gk.c) never
+// leaves KVM_RUN to end or start a turn. Between turns it runs this loop at
+// ring 0, with GS pointing at its park frame (gk_park in gk.c: supervisor
+// memory, host-written), which carries the next turn's entry state in and
+// the finished turn's result out. The frame's offsets are fixed here and
+// checked against the struct by gk.c.
+//
+// The loop runs on no stack of the turn's: the host sets RSP to the frame's
+// ring-0 stack, and nothing here pushes. An NMI (the host's kick, below)
+// takes the IST2 stack and returns with IRETQ, so it is safe at any point:
+// here, in a stub, or in the middle of a ring-3 turn.
+#define PARK_GO 0
+#define PARK_DONE 8
+#define PARK_RESULT 16
+#define PARK_CR3 24
+#define PARK_RSP 32
+#define PARK_FN 40
+#define PARK_ARG 48
+#define PARK_USER 56
+#define PARK_FLUSH 64
+#define PARK_SPIN 72
+#define PARK_HALTED 80
+#define PARK_OWNER_SLEEPING 88
+#define PARK_LEAVE 96
+#define PARK_PORT 104
+#define PARK_USER_GS 112
+#define PARK_STACK 120
+#define PARK_RELOAD 128
+#define PARK_CUR_CR3 136
+#define PARK_IN_TURN 144
+
+// Entry from the host: RDI = the frame. Sets GS base to the frame and
+// KERNEL_GS_BASE to the turn's GS base unconditionally, whatever state a
+// previous exit left the pair in (a fault mid-turn leaves them swapped one
+// way, a fault in the loop the other), then parks. Both MSRs are direct
+// access under KVM, so this costs no exit.
+    .globl gk_park_entry
+    .type gk_park_entry, @function
+gk_park_entry:
+    movq %rdi, %rax
+    movq %rdi, %rdx
+    shrq $32, %rdx
+    movl $0xC0000101, %ecx          /* MSR_GS_BASE */
+    wrmsr
+    movq PARK_USER_GS(%rdi), %rax
+    movq %rax, %rdx
+    shrq $32, %rdx
+    movl $0xC0000102, %ecx          /* MSR_KERNEL_GS_BASE */
+    wrmsr
+    jmp gk_park_loop
+
+// Ring-0 guest exit for a resident vCPU: the turn's return address. RAX is
+// the result.
+    .globl gk_park_exit_tramp
+    .type gk_park_exit_tramp, @function
+gk_park_exit_tramp:
+    movq %rax, %rdi
+    jmp gk_park_exit
+
+// SYSCALL entry (MSR_LSTAR) for a resident vCPU: the resolve is answered as
+// in gk_syscall_tramp, the exit sentinel (GK_EXIT_SYSCALL, 0xF4240) parks the
+// vCPU with RDI as the turn's result instead of leaving the VM, and every
+// other syscall is the hypercall as before. The host resumes a ring-0 guest
+// after a stub run at gk_syscall_tramp_resume, which is the same jmpq *%rcx.
+    .globl gk_park_syscall_tramp
+    .type gk_park_syscall_tramp, @function
+gk_park_syscall_tramp:
+    cmpq $0xF4242, %rax
+    je gk_resolve_tramp
+    cmpq $0xF4240, %rax
+    je gk_park_exit
+    outb %al, $0x11
+    jmpq *%rcx
+
+// The turn is over: RDI = its result, GS still the turn's. Publish the
+// result and echo the turn's sequence word into `done` with a locked
+// exchange, so the owner that sees `done` sees the result, and so this
+// store is ordered before the load of `owner_sleeping` that follows (x86
+// reorders a plain store past a later load). An owner that said it sleeps
+// is woken through the ioeventfd on the frame's port, which KVM services in
+// the kernel; otherwise it is spinning on `done` and nothing more is needed.
+    .globl gk_park_exit
+    .type gk_park_exit, @function
+gk_park_exit:
+    swapgs
+    movq %rdi, %gs:PARK_RESULT
+    movq $0, %gs:PARK_IN_TURN
+    movq %gs:PARK_GO, %rax
+    xchgq %rax, %gs:PARK_DONE
+    cmpq $0, %gs:PARK_OWNER_SLEEPING
+    je gk_park_loop
+    movq %gs:PARK_PORT, %rdx
+    xorl %eax, %eax
+    outb %al, %dx
+    /* falls through */
+
+// Wait for the next turn. `go` moves ahead of `done` when the host has
+// written the frame; the loop spins the frame's budget (negative: for ever)
+// and then halts: it raises `halted` with a locked exchange, re-reads `go`
+// and `leave` (an owner that bumped either before this vCPU raised the flag
+// sends no kick, and is seen here instead; one that bumped it after sees the
+// flag and kicks), and executes STI;HLT. An NMI wakes HLT whatever IF is,
+// and it is not held back by the STI shadow as a maskable interrupt would
+// be, so a kick can land anywhere between the raise of `halted` and the
+// HLT, where a plain return would leave the vCPU halting on a turn already
+// posted: the NMI handler (gk_exc_nmi) returns past the HLT instead when it
+// finds the interrupted RIP in that window, and the loop re-checks. `leave`
+// asks the loop to exit to userspace (port 0xF8), for the host operations
+// that need the vCPU out of KVM_RUN. `reload` names a root the loop is to
+// load at once and then clear, for a host that is about to free the root
+// the vCPU parked under (see park_reload_root in gk.c); a launch clears it
+// too, since the launch loads the root the turn wants. `cur_cr3` is the
+// root this loop is under, written here at every load, which is how the
+// host tells which parked vCPUs a root it is about to free still carries.
+// `in_turn` is set at the launch and cleared before `done` is echoed, so
+// the host can tell a turn reported ended from one still running.
+    .globl gk_park_loop
+    .type gk_park_loop, @function
+gk_park_loop:
+    movq %gs:PARK_STACK, %rsp
+    movq %gs:PARK_SPIN, %rcx
+1:  movq %gs:PARK_RELOAD, %rax
+    testq %rax, %rax
+    jz 0f
+    movq %rax, %cr3
+    movq %rax, %gs:PARK_CUR_CR3
+    movq $0, %gs:PARK_RELOAD
+0:  cmpq $0, %gs:PARK_LEAVE
+    jne 9f
+    movq %gs:PARK_GO, %rax
+    cmpq %gs:PARK_DONE, %rax
+    jne 5f
+    testq %rcx, %rcx
+    jz 2f
+    js 3f
+    decq %rcx
+3:  pause
+    jmp 1b
+2:  movl $1, %eax
+    xchgq %rax, %gs:PARK_HALTED
+gk_park_hlt_window:
+    cmpq $0, %gs:PARK_LEAVE
+    jne 4f
+    cmpq $0, %gs:PARK_RELOAD
+    jne 4f
+    movq %gs:PARK_GO, %rax
+    cmpq %gs:PARK_DONE, %rax
+    jne 4f
+    sti
+gk_park_hlt:
+    hlt
+gk_park_hlt_resume:
+    cli
+4:  movq $0, %gs:PARK_HALTED
+    movq %gs:PARK_SPIN, %rcx
+    jmp 1b
+    // Launch. A pending full TLB flush first (1: INVPCID all contexts, 2:
+    // the CR4.PGE toggle, as flush_stub_select chose; see the flush stubs
+    // above), then the root the turn runs under, if the host asked for a
+    // load (see gk_launch_cr3), then the entry registers; every other
+    // register is cleared so nothing of this loop reaches the turn, and GS
+    // is swapped back to the turn's.
+5:  movq %gs:PARK_FLUSH, %rax
+    testq %rax, %rax
+    jz 6f
+    cmpq $1, %rax
+    jne 7f
+    movl $2, %eax
+    invpcid gk_invpcid_desc(%rip), %rax
+    jmp 8f
+7:  movq %cr4, %rax
+    movq %rax, %rdx
+    andq $~0x80, %rdx
+    movq %rdx, %cr4
+    movq %rax, %cr4
+8:  movq $0, %gs:PARK_FLUSH
+6:  movq $0, %gs:PARK_RELOAD
+    movq %gs:PARK_CR3, %rsi
+    testq %rsi, %rsi
+    jz 1f
+    movq %rsi, %cr3
+    movq %rsi, %gs:PARK_CUR_CR3
+1:  movq $1, %gs:PARK_IN_TURN
+    movq %gs:PARK_RSP, %rsp
+    movq %gs:PARK_ARG, %rdi
+    movq %gs:PARK_FN, %rcx
+    movq %gs:PARK_USER, %rax
+    movl $2, %r11d
+    xorl %edx, %edx
+    xorl %esi, %esi
+    xorl %ebx, %ebx
+    xorl %ebp, %ebp
+    xorl %r8d, %r8d
+    xorl %r9d, %r9d
+    xorl %r10d, %r10d
+    xorl %r12d, %r12d
+    xorl %r13d, %r13d
+    xorl %r14d, %r14d
+    xorl %r15d, %r15d
+    testq %rax, %rax
+    jz 2f
+    xorl %eax, %eax
+    swapgs
+    sysretq
+2:  movq %rcx, %rax
+    xorl %ecx, %ecx
+    xorl %r11d, %r11d
+    swapgs
+    jmpq *%rax
+9:  outb %al, $0xF8
+    jmp gk_park_loop
+
+// The NMI the host kicks a halted resident vCPU with. Delivered on IST2, so
+// it never shares a stack with the exception handlers below. It returns
+// where it landed, HLT having been woken, except when it landed in the park
+// loop between the raise of `halted` and the HLT (see gk_park_loop): a
+// return there would run the HLT with the kick already consumed, so the
+// saved RIP is moved past it. Inclusive of the HLT's own address, which is
+// where an NMI taken before the HLT executes reports; an NMI that woke the
+// HLT reports the instruction after it. Touches nothing but RAX, restored.
+    .globl gk_exc_nmi
+    .type gk_exc_nmi, @function
+gk_exc_nmi:
+    pushq %rax
+    pushq %rcx
+    movq 16(%rsp), %rax                 /* the interrupted RIP */
+    leaq gk_park_hlt_window(%rip), %rcx
+    subq %rcx, %rax                     /* offset into the window, unsigned */
+    cmpq $(gk_park_hlt - gk_park_hlt_window), %rax
+    ja 1f
+    leaq gk_park_hlt_resume(%rip), %rcx
+    movq %rcx, 16(%rsp)
+1:  popq %rcx
+    popq %rax
+    iretq
+
 // Ring-3 guest exit: a ring-3 function returns here with its result in RAX. OUT
 // would #GP in ring 3, so the exit is a reserved sentinel syscall instead: move
 // the result into RDI and issue syscall number GK_EXIT_SYSCALL (0xF4240). The

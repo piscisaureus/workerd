@@ -406,13 +406,184 @@ guest kernel off: the guest's cold entry (204k cycles for 120k instructions,
 about 134k over the native rate, 31 us) and the runner's own return from the
 run (57k host-mode cycles for 16k instructions: the kernel's exit path with
 the IBPB, cold, and the futex handoff). Both are the one return to userspace
-per turn, now on the runner's thread; the lever that removes them is the
-runner that never returns (see "What would sharpen it").
+per turn, now on the runner's thread; the resident runner, next, removes
+them.
 
 The runner's memory is per vCPU, not per tenant: a 256 KiB stack mapping of
 which a few pages are touched, a 64-byte record, and a kernel thread. The
 marginal memory per tenant in section 1 is unaffected, and no page size or
 mapping granularity changed.
+
+### What a resident runner recovers
+
+`GK_RUNNER=resident` keeps the runner inside `KVM_RUN` across turns, so the
+vCPU's CPU sees no return to userspace on a turn's own path and no IBPB:
+the guest keeps its predictions from one turn to the next, as the owner
+keeps its own. The mechanism (the runner section in `gk.c`, and the README):
+between turns the vCPU runs a ring-0 park loop of gk's own, reading a
+per-vCPU frame in supervisor memory; the owner writes the next turn's entry
+state (root, stack, function, argument, ring) into the frame and bumps a
+sequence word, and the loop loads the root and `SYSRET`s into the turn. The
+turn's exit sentinel reaches the vCPU's own `SYSCALL` entry, which puts the
+result in the frame and echoes the word instead of leaving the VM. The loop
+spins the same budget as the runner handoff (`GK_RUNNER_SPIN`) and then
+halts with `STI;HLT`, which KVM services in the kernel (the VM gets a split
+irqchip, so the LAPIC is in the kernel); the owner kicks a halted vCPU with
+`KVM_SIGNAL_MSI` in NMI delivery mode, which wakes `HLT` whatever IF is
+and needs no EOI; the handler returns where it landed (past the `HLT`
+when it landed between the loop's last check and the `HLT`, which the
+`STI` shadow does not cover for an NMI), so a kick that lands after the
+loop already launched is harmless and none is lost. The owner spins the same
+budget and then sleeps on the vCPU's eventfd, which the loop signals through
+an `ioeventfd` (an `OUT` the kernel turns into the signal without leaving
+`KVM_RUN`), and which the runner writes when a run does return.
+
+The four questions this had to settle:
+
+- **Whether the turn can end without a userspace exit.** It can, and does:
+  on a hello request the vCPU's `KVM_RUN` returns 0.01 times per
+  request by KVM's own `kvm_userspace_exit` tracepoint, against
+  1.01 with the plain runner (the turn's end), and the exits
+  that remain are the events the host must serve: a forwarded syscall, a
+  hostcall, a demand fault, a fatal fault. Each returns to userspace once,
+  is handled by the owner exactly as before, and the runner runs the vCPU
+  again; the guest then re-enters cold for that turn. Hello makes none in
+  the steady state; the gk_test suite, which faults on purpose, makes about
+  one per turn through those (207k runs for 8.6k turns), which is the
+  measure of what a turn that touches new pages or makes syscalls costs.
+- **How registers and the result cross.** Through the park frame, a
+  `gk_park` in the first page of the vCPU's IST region: supervisor memory
+  that the host writes natively and ring 3 cannot touch, carrying in the
+  five entry values and out the 64-bit result. `kvm_run` is read and written
+  only once a run has returned, which is where every existing use of it
+  sits (exit handling), and CR3, which cannot be read back from `kvm_run`
+  while the vCPU is in flight, is tracked by the host as the root the loop
+  was last told to load. The loop finds the frame through GS, set by
+  `SWAPGS` from `KERNEL_GS_BASE`, which ring 3 can neither read nor write
+  (CR4.FSGSBASE is clear).
+- **Whether the ring-0 dispatcher can be made safe.** It reads the frame and
+  nothing else: no value the turn can write reaches it, since ring 3 faults
+  on the frame's page, and the five values it loads are the ones
+  `enter_guest` puts into `kvm_run` in the other modes, trusted exactly as
+  those are. The one thing a turn can do to it is end itself with any
+  result, which it could already. Ring-0 guest code could rewrite the frame,
+  and could also load CR3 directly, so the loop confers nothing ring 0 does
+  not have. Every register but the five is cleared before the `SYSRET`, and
+  the NMI handler writes nothing, so a kick that lands inside a turn (the
+  two sides race, and either may win) costs the turn one return.
+- **A faulting or abandoned turn.** The runner is always inside `KVM_RUN`,
+  so every exit that reaches userspace is observed by it and relayed to the
+  owner as before; nothing is unobserved. A fault that ends the turn
+  returns through the port the handler reports on, `run_vcpu` returns
+  `GK_EFAULT` with the vCPU left out of `KVM_RUN`, and the next entry on
+  that thread starts it through `gk_park_entry`, which resets GS from a
+  register, has the turn's root loaded through `kvm_run` first, and parks
+  from a fresh state; `fault-test.sh` exercises that path. A vCPU that goes
+  to the pool, or that a stub must run on, is first asked to leave the loop
+  and waited for (`park_leave`), since a vCPU ioctl would otherwise wait
+  behind the run. A parked vCPU keeps walking the last turn's root from
+  its loop, so an arena's destruction first moves every parked vCPU still
+  under that root to the base root and waits for the loop to say it has;
+  the loop publishes its root in the frame for that, since the owner's own
+  record runs ahead of the loop while it prepares an entry. A turn nobody
+  waits for -- the owner thread gone -- runs to its end and parks, as it
+  would run to its end today; there is no state in `kvm_run` to lose.
+
+Same method as the runner table, interleaved with it; medians of three
+rounds (`stall-resident.json`). The VMSCAPE mitigation read `Mitigation:
+IBPB before exit to userspace` before and after, as the script records.
+The build measured predates three corrections to the park loop that touch
+nothing on a turn's path (the order of the launch's stores, the root a
+parked loop walks, the NMI's window); a repeat of the one-connection hello
+latency on the final build gave 27.1 to 27.2 us spinning and 30.2 to 30.4 us
+sleeping, against 25.8 to 26.7 us with the guest kernel off and 139.5 us
+with it on. A one-connection figure moves by 10 to 20 us with where the
+scheduler puts the client relative to the server's two pinned CPUs (the
+same sleeping arrangement measures 30 us in most launches and 49 us in
+some; with the client pinned to a far CPU, 37 to 40 us in every launch),
+which every arrangement is subject to alike and the interleaving averages
+out.
+
+| hello                            | p50      | rps, one connection | CPU per request | logical CPUs busy | guest cycles | guest IPC | event loop's host cycles | its mispredicts | exits to userspace | exits, all | kicks | context switches |
+| -------------------------------- | -------- | ------------------- | --------------- | ----------------- | ------------ | --------- | ------------------------ | --------------- | ------------------ | ---------- | ----- | ---------------- |
+| guest kernel off                 | 24.1 us  | 32,844              | 30.0 us         | 1.05              | 0            | -         | 122k                     | 149             | 0                  | 0          | 0     | 0.00             |
+| guest kernel on                  | 138.0 us | 6,817               | 122.9 us        | 1.01              | 209k         | 0.59      | 259k                     | 3,265           | 1.03               | 1.42       | 0     | 0.00             |
+| runner on another core, sleeping | 91.5 us  | 9,930               | 104.5 us        | 1.00              | 226k         | 0.52      | 123k                     | 122             | 1.01               | 1.17       | 0     | 2.03             |
+| resident, both spinning          | 25.4 us  | 31,055              | 62.4 us, 2 CPUs | 2.00              | 132k         | 0.98      | 130k                     | 94              | 0.01               | 0.11       | 0     | 0.00             |
+| resident, both sleeping          | 28.5 us  | 28,045              | 52.5 us         | 1.44              | 79k          | 1.53      | 60k                      | 116             | 0.01               | 2.10       | 1.00  | 1.02             |
+
+| hello, two tenants alternating | p50      | rps, one connection | CPU per request  | logical CPUs busy | guest cycles | guest IPC | guest page walks | exits to userspace | kicks |
+| ------------------------------ | -------- | ------------------- | ---------------- | ----------------- | ------------ | --------- | ---------------- | ------------------ | ----- |
+| guest kernel off               | 24.6 us  | 29,430              | 126.4 us         | 2.02              | 0            | -         | 0                | 0                  | 0     |
+| guest kernel on                | 150.7 us | 6,135               | 187.4 us         | 1.11              | 238k         | 0.52      | 164              | 1.04               | 0     |
+| resident, both spinning        | 26.5 us  | 28,929              | 124.8 us, 2 CPUs | 2.00              | 264k         | 0.90      | 199              | 0.02               | 0     |
+| resident, both sleeping        | 30.3 us  | 25,944              | 91.2 us          | 1.46              | 130k         | 1.45      | 164              | 0.01               | 1.55  |
+
+| heavy                            | p50      | rps, one connection | CPU per request  | logical CPUs busy | guest cycles | guest IPC | event loop's host cycles | its mispredicts | exits to userspace | kicks |
+| -------------------------------- | -------- | ------------------- | ---------------- | ----------------- | ------------ | --------- | ------------------------ | --------------- | ------------------ | ----- |
+| guest kernel off                 | 123.3 us | 7,316               | 184.9 us         | 1.35              | 0            | -         | 561k                     | 1,263           | 0                  | 0     |
+| guest kernel on                  | 255.6 us | 3,694               | 275.7 us         | 1.18              | 717k         | 3.05      | 260k                     | 3,242           | 1.07               | 0     |
+| runner on another core, sleeping | 185.6 us | 5,117               | 202.1 us         | 1.00              | 697k         | 3.03      | 61k                      | 131             | 1.04               | 0     |
+| resident, both spinning          | 120.4 us | 7,785               | 253.2 us, 2 CPUs | 2.00              | 535k         | 4.03      | 539k, mostly spin        | 96              | 0.05               | 0     |
+| resident, both sleeping          | 123.7 us | 7,564               | 147.9 us         | 1.12              | 486k         | 4.51      | 61k                      | 127             | 0.05               | 1.02  |
+
+**The excess is gone.** Of hello's 113.9 us of excess latency over the
+guest kernel off, the resident runner recovers **99%** with both sides
+spinning (25.4 us, 1.3 us over the guest kernel off; 4.6 times the
+requests per second of the guest kernel on and 95% of the rate with it
+off) and **96%** with both sleeping (28.5 us, 4.4 us over; 4.1 times the
+rate, 85% of the rate with it off). With two tenants alternating, so that
+every turn loads another root, 98% and 96% (26.5 and 30.3 us against
+24.6). For the heavier worker the turn is now no slower than native:
+120.4 us spinning and 123.7 us sleeping against 123.3 us with the guest
+kernel off, which is 102% and 100% of the 132.3 us excess, with the
+guest's 2.1M instructions retiring at IPC 4.0 to 4.5 against 3.05 with the
+guest kernel on and 4.05 for the same work natively.
+
+The counters say why, and they are the ones the attribution above
+predicted. The exits to userspace per request, by KVM's own
+`kvm_userspace_exit` tracepoint, fall from 1.03 to 0.01 (0.05 for the
+heavy worker: an occasional demand fault). The guest side is warm:
+hello's guest instructions run at IPC 0.98 spinning and 1.53 sleeping
+against 0.59, with 113 to 131 mispredicts against 1,682, and 87 to 145
+instruction fills from beyond L2 against 6,349; the event loop's host
+side is native, 60k to 130k cycles with 94 to 116 mispredicts against
+the guest kernel off's 122k and 149. The sleeping arrangement's 2.10
+exits of all kinds per request are the two the kernel services without
+returning to gk, the HLT and the ioeventfd OUT; its one kick per turn is
+the owner's `KVM_SIGNAL_MSI`, and its 1.02 context switches per request
+are the owner's one sleep and wake (the runner handoff needed two). The
+spinning arrangement takes 0.11 exits per request and no kicks.
+
+What it costs. The spinning arrangement keeps the owner's CPU busy for
+the whole turn and the vCPU's CPU busy between turns, so it is two
+logical CPUs per event loop: 62.4 us of CPU per hello request against
+30.0 us with the guest kernel off in this run. The sleeping arrangement
+gives the owner's CPU back during the turn but not the vCPU's between
+turns: KVM polls for up to 200 us (`halt_poll_ns`) before it lets a
+halted vCPU's thread sleep, and under load the next turn always arrives
+within that, so the vCPU's thread spends the gap polling in the kernel,
+which is the 1.44 logical CPUs busy and the 52.5 us of CPU per hello
+request. That is CPU spent waiting, not working; for the heavy worker,
+whose turns are long against the gap, the sleeping arrangement costs
+147.9 us of CPU per request against 184.9 us with the guest kernel off.
+(The guest kernel off figure for hello's CPU per request is bimodal
+between runs, 30 and 72 us, with V8's background threads idle or not;
+the comparison within this run's rounds is the one to read.)
+
+What remains, per hello request sleeping, is about 4 us: the kick (a
+syscall), the HLT exit and the NMI delivery, the ioeventfd exit, and the
+owner's wake, each a microsecond or so. The guest's share of the old
+excess, 31 us of cold entry, is gone entirely: 79k cycles for 120k
+instructions, against 204k. The resident vCPU costs two touched pages
+more than a runner's (its park frame and the NMI stack, both inside the
+IST region it already had), an eventfd, and a LAPIC in the kernel; the
+marginal memory per tenant in section 1 is unaffected, and no page size
+or mapping granularity changed. The library's own empty turn costs
+2.75 us sleeping (against 6.77 us returning to userspace), and the exits
+that still return -- a forwarded syscall, a hostcall, a demand fault, a
+fatal fault -- cost what they did: the runner takes the IBPB on its
+return and the guest re-enters cold for that turn, once per event.
 
 ### Two tenants alternating
 
@@ -476,19 +647,24 @@ holds more tenants only while the average tenant serves fewer than about
 **8 requests per second**. Below that it holds up to 3.2 times more; above it
 the process model holds up to 3.4 times more.
 
-**The decision this supports.** The guest kernel is worth continuing only for a
-fleet whose tenants are nearly idle and whose binding constraint is memory
-rather than CPU, and only if the per-turn stall cost can be brought down.
-Section 4 says what that cost is (the branch-predictor flush the kernel's
-VMSCAPE mitigation puts on every return from a turn), that a runner thread
-recovers 62% of the excess latency and about 80% of the excess CPU per
-request on this machine (70% of the latency with a second CPU spinning), and what recovering the rest
-would take. It is not worth continuing on the strength of the dispatch
-argument, which is the
-argument the design is built around, because that argument measures backwards.
-This does not reduce to "the guest kernel is better" or "processes win": the
-guest kernel wins on memory, loses on dispatch and on CPU, and roughly ties on
-cold start.
+**The decision this supports.** The dispatch, CPU and crossover figures
+above were taken with every turn returning to userspace, and section 4
+shows that the cost they measure is the branch-predictor flush the
+kernel's VMSCAPE mitigation puts on that return, not the guest kernel's
+own mechanism: with a resident runner, which never returns, hello costs
+25.4 us against 24.1 with the guest kernel off (28.5 us with both sides
+sleeping), the heavier worker runs at native speed, and the per-request
+tax that made a crossing 3.3 times a process crossing is down to a few
+microseconds. The memory advantage stands at a factor of 1.8 to 3.4. What
+the resident runner costs is CPU spent waiting rather than working, 2
+logical CPUs per event loop spinning or a vCPU thread that halt-polls
+between turns sleeping, and the crossover computed above moves
+accordingly: it has to be recomputed with the sleeping arrangement's CPU
+per request for a realistic worker mix, which this document does not
+have. The dispatch argument the design is built around is therefore not
+contradicted after all, once the turn stays inside KVM_RUN; what remains
+open is the CPU per request of the sleeping arrangement, and the
+realistic worker mix that decides both axes.
 
 ## Caveats, and what each would change
 
@@ -521,19 +697,23 @@ cold start.
 
 ## What would sharpen it
 
-1. **Keep the vCPU thread out of userspace between turns.** Section 4 puts
-   the stall on the post-exit return to userspace and the runner recovers
-   the host side's share of it; the guest's share remains because the runner
-   still returns once per turn, and the flush that return brings is on the
-   CPU the next turn runs on. A runner that never returns -- the turn ends
-   with the guest signalling an `ioeventfd` and halting in the kernel
-   (`KVM_CAP_X86_DISABLE_EXITS`), and the next turn starts with the owner
-   writing an `irqfd` that an in-kernel LAPIC delivers to a guest dispatcher
-   -- takes no IBPB at all, with the mitigation on, and would recover the
-   guest's 31 us of the excess as well as the exit round trip
-   itself. It needs a ring-0 dispatcher in the guest, an interrupt vector,
-   and the register exchange moved out of `kvm_run` into gk's own frame,
-   since the host cannot read `kvm_run` while the run is in flight.
+1. **Take the remaining cost out of the sleeping arrangement.** The
+   resident runner leaves hello at 28.5 us against 24.1, but at 52.5 us of
+   CPU per request against 30.0, and the difference is the vCPU's thread
+   polling in the kernel between turns for a wake that always comes within
+   KVM's 200 us halt-poll budget. `KVM_CAP_HALT_POLL` sets that budget per
+   VM, from the process, so the trade between the poll's CPU and a
+   scheduler wakeup's latency (the runner handoff's 9 us) can be made per
+   deployment without touching the host; it was not measured here. The
+   exits that still return to userspace -- a forwarded syscall, a hostcall,
+   a demand fault -- each cost the turn a cold re-entry as before, so a
+   worker that makes syscalls inside its turn pays per syscall; hello makes
+   0.01 per request, and a realistic mix is the open question it was. The
+   IBPB itself has not left the machine: when a halted vCPU's thread does
+   schedule out, the next task to return to userspace on that CPU takes it
+   once, a bounded cost to a bystander. And a vCPU with an id above 254
+   needs the LAPIC in x2APIC mode to be kicked, which the code does not
+   do yet.
 2. **Build the pre-forked process model.** Fork a warmed workerd per tenant
    after V8 is initialized and before the tenant's script is known. It settles
    the memory comparison within 20% instead of within a bracket, and it is
