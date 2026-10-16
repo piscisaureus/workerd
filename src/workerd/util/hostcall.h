@@ -33,9 +33,21 @@ namespace workerd::hostcall {
 // an attack surface: it validates every field of the frame it is given -- the operation against
 // a closed set, a handle through hostMemory::resolveSlot(), each length against inLen -- and
 // computes only what the turn is entitled to. It must return rather than throw, must not make a
-// hostcall itself, and should not allocate from the heap: the turn issued the call at a point of
-// its choosing, possibly in the middle of the allocator, so a handler that takes the heap's lock
-// can be deadlocked by the turn that called it.
+// hostcall itself, and should not take the process heap.
+//
+// The heap rule is gk's (see "What a handler is" in experimental/guest-kernel/gk.h), and the
+// deadlock it is written against belongs to the paths where the guest picks the instant: the
+// demand-fault handler and the signal-time field write, either of which can land on a thread
+// the allocator has half-way through its own critical section, whose lock is not reentrant.
+// A hostcall is not one of those. It is issued from a call site in host code, and no call site
+// in this runtime is inside an allocation, an allocator hook or a signal handler, so a turn can
+// decide whether a hostcall happens and what it carries but not where in the host's stack it
+// happens from. What the rule buys here is that a handler stays bounded and that these bodies
+// remain safe to call from a path where the instant is the guest's -- a syscall filter, say,
+// which gk supports and this runtime does not yet install. Handlers hold to it on the path they
+// take when they succeed; a refusal logs, and logging allocates. Building with
+// GK_GUARD_HANDLER_ALLOC (gk.h) makes any allocation inside a handler abort, which is how that
+// line is drawn mechanically rather than by reading.
 constexpr size_t BYTES = 4096;
 constexpr size_t STATE = 1024;
 

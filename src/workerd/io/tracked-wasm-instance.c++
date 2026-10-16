@@ -200,7 +200,9 @@ void TrackedWasmInstanceList::writeTerminatedSignal() const {
 
 // The handler runs host-side at the turn's request, with the turn's arguments: what it passes
 // to the guest kernel is validated there against gk's record of the calling thread's arena, so
-// the handler itself checks only the operation. It allocates nothing.
+// the handler itself checks only the operation. It allocates nothing; the guest kernel reports
+// a handle it refuses on its own stderr path, which a turn can provoke by naming a field that
+// is not its own.
 long TrackedWasmInstanceList::hostcallHandler(hostcall::Frame& frame) {
 #ifdef WORKERD_HAS_GUEST_KERNEL
   switch (static_cast<Op>(frame.args[0])) {

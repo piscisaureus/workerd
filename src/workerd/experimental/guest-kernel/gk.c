@@ -1817,25 +1817,58 @@ static int mmu_map_range(uintptr_t s, uintptr_t e, int perms) {
   return 0;
 }
 
-// Allocation guard for the fault path (off by default). The fault handler must
-// not call malloc (see the region-pool note): the faulting guest thread may be
-// mid-malloc with its arena in a transient state. Building with
+// Allocation guard for the paths a handler runs on (off by default). Neither the
+// fault handler nor a registered hostcall handler may call malloc (see the
+// region-pool note and "What a handler is"): the guest thread may be mid-malloc
+// with the allocator's lock held, and that lock is not reentrant. Building with
 // -DGK_GUARD_HANDLER_ALLOC and -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc
 // makes any allocation between GK_HANDLER_ENTER/LEAVE abort loudly rather than
-// silently corrupt glibc's arena, so a future stray malloc/fopen on this path is
-// caught deterministically at any backing granularity. Shipping builds compile
-// the macros to nothing and never wrap malloc.
+// silently corrupt glibc's arena, so a stray malloc/fopen on these paths is
+// caught deterministically at any backing granularity. The brackets are around
+// the fault path, the signal-time field write and hostcall_dispatch's call to
+// the registered handler, so the check reaches the embedder's handler and
+// everything it calls, not only gk's own code.
+//
+// For the runtime, whose handlers are the ones worth checking, the define and
+// the wrap come from one flag on this library (see BUILD.bazel), so that the
+// wrap reaches the binaries that link gk and no others:
+//
+//   bazel build -c opt --platform_suffix=_guard \
+//     --//src/workerd/experimental/guest-kernel:handler_alloc_guard=True \
+//     --//src/workerd/server:use_tcmalloc=False \
+//     //src/workerd/server:workerd
+//
+// tcmalloc has to be off for that: it defines operator new without going through
+// malloc, so --wrap would see none of the C++ allocations, which are the ones a
+// handler is liable to make. What the wrap still misses is an allocation that
+// reaches the kernel without libc (a direct mmap), one made on another thread
+// that the handler then waits on, and a lock other than the allocator's.
+//
+// Shipping builds compile the macros to nothing and never wrap malloc.
+//
+// The brackets nest. A bracketed entry point can be reached from inside another
+// -- gk_resolve_typed from a hostcall handler is the common one -- and a
+// signal-time write can interrupt either. So ENTER yields what the flag held
+// and LEAVE puts that back, rather than clearing it: a LEAVE that cleared left
+// everything the outer handler did after its first inner call unguarded, which
+// is most of what a hostcall handler does.
 #ifdef GK_GUARD_HANDLER_ALLOC
 static __thread int g_in_handler;
-#define GK_HANDLER_ENTER() (g_in_handler = 1)
-#define GK_HANDLER_LEAVE() (g_in_handler = 0)
+static inline int gk_handler_enter(void) {
+  int was = g_in_handler;
+  g_in_handler = 1;
+  return was;
+}
+#define GK_HANDLER_ENTER() gk_handler_enter()
+#define GK_HANDLER_LEAVE(saved) (g_in_handler = (saved))
 extern void *__real_malloc(size_t);
 extern void *__real_calloc(size_t, size_t);
 extern void *__real_realloc(void *, size_t);
 static void gk_guard_alloc(const char *w) {
   if (!g_in_handler) return;
   const char a[] = "[gk] FATAL: ";
-  const char b[] = "() on the fault-handler path (must be malloc-free)\n";
+  const char b[] = "() inside a handler (the fault path, the signal-time field write or a "
+                   "hostcall handler; all must be malloc-free)\n";
   write(2, a, sizeof a - 1);
   write(2, w, strlen(w));
   write(2, b, sizeof b - 1);
@@ -1845,8 +1878,8 @@ void *__wrap_malloc(size_t n) { gk_guard_alloc("malloc"); return __real_malloc(n
 void *__wrap_calloc(size_t n, size_t s) { gk_guard_alloc("calloc"); return __real_calloc(n, s); }
 void *__wrap_realloc(void *p, size_t n) { gk_guard_alloc("realloc"); return __real_realloc(p, n); }
 #else
-#define GK_HANDLER_ENTER() ((void)0)
-#define GK_HANDLER_LEAVE() ((void)0)
+#define GK_HANDLER_ENTER() 0
+#define GK_HANDLER_LEAVE(saved) ((void)(saved))
 #endif
 
 // Map the pages around a just-mapped user page ahead of their own faults, from
@@ -3699,13 +3732,13 @@ static long hostcall_dispatch(gk_thread *t, uint64_t idx) {
   gk_hostcall_entry e = G->hostcalls[idx];
   pthread_mutex_unlock(&G->lock);
   if (!e.fn) return -GK_ENOSYS;
-  GK_HANDLER_ENTER();
+  int guard = GK_HANDLER_ENTER();
   // The region is the guest's; every field is read once, into the host frame,
   // and the copy is bounded by the frame, not by anything the guest wrote.
   volatile gk_hostcall_frame *g = hostcall_region_of(t);
   gk_hostcall_frame *h = t->hostcall_frame;
   uint64_t in_len = g->in_len;
-  if (in_len > GK_HOSTCALL_BYTES) { GK_HANDLER_LEAVE(); return -GK_E2BIG; }
+  if (in_len > GK_HOSTCALL_BYTES) { GK_HANDLER_LEAVE(guard); return -GK_E2BIG; }
   for (int i = 0; i < 4; i++) h->args[i] = g->args[i];
   h->in_len = in_len;
   h->out_len = 0;
@@ -3726,7 +3759,7 @@ static long hostcall_dispatch(gk_thread *t, uint64_t idx) {
   memset(h->args, 0, sizeof h->args);
   h->in_len = h->out_len = 0;
   __asm__ __volatile__("" : : "r"(h) : "memory");
-  GK_HANDLER_LEAVE();
+  GK_HANDLER_LEAVE(guard);
   return r;
 }
 
@@ -4147,9 +4180,9 @@ void *gk_resolve_typed(gk_resolve_handle h, uint64_t *type) {
     if (type) *type = rdx;
     return p;
   }
-  GK_HANDLER_ENTER();
+  int guard = GK_HANDLER_ENTER();
   void *p = resolve_lookup(h, type);
-  GK_HANDLER_LEAVE();
+  GK_HANDLER_LEAVE(guard);
   return p;
 }
 
@@ -4284,10 +4317,7 @@ int gk_signal_field_unregister(gk_signal_handle handle) {
 long gk_signal_field_write(unsigned kind, uint32_t value) {
   if (kind >= GK_SIGNAL_KINDS) return -GK_EINVAL;
   if (!G->initialized) return -GK_ESRCH;
-#ifdef GK_GUARD_HANDLER_ALLOC
-  int was_in_handler = g_in_handler;  // the signal may have interrupted a handler
-#endif
-  GK_HANDLER_ENTER();
+  int guard = GK_HANDLER_ENTER();  // the signal may have interrupted a handler
   long n = -GK_ESRCH;
   gk_thread *t = thread_cur_lockfree();
   gk_arena *a = t ? __atomic_load_n(&t->active_arena, __ATOMIC_ACQUIRE) : NULL;
@@ -4307,11 +4337,7 @@ long gk_signal_field_write(unsigned kind, uint32_t value) {
       i = __atomic_load_n(&f->next, __ATOMIC_ACQUIRE);
     }
   }
-#ifdef GK_GUARD_HANDLER_ALLOC
-  g_in_handler = was_in_handler;
-#else
-  GK_HANDLER_LEAVE();
-#endif
+  GK_HANDLER_LEAVE(guard);
   return n;
 }
 
@@ -5632,9 +5658,9 @@ static int handle_exit(gk_thread *t, long *result) {
             G->fault_addr = cr2;
             TURN_ENDS(GK_EFAULT);
           }
-          GK_HANDLER_ENTER();
+          int guard = GK_HANDLER_ENTER();
           int dm = demand_map(t, (uintptr_t)cr2, (uintptr_t)pf_sp);
-          GK_HANDLER_LEAVE();
+          GK_HANDLER_LEAVE(guard);
           if (dm < 0) {
             if (G->dbg) {  // still the fault path: raw output only
               struct kvm_regs rr;

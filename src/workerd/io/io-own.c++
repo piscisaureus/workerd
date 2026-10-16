@@ -708,8 +708,11 @@ OwnedObjectList::~OwnedObjectList() noexcept(false) {
 // record's queue apart: the handler hands the turn the signal's fulfiller (first call) and the
 // queued actions, up to a frame's worth per call, to destroy, frees the chunks, and on the last
 // call frees the record and retires the entry. Both validate the handle against the table and
-// the companion's kind, read nothing through the frame but the two arguments, and take neither
-// the process heap nor a lock but the guest kernel's own, the registry's and the record's.
+// the companion's kind and read nothing through the frame but the two arguments. On the path
+// each takes when it succeeds, neither takes the process heap nor a lock but the guest
+// kernel's own, the registry's and the record's; a teardown that finds objects still in the
+// record logs, which allocates, as every refusal path through these hooks does (see the
+// handler rules in util/hostcall.h).
 long OwnedObjectList::hostcallHandler(hostcall::Frame& frame) {
   hostMemory::ResolveHandle ctx = frame.args[1];
   switch (frame.args[0]) {
@@ -802,6 +805,11 @@ const hostcall::Entry OwnedObjectList::HOSTCALL = {
 
 void OwnedObjectList::installHostcall() {
   hostcall::install(HOSTCALL);
+  // As installResolveHostcall() does for the companion directory: the registry lock's slot is
+  // a function-local static whose first use would allocate, and its first use is inside a
+  // hostcall handler (a note the host queues for another context, or a context's teardown),
+  // which must not take the process heap. It is made here, host-side, before any turn runs.
+  registryLock();
 }
 
 OwnedObjectList::Stats OwnedObjectList::statsForTest() {

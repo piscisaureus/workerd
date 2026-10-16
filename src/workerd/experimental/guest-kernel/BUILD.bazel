@@ -1,4 +1,5 @@
 load("@bazel_skylib//lib:selects.bzl", "selects")
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load("@rules_cc//cc:defs.bzl", "cc_library")
 
 # gk: run a process inside a KVM guest as guest ring 0 (see README.md). The
@@ -9,6 +10,24 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 #
 # The standalone Makefile still builds gk + gk_test directly (see README.md);
 # this cc_library is for linking gk into the workerd binary.
+
+# The handler allocation guard (see GK_GUARD_HANDLER_ALLOC in gk.c): off by
+# default, and never in a shipping build. On, gk aborts on any allocation made
+# inside a fault, a signal-time field write or a registered hostcall handler,
+# which needs both the define and --wrap on the link of whatever binary links
+# gk -- hence a flag here rather than a command line, so the wrap reaches that
+# binary and no other (a host tool that does not link gk would have no
+# __wrap_malloc to resolve). Pair it with --//src/workerd/server:use_tcmalloc=False;
+# gk.c says why.
+bool_flag(
+    name = "handler_alloc_guard",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "guard_handler_alloc",
+    flag_values = {"handler_alloc_guard": "True"},
+)
 
 # True only on the platform gk supports; used by embedders to select the dep.
 selects.config_setting_group(
@@ -37,7 +56,16 @@ cc_library(
     ],
     # Let a dependent gate the gk_init() call site: the define is present only
     # when this library is actually linked in (via the :is_linux_x86_64 select).
-    defines = ["WORKERD_HAS_GUEST_KERNEL=1"],
+    defines = ["WORKERD_HAS_GUEST_KERNEL=1"] + select({
+        ":guard_handler_alloc": ["GK_GUARD_HANDLER_ALLOC=1"],
+        "//conditions:default": [],
+    }),
+    # Carried to every binary that links gk, and to none that does not, which is
+    # what makes __wrap_malloc resolvable exactly where it is defined.
+    linkopts = select({
+        ":guard_handler_alloc": ["-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc"],
+        "//conditions:default": [],
+    }),
     # Expose the header as <workerd/experimental/guest-kernel/gk.h>, matching the
     # rest of the tree.
     strip_include_prefix = "/src",

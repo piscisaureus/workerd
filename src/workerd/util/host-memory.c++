@@ -1055,6 +1055,11 @@ ResolveTurn::~ResolveTurn() noexcept(false) {
 
 void installResolveHostcall() {
   hostcall::install(RESOLVE_HOSTCALL);
+  // The companion directory's slot is a function-local static, so the first use allocates it
+  // from the process heap. The first use is inside a turn's refill, in a hostcall handler,
+  // which must not take the heap (see hostcall.h), so it is made here instead, host-side,
+  // before any turn runs -- as the host entropy buffer's state is (server/actor-id-impl.c++).
+  companionDirectory();
 }
 
 bool setResolveCompanion(ResolveHandle handle, ResolveCompanion companion) {
