@@ -1085,7 +1085,13 @@ so a crossing a turn makes on every dereference belongs on that path.
   (`u_setMemoryFunctions()` in `jsg/setup.c++`), everything V8's `Intl`
   builtins allocate (the hooks of `patches/v8/0049-Run-Intl-builtins-under-an-
   embedder-shared-allocation-scope.patch`, which V8 keeps process-wide caches
-  of locales, calendars and date formats behind), the thread's timer queue
+  of locales, calendars and date formats behind), what V8's wasm type
+  canonicalizer grows (the hooks of `patches/v8/0050-Canonicalize-wasm-types-
+  under-an-embedder-shared-allocation-scope.patch`; installing the
+  `WebAssembly` JS API canonicalizes the builtins' signatures on every
+  `Context::New`, so the first isolate in the process places the
+  canonicalizer's containers and a later one's rehash moves them), the
+  thread's timer queue
   entries (`TimerChannel` in `server.c++`), and the V8 platform's worker-thread
   task queues and job state (`jsg::V8PlatformWrapper`). It also covers what an
   in-process service binding call hands across: the request objects the caller
@@ -1093,8 +1099,22 @@ so a crossing a turn makes on every dereference belongs on that path.
   (`asHttpClient()`, `Server::WorkerService::createEntrypoint()`), and the
   response the callee sends back (`WorkerEntrypoint::ResponseSentTracker`).
   Each use is a confidentiality concession: subrequest URLs and headers,
-  response headers, a service-binding callee's `IoContext`, and whatever
-  `Intl` formats are readable from every isolate's ring 3.
+  response headers, a service-binding callee's `IoContext`, whatever
+  `Intl` formats, and the canonical wasm type table, are readable from every
+  isolate's ring 3.
+
+  The list is not complete yet. V8 has further process-wide registries that
+  grow with plain `operator new` from inside a turn, and each one faults the
+  next isolate that reads it. The one that remains is
+  `ThreadIsolation`'s JIT-page map (`src/common/code-memory-access.h`): its
+  `StlAllocator` uses the embedder's thread-isolated allocator when the
+  platform offers one and `::operator new` when it does not, which is
+  workerd's case, so the map's nodes land in whichever isolate was locked
+  when a code page was registered and an optimizing compile in another
+  isolate faults walking them. Placing that map in the shared heap is a
+  wider concession than the ones above -- it holds the code ranges of every
+  isolate in the process -- so it is a decision and not a mechanical
+  follow-up.
 
   The thread's event loop needs more than placement. Its run queue is an
   intrusive doubly linked list through the queued events, so arming an event

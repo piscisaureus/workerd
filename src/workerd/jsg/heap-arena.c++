@@ -285,19 +285,42 @@ SharedHeapScope::~SharedHeapScope() noexcept(false) {
   if (switched) restoreThreadArena(previousIndex);
 }
 
-// The hooks under which V8 runs its Intl builtins (patches/v8/0049-Run-Intl-builtins-under-an-
-// embedder-shared-allocation-scope.patch): V8 keeps process-wide Intl containers (available-locale
-// sets, calendar, date format and pattern generator caches) that it grows from inside those
-// builtins, which run in a turn, on the isolate's heap arena. V8 declares the pair weak and calls
-// them only when the embedder defines them; no header declares them. They are the SharedHeapScope
-// in two halves, with the arena to return to carried in the token (offset by one so that zero
-// means nothing was switched).
-extern "C" uintptr_t v8_intl_shared_allocation_enter() {
+// The hooks under which V8 runs the code that grows its process-wide state, one pair per patch
+// that needs them. Each pair is the SharedHeapScope in two halves, with the arena to return to
+// carried in the token (offset by one so that zero means nothing was switched). V8 declares each
+// function weak and calls it only when the embedder defines it, so a pair left undefined leaves
+// its patch inert; no header declares them.
+namespace {
+uintptr_t sharedAllocationEnter() {
   if (!heapArenasAvailable()) return 0;
   return switchThreadArena(SHARED_HEAP_ARENA_INDEX) + 1;
 }
-extern "C" void v8_intl_shared_allocation_leave(uintptr_t token) {
+void sharedAllocationLeave(uintptr_t token) {
   if (token != 0) restoreThreadArena(static_cast<unsigned>(token - 1));
+}
+}  // namespace
+
+// The Intl builtins (patches/v8/0049-Run-Intl-builtins-under-an-embedder-shared-allocation-
+// scope.patch): V8 keeps process-wide Intl containers (available-locale sets, calendar, date
+// format and pattern generator caches) that it grows from inside those builtins, which run in a
+// turn, on the isolate's heap arena.
+extern "C" uintptr_t v8_intl_shared_allocation_enter() {
+  return sharedAllocationEnter();
+}
+extern "C" void v8_intl_shared_allocation_leave(uintptr_t token) {
+  sharedAllocationLeave(token);
+}
+
+// The wasm type canonicalizer (patches/v8/0050-Canonicalize-wasm-types-under-an-embedder-shared-
+// allocation-scope.patch): the canonicalizer is a process-wide singleton whose zone, canonical
+// supertype vector and recursion-group sets grow from whichever isolate first needs a type that
+// is not canonicalized yet. Installing the WebAssembly JS API alone grows them, on every
+// Context::New, so without this the second isolate in a process faults creating its context.
+extern "C" uintptr_t v8_wasm_shared_allocation_enter() {
+  return sharedAllocationEnter();
+}
+extern "C" void v8_wasm_shared_allocation_leave(uintptr_t token) {
+  sharedAllocationLeave(token);
 }
 
 unsigned currentHeapArenaIndex() {
