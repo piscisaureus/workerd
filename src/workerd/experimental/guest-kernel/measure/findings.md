@@ -117,6 +117,21 @@ slot. Amortizing a workerd's 44.8 MB over 183 tenants adds 0.24 MB per tenant,
 so the practical marginal figure for the guest kernel is 2.84 MB. A process per
 tenant has no analogous cap.
 
+**And the slot is not reclaimed in practice, so the cap is cumulative rather
+than concurrent.** A slot comes back only when `gk_arena_destroy` runs, which
+has one caller, `~GuestArena` (`jsg/setup.c++`), reached only when a
+`jsg::IsolateBase` is destroyed. workerd holds every worker's isolate in its
+service table for the life of the process and never drops one: running the
+probe suite and a two-worker `workerd test` under `GK_DEBUG=1`, which logs
+every destroy, recorded **zero** of them, and a condemned isolate is fenced
+off rather than evicted (the `TODO(guest-kernel)` on `Worker::Isolate::condemn`
+in `io/worker.h`). So 183 is the number of distinct isolates a process may ever
+create, not the number it may hold at once. That is immaterial to a workerd
+serving a fixed configuration, and it is the difference between a bound and a
+leak for a long-running runtime that cycles tenants: such a runtime needs
+isolate eviction that reaches `gk_arena_destroy` before the density figures
+above describe it at all.
+
 ## 2. Cross-tenant dispatch
 
 A request arrives at one tenant, which hands it to a second tenant through a
