@@ -323,8 +323,9 @@ struct ResolveTurnHooks {
 // is in host memory and found through the guest kernel's per-thread words, never through
 // anything a turn can write; the journal is ordinary memory the turn writes, and the host reads
 // it by position, bounded by its own counts, taking from it only the pointers, which the table
-// validates on commit (gk_resolve_commit: ordinary user memory, outside gk's protected ranges
-// and every arena), and the words, which the hook validates. A turn can therefore commit
+// validates on commit (gk_resolve_commit: memory the entry's owner can reach, so outside gk's
+// protected ranges and outside every arena but the committing thread's own), and the words,
+// which the hook validates. A turn can therefore commit
 // pointers only into the entries reserved for it, and only pointers to memory it could already
 // write directly; it cannot commit into another tenant's entry, which is committed once, nor
 // send the host into memory it cannot reach itself. A turn's lies about its own journal cost

@@ -708,23 +708,43 @@ long gk_hostcall(unsigned idx);
 // for a pointer the table will not hold.
 //
 // What the table holds. The pointer the host will dereference comes from
-// the turn, so registration and commit admit only ordinary user memory of
-// the process: a non-NULL address outside every supervisor and refused range
-// and outside every arena. That is memory a turn can already write directly,
-// so a pointer laundered through the table gives the host nothing to touch
-// that the guest could not touch itself; what the check refuses is the
-// escalation -- a handle whose entry sends the host's write into gk's control
-// state, into host memory, or into another isolate's arena. A refused
-// pointer is reported on stderr. Register, reserve, commit and unregister are
-// host-side: they take gk's lock, and a call at ring 3 faults on the table.
+// the turn, so registration and commit admit only memory the entry's owner
+// can already reach: a non-NULL address outside every supervisor and refused
+// range, and outside every arena but the owner's own. That is memory the
+// owner's turns can already write directly, so a pointer laundered through
+// the table gives the host nothing to touch on that tenant's behalf that the
+// tenant could not touch itself; what the check refuses is the escalation --
+// a handle whose entry sends the host's write into gk's control state, into
+// host memory, or into another isolate's arena.
+//
+// The owner's own arena is admitted because that is where the objects an
+// isolate registers live: with a per-isolate heap, an object allocated under
+// an isolate's lock is in that isolate's arena, so a rule of "outside every
+// arena" refuses every registration a turn makes. What makes the admission
+// sound is that an arena-resident entry is a capability no other tenant
+// holds. The owner is gk's own record of which arena the registration was
+// made under, never a value the turn supplies -- the thread's active arena,
+// kept in supervisor memory, or the arena gk_resolve_register_for names; the
+// trampoline resolves the entry at ring 3 only under that root, so the same
+// handle at another isolate's ring 3 answers 0; and gk_arena_destroy retires
+// the arena's entries in the critical section that frees its root, so the
+// next arena handed that root inherits none of them. An entry the base root
+// owns -- a registration made with no arena active -- is still held to
+// "outside every arena": the base root is the root every thread is on
+// between turns, and no isolate's memory is its to name.
+//
+// A refused pointer is reported on stderr. Register, reserve, commit and
+// unregister are host-side: they take gk's lock, and a call at ring 3 faults
+// on the table.
 //
 // What this does not give. Ring 3 can resolve as often as it likes, with any
 // handle it likes, and the only thing it learns is the pointer behind a live
 // handle it holds -- an address the owner must still protect, since the table
-// holds only ordinary user memory (above) and so names only objects ring 3 can
-// already reach: the lookup makes a handle safe to keep in guest memory, it
-// does not make the object safe to reach from there, and an object in host
-// memory cannot be named by an entry at all. The operation must be safe for
+// holds only memory the entry's owner can reach (above) and so names only
+// objects that owner's ring 3 can already reach: the lookup makes a handle
+// safe to keep in guest memory, it does not make the object safe to reach
+// from there, and an object in host memory cannot be named by an entry at
+// all. The operation must be safe for
 // arbitrary input, and is: it reads the table and nothing else. A handle
 // rewritten to another live entry of the same arena still names that entry:
 // the owner is the isolate, not the object, so the table tells one isolate's
@@ -768,6 +788,16 @@ int gk_resolve_unregister_for(gk_arena *a, gk_resolve_handle handle);
 // passes that object's own address, which no other live object has. -EINVAL,
 // with a report, for a handle that names no such entry. Host-side: they take
 // gk's lock, and a call at ring 3 faults on the table.
+//
+// Neither re-runs the admission check above, because neither widens what the
+// table holds: the entry already holds that pointer, admitted by the
+// registration or commit that put it there. What they do move is which ring 3
+// may resolve it, so an entry whose object is in one arena can end up owned by
+// another -- which is the case the runtime has, a context built inside the
+// caller's turn and adopted by the callee's isolate. What that ring 3 gets is
+// the address and not access: the adopting arena's root does not map the other
+// arena, so a dereference faults. The object is still the adopting isolate's
+// to use through the host, as it was before it was adopted.
 int gk_resolve_disown(gk_resolve_handle handle, void *ptr, uint64_t type);
 int gk_resolve_adopt(gk_resolve_handle handle, void *ptr, uint64_t type);
 void *gk_resolve(gk_resolve_handle handle);
@@ -948,10 +978,10 @@ int gk_thread_words_get(unsigned first, unsigned n, uint64_t *values);
 enum {
   GK_LOG_HOST_SLOT_GET,         // gk_host_slot_get: the handle names no live slot
   GK_LOG_HOST_SLOT_FREE,        // gk_host_slot_free: the handle names no live slot
-  GK_LOG_RESOLVE_REGISTER,      // the pointer is not ordinary user memory
+  GK_LOG_RESOLVE_REGISTER,      // the pointer is not memory the entry's owner can reach
   GK_LOG_RESOLVE_REGISTER_FOR,  // the arena is not live
   GK_LOG_RESOLVE_COMMIT,        // the handle names no reserved entry
-  GK_LOG_RESOLVE_COMMIT_PTR,    // the pointer is not ordinary user memory
+  GK_LOG_RESOLVE_COMMIT_PTR,    // the pointer is not memory the entry's owner can reach
   GK_LOG_RESOLVE_UNREGISTER,    // the handle names no live entry
   GK_LOG_RESOLVE_OWNED_BY,      // the arena is not live
   GK_LOG_RESOLVE_REOWN,         // the handle names no live entry holding the pointer

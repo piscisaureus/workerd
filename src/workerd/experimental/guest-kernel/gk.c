@@ -4115,13 +4115,30 @@ static void *resolve_lookup(gk_resolve_handle h, uint64_t *type) {
 #endif
 }
 
-// Whether `ptr` may be placed in the table (see gk_resolve_commit in gk.h):
-// ordinary user memory of the process, which the host may dereference without
-// reaching anything the guest could not already write -- so not NULL, not in
-// a supervisor or refused range, and not inside an arena. Caller holds G->lock.
-static int resolve_ptr_ok(const void *ptr) {
+// Whether `ptr` may be placed in the table under an entry arena `owner` will
+// own, NULL for the base root (see gk_resolve_commit in gk.h): memory that
+// owner's ring 3 can already reach, which the host may therefore dereference
+// on its behalf without reaching anything it could not reach itself -- so not
+// NULL, not in a supervisor or refused range, and not inside an arena other
+// than `owner`. The owner's own arena is admitted because that is where the
+// objects it registers live; what keeps the admission from handing one
+// isolate another's memory is that the entry resolves at ring 3 only under
+// `owner`'s root (gk_resolve_tramp) and is retired with the arena
+// (gk_arena_destroy). Caller holds G->lock.
+static int resolve_ptr_ok(const void *ptr, const gk_arena *owner) {
   uintptr_t a = (uintptr_t)ptr;
-  return a != 0 && prot_class(a) == GK_PROT_KEEP && arena_containing(a) == NULL;
+  if (a == 0 || prot_class(a) != GK_PROT_KEEP) return 0;
+  const gk_arena *in = arena_containing(a);
+#ifdef GK_NEG_RESOLVE_ARENA
+  // GK_NEG_RESOLVE_ARENA (a negative-test build, never shipped) refuses every
+  // arena-resident pointer, the owner's own included, so an isolate cannot
+  // register an object of its own heap and the corresponding gk_test case
+  // fails.
+  (void)owner;
+  return in == NULL;
+#else
+  return in == NULL || in == owner;
+#endif
 }
 
 // Takes a free entry, gives it a fresh generation and publishes it with `ptr`
@@ -4160,12 +4177,12 @@ static gk_resolve_handle resolve_take(void *ptr, uint64_t owner, gk_arena *a, ui
 // arena `a`, or by the base root when `a` is NULL. Caller holds G->lock.
 static gk_resolve_handle resolve_register_locked(void *ptr, gk_arena *a, uint64_t type,
                                                 const char *who) {
-  if (resolve_ptr_ok(ptr)) return resolve_take(ptr, resolve_root_of(a), a, type);
+  if (resolve_ptr_ok(ptr, a)) return resolve_take(ptr, resolve_root_of(a), a, type);
   gk_dbuf d;
   int rep = log_report(&d, GK_LOG_RESOLVE_REGISTER, who);
   if (rep) {
     db_hex(&d, (uint64_t)(uintptr_t)ptr);
-    db_str(&d, " is not ordinary user memory; nothing is registered");
+    db_str(&d, " is not memory the entry's owner can reach; nothing is registered");
     log_report_end(&d, rep);
   }
   return 0;
@@ -4229,13 +4246,18 @@ int gk_resolve_commit(gk_resolve_handle h, void *ptr, uint64_t type) {
     }
     return -GK_EINVAL;
   }
-  if (!resolve_ptr_ok(ptr)) {
+  // The arena the entry comes to be owned by, which is also the one the
+  // pointer is admitted against: a commit runs after the turn but on the
+  // thread that ran it, still holding the isolate's lock and so still on its
+  // arena (ResolveTurn in util/host-memory.h).
+  gk_arena *a = resolve_arena_now();
+  if (!resolve_ptr_ok(ptr, a)) {
     pthread_mutex_unlock(&G->lock);
     gk_dbuf d;
     int rep = log_report(&d, GK_LOG_RESOLVE_COMMIT_PTR, "gk_resolve_commit");
     if (rep) {
       db_hex(&d, (uint64_t)(uintptr_t)ptr);
-      db_str(&d, " is not ordinary user memory; ");
+      db_str(&d, " is not memory the entry's owner can reach; ");
       db_hex(&d, h);
       db_str(&d, " stays unresolvable");
       log_report_end(&d, rep);
@@ -4246,7 +4268,6 @@ int gk_resolve_commit(gk_resolve_handle h, void *ptr, uint64_t type) {
   // becomes visible with the store after it, which is the word the trampoline
   // gates the owner comparison on, so a lookup that saw the pointer saw the
   // owner too. A lookup that read NULL before either answered nothing.
-  gk_arena *a = resolve_arena_now();
   __atomic_store_n(&e->type, type, __ATOMIC_RELEASE);
   __atomic_store_n(&e->owner, resolve_root_of(a), __ATOMIC_RELEASE);
   __atomic_store_n(&e->ptr, ptr, __ATOMIC_RELEASE);

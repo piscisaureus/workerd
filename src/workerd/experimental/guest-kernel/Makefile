@@ -21,10 +21,16 @@ gk_test_neg: gk.c gk_asm.S gk_test.c gk.h
 		-DGK_NEG_RESOLVE_OWNER -DGK_NEG_RESOLVE_ORPHAN -DGK_NEG_RESOLVE_REOWN \
 		-o $@ gk.c gk_asm.S gk_test.c
 
+# One knob on its own: the resolve table refuses every arena-resident pointer,
+# including the one the registering arena owns, so an isolate cannot register
+# an object of its own heap. The resolve case fails and no other does.
+gk_test_neg_arena: gk.c gk_asm.S gk_test.c gk.h
+	$(CC) $(CFLAGS) -DGK_NEG_RESOLVE_ARENA -o $@ gk.c gk_asm.S gk_test.c
+
 run: gk_test
 	./gk_test
 
 clean:
-	rm -f gk_test gk_test_guard gk_test_neg
+	rm -f gk_test gk_test_guard gk_test_neg gk_test_neg_arena
 
 .PHONY: run clean

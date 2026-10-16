@@ -84,8 +84,8 @@ A table validates the handle, not what the entry holds, and the resolve
 table (`gk_resolve` in `gk.h`) shows how far apart those are. Its entries
 are filled from the turn's journal: `registerResolve` takes the pointer and
 the type word from there, and `gk_resolve_commit` admits any pointer that is
-ordinary user memory outside gk's ranges and every arena, with no test of
-the type at all. So a turn can mint a live entry, owned by its own arena and
+memory the entry's owner can reach -- outside gk's ranges and outside every
+arena but the turn's own -- with no test of the type at all. So a turn can mint a live entry, owned by its own arena and
 tagged as whatever class it likes, naming an address of its choosing, and a
 host-side `resolveOfType` asking for that class answers with that address. A
 handle that passes the owner and class comparisons says that this isolate
@@ -145,7 +145,8 @@ to ring 0 trap inside the guest, with no VM exit, so the check costs a
 dereference tens of nanoseconds rather than microseconds; the table is
 written by the host alone, so the entries a turn's objects need are reserved
 before the turn and committed after it from the turn's journal, with the
-pointer checked against gk's protected ranges and every arena on commit (see
+pointer checked on commit against gk's protected ranges and against every
+arena but the one the turn ran under (see
 Cost, and `ResolveTurn` in `util/host-memory.h`). The table entry holds the
 object's pointer, which is what the turn resolves; the host's own record of
 the object -- the owned-list node, with the links its teardown walk and its
@@ -306,8 +307,9 @@ commits them after it (`ResolveTurn`, `util/host-memory.h`): a pool of 256
 reserved entries per thread, topped up at turn entry when below 64, a
 journal the turn fills with `{handle, pointer}` by position, and a host-side
 commit after the guest returns that validates each pointer (`gk_resolve_commit`,
-which admits only ordinary user memory outside gk's protected ranges and
-every arena) and retires what the turn released. A turn that outruns its
+which admits only memory the entry's owner can reach: outside gk's protected
+ranges, and outside every arena but the one the turn ran under) and retires
+what the turn released. A turn that outruns its
 pool refills it through one hostcall per 256 registrations.
 
 The node behind each entry is the other cost of a registration: a 40-byte
@@ -1121,10 +1123,11 @@ every read a late one), the `awaitJs` fulfiller (168), `SpanParent` and
 **A resolve entry cannot name host memory.** `gk_resolve_register`,
 `gk_resolve_register_for` and `gk_resolve_commit` all run the pointer
 through `resolve_ptr_ok` (`gk.c`), which admits only `GK_PROT_KEEP` memory
-outside every arena; a registration naming a `gk_host_alloc` block is
+outside every arena but the one that will own the entry; a registration
+naming a `gk_host_alloc` block is
 refused and returns handle 0, which the library confirms directly -- an
 ordinary heap pointer registers, a `gk_host_alloc` pointer is refused with
-"is not ordinary user memory". The check is right for the commit, whose
+"is not memory the entry's owner can reach". The check is right for the commit, whose
 pointer comes out of a turn's journal, but it forbids the host-side
 registration a placed `T` would need as well, and there is no way to move a
 committed entry's pointer afterwards. (The lookup's own description in
@@ -1238,9 +1241,9 @@ entry to its own isolate leaves.
 **Bounding the disposal pointer to the object's extent is not the bound it
 looks like.** Three things are wrong with it. The object pointer is
 journaled too, and all that separates it from the disposal pointer is
-`gk_resolve_commit`'s check that it is ordinary user memory outside gk's
-ranges and every arena, so a turn made to keep the two in agreement sets
-both to the same chosen address. The host never dereferences the disposal
+`gk_resolve_commit`'s check that it is memory the entry's owner can reach,
+so a turn made to keep the two in agreement sets both to the same chosen
+address. The host never dereferences the disposal
 pointer in any case: it is the argument to a call whose target is the
 disposer, which is the word that is followed, and a disposer the turn chose
 can ignore its argument. And the relation does not hold for the runtime's
@@ -1271,8 +1274,8 @@ in the shared heap, so a box whose pointer the host had validated would still
 be destroyed through a vtable the turn can write. The one thing a check would
 add is to keep the host from `operator delete`-ing an address that is not a
 block at all -- and a registration's object pointer can already be such an
-address, since gk admits any ordinary user memory outside its own ranges and
-every arena -- so it would narrow nothing that is not already open.
+address, since gk admits any memory the entry's owner can reach -- so it
+would narrow nothing that is not already open.
 
 Which is why the host destroys the box whenever no context takes it, whether
 because the note names a context of another isolate or because the context it

@@ -2399,11 +2399,16 @@ static int hostcall_check(void) {
 // is reusable; and the round trip is timed in sub-runs around which KVM's
 // own per-vCPU exit counter is read, so a kept sub-run is one that took
 // exactly the one exit that ends the turn, however many resolves it made.
+// What the table will hold is checked for each of the three ways an entry
+// comes to be owned: an arena's own memory is admitted for that arena and
+// for no other root, and gk's supervisor and refused pages, another live
+// arena's memory and NULL are refused.
 // The guard build runs the host-side path with allocation forbidden; the
 // ring-0 path is asm.
 
 enum { RS_N = 8000, RS_SUBRUNS = 64, RS_BAD = 13 };
 #define RS_BENCH_TYPE 0x5e5e5e5e5e5e5e5eULL
+#define RS_OWN_TYPE 0x0a0a0a0a0a0a0a0aULL
 
 struct rs_probe {
   gk_resolve_handle h, h2;   // a live handle, and the recycled slot's new one
@@ -2699,6 +2704,78 @@ static int resolve_check(void) {
   int reserve_freed = s5.resolve_entries == s3.resolve_entries && gk_resolve(rsv[0]) == NULL &&
                       gk_resolve(rsv[2]) == NULL;
 
+  // What the table holds, and for whom. An entry's pointer must be memory the
+  // arena that comes to own the entry can already reach, which includes that
+  // arena's own: an isolate's objects are allocated under its lock and so lie
+  // inside its arena, and a rule of "outside every arena" would refuse every
+  // registration a turn makes. Each of the three ways an entry comes to be
+  // owned decides that arena differently and all three are checked here --
+  // gk_resolve_register takes the registering thread's active arena,
+  // gk_resolve_register_for takes the arena the caller names, and
+  // gk_resolve_commit takes the arena of the thread that ran the turn, where
+  // the commit runs. SA's own page is admitted by all three and resolves at
+  // SA's ring 3 and at no other; another live arena's page, gk's supervisor
+  // and refused pages, the resolve table itself and NULL are refused by all
+  // three; and SA's page is refused for the base root, which owns an entry
+  // registered with no arena active.
+  gk_arena *SA = gk_arena_create(1UL << 20), *SB = gk_arena_create(1UL << 20);
+  void *sa_ptr = SA ? gk_arena_base(SA) : NULL, *sb_ptr = SB ? gk_arena_base(SB) : NULL;
+  gk_resolve_handle hsa = 0, hsa_for = 0, hsa_rsv[1] = {0};
+  long own_in_a = -1, own_in_b = -1;
+  int own_ok = SA != NULL && SB != NULL && sa_ptr != NULL && sb_ptr != NULL;
+  if (own_ok) {
+    gk_resolve_reserve(hsa_rsv, 1);
+    hsa_for = gk_resolve_register_for(SA, sa_ptr, RS_OWN_TYPE);
+    own_ok = hsa_rsv[0] != 0 && hsa_for != 0 && gk_resolve(hsa_for) == sa_ptr &&
+             gk_resolve_owned_by(SA, hsa_for) == 1 &&
+             // On no arena, where the base root would own the entry, an
+             // arena's memory is refused however the registration is made.
+             gk_resolve_register(sa_ptr, 0) == 0 &&
+             // Named for one arena, a pointer inside another is refused.
+             gk_resolve_register_for(SB, sa_ptr, 0) == 0 &&
+             gk_resolve_register_for(SA, sb_ptr, 0) == 0 &&
+             gk_resolve_register_for(SA, (void *)super_addr, 0) == 0 &&
+             gk_resolve_register_for(SA, (void *)refuse_addr, 0) == 0 &&
+             gk_resolve_register_for(SA, (void *)table, 0) == 0 &&
+             gk_resolve_register_for(SA, NULL, 0) == 0;
+    gk_arena_enter(SA);
+    hsa = gk_resolve_register(sa_ptr, RS_OWN_TYPE);
+    own_ok = own_ok && hsa != 0 && gk_resolve(hsa) == sa_ptr &&
+             gk_resolve_owned_by(SA, hsa) == 1 && gk_resolve_owned_by(SB, hsa) == 0 &&
+             // From inside SA, everything but SA's own memory is still refused.
+             gk_resolve_register(sb_ptr, 0) == 0 &&
+             gk_resolve_register((void *)super_addr, 0) == 0 &&
+             gk_resolve_register((void *)refuse_addr, 0) == 0 &&
+             gk_resolve_register((void *)table, 0) == 0 &&
+             gk_resolve_register(NULL, 0) == 0 &&
+             // The commit, which runs after the turn and on its thread, is
+             // held to the same rule against the same arena.
+             gk_resolve_commit(hsa_rsv[0], sb_ptr, 0) == -EINVAL &&
+             gk_resolve_commit(hsa_rsv[0], (void *)super_addr, 0) == -EINVAL &&
+             gk_resolve_commit(hsa_rsv[0], (void *)refuse_addr, 0) == -EINVAL &&
+             gk_resolve_commit(hsa_rsv[0], (void *)table, 0) == -EINVAL &&
+             gk_resolve_commit(hsa_rsv[0], NULL, 0) == -EINVAL &&
+             gk_resolve(hsa_rsv[0]) == NULL &&  // still reserved
+             gk_resolve_commit(hsa_rsv[0], sa_ptr, RS_OWN_TYPE) == 0 &&
+             gk_resolve_owned_by(SA, hsa_rsv[0]) == 1;
+    {
+      gk_resolve_handle three[3] = {hsa, hsa_for, hsa_rsv[0]};
+      void *in_a[3] = {sa_ptr, sa_ptr, sa_ptr};
+      void *in_b[3] = {NULL, NULL, NULL};
+      struct rs_all ra_sa = {three, in_a, 3}, ra_sb = {three, in_b, 3};
+      own_in_a = gk_run_here_user(rs_resolve_all, &ra_sa);  // 0: SA's ring 3 sees all three
+      gk_arena_enter(SB);
+      own_in_b = gk_run_here_user(rs_resolve_all, &ra_sb);  // 0: SB's ring 3 sees none
+    }
+    gk_arena_enter(NULL);
+    own_ok = own_ok && own_in_a == 0 && own_in_b == 0;
+    gk_resolve_unregister(hsa);
+    gk_resolve_unregister(hsa_for);
+    gk_resolve_unregister(hsa_rsv[0]);
+  }
+  if (SA) gk_arena_destroy(SA);
+  if (SB) gk_arena_destroy(SB);
+
   // The owner: an entry resolves at ring 3 only under the page-table root it
   // was registered under. Two arenas and the base root, one registration
   // made under each, and every combination resolved from ring 3 on the
@@ -2944,8 +3021,8 @@ static int resolve_check(void) {
 
   int ok = reg_bad && resolves && user_ok && here_ok && ring0_ok && host_ok && garbage_ok &&
            walled && bench_ok && freed && recycled && capacity_ok && fresh && reserve_ok &&
-           commit_ok && committed_wrong == 0 && reserve_freed && owner_ok && recycle_ok &&
-           owned_ok && reown_ok && type_ok && cost_ok && cpl == 3;
+           commit_ok && committed_wrong == 0 && reserve_freed && own_ok && owner_ok &&
+           recycle_ok && owned_ok && reown_ok && type_ok && cost_ok && cpl == 3;
   printf("ring-0 resolve: NULL refused %s; handle %#llx -> %p (host %s); ring 3 %s, caller's "
          "stack %s, ring 0 %s, host %s; %d garbage handles and 0 -> nothing at every ring (%s, "
          "caller's memory untouched %s); ring-3 read of the table -> %s (fault %#lx == %#lx), "
@@ -2956,7 +3033,12 @@ static int resolve_check(void) {
          "slot %s, old handle -> nothing %s, new -> %p %s); capacity %d: filled %d, next -> "
          "%#llx, %ld mismatched from ring 3, emptied %s; reusable %s; reserved 3 -> nothing "
          "until committed %s, commits once and refuses NULL, supervisor, refused and arena "
-         "pointers %s (%ld wrong from ring 3), released %s; three entries registered under "
+         "pointers %s (%ld wrong from ring 3), released %s; an arena's own page is "
+         "registered under it, registered for it by name and committed into a reservation "
+         "on its thread, and resolves %ld times wrongly from its ring 3 and %ld from "
+         "another arena's, while another arena's page, gk's supervisor, refused and table "
+         "pages and NULL are refused by all three and its own page is refused for the base "
+         "root %s; three entries registered under "
          "arena A, arena B and the base root: %ld, %ld and %ld of the three resolved wrongly "
          "from ring 3 under A, under B and on the base root, all three resolve host-side %s; "
          "two entries left registered on a destroyed arena, one made under it and one "
@@ -2981,7 +3063,8 @@ static int resolve_check(void) {
          GK_RESOLVE_SLOTS, n, (unsigned long long)over, mismatched,
          s5.resolve_entries == s3.resolve_entries ? "yes" : "NO", fresh ? "yes" : "NO",
          reserve_ok ? "yes" : "NO", commit_ok ? "yes" : "NO", committed_wrong,
-         reserve_freed ? "yes" : "NO", wrong_in_a, wrong_in_b, wrong_on_base,
+         reserve_freed ? "yes" : "NO", own_in_a, own_in_b, own_ok ? "yes" : "NO",
+         wrong_in_a, wrong_in_b, wrong_on_base,
          owner_ok ? "yes" : "NO", root_a, root_b == root_a ? "yes" : "NO", stale_in_b,
          gk_resolve(hstale) == NULL && gk_resolve(hstale_for) == NULL ? "nothing" : "AN OBJECT",
          recycle_ok ? "yes" : "NO",

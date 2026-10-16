@@ -541,10 +541,12 @@ hardware:
   the turn's journal (`gk_resolve_reserve`, `gk_resolve_commit`;
   `ResolveTurn` in `util/host-memory.h`), building each node from the
   journal's words as it commits: a commit takes once, only into a reserved
-  entry, and only a pointer to ordinary user memory -- outside gk's
-  supervisor and refused ranges and outside every arena -- so a turn can
-  launder nothing into the table that it could not already write directly,
-  and cannot aim the host at gk's state, host memory or another arena. The
+  entry, and only a pointer to memory the entry's owner can reach -- outside
+  gk's supervisor and refused ranges, and outside every arena but the one the
+  turn ran under, which is where the objects that isolate registers live -- so
+  a turn can launder nothing into the table that it could not already write
+  directly, and cannot aim the host at gk's state, host memory or another
+  arena. The
   capacity is set from the measured live count: five entries per in-flight
   request parked on a timer, eight per open WebSocket (memory-classes.md,
   Cost), so 2^20 holds about two hundred thousand such requests, in 32 MiB
