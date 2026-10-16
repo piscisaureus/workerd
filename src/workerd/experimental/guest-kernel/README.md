@@ -671,7 +671,15 @@ hardware:
   returns to userspace per request; the heavier worker runs at native
   speed. The sleeping arrangement's CPU per request is dominated by KVM's
   halt polling between turns (`measure/findings.md`, section 4, "What a
-  resident runner recovers").
+  resident runner recovers"). That polling wants a second logical CPU per
+  event loop, so the best placement depends on how full the machine is:
+  one process serves 18,784 requests per logical CPU with the runner in
+  the owner's cache and 13,262 on its SMT sibling, while sixteen
+  processes on 48 logical CPUs serve 9,361 in the cache -- the
+  per-process choice collides, and pinned threads cannot migrate off a
+  contended CPU -- against 14,592 on the sibling, which follows from the
+  owner's own core and so cannot collide. `GK_RUNNER_PIN` does not pick
+  between them; `other` is the quiet machine's choice.
 - **W^X.** Pages are mapped with their host protection: executable pages are not
   writable and writable pages are not executable (NX is enabled in the guest,
   and `CR0.WP` is set so the ring-0 guest cannot write a read-only page either).

@@ -687,6 +687,51 @@ nothing, and with the runner it costs 1.8 us. With the runner the guest
 also walks less after a switch (108 against 172): its translations live in
 the runner's core's TLB, where the host side's never displace them.
 
+### What it costs per CPU when the machine is packed
+
+Section 2's throughput sweep re-run with the resident runner, so that the
+crossover below rests on one basis: sixteen tenants kept busy on two
+connections each, three rounds, the optimized build, the VMSCAPE mitigation
+on (`throughput.py`; `results/cross-*.json`). The guest kernel off and the
+plain guest kernel rows reproduce section 2 to within 6% and 3%, which is
+the check that the two sweeps are comparable.
+
+| arrangement                                    | total rps | logical CPUs busy | rps per logical CPU | range         |
+| ---------------------------------------------- | --------- | ----------------- | ------------------- | ------------- |
+| one process, guest kernel off                   | 31,300    | 1.63              | 19,257              | 16,202-20,132 |
+| one process, guest kernel on, every turn exits  | 7,824     | 1.11              | 6,918               | 6,912-7,194   |
+| one process, resident, runner in the cache      | 25,905    | 1.38              | 18,784              | 18,399-19,239 |
+| one process, resident, runner on the sibling    | 19,705    | 1.49              | 13,262              | 13,113-14,257 |
+| one process, resident, runner unpinned          | 14,672    | 1.74              | 8,473               | 7,846-9,101   |
+| one process, resident, both sides spinning      | 29,599    | 2.00              | 14,813              | 13,831-15,082 |
+| process per tenant                              | 409,571   | 22.18             | 18,469              | 17,084-19,949 |
+| process per tenant, resident, in the cache      | 166,230   | 17.46             | 9,361               | 7,063-10,291  |
+| process per tenant, resident, unpinned          | 278,129   | 27.47             | 10,123              | 9,910-11,295  |
+| process per tenant, resident, on the sibling    | 348,771   | 23.89             | 14,592              | 13,988-14,928 |
+
+**The factor of 3.4 is gone, in one process.** A single process with the
+resident runner in the owner's cache serves 18,784 requests per logical CPU
+against the process model's 18,469, and against 19,257 with no isolation at
+all: parity on both, within a spread the three rounds do not separate. What
+section 2 measured was the cost of leaving KVM_RUN, not of the guest kernel.
+
+**It does not survive packing the machine.** Sixteen guest-kernel processes
+on 48 logical CPUs serve 9,361 per CPU with the same placement. A resident
+vCPU needs a second logical CPU -- between turns it halt-polls there, which
+is charged to the server as system time -- and when every event loop wants
+one the machine runs out. The placement is also chosen per process with
+nothing coordinating it, so owners and runners land on the same CPUs and,
+being pinned, cannot migrate off them.
+
+**Packed, the sibling is the right place.** An owner's SMT sibling follows
+from the owner's own core, so sixteen pairs occupy sixteen cores with no
+coordination and no collisions, and the figure recovers to 14,592 per CPU.
+The best placement therefore inverts with occupancy: in the owner's cache on
+a quiet machine (18,784 against the sibling's 13,262), on the sibling when
+the machine is full (14,592 against 9,361). Neither default is right for
+both. `GK_RUNNER_PIN` is left at the quiet machine's choice, and deriving it
+from the machine's occupancy is open.
+
 ## The answer against the criterion
 
 **By the letter of the criterion, it does not fire.** A process per isolate
@@ -703,8 +748,11 @@ whether memory justified the complexity. On this machine:
   between tenants as a page-table load instead of an IPC -- is contradicted.
 - cold start: the guest kernel is 1.5 times better than an unoptimized process
   spawn, and would be behind a pre-forked pool.
-- requests per second: the guest kernel costs **3.4 times** the CPU per
-  request, and 59 times the aggregate rate when confined to one process.
+- requests per second: with every turn returning to userspace the guest
+  kernel cost **3.4 times** the CPU per request. With a resident runner it is
+  at parity in one process and costs 1.27 times when the machine is packed
+  (see above). The 59 times aggregate rate when confined to one process
+  stands: one process cannot use the machine.
 - it has a hard ceiling of 183 isolates per process; the process model has
   none.
 
@@ -728,13 +776,22 @@ tax that made a crossing 3.3 times a process crossing is down to a few
 microseconds. The memory advantage stands at a factor of 1.8 to 3.4. What
 the resident runner costs is CPU spent waiting rather than working, 2
 logical CPUs per event loop spinning or a vCPU thread that halt-polls
-between turns sleeping, and the crossover computed above moves
-accordingly: it has to be recomputed with the sleeping arrangement's CPU
-per request for a realistic worker mix, which this document does not
-have. The dispatch argument the design is built around is therefore not
-contradicted after all, once the turn stays inside KVM_RUN; what remains
-open is the CPU per request of the sleeping arrangement, and the
-realistic worker mix that decides both axes.
+between turns sleeping.
+
+Recomputing the crossover on the basis used above, with the packed
+machine's 14,592 requests per logical CPU: 48 logical CPUs serve 700,000
+requests per second under the guest kernel against 887,000 with a process
+per tenant, and the tenant counts are unchanged at 123,000 and 38,975. The
+guest kernel therefore holds more tenants while the average tenant serves
+fewer than about **18 requests per second**, where section 2's figures put
+that at 8. Below about 6 it is memory-bound and holds 3.2 times more; above
+18 the process model holds more, but by at most **1.27 times** rather than
+3.4. The dispatch argument the design is built around is not contradicted
+after all, once the turn stays inside KVM_RUN, and the band in which the
+guest kernel is the denser arrangement is twice as wide as section 2 made
+it. What remains open is the realistic worker mix, which decides both axes,
+and whether a packed machine can be given a better placement than the SMT
+sibling.
 
 ## Caveats, and what each would change
 
@@ -753,8 +810,15 @@ realistic worker mix that decides both axes.
   process of kernel-side cost the system-wide fit shows, so about 6 MB. At 6 MB
   the process model is 2.1 times the guest kernel, still far outside 20%.
 - **The client shares the machine.** Absolute throughput ceilings are
-  underestimates for every arrangement; the comparisons are unaffected because
-  the client load is proportional to the work served.
+  underestimates for every arrangement, and the comparisons are unaffected
+  while the server uses two logical CPUs of 48, because the client load is
+  proportional to the work served. The packed rows are the exception:
+  sixteen server processes and the client together oversubscribe the
+  machine, so those per-CPU figures are a lower bound, and the guest
+  kernel, which wants a second logical CPU per event loop, is squeezed
+  harder by the client than the process model is. **The packed comparison
+  would have to be repeated with the client on another box to be tight**,
+  and the 18 requests per second crossover with it.
 - **Per-tenant latency under the guest kernel at saturation is not reported.**
   Some tenants were starved for the whole measurement window, so the per-tenant
   p50 in the guest-kernel throughput rows is not meaningful. Whether the single
