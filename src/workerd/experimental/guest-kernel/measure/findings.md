@@ -668,7 +668,9 @@ with V8's the remaining 16 to 18 us; spinning, 63 to 64 us on 1.94 CPUs;
 guest kernel off, 32 us on 1.00 CPU (76 us on 2.07 in one launch of
 three, with V8's background threads awake). The VMSCAPE mitigation read
 `Mitigation: IBPB before exit to userspace` and the host's `halt_poll_ns`
-200000 before and after every run, as the script records.
+200000 before and after every run, as the script records. These three
+figures were taken again after the per-turn work the resolve table now
+does; see "Re-measured after the per-turn work" below.
 
 ### Two tenants alternating
 
@@ -746,6 +748,89 @@ a quiet machine (18,784 against the sibling's 13,262), on the sibling when
 the machine is full (14,592 against 9,361). Neither default is right for
 both. `GK_RUNNER_PIN` is left at the quiet machine's choice, and deriving it
 from the machine's occupancy is open.
+
+### Re-measured after the per-turn work
+
+Everything above was measured before the per-turn work a resolve entry now
+carries: the owner compared against CR3 in the ring-3 trampoline, the type
+word returned beside the pointer, the per-arena entry list maintained at
+register and retire, the owner checked on every handle a turn hands the
+host, a context entry disowned and adopted around a service-binding
+subrequest, the journal's spent positions settled on a refill, and the
+isolate's lock depth saved and restored per turn. Those paths cost a ring-3
+resolve 9 ns more than they did when the figures above were taken, so a
+request that resolves a few tens of handles should lose a fraction of a
+microsecond. That is what the repeat measures: nothing moved by as much as
+half a microsecond per request, and nothing in the comparison changed
+hands.
+
+The one-connection hello latency, under the conditions of the runs above --
+the optimized build, the VMSCAPE mitigation reading `Mitigation: IBPB
+before exit to userspace` and the host's `halt_poll_ns` 200000 before and
+after each run (the script records both), an otherwise idle machine, and
+the runner in the owner's last-level cache in every launch
+(`haltpoll-remeasure-*.json`):
+
+| hello, one connection, p50        | before                   | after                    |
+| --------------------------------- | ------------------------ | ------------------------ |
+| resident sleeping, sixteen rounds | 27.8-28.9 us             | 28.1-28.6 us             |
+| resident spinning                 | 24.5-24.8 us, 3 launches | 24.9-26.0 us, 8 launches |
+| guest kernel off                  | 23.1-23.5 us, 3 launches | 23.1-23.6 us, 3 launches |
+
+The sleeping arrangement and the guest kernel off are where they were; the
+spinning arrangement is 0.4 us slower, and it is the only movement these
+measurements resolve. The counters behind them are unchanged: sleeping
+costs 50.9 to 52.5 us of CPU per request on 1.37 to 1.38 logical CPUs, of
+which the vCPU's thread is 33.9 to 35.2 us and the successful halt poll
+14.5 to 15.0 us, against 50 to 53 us on 1.37, 33.5 to 35.5 and 14.5 before;
+spinning costs 64.6 to 67.2 us on 1.94 CPUs against 63 to 64 on 1.94. Every
+request still halts the vCPU once, polls once, succeeds once, and never
+wakes the vCPU's thread from a sleep.
+
+The crossover re-run on the same basis -- sixteen tenants, two connections
+each, the optimized build, the mitigation on -- over more rounds than
+before, because the per-CPU figure is a ratio of two quantities that each
+move several percent from round to round (`recross-*.json`):
+
+| arrangement                                  | rps per logical CPU, before | after, median | after, range  | rounds |
+| -------------------------------------------- | --------------------------- | ------------- | ------------- | ------ |
+| one process, guest kernel off                | 19,257                      | 18,042        | 15,242-20,372 | 12     |
+| one process, resident, runner in the cache   | 18,784                      | 18,462        | 17,065-19,697 | 12     |
+| process per tenant                           | 18,469                      | 18,696        | 15,517-20,681 | 9      |
+| process per tenant, resident, on the sibling | 14,592                      | 13,683        | 10,018-14,499 | 9      |
+
+Three of the four medians land inside the spread of the three rounds each
+earlier figure was the median of, and the aggregate rate behind the ratio
+moves less than the ratio does: 30,316 requests per second against 31,300
+with the guest kernel off, 25,981 against 25,905 for the resident runner in
+one process, 413,818 against 409,571 for a process per tenant, and 310,633
+against 348,771 for a process per tenant on the sibling. What the table
+says is unchanged: one process with the resident runner is at parity with a
+process per tenant on a quiet machine (18,462 against 18,696), and the
+sibling is where the guest kernel's processes belong when the machine is
+packed.
+
+The fourth, the sibling arrangement, is 2% under the bottom of its earlier
+range, and two of its nine rounds fell to the collision this section
+already describes -- 10,018 and 10,125 per CPU on 17.5 busy CPUs, the
+median tenant's p50 at 240 us rather than 72 -- which is the placement
+lottery of sixteen independently pinned pairs and not something a turn now
+does. Over the seven rounds that placed cleanly the median tenant's p50 is
+72.4 us against 71.2 us before, while in the same session a process per
+tenant with the guest kernel off gives 51.7 us against 51.2 us before. So
+about 0.7 us of that 1.2 us is the guest kernel's and the rest is the
+session's.
+
+The library's own per-operation costs, from `gk_test` on an idle CPU, three
+runs agreeing to the last digit: a ring-3 resolve 27.8 ns, a register 74 to
+75 ns on the base root and 62 ns inside an arena, a retire 13 and 15 ns,
+and the disown and adopt that move a context's entry between arenas 35 ns
+each. The per-arena list still costs the register about a nanosecond inside
+an arena, as it did when it was added.
+
+The handler allocation guard costs a shipping build nothing. Without
+`GK_GUARD_HANDLER_ALLOC` its bracket compiles to `0` and `(void)0` and
+malloc is not wrapped, which is the build everything here was measured on.
 
 ## The answer against the criterion
 
