@@ -72,6 +72,7 @@ PATCHES = [
     "0047-Per-IsolateGroup-page-allocator-for-out-of-sandbox-memory.patch",
     "0048-Route-pointer-tables-through-the-IsolateGroup-page-allocator.patch",
     "0049-Run-Intl-builtins-under-an-embedder-shared-allocation-scope.patch",
+    "0050-Canonicalize-wasm-types-under-an-embedder-shared-allocation-scope.patch",
 ]
 
 http_archive(
