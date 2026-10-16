@@ -56,6 +56,25 @@ hostcall (`gk_hostcall` in `gk.h`, `util/hostcall.h` in C++): the host
 handler it names by a validated index runs host-side, on a copy of the
 arguments in H memory, and the turn resumes with the result.
 
+**Nothing a turn reads can be H.** The sentence above -- ring 3 can neither
+read nor write H memory -- is the class's whole value and also the one
+constraint that decides most placement arguments before they start. A
+`GK_PROT_REFUSE` range is in no guest root at all, so a ring-3 read of it
+faults exactly as a read of another isolate's arena does, and the host owning
+the memory changes nothing: the fault is the page-table walk, not a check the
+host could waive. `GK_PROT_SUPER` relaxes this only for ring 0, which is gk's
+own handler text and the resolve lookup, never embedder code. So H is
+available for state the host alone touches, and for nothing a turn
+dereferences, however indirectly -- and "a turn reads it" has to be answered
+about the code the turn runs through, not about the code the runtime wrote.
+This is why placing an `IoOwn`'s `T` in host memory is blocked (23 of the 36
+classes are read at ring 3 after the turn that created them, below), and it
+is the same rule that decides every piece of process-wide third-party state:
+V8's wasm type canonicalizer and its JIT-page map are both read at ring 3
+inside a turn, so for them the choice is a heap every arena maps or a
+per-isolate copy, and host memory is not on the list. When a placement
+argument reaches "put it in H", the first question is which ring reads it.
+
 **Boundary (B).** The one region both sides touch, one per isolate. Holds the
 messages the two sides exchange, the handle tables' isolate-visible halves,
 and buffer descriptors. Contains no pointers, only offsets, lengths and
@@ -1826,6 +1845,50 @@ under gk come from `gk_host_alloc` and are not in the heap at all) and one
 `PooledPage` cross-isolate frees the earlier run found are **zero** under the
 guest kernel here too, which is the per-`IsolateGroup` page allocator doing
 its job.
+
+### A turn can choose what the host casts to `InstructionStream`
+
+One of the registries above is also a hole in the shipping build, and the
+sharper of the two things being in the shared heap costs. V8's
+`ThreadIsolation` JIT-page map answers "which code allocation is this PC in?"
+for `Heap::GcSafeTryFindInstructionStreamForInnerPointer`, which is three
+lines long:
+
+    std::optional<Address> start = ThreadIsolation::StartOfJitAllocationAt(pc);
+    if (start.has_value()) {
+      return UncheckedCast<InstructionStream>(HeapObject::FromAddress(*start));
+    }
+
+The map is an ordinary `std::map` in the C++ heap -- the allocator V8's
+`StlAllocator` reaches is `DefaultThreadIsolatedAllocator::Allocate`, which
+is `return malloc(size)`, a stub V8 marks as one -- and in the default build
+the C++ heap is one heap in the base root, mapped writably into every arena
+root. So a turn with a write primitive can rewrite an entry, and the host's
+next stack walk or deopt takes the address the turn chose and casts it to an
+`InstructionStream` without a check. The callers are the deoptimizer
+(`deoptimizer.cc`), `StackFrame::GcSafeLookupCode` and the profiler's
+iterator (`frames.cc`), reloc-info and the diagnostics: every deopt and every
+stack walk over JIT code.
+
+This is reachable today, with no per-isolate heaps and no guest kernel,
+because the map is already shared and already writable at ring 3. Per-isolate
+heaps do not open it and placing the map in the shared heap does not open it
+either; what they change is only that the map stays as exposed as it is now
+while everything around it becomes private. The confidentiality half --
+another isolate's code ranges and allocation sizes being readable -- is the
+same, and under the guest kernel it discloses layout and not contents,
+because a read into another arena still faults.
+
+What would close the integrity half is a placement gk can already express but
+nothing uses yet: a page mapped into every arena root readable and **not**
+writable at ring 3. `GK_MAP_WALLED` is the mechanism -- `demand_map` already
+drops the write bit per PTE for the host-frame wall and tags the page so that
+`wall_lower` can give it back -- so a "shared, host-writable only" class is a
+flag on the mapping rather than a new mechanism. It would cost a hostcall or
+a host-side fixup for every write the host makes to such a page, which for
+the JIT-page map is every code allocation, so it is not free. Recorded here
+rather than built: the hole predates this work and closing it is a decision
+about V8's bookkeeping, not about arenas.
 
 ### What a check can enforce, and what it cannot
 
