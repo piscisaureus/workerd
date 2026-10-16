@@ -1248,6 +1248,67 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
       KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: queued an action for the context host-side", queued);
     }).then([promise = kj::mv(paf.promise)]() mutable { return kj::mv(promise); }));
   }
+  // /__gk_action_steal is the action side of the theft. An action a context is asked to run
+  // from inside a turn is boxed on the heap there and the box noted for the host to queue once
+  // the turn has returned; the note lives in the turn's journal, which is the turn's own
+  // memory, so a turn can leave behind a note naming a context that is not its isolate's. The
+  // probe makes real actions through the cross-context executor -- one it leaves alone, as the
+  // control, and then a run of them whose note it rewrites to the other isolate's announced
+  // context, as a write primitive would -- and counts the closures that are destroyed. The host
+  // must queue none of the rewritten ones there and must destroy every box no context took, so
+  // the count after the turn is the number of notes rewritten and the other isolate runs
+  // nothing. (In the WORKERD_GK_NEG_FOREIGN_ACTION build the host leaves those boxes alone,
+  // none of the closures is destroyed, and this script fails.)
+  static size_t stolenActionsDestroyed = 0;
+  static size_t controlActionsDestroyed = 0;
+  struct ActionProbe {
+    bool stolen;
+    explicit ActionProbe(bool stolen): stolen(stolen) {}
+    KJ_DISALLOW_COPY_AND_MOVE(ActionProbe);
+    ~ActionProbe() {
+      if (stolen) {
+        stolenActionsDestroyed++;
+      } else {
+        controlActionsDestroyed++;
+      }
+    }
+  };
+  if (probeEnabled && url.endsWith("/__gk_action_steal")) {
+    KJ_REQUIRE(announcedIoOwnContext != 0, "no IoOwn announced");
+    auto& context = IoContext::current();
+    // Fewer than the notes a turn may hold, so every one of them is still in the journal when
+    // the turn ends and the host reads them there.
+    constexpr size_t STOLEN_ACTIONS = 400;
+    auto executor = context.getCrossContextExecutor();
+    // The control is queued on this context, which runs it when the signal wakes it: the
+    // request waits for that, so the context is still there to run it.
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    bool control = executor.tryExecute([probe = kj::heap<ActionProbe>(false),
+                                           fulfiller = kj::mv(paf.fulfiller)](jsg::Lock&) mutable {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: a control action ran in its own context");
+      fulfiller->fulfill();
+    });
+    size_t stolen = 0;
+    for (size_t i = 0; i < STOLEN_ACTIONS; i++) {
+      if (!executor.tryExecute([probe = kj::heap<ActionProbe>(true)](jsg::Lock&) mutable {
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: a stolen action ran in a context");
+      })) {
+        break;
+      }
+      uint64_t* note = hostMemory::lastNoteForTest();
+      if (note == nullptr) break;
+      note[1] = announcedIoOwnContext;
+      stolen++;
+    }
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: rewrote the actions' notes to another isolate's context from "
+        "inside the JS turn",
+        control, stolen, kj::str("0x", kj::hex(announcedIoOwnContext)));
+    context.addWaitUntil(kj::evalLater([stolen]() {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the actions after the turn", stolen,
+          stolenActionsDestroyed, controlActionsDestroyed);
+    }).then([promise = kj::mv(paf.promise)]() mutable { return kj::mv(promise); }));
+  }
   if (probeEnabled && url.endsWith("/__gk_refused_registration")) {
     // What becomes of an owned object whose registration the commit hook refuses. The
     // registration names a context that no longer exists, which is a refusal the hook makes on
@@ -1276,9 +1337,10 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
     IoContext::current().addTask(kj::evalLater([]() {
       auto stats = OwnedObjectList::statsForTest();
       KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: owned-node counts", stats.foreignInTurnDrops,
-          stats.registrationsRefused, stats.objectsDisposedOnRefusal, stats.nodesAllocated,
-          stats.nodesFreed, stats.recordsAllocated, stats.recordsFreed, stats.chunksAllocated,
-          stats.chunksFreed, hostMemory::liveResolveEntries());
+          stats.registrationsRefused, stats.objectsDisposedOnRefusal, stats.foreignActionNotes,
+          stats.actionsDestroyedOnDrop, stats.nodesAllocated, stats.nodesFreed,
+          stats.recordsAllocated, stats.recordsFreed, stats.chunksAllocated, stats.chunksFreed,
+          hostMemory::liveResolveEntries());
     }));
   }
   // The AbortSignal native registration (api/basics.h): the record holding one abort action,

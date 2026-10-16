@@ -56,6 +56,8 @@ struct Chunk {
 static_assert(sizeof(Chunk) == 1024);
 
 std::atomic<size_t> foreignInTurnDrops{0};
+std::atomic<size_t> foreignActionNotes{0};
+std::atomic<size_t> actionsDestroyedOnDrop{0};
 std::atomic<size_t> registrationsRefused{0};
 std::atomic<size_t> objectsDisposedOnRefusal{0};
 std::atomic<size_t> nodesAllocated{0};
@@ -448,7 +450,9 @@ bool OwnedObjectList::noted(const uint64_t* words, bool inHandler) {
   // made it; a note naming another isolate's queues nothing there. The context's own check is
   // what keeps a forged pair -- another isolate's context and an object of that same context,
   // which agree with each other and so pass queueDeletionHost -- from releasing that isolate's
-  // object early.
+  // object early. What the two kinds leave behind when they refuse differs: a deletion the
+  // host does not queue leaves the object owned by its own context's list, which disposes of
+  // it at teardown, while an action the host does not queue leaves nobody holding the box.
   switch (words[0]) {
     case DELETION:
       if (!hostMemory::ownedByTurn(words[1]) || !hostMemory::ownedByTurn(words[2])) {
@@ -461,18 +465,37 @@ bool OwnedObjectList::noted(const uint64_t* words, bool inHandler) {
     case ACTION: {
       auto* box = reinterpret_cast<Action*>(static_cast<uintptr_t>(words[2]));
       if (box == nullptr) return true;
-      if (!hostMemory::ownedByTurn(words[1])) {
-        // The box is left alone: a note that lies about its context may lie about the pointer
-        // too, and destroying it would be the host following the turn's choice of address.
+      bool queued = false;
+      if (hostMemory::ownedByTurn(words[1])) {
+        queued = queueActionHost(words[1], box);
+      } else {
         KJ_LOG(ERROR, "a turn's note names a context of another isolate; nothing is queued",
             kj::hex(words[1]));
+        foreignActionNotes.fetch_add(1, std::memory_order_relaxed);
+#ifdef WORKERD_GK_NEG_FOREIGN_ACTION
+        // WORKERD_GK_NEG_FOREIGN_ACTION is a negative-test build, never shipped: the box of a
+        // note no context takes is left alone when the context it names is another isolate's,
+        // so a turn journaling such notes leaks one box, and whatever its closure holds, per
+        // note. The guest kernel's ioown-test.sh must then fail -- the closures of the actions
+        // the host drops are never destroyed; this is the check that the test tests the
+        // destruction.
         return true;
+#endif
       }
-      if (queueActionHost(words[1], box)) return true;
-      // The context ended before the turn did: the action is dropped. Destroying it runs the
-      // closure's destructor, which may take the heap, so not inside a hostcall; the note waits
-      // for the end of the turn.
+      if (queued) return true;
+      // Nothing took the box: the context the note names is another isolate's, or it ended
+      // before the turn did. The action is dropped either way and the box destroyed, which is
+      // what the context would have done with an action it never ran. A note whose context is
+      // a lie may be lying about the box too, so this is the host destroying an address the
+      // turn chose; it is the same address the turn would have had destroyed by naming a
+      // context that has ended, and the same one the closure's own vtable is reached through
+      // when a context drops a queued action (see "The disposer a registration journals" in
+      // experimental/guest-kernel/memory-classes.md). Leaving it instead costs one box per
+      // note, at whatever rate a turn can journal them. Destroying it runs the closure's
+      // destructor, which may take the heap, so not inside a hostcall; the note waits for the
+      // end of the turn.
       if (inHandler) return false;
+      actionsDestroyedOnDrop.fetch_add(1, std::memory_order_relaxed);
       delete box;
       return true;
     }
@@ -786,6 +809,8 @@ OwnedObjectList::Stats OwnedObjectList::statsForTest() {
     foreignInTurnDrops.load(std::memory_order_relaxed),
     registrationsRefused.load(std::memory_order_relaxed),
     objectsDisposedOnRefusal.load(std::memory_order_relaxed),
+    foreignActionNotes.load(std::memory_order_relaxed),
+    actionsDestroyedOnDrop.load(std::memory_order_relaxed),
     nodesAllocated.load(std::memory_order_relaxed),
     nodesFreed.load(std::memory_order_relaxed),
     recordsAllocated.load(std::memory_order_relaxed),

@@ -850,6 +850,14 @@ bool noteInTurn(const uint64_t (&words)[NOTE_WORDS]) {
   return true;
 }
 
+uint64_t* lastNoteForTest() {
+  TurnJournal* journal = activeJournal();
+  if (journal == nullptr) return nullptr;
+  uint32_t n = kj::min(journal->noteCount, NOTE_CAPACITY);
+  if (n == 0) return nullptr;
+  return journal->notes[n - 1];
+}
+
 size_t liveResolveEntries() {
 #ifdef WORKERD_HAS_GUEST_KERNEL
   if (guestKernelActive()) {

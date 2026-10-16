@@ -86,6 +86,19 @@
 # own -- what the delete queue pointer was -- and destroys the holder the same way: the host must
 # refuse the handle, read and write nothing at the buffer, and leave the object to the context.
 #
+# /__gk_action_steal is the action side of the same theft, and the other kind of note a turn
+# leaves for the host. An action a context is asked to run from inside a turn is boxed on the
+# heap there and the box noted for the host to queue after the turn; the note is in the turn's
+# journal, which is the turn's own memory. The victim makes real actions through its own
+# context's cross-context executor -- one it leaves alone, as the control, and four hundred
+# whose note it then rewrites to the other isolate's announced context, as a write primitive
+# would. The host must queue none of those on the other context, which goes on serving, and
+# must destroy every box no context took, so the closures the actions hold are destroyed once
+# each and the other isolate never runs one; the control, whose note says what the runtime
+# wrote, is queued and runs in its own context. (In the WORKERD_GK_NEG_FOREIGN_ACTION build the
+# host leaves a refused note's box alone, so a turn leaks one box and its closure per note:
+# none of the closures is destroyed and this script fails.)
+#
 # /__gk_queue_corrupt, on the queue worker, aims at the record itself: the turn creates an IoOwn;
 # the host, on the event loop, finds the record behind its context handle and announces its
 # address and the word holding the cross-thread signal's fulfiller, which the host calls through
@@ -450,4 +463,49 @@ echo "23. GET $hello/            -> $s (other isolates must still serve)"
 [ "$s" = 200 ] || fail "hello stopped serving after the record fault"
 kill -0 "$pid" 2>/dev/null || fail "workerd died"
 
-echo "PASS: an IoOwn handle rewritten from inside a turn to an address the turn chose was refused by the next turn's dereference and by the host's drain of the delete queue, reaching neither the chosen buffer nor its magic; the isolate kept serving; a handle rewritten to another isolate's live handle was refused although the entry was live -- the host resolved the very same handle to that isolate's object -- and was refused again once that isolate's context had ended; a turn's write into the owned node behind a handle faulted at the node, and the host's teardown walk disposed of the object through the node's own disposer, never the chosen one; an IoOwn's context handle rewritten to another isolate's live context queued nothing there, since the dropped handle names an object of this context's list, and one rewritten to a buffer the turn chose queued nothing and reached nothing at the buffer, with both objects disposed of by their own context's teardown; a turn's write into the context record behind a handle faulted at the record, and the host's teardown locked the record and disposed of the object without calling the fulfiller the turn chose, after which the host queued and ran an action for another context through its record; and a handle written over another of the same isolate's, of an unrelated class, was refused at the use -- the call never reached the other class's vtable -- and at the drop, leaving that object with its own holder; and an IoOwn's handle written over an IoPtr's and dropped on the event loop, outside any turn, retired nothing, leaving the IoOwn's entry resolving and its holder reaching its object"
+curl -s -o /dev/null "$other/__gk_ioown_announce" &
+announce_pid=$!
+wait_for_count "announced this isolate's IoOwn for another worker's turn" 2 ||
+  fail "the second announce request did not run"
+ann2=$(grep -o "announced this isolate's IoOwn for another worker's turn.*" "$log" | tail -n1)
+ann_ctx2=$(echo "$ann2" | grep -o '0x[0-9a-f]*' | sed -n 3p)
+[ -n "$ann_ctx2" ] || fail "no announced context in: $ann2"
+echo "24. GET $other/__gk_ioown_announce again (in flight: other's context $ann_ctx2 is live for 3 s)"
+
+s=$(status "$victim/__gk_action_steal")
+echo "25. GET $victim/__gk_action_steal -> $s (victim journals actions and rewrites their notes to other's context)"
+[ "$s" = 200 ] || fail "the action steal request failed"
+wait_for "rewrote the actions' notes to another isolate's context from inside the JS turn" ||
+  fail "the action steal probe did not run"
+made=$(grep -o "rewrote the actions' notes to another isolate's context from inside the JS turn.*" "$log" | head -n1)
+stolen=$(echo "$made" | sed -n 's/.*stolen = \([0-9]*\).*/\1/p')
+[ -n "$stolen" ] && [ "$stolen" -gt 0 ] || fail "no actions were journaled: $made"
+echo "$made" | grep -q "control = true" || fail "the control action was not journaled: $made"
+echo "$made" | grep -qi "${ann_ctx2#0x}" || fail "the notes were not aimed at other's context: $made"
+echo "    $stolen notes rewritten to $ann_ctx2, one left alone as the control"
+wait_for_count "a turn's note names a context of another isolate" "$stolen" ||
+  fail "the host did not refuse every note naming the other isolate's context"
+refusals=$(grep -c "a turn's note names a context of another isolate" "$log")
+echo "26. the host refused $refusals of the $stolen notes and queued nothing on the other context"
+grep -q "a stolen action ran in a context" "$log" && fail "an action with a rewritten note was run"
+wait_for "the actions after the turn" || fail "the probe did not report after the turn"
+after=$(grep -o "the actions after the turn.*" "$log" | head -n1)
+destroyed=$(echo "$after" | sed -n 's/.*stolenActionsDestroyed = \([0-9]*\).*/\1/p')
+echo "    the closures of the dropped actions destroyed after the turn: ${destroyed:-none}"
+[ -n "$destroyed" ] || fail "no destroyed count in: $after"
+[ "$destroyed" -eq "$stolen" ] ||
+  fail "the host kept $((stolen - destroyed)) of the $stolen boxes no context took: $after"
+wait_for "a control action ran in its own context" ||
+  fail "the control action, whose note was left alone, did not run in its context"
+echo "27. control: the action whose note was left alone was queued and ran in its own context"
+
+s=$(status "$other/")
+echo "28. GET $other/            -> $s (the isolate the notes named must still serve)"
+[ "$s" = 200 ] || fail "other stopped serving"
+s=$(status "$hello/")
+echo "29. GET $hello/            -> $s (other isolates must still serve)"
+[ "$s" = 200 ] || fail "hello stopped serving"
+kill -0 "$pid" 2>/dev/null || fail "workerd died"
+wait "$announce_pid"
+
+echo "PASS: an IoOwn handle rewritten from inside a turn to an address the turn chose was refused by the next turn's dereference and by the host's drain of the delete queue, reaching neither the chosen buffer nor its magic; the isolate kept serving; a handle rewritten to another isolate's live handle was refused although the entry was live -- the host resolved the very same handle to that isolate's object -- and was refused again once that isolate's context had ended; a turn's write into the owned node behind a handle faulted at the node, and the host's teardown walk disposed of the object through the node's own disposer, never the chosen one; an IoOwn's context handle rewritten to another isolate's live context queued nothing there, since the dropped handle names an object of this context's list, and one rewritten to a buffer the turn chose queued nothing and reached nothing at the buffer, with both objects disposed of by their own context's teardown; a turn's write into the context record behind a handle faulted at the record, and the host's teardown locked the record and disposed of the object without calling the fulfiller the turn chose, after which the host queued and ran an action for another context through its record; and a handle written over another of the same isolate's, of an unrelated class, was refused at the use -- the call never reached the other class's vtable -- and at the drop, leaving that object with its own holder; and an IoOwn's handle written over an IoPtr's and dropped on the event loop, outside any turn, retired nothing, leaving the IoOwn's entry resolving and its holder reaching its object; and a turn's notes rewritten to name another isolate's live context queued no action there, left that isolate serving, and had every box no context took destroyed, while the one note left alone was queued and ran in its own context"

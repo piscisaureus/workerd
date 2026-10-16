@@ -350,6 +350,13 @@ struct HandleProbeForTest {
 void setHandleProbeForTest(HandleProbeForTest probe);
 kj::Maybe<HandleProbeForTest&> handleProbeForTest();
 
+// The words of the note the turn on this thread recorded last (noteInTurn), where it recorded
+// them: the journal, which is the turn's own memory. A test rewrites a note through this from
+// inside the turn that made it, as a write primitive would, for the check that the host
+// validates what a note says rather than acting on it (/__gk_action_steal in
+// api/global-scope.c++). Null outside a turn and when the turn has recorded no note.
+uint64_t* lastNoteForTest();
+
 // A host use is a host-side operation registered under a name, which a request runs on the
 // event loop, outside the guest, after a turn has done something to the memory it draws on, and
 // which logs what it got. "mint-token" (server/channel-token.c++) mints an RPC channel token and

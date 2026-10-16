@@ -1218,6 +1218,21 @@ block at all -- and a registration's object pointer can already be such an
 address, since gk admits any ordinary user memory outside its own ranges and
 every arena -- so it would narrow nothing that is not already open.
 
+Which is why the host destroys the box whenever no context takes it, whether
+because the note names a context of another isolate or because the context it
+names has ended. The two are the same call on the same turn-chosen address,
+and a turn reaches the second by naming a handle that resolves to nothing,
+which the owner comparison admits on purpose. Not destroying it on the first
+would buy nothing and cost a leak the turn paces: a box and the closure it
+holds, never reclaimed because nothing else names them, one per note, up to
+the notes a journal holds in each turn and again in the next -- against a
+turn's other allocations, which the request's end reclaims. A note naming
+another isolate's live context has no producer in the runtime, since the
+`DeleteQueue` a turn reaches an action through is named by a JS object of the
+turn's own isolate; destroying the box is the right answer for one anyway,
+being what a context that cannot be reached does with an action it will never
+run.
+
 ### Disposing of an owned object inside a turn
 
 Placing the object out of a turn's reach is the one direction; the other is to

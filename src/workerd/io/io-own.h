@@ -169,13 +169,17 @@ class OwnedObjectList {
   // What the owned lists have done since the process started, for tests and diagnostics: the
   // holders dropped inside a turn that could not resolve their object, the registrations the
   // commit hook refused and the objects disposed of because a registration did not survive
-  // its turn, and the host-memory blocks allocated and freed -- the owned nodes, the context
-  // records (DeleteQueueOwner) and the queue chunks the records' queues are kept in. The first
-  // is counted inside turns, so it is a turn's own word about itself; the rest are the host's.
+  // its turn, the notes a turn made for a context of another isolate and the action boxes
+  // destroyed because no context took them, and the host-memory blocks allocated and freed --
+  // the owned nodes, the context records (DeleteQueueOwner) and the queue chunks the records'
+  // queues are kept in. The first is counted inside turns, so it is a turn's own word about
+  // itself; the rest are the host's.
   struct Stats {
     size_t foreignInTurnDrops;
     size_t registrationsRefused;
     size_t objectsDisposedOnRefusal;
+    size_t foreignActionNotes;
+    size_t actionsDestroyedOnDrop;
     size_t nodesAllocated;
     size_t nodesFreed;
     size_t recordsAllocated;
