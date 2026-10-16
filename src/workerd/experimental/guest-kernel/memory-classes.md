@@ -1416,12 +1416,18 @@ What the refusals cost, which is the part to watch. A foreign in-turn drop
 under the guest kernel disposes of nothing and retires nothing, so the object
 stays on its own context's list until that context is torn down, where the
 same drop without the guest kernel disposes of it at once. A foreign in-turn
-registration is worse: `registerOwned` has already disowned the object by the
-time the commit hook refuses it, so no node is ever built and nothing owns
-it -- the reproducer leaks 400 `TraceContextParent`s that way, one per
-cross-isolate stub. Both refusals are silent at the call site, which is why
-neither was visible until it was counted, and both are the guest kernel's
-build differing from the ordinary one on paths the ordinary suite covers.
+registration used to be worse: `registerOwned` disowns the object before the
+commit hook can refuse it, so no node was built and nothing owned it, and the
+reproducer lost one object per cross-isolate stub. Two changes closed that. A
+context's entry is adopted by the isolate it belongs to rather than left owned
+by whichever turn built it, so a callee's own registrations are no longer
+foreign at all; and the `refused` turn hook disposes the object of any
+registration whose entry does not survive, so a refusal that does happen
+drops the object instead of orphaning it. `rpc-context-test.sh` reports no
+refusals and no orphans across 120 subrequests. Both refusals are silent at
+the call site, which is why neither was visible until it was counted, and both
+are the guest kernel's build differing from the ordinary one on paths the
+ordinary suite covers.
 
 ## What is in H memory
 
