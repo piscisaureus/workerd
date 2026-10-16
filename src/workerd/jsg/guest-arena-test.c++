@@ -19,6 +19,7 @@
 #include <cppgc/allocation.h>
 #include <cppgc/garbage-collected.h>
 #include <cppgc/persistent.h>
+#include <unistd.h>
 #include <v8-cppgc.h>
 #include <v8-internal.h>
 
@@ -87,13 +88,18 @@ bool inTail(GuestArena& arena, void* p) {
 // which is decided from the environment on first use. Returns false if gk is unavailable here.
 bool enableGuestKernel() {
   setenv("WORKERD_EXPERIMENTAL_GUEST_KERNEL", "1", 1);
-  if (gk_init() < 0) {
-    KJ_LOG(WARNING, "skipping: guest kernel unavailable",
-        kj::StringPtr(gk_last_error() != nullptr ? gk_last_error() : "unknown"));
-    return false;
+  if (gk_init() >= 0) {
+    KJ_ASSERT(isGuestKernelEnabled());
+    return true;
   }
-  KJ_ASSERT(isGuestKernelEnabled());
-  return true;
+  kj::StringPtr reason = gk_last_error() != nullptr ? gk_last_error() : "unknown";
+  // A machine without a usable /dev/kvm is the one reason to skip: gk cannot run there at all,
+  // and the hosts this is built on need not offer one. Every other failure belongs to this
+  // build, and treating it as "not supported here" is what left everything below unrun.
+  KJ_ASSERT(access("/dev/kvm", R_OK | W_OK) != 0,
+      "the guest kernel did not initialize although /dev/kvm is usable", reason);
+  KJ_LOG(WARNING, "skipping: no usable /dev/kvm", reason);
+  return false;
 }
 
 // A cppgc-managed object, allocated in an isolate's CppHeap.
@@ -437,10 +443,9 @@ KJ_TEST("each isolate's memory lives in its own guest-kernel arena") {
   constexpr size_t pageSize = 4096;
   auto refusesOutside = [](ArenaPageAllocator& tail, uintptr_t address) {
     auto* p = reinterpret_cast<void*>(address);
-    KJ_EXPECT_THROW_MESSAGE("not in the arena tail",
-        tail.SetPermissions(p, pageSize, v8::PageAllocator::kNoAccess));
     KJ_EXPECT_THROW_MESSAGE(
-        "not in the arena tail", tail.DiscardSystemPages(p, pageSize));
+        "not in the arena tail", tail.SetPermissions(p, pageSize, v8::PageAllocator::kNoAccess));
+    KJ_EXPECT_THROW_MESSAGE("not in the arena tail", tail.DiscardSystemPages(p, pageSize));
     KJ_EXPECT_THROW_MESSAGE("not in the arena tail", tail.DecommitPages(p, pageSize));
   };
   refusesOutside(tailA, tailA.end());

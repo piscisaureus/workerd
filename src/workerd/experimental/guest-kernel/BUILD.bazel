@@ -29,6 +29,22 @@ config_setting(
     flag_values = {"handler_alloc_guard": "True"},
 )
 
+# Shrinks the runtime-image table below what any real binary needs (see
+# GK_NEG_IMAGE_LIMIT in gk.c), so that the overflow path runs: gk_init fails
+# with a report naming the limit, and a caller that mistakes that for "this
+# machine has no /dev/kvm" is caught. Off by default, and never in a shipping
+# build. Left out of --platform_suffix so that flipping it rebuilds gk.c and
+# relinks rather than rebuilding the tree.
+bool_flag(
+    name = "neg_image_limit",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "negative_image_limit",
+    flag_values = {"neg_image_limit": "True"},
+)
+
 # True only on the platform gk supports; used by embedders to select the dep.
 selects.config_setting_group(
     name = "is_linux_x86_64",
@@ -58,6 +74,9 @@ cc_library(
     # when this library is actually linked in (via the :is_linux_x86_64 select).
     defines = ["WORKERD_HAS_GUEST_KERNEL=1"] + select({
         ":guard_handler_alloc": ["GK_GUARD_HANDLER_ALLOC=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":negative_image_limit": ["GK_NEG_IMAGE_LIMIT=1"],
         "//conditions:default": [],
     }),
     # Carried to every binary that links gk, and to none that does not, which is

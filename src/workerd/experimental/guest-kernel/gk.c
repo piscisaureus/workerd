@@ -507,9 +507,27 @@ typedef struct gk_region {
 typedef struct { uintptr_t start, end; int pkey; } gk_pkey_range;
 
 // A page-aligned [start, end) span of the runtime image (see the
-// mapping-change policy section). Each loaded object has a handful of PT_LOAD
-// segments; the stack is one more.
-#define GK_MAX_IMAGE_RANGES 64
+// mapping-change policy section). The table holds the PT_LOAD segments of
+// every object the dynamic loader has mapped when gk_init runs, plus the main
+// thread's stack, after image_compact has merged the spans that touch.
+//
+// The bound is on spans rather than on segments: image_add compacts when the
+// table fills and fails only if that frees nothing, so what has to fit is the
+// set of ranges the address space actually holds, which does not depend on
+// how the binary was linked. The shipping workerd maps 6 objects with 21
+// PT_LOAD segments, which compact to 6 ranges; a Bazel cc_test of the runtime,
+// which links each library as its own shared object, maps 158 objects with 629
+// segments, which compact to 41 -- the loader places an object's segments next
+// to each other, and whole objects next to each other, so nearly all of them
+// merge. 1024 spans (16 KiB of the control block) is twenty times the larger
+// of those.
+#ifdef GK_NEG_IMAGE_LIMIT
+// GK_NEG_IMAGE_LIMIT (a negative-test build, never shipped) shrinks the table
+// below what any real binary needs, so that the overflow path runs.
+#define GK_MAX_IMAGE_RANGES 4
+#else
+#define GK_MAX_IMAGE_RANGES 1024
+#endif
 typedef struct { uintptr_t start, end; } gk_span;
 
 #define GK_CPUID_ENTRIES 128
@@ -685,6 +703,9 @@ struct gk_ctl {
   // afterwards.
   gk_span image[GK_MAX_IMAGE_RANGES];
   int image_n;
+  // Set when image_add found the table full, so that gk_init can tell an
+  // overflow from the other reasons recording the image fails.
+  int image_full;
 
   // What each report site may still say outside any arena -- on the event
   // loop, in a teardown, before the first isolate exists (see gk_log_budget
@@ -3152,22 +3173,39 @@ static int map_handler_text(void) {
 // the supervisor control block, so the syscall path consults a small array
 // rather than re-reading /proc/self/maps, and so the set cannot be edited
 // from ring 3. An object loaded later (dlopen) is not in the set.
+static void image_compact(void);
+
 static int image_add(uintptr_t s, uintptr_t e) {
-  if (G->image_n >= GK_MAX_IMAGE_RANGES) return -1;
+  if (G->image_n >= GK_MAX_IMAGE_RANGES) {
+    // Full of segments, which is not the same as full of distinct ranges: the
+    // loader maps an object's PT_LOADs next to each other, so most of them
+    // merge. Compact and look again, once -- if that frees nothing the ranges
+    // really are disjoint and the table is too small for this address space.
+    int before = G->image_n;
+    image_compact();
+    if (G->image_n >= before) { G->image_full = 1; return -1; }
+  }
   G->image[G->image_n++] = (gk_span){s & ~0xfffUL, (e + 0xfffUL) & ~0xfffUL};
   return 0;
 }
 
+// What the walk saw, for the report: how the counts relate says whether a
+// binary is near the table's bound and why.
+typedef struct { int objects, segments; } gk_image_walk;
+
 // One loaded object: its PT_LOAD segments, with p_memsz (which extends past
-// the file for bss), join the image. `data` points at an error flag; the
-// walk stops once the set is full.
+// the file for bss), join the image. The walk stops once the table is full,
+// which image_add has recorded in G->image_full.
 static int image_phdr_cb(struct dl_phdr_info *info, size_t size, void *data) {
   (void)size;
+  gk_image_walk *w = data;
+  w->objects++;
   for (int i = 0; i < info->dlpi_phnum; i++) {
     const ElfW(Phdr) *p = &info->dlpi_phdr[i];
     if (p->p_type != PT_LOAD || p->p_memsz == 0) continue;
     uintptr_t s = info->dlpi_addr + p->p_vaddr;
-    if (image_add(s, s + p->p_memsz) < 0) { *(int *)data = 1; return 1; }
+    w->segments++;
+    if (image_add(s, s + p->p_memsz) < 0) return 1;
   }
   return 0;
 }
@@ -3205,11 +3243,69 @@ static int image_record_stack(void) {
   return image_add(lo, se);
 }
 
+// Sorts the spans by start and merges those that overlap or touch. The result
+// covers exactly the same addresses -- only spans whose rounded ranges meet are
+// merged, so no address joins the set that was not already in it -- and it buys
+// two things: range_clear_locked can binary-search a sorted disjoint array
+// instead of scanning, and an object's page-adjacent PT_LOAD segments cost one
+// entry rather than four. Insertion sort: this runs once, at init, over a few
+// hundred entries, and allocates nothing.
+static void image_compact(void) {
+  if (G->image_n <= 0) return;
+  for (int i = 1; i < G->image_n; i++) {
+    gk_span v = G->image[i];
+    int j = i - 1;
+    while (j >= 0 && G->image[j].start > v.start) { G->image[j + 1] = G->image[j]; j--; }
+    G->image[j + 1] = v;
+  }
+  int w = 0;
+  for (int i = 1; i < G->image_n; i++) {
+    if (G->image[i].start <= G->image[w].end) {
+      if (G->image[i].end > G->image[w].end) G->image[w].end = G->image[i].end;
+    } else {
+      G->image[++w] = G->image[i];
+    }
+  }
+  G->image_n = w + 1;
+}
+
+// Records the image, or fails with a reason the caller can act on. Every
+// failure here leaves gk unstarted, which is safe -- nothing is running in a
+// guest yet -- so none of them is gk_fatal; what each one must not be is
+// indistinguishable from "this machine has no /dev/kvm", which is the other
+// reason gk_init fails and the only one a caller may answer by carrying on
+// without gk. An overflow in particular is reported on stderr as well, because
+// it is a property of how the binary was linked rather than of the machine,
+// and because the alternative to failing is running gk_mapping_change_ok
+// against an incomplete picture of what a guest munmap may remove.
 static int image_record(void) {
-  int full = 0;
-  dl_iterate_phdr(image_phdr_cb, &full);
-  if (full || G->image_n == 0) return -1;
-  return image_record_stack();
+  gk_image_walk walk = {0, 0};
+  dl_iterate_phdr(image_phdr_cb, &walk);
+  if (!G->image_full) {
+    if (G->image_n == 0) {
+      G->err = "the runtime image has no loaded object";
+      return -1;
+    }
+    // A failure here is the stack's own unless the add overflowed, which the
+    // report below is for.
+    if (image_record_stack() < 0 && !G->image_full) {
+      G->err = "the runtime image has no main-thread stack";
+      return -1;
+    }
+  }
+  if (G->image_full) {
+    fprintf(stderr,
+            "[gk] the runtime image does not fit in %d ranges (%d objects, %d segments so "
+            "far); gk will not start\n",
+            GK_MAX_IMAGE_RANGES, walk.objects, walk.segments);
+    G->err = "the runtime image does not fit in the image table";
+    return -1;
+  }
+  image_compact();
+  if (G->dbg)
+    fprintf(stderr, "[gk] runtime image: %d objects, %d segments, %d ranges\n", walk.objects,
+            walk.segments, G->image_n);
+  return 0;
 }
 
 // Pick the TLB flush stub (see gk_asm.S): INVPCID when the CPUID every vCPU
@@ -3409,7 +3505,7 @@ int gk_init(void) {
   }
   if (G->dbg) fprintf(stderr, "[gk] registers via %s\n", G->sync_regs ? "kvm_run" : "ioctl");
   if (pthread_key_create(&G->thread_key, thread_key_dtor) != 0) { G->err = "pthread_key_create"; return -1; }
-  if (image_record() < 0) { G->err = "record the runtime image"; return -1; }
+  if (image_record() < 0) return -1;  // image_record says which failure it was
   // The hostcall exchange regions (see the hostcalls section): one
   // reservation, committed a region at a time as thread records are taken.
   // Reserved before the first record below needs its region.
@@ -5005,8 +5101,17 @@ static long forward_syscall(gk_thread *t, struct kvm_regs *r) {
 // Whether [s, e) (page-aligned, s < e) is clear of every range the calling
 // thread may not change. Caller holds G->lock.
 static int range_clear_locked(uintptr_t s, uintptr_t e, const gk_arena *mine) {
-  for (int i = 0; i < G->image_n; i++)
-    if (s < G->image[i].end && G->image[i].start < e) return 0;
+  // The image is sorted and disjoint (image_compact), so as with the registry
+  // below, the first span ending past s is the only candidate for an overlap.
+  {
+    int lo = 0, hi = G->image_n;
+    while (lo < hi) {
+      int mid = lo + (hi - lo) / 2;
+      if (G->image[mid].end <= s) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo < G->image_n && G->image[lo].start < e) return 0;
+  }
   // The hostcall exchange regions: the host copies from and to a thread's
   // region on every hostcall, so the guest may not pull the mapping away.
   if (s < G->hostcall_area + GK_HOSTCALL_AREA_BYTES && G->hostcall_area < e) return 0;
