@@ -5,11 +5,25 @@
       Every site whose stack matches `pattern` (default: the ones with a
       cross-isolate free), with its counters.
 
-  alloc-census-report.py shared <earlier-dump> <later-dump> <binary>
+  alloc-census-report.py shared <earlier-dump> <later-dump> <binary> [min]
       Sites allocated under exactly one isolate's lock whose counts do not grow
       when a second isolate does the same work and whose blocks are still live:
       process-wide state established inside one isolate's turn, which the free
-      counters cannot see.
+      counters cannot see. `min` is the smallest number of allocations under a
+      lock to report, 10 by default.
+
+  alloc-census-report.py phases <p0> <p1> <p2> <binary> [min]
+      The same question over the three dumps census-run.sh writes, and with the
+      sites aggregated by their symbol names first. A site is keyed on ten
+      return addresses, and an allocation made inside a turn has JIT code
+      addresses among them, which differ between two isolates running the same
+      script: keying on the raw stack therefore splits one logical site into one
+      per isolate, and each piece then looks like state only one isolate ever
+      allocated. Aggregating first is what makes the diff mean what it says.
+      Reports where each aggregate grew -- `startup` for what was there before
+      any request, `phase1` for what the first worker's own requests added --
+      and how much of it was allocated with no lock held at all, which is in
+      the shared heap already and is not a hazard.
 
 The binary must be the one that wrote the dump, built with --copt=-g1 and
 --strip=never. Needs llvm-symbolizer on PATH or in LLVM_SYMBOLIZER.
@@ -94,6 +108,7 @@ def symbolize(rows, binary):
             if NOISE.match(n) or n in seen:
                 continue
             seen.append(n)
+        r["names"] = seen
         r["site"] = " <- ".join(s[:62] for s in seen[:5])
 
 
@@ -145,12 +160,12 @@ def sites(dump, binary, pattern=None):
     report(sel, title)
 
 
-def shared(earlier, later, binary):
+def shared(earlier, later, binary, low=10):
     before = {tuple(r["frames"]): r for r in load(earlier)}
     sel = [
         r
         for r in load(later)
-        if r["underLock"] >= 10
+        if r["underLock"] >= low
         and r["nAllocIsolates"] == 1
         and r["live"] > 0
         and tuple(r["frames"]) in before
@@ -161,11 +176,83 @@ def shared(earlier, later, binary):
     report(sel, "process-wide state established in one isolate's turn")
 
 
+# The name of a frame, for aggregating sites that are the same code reached
+# through different JIT addresses. The allocator's own frames carry no
+# information and the STL's container plumbing repeats across every container,
+# so both are dropped before the first five distinct names are taken.
+PLUMBING = re.compile(
+    r"^(Malloc|AllocateAtLeast|__libcpp_allocate|allocate$|__construct|"
+    r"std::__1::__hash_table|std::__1::__tree)"
+)
+
+
+def labels(rows, binary):
+    symbolize(rows, binary)
+    out = []
+    for r in rows:
+        names = [n for n in r["names"] if not PLUMBING.match(n)]
+        out.append(tuple(names[:5]) or ("?",))
+    return out
+
+
+def phases(p0, p1, p2, binary, low=1):
+    d0, d1, d2 = ({tuple(r["frames"]): r for r in load(p)} for p in (p0, p1, p2))
+    keys = set(d0) | set(d1) | set(d2)
+    rows = [d2.get(k) or d1.get(k) or d0.get(k) for k in keys]
+    for r, k in zip(rows, keys, strict=True):
+        r["frames"] = list(k)
+    lab = labels(rows, binary)
+    agg = {}
+    for k, r, name in zip(keys, rows, lab, strict=True):
+        a = agg.setdefault(
+            name,
+            dict(startup=0, phase1=0, phase2=0, turn=0, nolock=0, live=0, iso=0, n=0),
+        )
+        u0 = d0.get(k, {}).get("underLock", 0)
+        u1 = d1.get(k, {}).get("underLock", u0)
+        u2 = d2.get(k, {}).get("underLock", u1)
+        a["startup"] += u0
+        a["phase1"] += u1 - u0
+        a["phase2"] += u2 - u1
+        a["turn"] += r["aTurn"]
+        a["nolock"] += r["aNone"]
+        a["live"] += r["live"]
+        a["iso"] += r["nAllocIsolates"]
+        a["n"] += 1
+    sel = [
+        (name, a)
+        for name, a in agg.items()
+        if a["phase2"] == 0 and a["startup"] + a["phase1"] >= low and a["iso"] <= 1
+    ]
+    sel.sort(key=lambda p: -(p[1]["startup"] + p[1]["phase1"]))
+    total = sum(a["startup"] + a["phase1"] for _, a in sel)
+    print(
+        f"established by one isolate and not by the second: {len(sel)} aggregated "
+        f"sites, {total} allocations under a lock"
+    )
+    head = "{:>7} {:>7} {:>7} {:>7} {:>6} {:>5}  {}"
+    print(head.format("startup", "phase1", "inTurn", "nolock", "live", "sites", "site"))
+    for name, a in sel:
+        print(
+            head.format(
+                a["startup"],
+                a["phase1"],
+                a["turn"],
+                a["nolock"],
+                a["live"],
+                a["n"],
+                " <- ".join(x[:62] for x in name),
+            )
+        )
+
+
 def main(argv):
     if len(argv) >= 4 and argv[1] == "sites":
         sites(argv[2], argv[3], argv[4] if len(argv) > 4 else None)
-    elif len(argv) == 5 and argv[1] == "shared":
-        shared(argv[2], argv[3], argv[4])
+    elif len(argv) in (5, 6) and argv[1] == "shared":
+        shared(argv[2], argv[3], argv[4], int(argv[5]) if len(argv) > 5 else 10)
+    elif len(argv) in (6, 7) and argv[1] == "phases":
+        phases(argv[2], argv[3], argv[4], argv[5], int(argv[6]) if len(argv) > 6 else 1)
     else:
         sys.exit(__doc__)
 

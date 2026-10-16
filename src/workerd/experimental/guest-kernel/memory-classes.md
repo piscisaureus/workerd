@@ -1677,6 +1677,156 @@ each one at the allocation site that produces it. What it adds is that the
 second class has a V8 half the ICU hook does not reach, and that the first
 class is not a handful of workerd objects but Cap'n Proto's message arena.
 
+### The enumeration
+
+The four classes above came out of one workload each time something faulted,
+which is a linear search over a list of unknown length, and the length is
+what decides whether per-isolate C++ heaps are worth having at all. So the
+phase experiment was run again against a workload chosen to reach what the
+faults came from rather than what was convenient: two workers running the
+same module, each request instantiating a wasm module, running a function hot
+enough to be optimized and then calling it with another type so it deopts,
+driving a loop long enough to be replaced on the stack, constructing
+`Intl.DateTimeFormat`, `NumberFormat`, `Collator`, `PluralRules` and
+`RelativeTimeFormat` over four locales, and making a service-binding `fetch`
+and eight JS RPC calls against a third worker
+(`measure/census-workload.capnp` and `measure/census-run.sh`). 30 rounds per
+phase, with the guest kernel on and again off: 413,505 allocations over 7,043
+sites, 331,580 of them under an isolate lock and 313,902 of those at ring 3.
+
+Three dumps, not two: one after startup with no request served, one after the
+first worker's rounds, one after the second's. Neither isolate exists at the
+first dump, because a worker's isolate is created by its first request, so
+creating it, running its module and compiling its wasm all fall inside that
+worker's own phase -- which matters, because the wasm entry below is
+established there and not in a turn.
+
+**The list.** Six process-wide registries end up in whichever isolate was
+locked when they were first needed. For each one, where it is grown, what
+reads it, and whether an embedder choke point reaches it:
+
+1. **ICU's caches** -- the resource-bundle cache (`ures_openWithType`,
+   `init_entry`, `UDataMemory_createNewInstance`), the locale and legacy-key
+   pools under `icu::Locale::init`, `UnifiedCache` entries for
+   `DateFormatSymbols`, `PluralRules` and `RelativeDateTimeCacheData`, the
+   `DateTimePatternGenerator` pattern maps, `LikelySubtags`. 166 of the 257
+   aggregated sites and the bulk of the allocations. Read by the `Intl`
+   builtins at ring 3. **Embedder**: `u_setMemoryFunctions()`, one hook for
+   all of it.
+2. **V8's `Intl` available-locale sets** -- `std::set<std::string>` trees
+   built by `Intl::BuildLocaleSet` behind
+   `v8::base::LazyInstanceImpl<...>` and `CallOnceImpl`, reached from
+   `JSDateTimeFormat::CreateDateTimeFormat`, `JSNumberFormat::New`,
+   `JSPluralRules::GetAvailableLocales` and `JSCollator::GetAvailableLocales`.
+   19 aggregates. Read by the same builtins at ring 3. **V8 patch**, which
+   `patches/v8/0049-...` is.
+3. **V8's wasm type canonicalizer** -- the recursion-group sets and
+   `canonical_supertypes_`, grown at `AddRecursiveSingletonGroup` from
+   `ModuleDecoderImpl::DecodeTypeSection`, under the isolate's lock and
+   **outside any turn**, when the worker's module is compiled at script load.
+   Read by `WasmJs::Install` on every `v8::Context::New`, at ring 3.
+   **V8 patch**, which `patches/v8/0050-...` is.
+4. **V8's `ThreadIsolation` JIT-page map** --
+   `JitPageReference::RegisterAllocation` from
+   `NativeModule::AddCompiledCode` under `Runtime_WasmCompileLazy`, and the
+   map inserts in `JitPageReference::Shrink` and `SplitJitPageLocked`. Read by
+   `StartOfJitAllocationAt` from GC-safe code lookup, the deoptimizer and
+   stack iteration, at ring 3. **Embedder**: the map's allocations all go
+   through the platform's `ThreadIsolatedAllocator`, so a workerd one
+   overriding `Allocate` reaches every one of them (see "What is in H memory"
+   and the branch README).
+5. **V8's wasm engine registries** -- `WasmEngine`'s `NativeModuleInfo` map
+   and the per-isolate sets `UseNativeModuleInIsolate` fills, the
+   `NativeModuleCache` keyed on wire bytes, `WasmCodeManager`'s allocation
+   pool, and each `NativeModule`'s own code vectors and jump tables. 69
+   aggregates between them, grown at module compile under the compiling
+   isolate's lock and at lazy compilation inside a turn; `WasmCodeManager` and
+   the caches are read at ring 3 through `Runtime_WasmCompileLazy`. **V8
+   patch**: these are members of the process-wide `GlobalWasmState` with no
+   embedder allocator between them and `operator new`. Not previously known.
+6. **The thread's timer multimap** in `kj::TimerImpl`, which this workload
+   does not exercise and the earlier one did. **Embedder**: a shared scope at
+   `TimerChannel`.
+
+Everything else the diff reports is per-isolate state that the instrument
+cannot tell from process-wide state, and the exclusions are a judgement rather
+than a measurement: `GlobalHandles` and `TracedHandles` node blocks, the
+parser's and preparse data's zones, workerd's own module registry and the
+`kj::Path` strings in it, the microtask queue. Each belongs to one isolate, so
+each is correctly placed in that isolate's arena; they appear only because the
+diff asks "did the second isolate allocate here" and the answer for a
+per-isolate site reached through different code addresses is no.
+
+**What the instrument gets wrong, and what to do about it.** Three things,
+each of which hid a member of the list above:
+
+- **A site is keyed on ten return addresses, and an allocation made inside a
+  turn has JIT code addresses among them.** Two isolates running the same
+  script therefore allocate at *different* sites, each with one isolate and no
+  growth in the other's phase, and the diff reports both. Keying on the raw
+  stack turned 92 aggregated sites into 571. The `phases` mode of
+  `alloc-census-report.py` aggregates by symbol name before diffing, which is
+  what makes the question mean what it says.
+- **Size is not a proxy for hazard.** The JIT-page map's dangerous part is
+  four allocations in a whole run, and the canonicalizer's is seven. The
+  earlier `shared` mode required ten allocations under a lock before it would
+  report a site, which is exactly why neither appeared, and the figure that
+  matters is not how much a registry allocates but how many isolates read it.
+  Both modes now take the threshold as an argument and the useful value is 1.
+- **Ten frames do not reach through the STL.** An allocation inside a
+  templated container spends five or six frames on `operator new`,
+  `__libcpp_allocate`, `__construct_node` and the key-extraction helpers
+  before the first frame that says anything, so the caller that matters is
+  sometimes past the tenth. `WasmJs::Install` does not appear in any site of
+  this run although `guest-arena-test` faults inside it; what the census sees
+  there is the canonicalizer's container frames and nothing above them.
+
+**And what it cannot see at all** is a read, which is the thing that actually
+faults. The list above pairs each site with a reader found by following the
+code, not by measuring. Two consequences: a registry that is established and
+read by the same isolate in every real workload would be on the list
+wrongly, and one established outside any lock -- so already in the shared
+heap, which `nolock` counts -- is on the list not at all, correctly.
+
+**Is the list long enough to change the judgement?** No. Four of the six have
+a fix already written, the fifth is an embedder allocator and the sixth is a
+V8 patch of the same shape as the two that exist, and it is only reached by a
+worker that uses wasm. The open-ended series is closed at six for this
+workload. What is not settled is how many more workloads add to it: this one
+does not exercise streams over RPC, hibernatable WebSockets, the shared memory
+cache, Pyodide, `WorkerLoader`, replica storage, `AbortSignal` over RPC or
+`setTimeout`, and the earlier run shows that a workload's reach is what the
+enumeration is bounded by.
+
+**The Cap'n Proto question, settled.** The cross-isolate free set is 37 sites
+and 20,720 frees under the guest kernel, every one on the in-process call
+path, and each RPC call accounts for about one free at every site. Of those 37
+sites, **14 have `BuilderArena::allocate` or `MallocMessageBuilder::
+allocateSegment` in their stack and 23 do not**: the others are
+`TransientJsRpcTarget` and its `Handles`, the `JsRpcTargetBase` function box,
+`IoContext::makeReentryCallback`'s lambda and its `kj::Deferred`,
+`Capability::Client::makeLocalClient`'s `LocalClient`,
+`MembraneHook::wrap` and `MembranePolicy::exportInternal` with the
+membrane's `HashMap<ClientHook*, ClientHook*>` and its rehash buckets,
+`LocalCallContext::getResults`'s `LocalResponse`,
+`BuilderArena::LocalCapTable::injectCap`'s vector, and
+`IoContext::PendingEvent`. So `BuilderArena::allocate` is **not** the right
+choke point: a scope there would leave the majority of the set, including
+every capability stub and membrane hook, in the caller's arena. The scope has
+to span the call -- `LocalClient::call` and the `JsRpcTargetBase` and
+`TransientJsRpcTarget` constructors -- which is what the earlier section
+proposed and what this measurement confirms by counting what a narrower scope
+would miss.
+
+Without the guest kernel the same run has 47 cross-isolate-free sites rather
+than 37, and the six extra are the owned-list nodes
+(`hostMemory::allocate` from `OwnedObjectList::committed`, 2,240 frees, which
+under gk come from `gk_host_alloc` and are not in the heap at all) and one
+`v8::base::RegionAllocator` region-map node. The `RegionAllocator` and
+`PooledPage` cross-isolate frees the earlier run found are **zero** under the
+guest kernel here too, which is the per-`IsolateGroup` page allocator doing
+its job.
+
 ### What a check can enforce, and what it cannot
 
 The `workerd-memory-class` check cannot carry placement, and the reason is
