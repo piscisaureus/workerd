@@ -80,6 +80,20 @@ tenant's from the owner's own. That is an ownership bound, the same one
 `gk_arena_enter` and `gk_arena_destroy` carry for a pointer rewritten to
 another live arena.
 
+A table validates the handle, not what the entry holds, and the resolve
+table (`gk_resolve` in `gk.h`) shows how far apart those are. Its entries
+are filled from the turn's journal: `registerResolve` takes the pointer and
+the type word from there, and `gk_resolve_commit` admits any pointer that is
+ordinary user memory outside gk's ranges and every arena, with no test of
+the type at all. So a turn can mint a live entry, owned by its own arena and
+tagged as whatever class it likes, naming an address of its choosing, and a
+host-side `resolveOfType` asking for that class answers with that address. A
+handle that passes the owner and class comparisons says that this isolate
+registered something and called it that. It does not say that the address is
+an object, or an object of that class, or an allocation at all -- so a
+pointer does not become H-provenance by being carried as a handle, which is
+what the rule above is about.
+
 The first two classes are the whole point: an object is one isolate's or it is
 the runtime's. B is not a third kind of object but the channel, and it exists
 because without a region both sides can touch there is nothing to carry a
@@ -1194,8 +1208,47 @@ object's is not: the owned object is in the shared C++ heap, which gk maps
 writable into every arena, so for the 1162 the host's call goes through a
 vtable word the turn can write whether the pointer was checked or not.
 Bounding the pointer to the object's extent confines the host to the object it
-was about to dispose of and nothing further, which is worth having, but it
-does not reduce what a turn can make the host do.
+was about to dispose of and nothing further, which is less than it reads as,
+since the object pointer is journaled too (below), and it does not reduce what
+a turn can make the host do.
+
+**Four host-side calls go through the journaled pair, and the loosest needs
+no object at all.** A registration journals a disposer and the address to
+hand it, and the host calls the two together from four places: the
+delete-queue drain and an off-turn drop (`OwnedObjectList::release`), the
+context's teardown walk (`~OwnedObjectList`), and the refusal hook
+(`OwnedObjectList::refused`). The first three read the pair out of the owned
+node, which is in host memory, but the node's two words were copied there
+from the turn's aux words when the registration committed, so the pair is
+the turn's either way. `refused` reads the aux words directly, and it is the
+one that needs no node and no registration that survives: a registration
+naming a context that no longer exists is refused on the hook's own terms,
+with nothing linked anywhere, and the pair is called all the same. The two
+words need bear no relation to the object the registration carried. In all
+four the host loads a vtable word from an address the turn supplied and
+calls through it with an argument the turn supplied. The refusal hook is the
+narrowest of them in practice rather than the widest: over `api/tests` and
+`io`, 556,386 registrations against 16,588 contexts, no registration is
+refused at all and it disposes of nothing, which is what giving a context's
+entry to its own isolate leaves.
+
+**Bounding the disposal pointer to the object's extent is not the bound it
+looks like.** Three things are wrong with it. The object pointer is
+journaled too, and all that separates it from the disposal pointer is
+`gk_resolve_commit`'s check that it is ordinary user memory outside gk's
+ranges and every arena, so a turn made to keep the two in agreement sets
+both to the same chosen address. The host never dereferences the disposal
+pointer in any case: it is the argument to a call whose target is the
+disposer, which is the word that is followed, and a disposer the turn chose
+can ignore its argument. And the relation does not hold for the runtime's
+own registrations -- `kj::Own` hands its disposer the most-derived object's
+address (`kj::_::castToVoid`), which for a `T` that is not the primary base
+of its dynamic type lies below the `T*` the table holds. 978 of the 556,386
+registrations are that case, every one of them with the disposal pointer
+below the object pointer, so a host that required it inside the object would
+orphan them -- and the host has no size to bound it with, since nothing
+carries `sizeof(T)` past the registration and the most-derived extent is not
+`sizeof(T)` anyway.
 
 **The journaled pointer is not the only route to the same call.** A disposal
 through a correct `HeapDisposer<D>` runs `~D()` over members the turn
