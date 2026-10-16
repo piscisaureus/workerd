@@ -1043,6 +1043,119 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
           stats.chunksFreed, hostMemory::liveResolveEntries());
     }));
   }
+  // The AbortSignal native registration (api/basics.h): the record holding one abort action,
+  // which the signal owns and only code under the isolate lock reads, and the table entry that
+  // says the consumer still wants it, which the consumer's RAII handle owns and retires when
+  // it is dropped -- on the event loop, outside the guest, where a `fetch` with a signal drops
+  // it when its promise settles. /__gk_abort_cell_corrupt creates a signal and an action in
+  // the turn, keeps both alive, and then, from a later turn, overwrites the disposer word of
+  // the action's kj::Function with a disposer the turn chose, as a write primitive would. The
+  // handle is then dropped on the event loop: it must retire the entry and nothing else, so
+  // the chosen disposer is never called. (Where the handle clears the action instead, as in
+  // the WORKERD_GK_NEG_ABORT_CELL build, the host destroys the function and calls the disposer
+  // the turn chose, which logs that it was reached, and this script fails.)
+  //
+  // /__gk_abort_cell_live and /__gk_abort_cell_dropped are the behaviour either side of that:
+  // a signal aborted while its consumer's handle is alive must run the action, and one aborted
+  // after the handle was dropped on the event loop must not.
+  struct ChosenActionDisposer final: public kj::Disposer {
+    void disposeImpl(void* pointer) const override {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the chosen action disposer was called",
+          kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(pointer))),
+          kj::str("inTurn = ", hostMemory::inTurn()));
+    }
+  };
+  static const ChosenActionDisposer chosenActionDisposer;
+  struct AbortProbe {
+    jsg::Ref<AbortSignal> signal;
+    kj::Own<void> registration;
+  };
+  if (probeEnabled && url.endsWith("/__gk_abort_cell_corrupt")) {
+    jsg::Lock& js = lock;
+    auto& context = IoContext::current();
+    static kj::Maybe<AbortProbe> corruptProbe;
+    auto signal = js.alloc<AbortSignal>();
+    auto registration = signal->addAbortAction(js, [](jsg::Lock&, const kj::Exception&) {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the corrupt probe's abort action ran");
+    });
+    auto found = signal->newestNativeRegistrationForTest();
+    KJ_REQUIRE(found.record != nullptr && found.actionDisposerSlot != nullptr,
+        "no native registration was made");
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: created an AbortSignal registration inside the JS turn",
+        url, addr(found.record), addr(found.actionDisposerSlot),
+        kj::str("0x", kj::hex(found.armed)));
+    corruptProbe = AbortProbe{.signal = kj::mv(signal), .registration = kj::mv(registration)};
+    context.addWaitUntil(context
+                             .run([url = kj::str(url), addr](Worker::Lock& lock) {
+      auto& probe = KJ_ASSERT_NONNULL(corruptProbe);
+      auto found = probe.signal->newestNativeRegistrationForTest();
+      void* saved = found.actionDisposerSlot[0];
+      found.actionDisposerSlot[0] = const_cast<ChosenActionDisposer*>(&chosenActionDisposer);
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: overwrote the abort action's disposer from inside the JS turn",
+          url, addr(found.record), addr(saved), addr(&chosenActionDisposer));
+    })
+                             .then([]() {
+      return kj::evalLater([]() {
+        // On the event loop, outside the guest, as the holder of a signal-wrapped promise is.
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: dropping the abort registration on the event loop",
+            kj::str("inTurn = ", hostMemory::inTurn()));
+        KJ_ASSERT_NONNULL(corruptProbe).registration = nullptr;
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the abort registration was dropped");
+      });
+    }).then([&context]() {
+      return context.run([](Worker::Lock&) {
+        auto& probe = KJ_ASSERT_NONNULL(corruptProbe);
+        auto found = probe.signal->newestNativeRegistrationForTest();
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the turn after the registration was dropped ran",
+            kj::str("count = ", probe.signal->getNativeRegistrationCountForTest()),
+            kj::str("armed = 0x", kj::hex(found.armed)),
+            kj::str("resolves = ", hostMemory::resolve(found.armed) == found.record),
+            kj::str("action = ", found.actionDisposerSlot != nullptr ? "present" : "destroyed"));
+      });
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_abort_cell_live")) {
+    // The control: the handle is still held, so the abort runs the action.
+    jsg::Lock& js = lock;
+    auto& context = IoContext::current();
+    static kj::Maybe<AbortProbe> liveProbe;
+    auto signal = js.alloc<AbortSignal>();
+    auto registration = signal->addAbortAction(js, [](jsg::Lock&, const kj::Exception&) {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the live probe's abort action ran");
+    });
+    liveProbe = AbortProbe{.signal = kj::mv(signal), .registration = kj::mv(registration)};
+    context.addWaitUntil(context.run([](Worker::Lock& lock) {
+      jsg::Lock& js = lock;
+      auto& probe = KJ_ASSERT_NONNULL(liveProbe);
+      probe.signal->triggerAbort(js, kj::none);
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the live probe's signal was aborted");
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_abort_cell_dropped")) {
+    // The other side: the handle is dropped on the event loop first, so the abort must not run
+    // the action even though the record is still the signal's.
+    jsg::Lock& js = lock;
+    auto& context = IoContext::current();
+    static kj::Maybe<AbortProbe> droppedProbe;
+    auto signal = js.alloc<AbortSignal>();
+    auto registration = signal->addAbortAction(js, [](jsg::Lock&, const kj::Exception&) {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the dropped probe's abort action ran");
+    });
+    droppedProbe = AbortProbe{.signal = kj::mv(signal), .registration = kj::mv(registration)};
+    context.addWaitUntil(kj::evalLater([]() {
+      KJ_ASSERT_NONNULL(droppedProbe).registration = nullptr;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the dropped probe's registration was dropped",
+          kj::str("inTurn = ", hostMemory::inTurn()));
+    }).then([&context]() {
+      return context.run([](Worker::Lock& lock) {
+        jsg::Lock& js = lock;
+        auto& probe = KJ_ASSERT_NONNULL(droppedProbe);
+        probe.signal->triggerAbort(js, kj::none);
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the dropped probe's signal was aborted");
+      });
+    }));
+  }
   if (probeEnabled && url.endsWith("/__gk_corrupt_handle")) {
     KJ_IF_SOME(probe, hostMemory::handleProbeForTest()) {
       static byte chosenKey[32] = {0x41};

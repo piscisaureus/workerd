@@ -345,7 +345,7 @@ Each rule has a test that can be applied without reading the class body.
 | R4 | Abstract class of embedder hooks whose implementation lives outside `io/` and `jsg/` (the `observer.h` convention) | **H**, and every in-turn call through its vtable is a message site. Covers `RequestObserver` (`io/observer.h:93`), `LimitEnforcer` (`io/limit-enforcer.h:221`), `IoChannelFactory` and its channels (`io/io-channels.h:119`), `TimerChannel` (`:69`), `CacheClient` (`:44`), `ActorIdFactory` (`io/actor-id.h:41`), the gate hooks (`io/io-gate.h:44`), `jsg::IsolateObserver` (`jsg/observer.h:25`), `Serializer::ExternalHandler` (`jsg/ser.h:73`) |
 | R5 | No path from a `Wrappable` except through `IoOwn`/`IoPtr`/`ReverseIoOwn` or a `kj::Function` captured into a KJ promise | **H**. Promise nodes, `TaskSet` entries, timer tasks, HTTP client objects, `WorkerInterface` instances, capnp RPC state |
 | R6 | Every member is an integer, enum, `bool`, `kj::Date`, `kj::Duration`, or a `kj::String`/`kj::Array<byte>`/`kj::Vector` of the same | Side-neutral; crosses by copying into B. `IoContext::Id` (`io-context.h:521`), `TimeoutId` (`io/io-timers.h:17`), `tracing::SpanId`/`TraceId` (`io/trace.h:45`, `:128`), every event struct in `io/trace.h:373-985`, `Trace` (`:989`, which already has capnp `copyTo`/`mergeFrom` at `:1049`), `jsg::GuestTurnOutcome`. Caveat: a `kj::String` carries an `ArrayDisposer*`, so it crosses as bytes plus length and is re-owned on arrival, never moved as a `kj::String` |
-| R7 | `thread_local`, or a function-local `static` with mutable state | Reachable by the guest, so a value the host trusts after a turn, or that a signal handler or a forwarded syscall consumes mid-turn, must not come from it. Two remedies are in use. A value the host reads only *after* the turn is saved on the host stack frame that runs the turn and put back when the guest returns (the frame is read-only to the guest under the host-frame wall): `GuestTurnThreadLocals` (`io/guest-turn-thread-locals.h`) does this for `threadLocalRequest` (`io-context.c++:29`), `currentApi` (`worker.c++:557`, with `Worker::Lock` also restoring it from the stack rather than its heap `Impl` at release), `tmpDirStorageScope` (`worker-fs.c++:57`), `symbolicLinkGuard` (`worker-fs.c++:53`), `SqliteMemoryScope::threadLocalScope` (`sqlite-metering.c++:36`) and the `AllowV8BackgroundThreads`/`WarnAboutIsolateLock` scope depths (`thread-scopes.c++`); `guestTurnDepth` (`guest-run.c++:22`) was the first. A value consumed *during* the turn with host privilege is kept out of the guest's reach instead: `activeProgressCounter` (`thread-scopes.c++:27`), read by the watchdog's signal handler, lives in gk's per-thread supervisor words (`gk_thread_words_*`), and `currentVfsRoot` (`sqlite.c++:1860`), the dirfd of SQLite's forwarded path syscalls, is bounded by gk's turn directory (`gk_confine_paths`/`gk_turn_dir_set`), which the wrapped-native VFS sets around each native call that may name a file through a hostcall whose handler reads the descriptor from a host slot. `guestTurnArena` (`guest-run.c++:35`) needs neither: a rewrite only weakens a diagnostic the guest draws at ring 3, and the host never dereferences it. `vfsErrorListener` (`sqlite.c++:196`) needs neither: `SqliteCallScope` clears it unconditionally and it is consumed only at ring 3 within the turn. Still open: `inCppgcShimDestructor` (`wrappable.c++:29`), `CompileCache::get()`'s static (`jsg/compile-cache.h:47`), `AsyncLockQueue::threadCurrentWaiter` (`io/async-lock-scheduler.h:159`) |
+| R7 | `thread_local`, or a function-local `static` with mutable state | Reachable by the guest, so a value the host trusts after a turn, or that a signal handler or a forwarded syscall consumes mid-turn, must not come from it. Two remedies are in use. A value the host reads only *after* the turn is saved on the host stack frame that runs the turn and put back when the guest returns (the frame is read-only to the guest under the host-frame wall): `GuestTurnThreadLocals` (`io/guest-turn-thread-locals.h`) does this for `threadLocalRequest` (`io-context.c++:29`), `currentApi` (`worker.c++:557`, with `Worker::Lock` also restoring it from the stack rather than its heap `Impl` at release), `tmpDirStorageScope` (`worker-fs.c++:57`), `symbolicLinkGuard` (`worker-fs.c++:53`), `SqliteMemoryScope::threadLocalScope` (`sqlite-metering.c++:36`) and the `AllowV8BackgroundThreads`/`WarnAboutIsolateLock` scope depths (`thread-scopes.c++`); `guestTurnDepth` (`guest-run.c++:22`) was the first. A value consumed *during* the turn with host privilege is kept out of the guest's reach instead: `activeProgressCounter` (`thread-scopes.c++:27`), read by the watchdog's signal handler, lives in gk's per-thread supervisor words (`gk_thread_words_*`), and `currentVfsRoot` (`sqlite.c++:1860`), the dirfd of SQLite's forwarded path syscalls, is bounded by gk's turn directory (`gk_confine_paths`/`gk_turn_dir_set`), which the wrapped-native VFS sets around each native call that may name a file through a hostcall whose handler reads the descriptor from a host slot. `guestTurnArena` (`guest-run.c++:35`) needs neither: a rewrite only weakens a diagnostic the guest draws at ring 3, and the host never dereferences it. `vfsErrorListener` (`sqlite.c++:196`) needs neither: `SqliteCallScope` clears it unconditionally and it is consumed only at ring 3 within the turn. Still open: `inCppgcShimDestructor` (`wrappable.c++:29`) and `AsyncLockQueue::threadCurrentWaiter` (`io/async-lock-scheduler.h:159`). `CompileCache::get()`'s static (`jsg/compile-cache.h:47`) is not reached at all: nothing calls the class (violation 10f) |
 | R8 | Every public method takes `jsg::Lock&` and the class has no R3 member | **I**. `jsg::Serializer`/`Deserializer` (`jsg/ser.h:60`), `MemoryTracker` (`jsg/memory.h:176`), `jsg::Url` and friends, the `TypeWrapper`/`ResourceWrapper` machinery (`jsg/type-wrapper.h:635`), `ModuleRegistryImpl` (`jsg/modules.h:280`), `AsyncContextFrame` (`jsg/async-context.h:70`) |
 | R9 | Process-wide singleton of the V8 embedding | **H**. `V8System` (`jsg/setup.h:53`), `V8PlatformWrapper` (`jsg/v8-platform-wrapper.h:13`), `GuestArena` (`setup.h:194`). `ArenaPageAllocator` (`setup.h:121`) is the exception: V8 calls it from in-arena threads, so its code runs in the guest and its range checks are not a host-side guarantee -- the enforcement for it is the syscall filter's `gk_mapping_syscall_ok` |
 
@@ -523,12 +523,11 @@ at.
    What in-arena code still touches of this family: `ReverseIoOwnValidity`'s
    refcount when a `ReverseIoOwn` is dropped in a turn, and the event loop's
    executor lock when a context torn down inside a turn destroys its
-   cross-thread fulfiller there (both as before). Still open elsewhere:
-   `IsolateBase::queue` from `Data::destroy` (`setup.h:755`), the module
-   registry on every lookup (`modules-new.h:801`), `CompileCache`
-   (`compile-cache.h:54`), the actor cache LRU (`actor-cache.h:1084`), and
-   the `AbortSignal` registration cells (`api/basics.h:804`), which are
-   `kj::Arc` + `MutexGuarded` in the shared heap taken from turns.
+   cross-thread fulfiller there (both as before). The `AbortSignal`
+   registration cells are closed; see violation 10 below, which also triages
+   the rest of the family -- the actor cache LRU, the module registry,
+   `ReverseIoOwnValidity`, `IsolateBase::queue` and `CompileCache` -- by what
+   an attacker gets from each.
 5. **Guest-built KJ objects with vtables are consumed by the event loop.**
    `awaitIoImpl` builds promise nodes in-turn and hands them to `addTask`
    (`io-context.h:1600`); `IoContext::abort` stores a guest-built
@@ -550,6 +549,158 @@ at.
    (`jsg.h:1660`), which is the H-touches-I pattern the rubric forbids; same
    for `workerd::WeakRef<IoContext>::tryGet()` from `makeReentryCallbackImpl`
    (`io-context.h:1811`).
+10. **The shared structures a turn reaches that the host also uses.** Five
+   were named beside `ReverseIoOwnValidity` as the remainder of violation 4.
+   What matters about each is not that it is shared -- the whole C++ heap is,
+   until it moves -- but what an attacker with a write primitive gets out of
+   it that it does not already have from the heap at large: whether host code,
+   running outside any arena with host privilege, later reads a pointer or
+   calls through a vtable the turn wrote, and whether it is another tenant's
+   state. In that order:
+
+   **a. The `AbortSignal` registration cells (`api/basics.h`): a host
+   control-flow hijack, reachable from any worker. Closed.** A native abort
+   registration was a `kj::Arc<RegistrationCell>` on the shared heap holding
+   `kj::MutexGuarded<kj::Maybe<kj::Function<void(jsg::Lock&, const
+   kj::Exception&)>>>`, shared between the signal and one consumer. The
+   consumer's RAII handle is held by (or attached to) objects the owning
+   request destroys -- `AbortSignal::wrap` attaches the `Cancellation` to the
+   wrapped `kj::Promise`, which is how `fetch(url, {signal})` registers -- so
+   it is dropped on the event loop, outside the isolate lock and outside the
+   guest. That drop did two things in memory a turn can write: it took the
+   cell's mutex, and it destroyed the `kj::Function`, which is a call through
+   the disposer pointer of that function's `kj::Own`. A turn that rewrites
+   that one word therefore makes the host jump to an address of its choosing,
+   with the host's privilege rather than ring 3's, at a moment it controls
+   (the request completing). The `kj::Arc` refcount, likewise written by that
+   thread, is a second primitive: forced to zero early it frees the cell under
+   the host, and left high it leaks it. Reachability is as good as it gets for
+   an attacker -- one `fetch` with a signal per request, no flags, no
+   configuration.
+
+   What closes it is that the drop no longer touches the signal's memory at
+   all. The record holding the action is the signal's own, read and written
+   only under the isolate lock and destroyed only there; the separate fact of
+   whether the consumer still wants the action is an entry in gk's ring-0
+   resolve table, which the handle owns and retires when it is dropped. The
+   table is beyond a turn's reach, so dropping the handle is one validated
+   retirement and nothing else: no lock in guest memory, no refcount, no
+   destructor over bytes a turn can write. A turn resolves the entry before it
+   takes the action, so a dropped handle disarms the registration as the
+   cleared slot used to; a cross-context abort takes the action with it and
+   resolves the handle again on arrival, which keeps the "a consumer that went
+   away turns the delivery into a no-op" rule. The signal retires whatever
+   entries it still holds when it is destroyed, and each side retires only an
+   entry that still resolves to its own record, so whichever runs first wins
+   and the other finds nothing. `abort-signal-test.sh` drives it: a turn
+   rewrites the disposer word of a live action's `kj::Function`, the host
+   drops the handle on the event loop, and the chosen disposer is never
+   called, the action is still there and the entry no longer resolves; a
+   registration whose handle is still held still runs its action on abort, and
+   one whose handle was dropped does not. (In the `WORKERD_GK_NEG_ABORT_CELL`
+   build the handle clears the action wherever it is dropped, as it did
+   before, and the chosen disposer logs that the host called it, which fails
+   the script.)
+
+   The `RpcRegistration` cells beside them (`api/basics.h`) have the same
+   shape but not the same exposure: there is no consumer-side handle, and
+   every one of their slots is taken under the isolate lock -- on abort, on a
+   sweep, or when the signal is destroyed -- so no host thread locks or
+   destroys anything in them. They stay as they are.
+
+   **b. The actor cache LRU (`io/actor-cache.h:1084`): host-side writes
+   through guest-written pointers, across the actors of one isolate. Open.**
+   `SharedLru::cleanList` is a `kj::MutexGuarded<kj::List<Entry,
+   &Entry::link>>` holding the clean entries of every `ActorCache` in the
+   isolate (`Worker::Isolate::Impl::actorCacheLru`, `worker.c++:620`), so one
+   actor's turn can write the links of another actor's entries. A turn reaches
+   it on ordinary storage calls -- `ActorCache::get` and friends take
+   `lru.cleanList.lockExclusive()` directly (`actor-cache.c++:395`, `:439`,
+   `:465`, `:614`, ...) -- and so does host code on the event loop, in the RPC
+   completions and the flush (`:491`, `:541`, `:802`, `:860`, `:1180`,
+   `:1228`). The host walks and splices that list and drops `kj::Own<Entry>`
+   from it, so a rewritten link is an arbitrary write performed by the host
+   and a rewritten entry is a call through a disposer the turn chose, both
+   outside any arena. The bound is the isolate: entries from different actors
+   share the list, entries from different isolates do not. In workerd this is
+   reachable with a Durable Object namespace that has no `actorStorage`
+   directory, where `ActorCache` backs in-memory storage
+   (`server.c++:1305`); in production it is the RPC-backed storage path.
+   Closing it is the split the inventory already names -- the cache is H only,
+   with messages for get/put/delete/list -- which is a larger piece of work
+   than a holder conversion.
+
+   **c. The module registry (`jsg/modules-new.h:801`): cross-isolate, but
+   within one worker and behind an experimental flag. Open.**
+   `ModuleRegistry::lookup` takes `impl.lockExclusive()` on every resolution
+   (`modules-new.c++:2330`), which is every static import, dynamic `import()`
+   and `require()` a turn makes, and the lock guards the bundle arrays the
+   lookup walks and the caching it does. The registry is a `kj::Arc` that in
+   workerd belongs to one worker (`server.c++:5765`) but in production may be
+   shared by several replicas of that worker, so a rewritten bundle array
+   gives another isolate's `import` a `const Module&` the attacker chose -- a
+   vtable call at that isolate's ring 3, and the ability to serve it source of
+   the attacker's choosing -- and a corrupted mutex word deadlocks the next
+   replica to resolve. The bound is the worker: one tenant's replicas, never
+   another tenant. It is gated on the new module registry, which requires
+   `--experimental` (`server.c++:5756`), so it is not reachable in a default
+   configuration today. The split the inventory names -- the bundles mapped
+   read-only into the arena, since they are immutable after `finish()`, and
+   the builder and the lock H -- is the fix.
+
+   **d. `ReverseIoOwnValidity`'s refcount (`io/io-own.h:23`): a host-side
+   use-after-free of its own tenant's object. Open.** The validity token is a
+   `kj::Arc<ReverseIoOwnValidity>` -- an `AtomicRefcounted` on the shared heap
+   -- held by the `IoContext` (`io-context.h:1213`) and by every
+   `ReverseIoOwn`. A turn that drops a `ReverseIoOwn` writes the refcount,
+   which is the one refcount of the `IoOwn` family still in guest reach. Set
+   to one before such a drop it frees the token while the context still holds
+   its `Arc`, so the context's `invalidate()` (`io-context.c++:786`) writes
+   into freed memory and `checkValid()` reads it, and the free itself runs the
+   `Arc`'s disposer host-side. What that buys is a one-byte write and a stale
+   read at an address the attacker can groom, within its own tenant, plus a
+   double free. Reachability is narrow: the holders are
+   `JsRpcPromise::Handles` (`worker-rpc.c++:2099`) and the trace-stream
+   handler (`trace-stream.c++:1033`), dropped in a turn only when the
+   context's list disposes of them, and `ReverseIoOwn` is never dereferenced
+   in a turn at all (see Cost). The conversion is the same one `IoOwn` had:
+   the token becomes a handle whose entry the host retires, with validity
+   being the entry's liveness rather than a flag in a refcounted object.
+
+   **e. `IsolateBase::queue` from `Data::destroy` (`jsg/setup.h`): not
+   reachable from a turn.** Every path that pushes onto the deferred
+   destruction queue is guarded by the isolate *not* being locked on the
+   calling thread: `Data::destroy` (`jsg.c++:58`) and `WeakV8Ref::destroy`
+   (`jsg.h:1196`) call `deferGlobalDestruction` only in the
+   `!v8::Locker::IsLocked(isolate)` branch, `Wrappable::maybeDeferDestruction`
+   (`wrappable.c++:322`) the same, and both callers of `destroyUnderLock`
+   (`setup.h:1341`, `filesystem.c++:2044`) are in that branch too. Inside a
+   turn the isolate is locked by that thread, so in-arena code does not take
+   this mutex; it is host-side code dropping handles off the isolate's thread
+   that does. What remains is not specific to the queue: its items are
+   destroyed host-side at the next lock (`applyDeferredActions`,
+   `setup.c++:288`), and an item is a `kj::OneOf` holding a `v8::Global`, a
+   `RefToDelete` or a `kj::Own<void>` on the shared heap, so the host calls
+   through disposers a turn can write -- which is true of every `kj::Own` on
+   that heap and goes away with the heap, not with anything done to this
+   queue. The inventory's plan for it (a ring of `{kind, handle}` records)
+   still stands as part of that; it is not a violation-4 item.
+
+   **f. `CompileCache` (`jsg/compile-cache.h:54`): not an exposure.** Nothing
+   calls it. `CompileCache::get()` has no caller in the tree, and neither
+   `add()` nor `find()` is reached from anywhere: the only file that includes
+   the header besides its own translation unit is the build-time code-cache
+   generator (`src/rust/gen-compile-cache/cxx-bridge.c++`), which does not use
+   the class. The compile-cache bytes the runtime actually consumes come from
+   elsewhere and are read-only -- `script.getCompileCache()` out of the capnp
+   config (`per-isolate-bootstrap.c++:378`) and `module.getCompileCache()` out
+   of the embedded module table (`api/node/node.h:93`). The class is dead code
+   on this branch, and its function-local static (R7) is never reached. Were
+   it ever wired up it would be the worst of the six -- a process-wide map
+   whose values are a raw `{data, length}` fed to V8 as a code cache, so a
+   write to it would hand every other isolate in the process a deserialized
+   code object of the attacker's choosing -- which is the reason to delete it
+   rather than leave it for someone to start using.
 
 ## Inventory: `api/`
 
@@ -574,7 +725,7 @@ The escapees, condensed:
 | `DeferredProxy<T>` (`api/deferred-proxy.h:37`) | The `IoContext::run` result problem in its natural habitat: a promise node graph allocated in-turn and run by the host |
 | `MemoryCache` (`api/memory-cache.h:526`) | I object plus a handle. `SharedMemoryCache` is `kj::AtomicRefcounted` with a `MutexGuarded` map and is shared across isolates by design (`:119`, `:477`) |
 | `CapnpServer` (`api/capnp.h:36`) | An H capnp server holding a `jsg::V8Ref<v8::Object>` and a wrapper reference its own comment marks "only valid if isolate is locked" |
-| `AbortSignal` registration cells (`api/basics.h:804`, `:887`) | The cells are `kj::Arc` + `MutexGuarded` and are taken from *other* IoContexts through `DeleteQueue::scheduleAction`; they become H objects the signal holds by handle |
+| `AbortSignal` registration cells (`api/basics.h`) | **Native registrations: done.** The record holding the action is the signal's, written only under the isolate lock, and the consumer's RAII handle owns a resolve entry instead of a share in the record: dropping it on the event loop retires the entry and touches nothing in the signal. A turn resolves the entry before it takes the action, and a cross-context delivery resolves it again on arrival. The RPC registrations beside them keep the `kj::Arc` + `MutexGuarded` shape, which no host thread touches. See violation 10a |
 | `Rewriter` (`api/html-rewriter.c++:214`) | An H `WritableStreamSink` holding `IoContext&`, the lol_html parser, and handler registrations that call back into JS |
 | `jsg::ExternalMemoryAdjustment` (`api/actor.h:402`, `api/worker-rpc.h:645`) | Holds a `kj::Arc<const ExternalMemoryTarget>` with an `IsolateLiveness` weak ref touched outside the turn, so H objects hold per-isolate state and I objects hold an Arc shared with the GC thread |
 | `PyodideBundleManager` (`api/pyodide/pyodide.h:33`) | H, process-wide and `MutexGuarded`; `ReadOnlyBuffer::source` is an `ArrayPtr` into a process-lifetime bundle read in-turn. Admissible only if those pages are mapped read-only into every arena |

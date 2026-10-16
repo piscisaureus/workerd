@@ -109,6 +109,18 @@ isolate's JS turn at guest ring 3.
   rewritten to another isolate's live context, or to a buffer the turn
   chose, queues nothing when the holder is dropped, with the object left to
   its own context's teardown.
+- `abort-signal-test.sh` / `abort-signal-test.capnp` — end-to-end check
+  against a built workerd that an `AbortSignal`'s native abort registration
+  (`api/basics.h`) keeps the host out of the signal's own memory: the record
+  holding the abort action is the signal's and is read, written and destroyed
+  only under the isolate lock, while the consumer's RAII handle owns nothing
+  but an entry in the resolve table, which it retires when it is dropped. A
+  JS turn rewrites the disposer word of a live action's `kj::Function`, as a
+  write primitive would, and the handle is then dropped on the event loop,
+  outside the guest, where a `fetch` with a signal drops it: the chosen
+  disposer is never called, the action is still the signal's and the entry no
+  longer resolves. A registration whose handle is still held runs its action
+  on abort; one whose handle was dropped does not.
 
 ## API
 
