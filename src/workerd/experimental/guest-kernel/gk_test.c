@@ -2832,6 +2832,81 @@ static int resolve_check(void) {
   if (XA) gk_arena_destroy(XA);
   if (XB) gk_arena_destroy(XB);
 
+  // Re-owning. The runtime creates objects for one isolate inside turns of
+  // another -- a subrequest builds the callee's IoContext inside the caller's
+  // turn -- and an entry registered that way is owned by the wrong arena,
+  // with nothing a turn supplies able to say which arena is right. So an
+  // entry is disowned, where it resolves for no ring 3 at all, and adopted
+  // later by the arena the adopting thread is on, which gk takes from its own
+  // record. One entry registered under arena NA, disowned, resolved from NA's
+  // ring 3 and from the host, then adopted under NB and resolved from both
+  // rings again. The pointer is what keeps one caller from re-owning
+  // another's entry, so a wrong pointer, a wrong type and a dead handle are
+  // tried too, and must leave the owner where it was.
+  static int on, onb;
+  gk_arena *NA = gk_arena_create(1UL << 20), *NB = gk_arena_create(1UL << 20);
+  gk_resolve_handle hn = 0;
+  double ns_reown = 0;
+  long disowned_in_a = -1, adopted_in_b = -1, adopted_in_a = -1;
+  int reown_ok = NA != NULL && NB != NULL;
+  if (reown_ok) {
+    gk_arena_enter(NA);
+    hn = gk_resolve_register(&on, RS_TYPE_A);
+    gk_arena_enter(NULL);
+    reown_ok = hn != 0 && gk_resolve_owned_by(NA, hn) == 1 &&
+        // A wrong pointer or type is refused, and the entry stays NA's.
+        gk_resolve_disown(hn, &onb, RS_TYPE_A) == -EINVAL &&
+        gk_resolve_disown(hn, &on, RS_TYPE_B) == -EINVAL &&
+        gk_resolve_adopt(hn, &onb, RS_TYPE_A) == -EINVAL &&
+        gk_resolve_adopt(0, &on, RS_TYPE_A) == -EINVAL &&
+        gk_resolve_adopt(bad[3], &on, RS_TYPE_A) == -EINVAL &&
+        gk_resolve_owned_by(NA, hn) == 1 && gk_resolve(hn) == &on &&
+        // Disowned: no arena owns it, the host still resolves it.
+        gk_resolve_disown(hn, &on, RS_TYPE_A) == 0 && gk_resolve_owned_by(NA, hn) == 0 &&
+        gk_resolve_owned_by(NB, hn) == 0 && gk_resolve_owned_by(NULL, hn) == 1 &&
+        gk_resolve(hn) == &on;
+    {
+      gk_resolve_handle one[1] = {hn};
+      void *none_wanted[1] = {NULL};
+      void *on_wanted[1] = {&on};
+      struct rs_all rs = {one, none_wanted, 1};
+      gk_arena_enter(NA);
+      disowned_in_a = gk_run_here_user(rs_resolve_all, &rs);  // 0: it answered NULL
+      gk_arena_enter(NULL);
+      gk_arena_enter(NB);
+      reown_ok = reown_ok && gk_resolve_adopt(hn, &on, RS_TYPE_A) == 0;
+      rs.want = on_wanted;
+      adopted_in_b = gk_run_here_user(rs_resolve_all, &rs);  // 0: NB's ring 3 sees it
+      gk_arena_enter(NULL);
+      gk_arena_enter(NA);
+      rs.want = none_wanted;
+      adopted_in_a = gk_run_here_user(rs_resolve_all, &rs);  // 0: NA's no longer does
+      gk_arena_enter(NULL);
+    }
+    // What a disown and an adopt cost, which the runtime pays once each per
+    // context built inside another isolate's turn: a pair per iteration, the
+    // arena entered as the adopting thread has it.
+    {
+      int m = 0;
+      gk_arena_enter(NB);
+      double t0 = now_ns();
+      for (; m < 20000; m++) {
+        if (gk_resolve_disown(hn, &on, RS_TYPE_A) != 0) break;
+        if (gk_resolve_adopt(hn, &on, RS_TYPE_A) != 0) break;
+      }
+      ns_reown = (now_ns() - t0) / (m ? 2 * m : 1);
+      gk_arena_enter(NULL);
+      reown_ok = reown_ok && m == 20000;
+    }
+    reown_ok = reown_ok && disowned_in_a == 0 && adopted_in_b == 0 && adopted_in_a == 0 &&
+        gk_resolve_owned_by(NB, hn) == 1 && gk_resolve_owned_by(NA, hn) == 0 &&
+        gk_resolve_unregister_for(NA, hn) == -EINVAL &&
+        gk_resolve_unregister_for(NB, hn) == 0 && gk_resolve(hn) == NULL &&
+        gk_resolve_adopt(hn, &on, RS_TYPE_A) == -EINVAL;
+  }
+  if (NA) gk_arena_destroy(NA);
+  if (NB) gk_arena_destroy(NB);
+
   // The type word. The owner says whose entry it is and nothing about what
   // it is, so an entry carries a word the registrant chooses and the lookup
   // hands back beside the pointer, for the caller to compare against what it
@@ -2870,7 +2945,7 @@ static int resolve_check(void) {
   int ok = reg_bad && resolves && user_ok && here_ok && ring0_ok && host_ok && garbage_ok &&
            walled && bench_ok && freed && recycled && capacity_ok && fresh && reserve_ok &&
            commit_ok && committed_wrong == 0 && reserve_freed && owner_ok && recycle_ok &&
-           owned_ok && type_ok && cost_ok && cpl == 3;
+           owned_ok && reown_ok && type_ok && cost_ok && cpl == 3;
   printf("ring-0 resolve: NULL refused %s; handle %#llx -> %p (host %s); ring 3 %s, caller's "
          "stack %s, ring 0 %s, host %s; %d garbage handles and 0 -> nothing at every ring (%s, "
          "caller's memory untouched %s); ring-3 read of the table -> %s (fault %#lx == %#lx), "
@@ -2889,7 +2964,11 @@ static int resolve_check(void) {
          "arena %s, stale handles resolved %ld times from its ring 3, host-side %s) %s; %.0f ns per register and %.0f ns per retire on the base root, "
          "%.0f and %.0f in an arena %s; an entry is owned by its own arena and by no other, "
          "and a retire for another arena, for the base root or of a base-root entry is refused "
-         "%s; an entry's type word comes back with the pointer, host-side and at ring 3, and "
+         "%s; an entry of one arena, disowned, resolves at no ring 3 and still resolves "
+         "host-side, and adopted under another arena resolves at that arena's ring 3 and not "
+         "the first's, while a wrong pointer, type or handle re-owns nothing %s (%.0f ns per "
+         "re-owning); an entry's "
+         "type word comes back with the pointer, host-side and at ring 3, and "
          "a reserved, committed or retired entry carries what it should %s; CPL %ld [%s]\n",
          reg_bad ? "yes" : "NO", (unsigned long long)h, (void *)&obj, resolves ? "ok" : "BROKEN",
          user_ok ? "ok" : "BROKEN", here_ok ? "ok" : "BROKEN", ring0_ok ? "ok" : "BROKEN",
@@ -2908,7 +2987,8 @@ static int resolve_check(void) {
          recycle_ok ? "yes" : "NO",
          ns_register, ns_unregister, ns_register_arena,
          ns_unregister_arena, cost_ok ? "ok" : "BROKEN", owned_ok ? "yes" : "NO",
-         type_ok ? "yes" : "NO", cpl, ok ? "OK" : "FAIL");
+         reown_ok ? "yes" : "NO", ns_reown, type_ok ? "yes" : "NO", cpl,
+         ok ? "OK" : "FAIL");
   free(p);
   free(heap);
   munmap(none, 4096);

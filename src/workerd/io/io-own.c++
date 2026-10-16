@@ -18,6 +18,10 @@ namespace {
 // an owned node.
 enum CompanionKind : uint64_t { NONE = 0, CONTEXT = 1, NODE = 2 };
 
+// A context's own entry names the owner, which is not an owned object: tagging it keeps a
+// holder's typed resolve from reaching it, beside the companion's kind, which already does.
+constexpr uint64_t CONTEXT_TYPE = hostMemory::resolveTypeTag<DeleteQueueOwner>();
+
 // A node of an owned list, in host memory (see OwnedObjectList).
 struct OwnedNode {
   OwnedNode* next;
@@ -51,6 +55,9 @@ struct Chunk {
 };
 static_assert(sizeof(Chunk) == 1024);
 
+std::atomic<size_t> foreignInTurnDrops{0};
+std::atomic<size_t> registrationsRefused{0};
+std::atomic<size_t> objectsDisposedOnRefusal{0};
 std::atomic<size_t> nodesAllocated{0};
 std::atomic<size_t> nodesFreed{0};
 std::atomic<size_t> recordsAllocated{0};
@@ -330,14 +337,29 @@ bool OwnedObjectList::committed(hostMemory::ResolveHandle handle, void* ptr, con
   switch (aux[AUX_KIND]) {
     case NONE:
       return true;
-    case CONTEXT:
-      return hostMemory::setResolveCompanion(handle, {CONTEXT, allocateRecord()});
+    case CONTEXT: {
+      ContextRecord* record = allocateRecord();
+      if (!hostMemory::setResolveCompanion(handle, {CONTEXT, record})) {
+        freeRecord(record);
+        return false;
+      }
+      // Registered inside a turn, so the entry is owned by the arena that turn ran under, which
+      // need not be the isolate the context belongs to: a subrequest builds the callee's
+      // IoContext inside the caller's turn. Left owned by no arena, it resolves for no turn --
+      // neither the one that made it nor any other -- until the isolate it belongs to adopts
+      // it on its own thread (DeleteQueueOwner::adoptEntry).
+#ifndef WORKERD_GK_NEG_CONTEXT_ADOPT
+      hostMemory::disownResolve(handle, ptr, CONTEXT_TYPE);
+#endif
+      return true;
+    }
     case NODE: {
       auto* disposer = reinterpret_cast<const kj::Disposer*>(aux[AUX_DISPOSER]);
       auto* disposal = reinterpret_cast<void*>(aux[AUX_DISPOSAL]);
       if (disposer == nullptr || disposal == nullptr) {
         KJ_LOG(ERROR, "an owned object's registration names no disposer; it is refused",
             kj::hex(handle));
+        registrationsRefused.fetch_add(1, std::memory_order_relaxed);
         return false;
       }
       hostMemory::ResolveHandle context = aux[AUX_CONTEXT];
@@ -348,12 +370,14 @@ bool OwnedObjectList::committed(hostMemory::ResolveHandle handle, void* ptr, con
         KJ_LOG(ERROR,
             "an owned object's registration names a context of another isolate; it is refused",
             kj::hex(handle), kj::hex(context));
+        registrationsRefused.fetch_add(1, std::memory_order_relaxed);
         return false;
       }
       ContextRecord* record = recordOf(context);
       if (record == nullptr) {
         KJ_LOG(ERROR, "an owned object's registration names no live context; it is refused",
             kj::hex(handle), kj::hex(context));
+        registrationsRefused.fetch_add(1, std::memory_order_relaxed);
         return false;
       }
       OwnedNode* node = allocateNode();
@@ -365,6 +389,7 @@ bool OwnedObjectList::committed(hostMemory::ResolveHandle handle, void* ptr, con
       if (!hostMemory::setResolveCompanion(handle, {NODE, node})) {
         unlinkNode(node);
         freeNode(node);
+        registrationsRefused.fetch_add(1, std::memory_order_relaxed);
         return false;
       }
       return true;
@@ -456,8 +481,30 @@ bool OwnedObjectList::noted(const uint64_t* words, bool inHandler) {
   return true;
 }
 
-const hostMemory::ResolveTurnHooks OwnedObjectList::TURN_HOOKS = {
-  &OwnedObjectList::committed, &OwnedObjectList::released, &OwnedObjectList::noted};
+void OwnedObjectList::refused(hostMemory::ResolveHandle handle, void* ptr, const uint64_t* aux) {
+#ifdef WORKERD_GK_NEG_REFUSED_DISPOSE
+  // WORKERD_GK_NEG_REFUSED_DISPOSE is a negative-test build, never shipped: a registration the
+  // turn's commit refuses leaves its object owned by nothing, which is what it did before the
+  // owner was told. The guest kernel's rpc-context-test.sh must then fail -- the object of a
+  // deliberately refused registration is never disposed of; this is the check that the test
+  // tests the disposal.
+  return;
+#else
+  if (aux[AUX_KIND] != NODE) return;
+  // registerOwned() hands the object to the table before the turn ends and the holder keeps
+  // only the handle, so an object whose registration does not survive the turn is owned by
+  // nothing: no node was built for it and no holder can reach it. It is disposed of here,
+  // which is what the owned list would have done for it.
+  auto* disposer = reinterpret_cast<const kj::Disposer*>(aux[AUX_DISPOSER]);
+  auto* disposal = reinterpret_cast<void*>(aux[AUX_DISPOSAL]);
+  if (disposer == nullptr || disposal == nullptr) return;
+  objectsDisposedOnRefusal.fetch_add(1, std::memory_order_relaxed);
+  disposer->dispose(disposal);
+#endif
+}
+
+const hostMemory::ResolveTurnHooks OwnedObjectList::TURN_HOOKS = {&OwnedObjectList::committed,
+  &OwnedObjectList::released, &OwnedObjectList::noted, &OwnedObjectList::refused};
 
 void OwnedObjectList::releaseInTurn(hostMemory::ResolveHandle handle) {
   hostMemory::unregisterResolve(handle);
@@ -492,16 +539,37 @@ void DeleteQueue::releaseReference(hostMemory::ResolveHandle handle, uint64_t ta
 #endif
 }
 
-void OwnedObjectList::drop(
-    hostMemory::ResolveHandle handle, uint64_t type, const OwnedDisposal& disposal) {
+void OwnedObjectList::drop(hostMemory::ResolveHandle handle,
+    uint64_t type,
+    const OwnedDisposal& disposal,
+    HolderMayBeForeign foreign) {
   if (hostMemory::inTurn()) {
     // Inside the turn, where the list cannot be reached: dispose of the object here and release
     // the entry through the journal; the host frees the node after the turn.
     void* object = hostMemory::resolveOfType(handle, type);
-    if (object == nullptr && hostMemory::resolve(handle) != nullptr) {
-      KJ_LOG(ERROR, "an IoOwn handle names an object of another class; nothing is released",
-          kj::hex(handle));
-      return;
+    if (object == nullptr) {
+      if (hostMemory::resolve(handle) != nullptr) {
+        KJ_LOG(ERROR, "an IoOwn handle names an object of another class; nothing is released",
+            kj::hex(handle));
+        return;
+      }
+      if (foreign) {
+        // The handle resolves to nothing for this turn, and for this holder that is the
+        // ordinary cross-isolate case: a ReverseIoOwn names an object of the context whose
+        // thread it shares, and that thread runs other isolates' turns. Nothing can be done
+        // with it from here -- a turn cannot dispose of an object whose vtable is another
+        // isolate's, and a retire the host would have to refuse is work it should not be
+        // asked for -- so the object stays on its own context's list and is disposed of when
+        // that list is torn down: reclaim at the end of the owning request rather than here.
+        foreignInTurnDrops.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      // This holder's context is the thread's current one, so its object's entry should be
+      // this isolate's and resolve. It does not: the handle was rewritten, or names an entry
+      // already released. The release is journaled all the same, so that the host sees what
+      // was asked of it -- it retires nothing for a handle that names nothing, and refuses one
+      // that names another isolate's entry, which is what keeps a turn from retiring an entry
+      // it was never given.
     }
     releaseInTurn(handle);
     if (object != nullptr) disposal.dispose(object, *disposal.disposer);
@@ -715,6 +783,9 @@ void OwnedObjectList::installHostcall() {
 
 OwnedObjectList::Stats OwnedObjectList::statsForTest() {
   return {
+    foreignInTurnDrops.load(std::memory_order_relaxed),
+    registrationsRefused.load(std::memory_order_relaxed),
+    objectsDisposedOnRefusal.load(std::memory_order_relaxed),
     nodesAllocated.load(std::memory_order_relaxed),
     nodesFreed.load(std::memory_order_relaxed),
     recordsAllocated.load(std::memory_order_relaxed),
@@ -722,6 +793,17 @@ OwnedObjectList::Stats OwnedObjectList::statsForTest() {
     chunksAllocated.load(std::memory_order_relaxed),
     chunksFreed.load(std::memory_order_relaxed),
   };
+}
+
+hostMemory::ResolveHandle OwnedObjectList::registerRefusedForTest(
+    void* object, void* disposal, const kj::Disposer& disposer) {
+  KJ_REQUIRE(hostMemory::inTurn(), "a refused registration is made from inside a turn");
+  // A handle no live entry carries, so the commit hook finds no context behind it and refuses
+  // the registration -- the path a registration takes when the context it names has ended.
+  constexpr hostMemory::ResolveHandle NO_CONTEXT = ~hostMemory::ResolveHandle(0);
+  uint64_t aux[hostMemory::RESOLVE_AUX_WORDS] = {NODE, reinterpret_cast<uintptr_t>(&disposer),
+    NO_CONTEXT, reinterpret_cast<uintptr_t>(disposal)};
+  return hostMemory::registerResolve(object, hostMemory::RESOLVE_TYPE_NONE, aux);
 }
 
 OwnedObjectList::NodeForTest OwnedObjectList::nodeForTest(hostMemory::ResolveHandle handle) {
@@ -837,23 +919,26 @@ void ReverseIoOwnValidity::checkValid() const {
       isValid(), Error, "Couldn't complete operation because the execution context has ended.");
 }
 
-// A context's own entry names the owner, which is not an owned object: tagging it keeps a
-// holder's typed resolve from reaching it, beside the companion's kind, which already does.
-constexpr uint64_t CONTEXT_TYPE = hostMemory::resolveTypeTag<DeleteQueueOwner>();
-
 DeleteQueueOwner::DeleteQueueOwner(hostMemory::IsolateArena arena) {
   // The entry's pointer is this owner, in the context, which nothing dereferences through the
-  // table; what the entry is for is its companion, the record in host memory. Registered inside
-  // a turn, the record is built by the committed hook after the turn; the holders the turn
-  // creates meanwhile need only the handle. Outside a turn -- the usual case, since a context
-  // is created on the event loop -- the registration names the isolate the context belongs to,
-  // because the turns that resolve this handle (isDefunct, tryScheduleAction, a holder dropped
-  // inside a turn) run under that isolate's arena and an entry resolves at ring 3 only under
-  // the root it was registered with.
+  // table; what the entry is for is its companion, the record in host memory. Outside a turn --
+  // the usual case, since a context is created on the event loop -- the registration names the
+  // isolate the context belongs to, because the turns that resolve this handle (isDefunct,
+  // tryScheduleAction, a holder dropped inside a turn) run under that isolate's arena and an
+  // entry resolves at ring 3 only under the root it was registered with.
+  //
+  // Inside a turn the entry comes from that turn's journal, and the turn need not be of this
+  // context's isolate: a subrequest builds the callee's IoContext inside the caller's turn. An
+  // entry registered that way would be owned by the caller's isolate, so the commit hook that
+  // builds the record leaves it owned by no arena instead, and this context's own isolate
+  // claims it on its own thread (adoptEntry). Between the two it resolves for no turn, which
+  // is what a context nothing has run yet needs: the holders the creating turn makes need only
+  // the handle, and every use before the first turn is host-side.
   hostMemory::ResolveHandle handle;
   if (hostMemory::inTurn()) {
     uint64_t aux[hostMemory::RESOLVE_AUX_WORDS] = {CONTEXT, 0, 0, 0};
     handle = hostMemory::registerResolve(this, CONTEXT_TYPE, aux);
+    entryNeedsAdoption = true;
   } else {
     handle = hostMemory::registerResolveFor(arena, this, CONTEXT_TYPE);
     if (handle != 0 && !hostMemory::setResolveCompanion(handle, {CONTEXT, allocateRecord()})) {
@@ -864,6 +949,34 @@ DeleteQueueOwner::DeleteQueueOwner(hostMemory::IsolateArena arena) {
   KJ_REQUIRE(handle != 0, "the resolve table is full; cannot create another I/O context",
       hostMemory::RESOLVE_CAPACITY);
   queue = DeleteQueue(handle);
+}
+
+void DeleteQueueOwner::adoptEntry() {
+#ifdef WORKERD_GK_NEG_CONTEXT_ADOPT
+  // WORKERD_GK_NEG_CONTEXT_ADOPT is a negative-test build, never shipped: a context created
+  // inside a turn keeps the entry that turn's journal gave it, owned by whichever isolate's
+  // turn built the context, which is what it kept before it was adopted. The guest kernel's
+  // rpc-context-test.sh must then fail -- the callee's own turns registering owned objects
+  // against their own context are refused by the commit hook, which is where the objects were
+  // lost; this is the check that the test tests the adoption.
+  return;
+#else
+  if (!entryNeedsAdoption) return;
+  entryNeedsAdoption = false;
+  // The entry was registered from the journal of a turn of whichever isolate built this
+  // context, and the commit hook left it owned by no arena. This is the context's own thread,
+  // with its isolate locked and its arena entered, so the arena gk records for this thread is
+  // the one whose turns resolve this handle. gk takes it from that record; nothing here names
+  // it. The handle is this owner's own field, which a turn can write, so gk is told the entry
+  // must hold this owner's address: a handle rewritten to another context's entry holds that
+  // context's owner and is refused, leaving that context where it was.
+  if (!hostMemory::adoptResolve(queue.getContext(), this, CONTEXT_TYPE)) {
+    KJ_LOG(ERROR,
+        "a context's entry could not be adopted by its own isolate; the context's "
+        "handle resolves for no turn",
+        kj::hex(queue.getContext()));
+  }
+#endif
 }
 
 DeleteQueueOwner::~DeleteQueueOwner() noexcept(false) {

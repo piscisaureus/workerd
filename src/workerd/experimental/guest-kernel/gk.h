@@ -752,6 +752,24 @@ int gk_resolve_owned_by(gk_arena *a, gk_resolve_handle handle);
 // check and the retire in one step under gk's lock. -EINVAL, with a report,
 // for a handle that is not a live entry of `a`.
 int gk_resolve_unregister_for(gk_arena *a, gk_resolve_handle handle);
+// Re-owning. An entry registered from a turn is owned by the arena that turn
+// ran under, and the runtime creates objects for one isolate inside turns of
+// another: the IoContext of the worker a subrequest is addressed to is built
+// by the calling worker's turn. Such an entry has to end up owned by the
+// isolate whose turns will resolve it, and no value a turn supplies can say
+// which isolate that is. So neither of these takes an arena. gk_resolve_disown
+// leaves the entry owned by the base root, where it resolves for no ring 3 at
+// all, so no turn can name it; gk_resolve_adopt gives it to the arena the
+// calling thread is on, from gk's own record of the thread, which is how the
+// isolate claims its own entry host-side, on its own thread, under its lock.
+//
+// What keeps one caller from re-owning another's entry is the pointer: the
+// entry must hold exactly `ptr` under `type`, and the owner of an object
+// passes that object's own address, which no other live object has. -EINVAL,
+// with a report, for a handle that names no such entry. Host-side: they take
+// gk's lock, and a call at ring 3 faults on the table.
+int gk_resolve_disown(gk_resolve_handle handle, void *ptr, uint64_t type);
+int gk_resolve_adopt(gk_resolve_handle handle, void *ptr, uint64_t type);
 void *gk_resolve(gk_resolve_handle handle);
 // gk_resolve, and the entry's type word through `type` when it is not NULL;
 // 0 there for a lookup that resolved to nothing.

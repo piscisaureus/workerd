@@ -728,6 +728,22 @@ ResolveHandle registerResolveFor(IsolateArena arena, void* ptr, uint64_t type) {
   return fallbackRegisterResolve(ptr, type);
 }
 
+bool disownResolve(ResolveHandle handle, void* ptr, uint64_t type) {
+  // No inTurn() bar: the commit hook that disowns a context entry runs while the journal it
+  // came from is still being processed, which is host-side all the same.
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (guestKernelActive()) return gk_resolve_disown(handle, ptr, type) == 0;
+#endif
+  return true;
+}
+
+bool adoptResolve(ResolveHandle handle, void* ptr, uint64_t type) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (guestKernelActive()) return gk_resolve_adopt(handle, ptr, type) == 0;
+#endif
+  return true;
+}
+
 ResolveHandle registerResolve(void* ptr, uint64_t type, const uint64_t (&aux)[RESOLVE_AUX_WORDS]) {
   KJ_REQUIRE(ptr != nullptr);
   if (TurnJournal* journal = activeJournal()) {
@@ -915,6 +931,9 @@ ResolveTurn::~ResolveTurn() noexcept(false) {
         KJ_LOG(ERROR, "a turn's resolve entry could not be committed; it resolves to nothing",
             kj::hex(handle), journal.ptr[i]);
       }
+      // The entry is about to be retired with nothing of the turn's left naming it, so the
+      // owner is told before the handle stops meaning anything.
+      if (hooks.refused != nullptr) hooks.refused(handle, journal.ptr[i], journal.aux[i]);
     }
     // Retired by the turn, never used, or refused: the entry resolves to nothing from now on,
     // and so does any holder of it.

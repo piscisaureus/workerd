@@ -1424,6 +1424,11 @@ void IoContext::runInContextScope(Worker::LockType lockType,
       v8::Isolate::PromiseContextScope promiseContextScope(
           lock.getIsolate(), getPromiseContextTag(lock));
 
+      // A context built inside a turn of another isolate holds an entry that no arena owns
+      // yet; claim it for this isolate, whose lock this thread holds and whose arena it is in.
+      // Before the turn enters the guest, so the turn below resolves its own context's handle.
+      deleteQueue.adoptEntry();
+
       // Handle any pending deletions that arrived while the worker was processing a different
       // request. Host-side: the queue is in host memory, and this runs before the turn enters
       // the guest.

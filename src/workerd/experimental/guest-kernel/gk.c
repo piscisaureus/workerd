@@ -4056,6 +4056,56 @@ int gk_resolve_owned_by(gk_arena *a, gk_resolve_handle h) {
   return ok;
 }
 
+// The body of both re-ownings: the entry must be live and committed and must
+// hold exactly `ptr` under `type`, which is what keeps a caller to entries
+// naming an object it has in hand, since two live objects never share an
+// address. The pointer is cleared across the owner store and put back after
+// it, so a lookup in flight either sees no pointer, and answers nothing, or
+// sees the pointer with the owner that goes with it (see resolve_take).
+// Caller holds G->lock.
+static int resolve_reown_locked(
+    gk_resolve_handle h, void *ptr, uint64_t type, gk_arena *a, const char *who) {
+  uint64_t idx = h & ((1ULL << GK_RESOLVE_INDEX_BITS) - 1), gen = h >> GK_RESOLVE_INDEX_BITS;
+  gk_resolve_entry *e = &gk_resolve_table.e[idx];  // the mask bounds idx (see the table)
+#ifdef GK_NEG_RESOLVE_REOWN
+  // GK_NEG_RESOLVE_REOWN (a negative-test build, never shipped) re-owns a live
+  // entry whatever it holds, so a caller can take an entry it was never given
+  // by naming its handle, and the corresponding gk_test case fails.
+  if (gen == 0 || e->gen != gen || e->ptr == NULL) {
+#else
+  if (gen == 0 || e->gen != gen || e->ptr == NULL || e->ptr != ptr || e->type != type) {
+#endif
+    fprintf(stderr, "[gk] %s: %#llx does not name a live resolve entry holding %p; nothing is "
+            "re-owned\n", who, (unsigned long long)h, ptr);
+    return -GK_EINVAL;
+  }
+#ifdef GK_NEG_RESOLVE_REOWN
+  ptr = e->ptr;
+#endif
+  __atomic_store_n(&e->ptr, NULL, __ATOMIC_RELEASE);
+  resolve_chain_remove((int)idx);
+  __atomic_store_n(&e->owner, resolve_root_of(a), __ATOMIC_RELEASE);
+  resolve_chain_add((int)idx, a);
+  __atomic_store_n(&e->ptr, ptr, __ATOMIC_RELEASE);
+  return 0;
+}
+
+int gk_resolve_disown(gk_resolve_handle h, void *ptr, uint64_t type) {
+  if (!G->initialized) return -GK_EINVAL;
+  pthread_mutex_lock(&G->lock);
+  int r = resolve_reown_locked(h, ptr, type, NULL, "gk_resolve_disown");
+  pthread_mutex_unlock(&G->lock);
+  return r;
+}
+
+int gk_resolve_adopt(gk_resolve_handle h, void *ptr, uint64_t type) {
+  if (!G->initialized) return -GK_EINVAL;
+  pthread_mutex_lock(&G->lock);
+  int r = resolve_reown_locked(h, ptr, type, resolve_arena_now(), "gk_resolve_adopt");
+  pthread_mutex_unlock(&G->lock);
+  return r;
+}
+
 int gk_resolve_unregister_for(gk_arena *a, gk_resolve_handle h) {
   uint64_t idx = h & ((1ULL << GK_RESOLVE_INDEX_BITS) - 1), gen = h >> GK_RESOLVE_INDEX_BITS;
   pthread_mutex_lock(&G->lock);

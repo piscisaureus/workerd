@@ -66,6 +66,14 @@ using RemoveIoOwn = RemoveIoOwn_<T>::Type;
 
 WD_STRONG_BOOL(DestroyOwnedObject);
 
+// Whether a holder being dropped may name an object of another isolate. An IoOwn names an
+// object of its own context, and its in-turn drop happens only when that context is the
+// thread's current one, so a handle that resolves to nothing there is one that was rewritten.
+// A ReverseIoOwn is held by a KJ object on the context's thread and dropped wherever that
+// object is destroyed, and that thread runs other isolates' turns, so the same handle
+// resolving to nothing is the ordinary cross-isolate case.
+WD_STRONG_BOOL(HolderMayBeForeign);
+
 // How a holder disposes of its object inside a turn, where the context's record of the object
 // (OwnedObjectList) cannot be reached: the disposer recorded when the object was registered,
 // and the call to it for the object's type, bound at registration, where the type is complete,
@@ -144,8 +152,12 @@ class OwnedObjectList {
 
   // Drops the object `handle` names on the thread of the context that owns it: inside a turn,
   // through `disposal` and releaseInTurn(); outside one, host-side through the list. Refuses a
-  // handle that names a live object of a class other than `type`.
-  static void drop(hostMemory::ResolveHandle handle, uint64_t type, const OwnedDisposal& disposal);
+  // handle that names a live object of a class other than `type`. `foreign` says what a handle
+  // that resolves to nothing inside a turn means for this holder (HolderMayBeForeign above).
+  static void drop(hostMemory::ResolveHandle handle,
+      uint64_t type,
+      const OwnedDisposal& disposal,
+      HolderMayBeForeign foreign = HolderMayBeForeign::NO);
 
   // The hooks a ResolveTurn runs host-side for the entries a turn registered and released and
   // the notes it made (the delete queue's, see DeleteQueue).
@@ -154,10 +166,16 @@ class OwnedObjectList {
   // Registers the IO_CONTEXT hostcall. Called once, host-side, before any turn runs.
   static void installHostcall();
 
-  // Host-memory blocks allocated and freed since the process started, for tests and
-  // diagnostics: the owned nodes, the context records (DeleteQueueOwner) and the queue chunks
-  // the records' queues are kept in.
+  // What the owned lists have done since the process started, for tests and diagnostics: the
+  // holders dropped inside a turn that could not resolve their object, the registrations the
+  // commit hook refused and the objects disposed of because a registration did not survive
+  // its turn, and the host-memory blocks allocated and freed -- the owned nodes, the context
+  // records (DeleteQueueOwner) and the queue chunks the records' queues are kept in. The first
+  // is counted inside turns, so it is a turn's own word about itself; the rest are the host's.
   struct Stats {
+    size_t foreignInTurnDrops;
+    size_t registrationsRefused;
+    size_t objectsDisposedOnRefusal;
     size_t nodesAllocated;
     size_t nodesFreed;
     size_t recordsAllocated;
@@ -166,6 +184,13 @@ class OwnedObjectList {
     size_t chunksFreed;
   };
   static Stats statsForTest();
+
+  // Registers an owned object naming a context that no longer exists, for a test of what
+  // becomes of a registration the commit hook refuses: nothing can reach the object, since
+  // registerOwned() has already given it to the table, so the hook's refusal has to dispose of
+  // it. Returns the handle, which names nothing once the turn has ended. Inside a turn only.
+  static hostMemory::ResolveHandle registerRefusedForTest(
+      void* object, void* disposal, const kj::Disposer& disposer);
 
   // The node behind `handle`, for a test that corrupts it from inside a turn: the node's
   // address, and its link and disposer fields; null if the handle names no owned object.
@@ -182,6 +207,7 @@ class OwnedObjectList {
   static bool committed(hostMemory::ResolveHandle handle, void* ptr, const uint64_t* aux);
   static void released(hostMemory::ResolveHandle handle);
   static bool noted(const uint64_t* words, bool inHandler);
+  static void refused(hostMemory::ResolveHandle handle, void* ptr, const uint64_t* aux);
   static long hostcallHandler(hostcall::Frame& frame);
   static const hostcall::Entry HOSTCALL;
 
@@ -392,6 +418,16 @@ class DeleteQueueOwner {
   KJ_DISALLOW_COPY_AND_MOVE(DeleteQueueOwner);
   ~DeleteQueueOwner() noexcept(false);
 
+  // Host-side, on the context's thread, with the isolate locked: makes the context's entry the
+  // isolate's own, for a context created inside a turn. Such a context's entry comes from that
+  // turn's journal, and the turn may be another isolate's -- a subrequest builds the callee's
+  // IoContext inside the caller's turn -- so the commit hook leaves it owned by no arena, where
+  // it resolves for no turn at all. This claims it for the arena gk records this thread as
+  // running under, which is the isolate whose turns will resolve it. Called before each of the
+  // context's turns; it does nothing after the first, and nothing at all for a context whose
+  // entry was registered host-side.
+  void adoptEntry();
+
   // Host-side, on the context's thread: releases, disposing of each, the objects whose holders
   // were dropped off the context since the last drain.
   void drainDeletions();
@@ -407,6 +443,13 @@ class DeleteQueueOwner {
 
   // The queue, as holders name it. Set once, when the entry is registered.
   DeleteQueue queue;
+
+ private:
+  // Whether the entry still has to be claimed by its own isolate (adoptEntry). Set when the
+  // entry is registered from a turn's journal. A turn that writes this cannot make another
+  // isolate adopt anything -- adoptEntry names this owner's address and gk compares it against
+  // the entry -- and can at most leave this context's own handle resolving for no turn.
+  bool entryNeedsAdoption = false;
 };
 
 // Owned reference held by a V8 heap object, naming a KJ event loop object. Cannot be
@@ -696,7 +739,7 @@ ReverseIoOwn<T>::ReverseIoOwn(ReverseIoOwn&& other) noexcept
 template <typename T>
 void ReverseIoOwn<T>::drop() {
   if (handle == 0 || !validity->isValid()) return;
-  OwnedObjectList::drop(handle, hostMemory::resolveTypeTag<T>(), disposal);
+  OwnedObjectList::drop(handle, hostMemory::resolveTypeTag<T>(), disposal, HolderMayBeForeign::YES);
 }
 
 template <typename T>

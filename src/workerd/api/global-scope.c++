@@ -1248,12 +1248,35 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
       KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: queued an action for the context host-side", queued);
     }).then([promise = kj::mv(paf.promise)]() mutable { return kj::mv(promise); }));
   }
+  if (probeEnabled && url.endsWith("/__gk_refused_registration")) {
+    // What becomes of an owned object whose registration the commit hook refuses. The
+    // registration names a context that no longer exists, which is a refusal the hook makes on
+    // its own terms; registerOwned() has handed the object to the table by then and the holder
+    // keeps only a handle, so the refusal is the last thing that can reach the object and has
+    // to dispose of it. The destructor says so. (Where a refusal only retires the entry, as in
+    // the WORKERD_GK_NEG_REFUSED_DISPOSE build, nothing says so and this script fails.)
+    struct Probe {
+      ~Probe() noexcept(false) {
+        KJ_LOG(
+            WARNING, "WORKERD_GK_TEST_PROBE: the object of a refused registration was disposed of");
+      }
+    };
+    auto obj = kj::heap<Probe>();
+    const kj::Disposer& disposer = obj.getDisposer();
+    Probe* object = obj.get();
+    auto handle =
+        OwnedObjectList::registerRefusedForTest(object, kj::_::castToVoid(object), disposer);
+    obj.disown(&disposer);
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: registered an owned object naming no live context",
+        kj::hex(handle));
+  }
   if (probeEnabled && url.endsWith("/__gk_ioown_counts")) {
     // The host-memory block and resolve-entry counts, for a leak check across a load: read on
     // the event loop, since the entry count is the guest kernel's, which a turn cannot read.
     IoContext::current().addTask(kj::evalLater([]() {
       auto stats = OwnedObjectList::statsForTest();
-      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: owned-node counts", stats.nodesAllocated,
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: owned-node counts", stats.foreignInTurnDrops,
+          stats.registrationsRefused, stats.objectsDisposedOnRefusal, stats.nodesAllocated,
           stats.nodesFreed, stats.recordsAllocated, stats.recordsFreed, stats.chunksAllocated,
           stats.chunksFreed, hostMemory::liveResolveEntries());
     }));

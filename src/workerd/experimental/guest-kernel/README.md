@@ -117,6 +117,24 @@ isolate's JS turn at guest ring 3.
   rewritten to another isolate's live context, or to a buffer the turn
   chose, queues nothing when the holder is dropped, with the object left to
   its own context's teardown.
+- `rpc-context-test.sh` / `rpc-context-test.capnp` /
+  `rpc-context-caller.js` / `rpc-context-callee.js` — end-to-end check
+  against a built workerd that a worker whose `IoContext` was built inside
+  another worker's JS turn owns the objects it registers against that
+  context. A subrequest builds the callee's context from the caller's turn
+  (`IoContext::getSubrequestChannel`), so the context's entry comes out of
+  the caller's journal; registered under the caller's arena it would make
+  every owned object the callee registers against its own context name a
+  context of another isolate, which the commit hook refuses with the object
+  already handed over, and would make the callee's own turns resolve their
+  context's handle to nothing. The entry is therefore owned by no arena
+  until the isolate it belongs to adopts it host-side (`gk_resolve_adopt`).
+  100 cross-worker RPC calls and 20 service-binding fetches must refuse no
+  registration and leave no owned node or context record behind; the stubs
+  the RPC calls dispose of inside the caller's turn must still reach the
+  cross-arena case, counted so that the check cannot pass by not happening;
+  and an owned object whose registration is refused must be disposed of by
+  the refusal rather than left owned by nothing.
 - `abort-signal-test.sh` / `abort-signal-test.capnp` — end-to-end check
   against a built workerd that an `AbortSignal`'s native abort registration
   (`api/basics.h`) keeps the host out of the signal's own memory: the record
@@ -455,7 +473,30 @@ hardware:
   a host thread that registers an entry for an isolate it is not locked into
   names the isolate instead (`gk_resolve_register_for`,
   `hostMemory::registerResolveFor`, used for a context's own entry, which is
-  created on the event loop). Guest ring 0 and the host are not compared:
+  usually created on the event loop).
+
+  A turn cannot name an isolate that way, and sometimes has to: a subrequest
+  builds the callee worker's `IoContext` inside the calling worker's turn
+  (`IoContext::getSubrequestChannel`), so that context's entry comes out of
+  the caller's journal and would be owned by the caller's arena -- leaving
+  the callee's own turns unable to resolve their own context's handle, and
+  every owned object they register against it refused by the commit hook
+  with the object already handed to the table and so lost. Nothing in a
+  turn's reach can say which isolate the context belongs to: the arena, the
+  `Worker::Isolate` it would be read from and the handle itself are all in
+  the shared heap a turn can write, and gk validating an arena pointer
+  against its pool only narrows a forged value to *some* live arena. So the
+  entry names no arena at all. The commit hook that builds the context's
+  record leaves it owned by the base root (`gk_resolve_disown`), where it
+  resolves for no ring 3 -- not the turn that made it either -- and the
+  isolate it belongs to claims it host-side, on its own thread, under its
+  own lock, before its first turn (`DeleteQueueOwner::adoptEntry`,
+  `gk_resolve_adopt`); the arena comes from gk's record of that thread, as a
+  turn's own does, and is never named. What keeps one caller from claiming
+  another's entry is the pointer: the entry must hold exactly the pointer
+  the caller passes, and a `DeleteQueueOwner` passes its own address, so a
+  handle rewritten to another context's entry finds that context's owner
+  there and re-owns nothing. Guest ring 0 and the host are not compared:
   host code resolves on behalf of whichever context it is serving, from
   threads that are usually on no arena at all. The lookup takes no
   lock and writes nothing: it reads the generation on both sides of the

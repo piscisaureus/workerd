@@ -164,6 +164,24 @@ ResolveHandle registerResolve(void* ptr, uint64_t type, const uint64_t (&aux)[RE
 // turn's isolate's already.
 using IsolateArena = void*;
 ResolveHandle registerResolveFor(IsolateArena arena, void* ptr, uint64_t type);
+
+// An entry registered inside a turn is owned by the arena that turn ran under, which is the
+// isolate whose turn it was. The runtime builds objects for one isolate inside turns of
+// another -- the IoContext of the worker a subrequest is addressed to is built by the calling
+// worker's turn -- and such an entry has to end up owned by the isolate whose turns will
+// resolve it. Nothing a turn supplies can say which isolate that is, so neither of these takes
+// an arena.
+//
+// disownResolve() leaves the entry owned by no arena, where it resolves for no turn at all;
+// adoptResolve() gives it to the isolate whose arena the calling thread is in, taken from gk's
+// record of the thread, and is how that isolate claims the entry host-side, on its own thread,
+// under its own lock. Both identify the entry by what it holds: the handle must name a live
+// entry whose pointer is exactly `ptr` and whose tag is `type`, so a caller passing its own
+// object's address can re-own that entry and no other, whatever handle it was given. False,
+// with a report, otherwise. Host-side only. Without the guest kernel there are no arenas and
+// both do nothing.
+bool disownResolve(ResolveHandle handle, void* ptr, uint64_t type);
+bool adoptResolve(ResolveHandle handle, void* ptr, uint64_t type);
 void* resolve(ResolveHandle handle);
 
 // resolve(), for a caller that knows what the entry should be: null unless the entry's tag is
@@ -252,11 +270,17 @@ bool ownedByTurn(ResolveHandle handle);
 // also run inside a hostcall (a turn that outruns its retire list or its notes), so they must
 // not take the process heap; noted() is told when it does (`inHandler`) and returns whether it
 // consumed the note, and one it could not consume there is handed to it again at the end of the
-// turn, where it must.
+// turn, where it must. refused() runs for a registration the entry does not keep, at
+// the end of the turn, where it may dispose of what the registration named.
 struct ResolveTurnHooks {
   bool (*committed)(ResolveHandle handle, void* ptr, const uint64_t* aux);
   void (*released)(ResolveHandle handle);
   bool (*noted)(const uint64_t* words, bool inHandler);
+  // For a registration that does not survive the turn: the table would not take the pointer,
+  // or committed() refused it. The entry is retired either way and no holder can reach what
+  // the registration named, so this is where the owner gives the object up. It runs after
+  // committed() for a refusal, with the same words.
+  void (*refused)(ResolveHandle handle, void* ptr, const uint64_t* aux);
 };
 
 // A JS turn's registrations, batched. The table is written only by the host, and the objects
