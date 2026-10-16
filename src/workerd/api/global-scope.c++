@@ -888,7 +888,18 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
     IoOwn<TypeProbeA> a;
     IoOwn<TypeProbeB> b;
   };
+  // For the IoPtr half of the same swap: a holder of each, so that one can be dropped on the
+  // event loop while the other keeps naming its object.
+  struct PtrProbeHolder {
+    IoPtr<TypeProbeA> ptr;
+  };
+  struct OwnProbeHolder {
+    IoOwn<TypeProbeB> own;
+  };
   static_assert(sizeof(IoOwn<TypeProbeA>) == sizeof(IoOwn<TypeProbeB>));
+  // An IoPtr keeps its handle in the same word an IoOwn does, after its DeleteQueue, so the
+  // same write primitive reaches it.
+  static_assert(sizeof(IoPtr<TypeProbeA>) == sizeof(DeleteQueue) + sizeof(uint64_t));
   // Reads or writes the handle word of any IoOwn, which is the word after its DeleteQueue, as
   // a write primitive aiming at it would.
   auto ownHandle = [](auto& own) {
@@ -949,6 +960,62 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
       return callMagic(context, "other-class-after-drop", h.b);
     }).then([holder = kj::mv(holder)]() mutable {
       return kj::evalLater([holder = kj::mv(holder)]() mutable { holder = nullptr; });
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_ioptr_type_swap")) {
+    // The IoPtr half of the type swap. An IoPtr owns its table entry but not the object the
+    // entry names, and its destructor retires that entry wherever the holder is dropped --
+    // including on the event loop, outside any turn, which is where a JS wrapper's C++ object
+    // is destroyed and where no turn's arena is there to compare the handle against. So the
+    // class comparison is what keeps a handle written over another of this isolate's from
+    // retiring that entry: the holder that really owns it would then resolve nothing and every
+    // later use of its object would be refused.
+    auto& context = IoContext::current();
+    // The object the IoPtr legitimately names; an IoPtr owns nothing, so it outlives the holder.
+    static TypeProbeA* target = new TypeProbeA();
+    // The other class's object, kept alive with its own holder past this request's turns.
+    static kj::Vector<kj::Own<OwnProbeHolder>> kept;
+    kept.add(
+        kj::heap<OwnProbeHolder>(OwnProbeHolder{.own = context.addObject(kj::heap<TypeProbeB>())}));
+    OwnProbeHolder& victim = *kept.back();
+    uint64_t hb = ownHandle(victim.own);
+    auto holder = kj::heap<PtrProbeHolder>(PtrProbeHolder{.ptr = context.addObject(*target)});
+    uint64_t ha = ownHandle(holder->ptr);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: created an IoPtr and an IoOwn of another class inside the JS turn",
+        url, kj::str("0x", kj::hex(ha)), kj::str("0x", kj::hex(hb)));
+    context.addWaitUntil(
+        // The control: the IoOwn of the other class reaches its own object.
+        callMagic(context, "ioptr-control-b", victim.own)
+            .then([&context, holder = kj::mv(holder), hb, setOwnHandle,
+                      url = kj::str(url)]() mutable {
+      return context
+          .run([&h = *holder, hb, setOwnHandle, url = kj::mv(url)](Worker::Lock&) {
+        // The turn's own act: the IoPtr now names the IoOwn's entry, which is live and this
+        // isolate's, so the owner the entry records has nothing to say about it.
+        setOwnHandle(h.ptr, hb);
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: overwrote an IoPtr's handle from inside the JS turn with an "
+            "IoOwn's of another class",
+            url, kj::str("0x", kj::hex(hb)));
+      }).then([holder = kj::mv(holder)]() mutable {
+        // Outside any turn, on the event loop: ~IoPtr retires the entry its handle names.
+        return kj::evalLater([holder = kj::mv(holder)]() mutable {
+          holder = nullptr;
+          KJ_LOG(WARNING,
+              "WORKERD_GK_TEST_PROBE: dropped the IoPtr on the event loop, with the other "
+              "class's handle in it");
+        });
+      });
+    })
+            .then([addr, hb]() {
+      return kj::evalLater([addr, hb]() {
+        // Host-side: the victim's entry, which the drop must have left alone.
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the IoOwn's entry after the IoPtr's drop",
+            kj::str("0x", kj::hex(hb)), addr(hostMemory::resolve(hb)));
+      });
+    }).then([&context, &victim, callMagic]() {
+      return callMagic(context, "ioptr-other-class-after-drop", victim.own);
     }));
   }
   // The owned node (see OwnedObjectList in io/io-own.h): the record the host keeps about the

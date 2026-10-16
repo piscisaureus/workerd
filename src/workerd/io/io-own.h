@@ -272,6 +272,15 @@ class DeleteQueue {
   static void* resolveOwned(
       hostMemory::ResolveHandle handle, uint64_t tag, const std::type_info& type);
 
+  // Retires the entry `handle` names, for a holder that owns the entry rather than the object
+  // it names (IoPtr). The entry must be a live one of class `tag`, or name nothing; one that
+  // names a live object of another class is a holder's handle written over another of this
+  // isolate's, where retiring would leave that object's own holder unable to resolve it, so it
+  // is reported and nothing is retired. Inside a turn the release is journaled and the host
+  // checks it against the arena the turn ran under; outside one there is no caller to compare,
+  // which is the residual every host-side retire of a guest-supplied handle carries.
+  static void releaseReference(hostMemory::ResolveHandle handle, uint64_t tag);
+
   // Adds the object to the owned list and returns the handle naming it with the disposer the
   // holder records; on a full table, disposes of the object and throws.
   struct OwnedRegistration {
@@ -474,7 +483,10 @@ class IoOwn {
 //
 // Like an IoOwn, the IoPtr names its object by a resolve handle rather than a pointer, with an
 // entry of its own that lives as long as the IoPtr does; it owns nothing, so there is no node
-// behind the entry.
+// behind the entry. The class of the object is checked against the entry's type word at the
+// dereference and at the drop, as an IoOwn's is: a handle written over another of this
+// isolate's names that entry's object, and retiring it would leave the holder that really owns
+// it resolving nothing.
 template <typename T>
 class IoPtr {
  public:
@@ -655,12 +667,12 @@ inline IoPtr<T>::IoPtr(IoPtr&& other) noexcept
 
 template <typename T>
 inline IoPtr<T>::~IoPtr() noexcept(false) {
-  if (handle != 0) hostMemory::unregisterResolve(handle);
+  if (handle != 0) DeleteQueue::releaseReference(handle, hostMemory::resolveTypeTag<T>());
 }
 
 template <typename T>
 IoPtr<T>& IoPtr<T>::operator=(decltype(nullptr)) {
-  if (handle != 0) hostMemory::unregisterResolve(handle);
+  if (handle != 0) DeleteQueue::releaseReference(handle, hostMemory::resolveTypeTag<T>());
   deleteQueue = nullptr;
   handle = 0;
   return *this;

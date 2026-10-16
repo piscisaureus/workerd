@@ -50,6 +50,15 @@
 # other class's object with its own holder. (In the WORKERD_GK_NEG_RESOLVE_TYPE build the
 # comparison is not made, the use answers with the other class's magic, and this script fails.)
 #
+# /__gk_ioptr_type_swap is the same swap through an IoPtr, which owns its table entry but not
+# the object the entry names and whose destructor therefore retires the entry wherever the
+# holder is dropped -- on the event loop, outside any turn, where there is no arena to compare
+# the handle against. The turn writes an IoOwn's handle, of an unrelated class, over its own
+# IoPtr's and has the IoPtr dropped there: the class comparison refuses the retire, the IoOwn's
+# entry still resolves host-side, and the IoOwn's own holder reaches its object afterwards. (In
+# the WORKERD_GK_NEG_IOPTR_TYPE build the entry is retired whatever class it names, the IoOwn's
+# holder then resolves nothing, and this script fails.)
+#
 # /__gk_ioown_steal_drop is the retire side of the same theft. A drop is not a use: the holder's
 # destructor releases the entry whatever the resolve answered, and inside a turn that release
 # goes into the turn's journal, which is the turn's own memory, for the host to act on once the
@@ -416,9 +425,29 @@ after=$(grep -o "IoOwn use after the type swap; what = other-class-after-drop.*"
 echo "    the other class's holder afterwards: ${after#*verdict = }"
 echo "$after" | grep -q "read magic 0x$type_b_magic" || fail "the drop of the swapped holder cost the other class its object: $after"
 
+s=$(status "$victim/__gk_ioptr_type_swap")
+echo "21. GET $victim/__gk_ioptr_type_swap -> $s (victim writes an IoOwn's handle, of another class, over its own IoPtr's and drops the IoPtr off-turn)"
+[ "$s" = 200 ] || fail "the IoPtr type swap request failed"
+wait_for "IoOwn use after the type swap; what = ioptr-control-b" || fail "the control use of the IoOwn did not run"
+ptr_ctl=$(grep -o "IoOwn use after the type swap; what = ioptr-control-b.*" "$log" | head -n1)
+echo "    control: the IoOwn reads ${ptr_ctl#*verdict = }"
+echo "$ptr_ctl" | grep -q "read magic 0x$type_b_magic" || fail "the IoOwn did not read its own class's magic: $ptr_ctl"
+wait_for "dropped the IoPtr on the event loop" || fail "the IoPtr was not dropped on the event loop"
+ptr_refused=$(grep -o "an IoPtr handle names an object of another class; nothing is retired.*" "$log" | head -n1)
+echo "    the host's answer to the IoPtr's drop: ${ptr_refused:-NOT REFUSED}"
+[ -n "$ptr_refused" ] || fail "the retire through the swapped IoPtr was not refused"
+wait_for "the IoOwn's entry after the IoPtr's drop" || fail "the victim's entry was not reported"
+ptr_entry=$(grep -o "the IoOwn's entry after the IoPtr's drop.*" "$log" | head -n1)
+echo "    ${ptr_entry}"
+echo "$ptr_entry" | grep -q "= 0x0" && fail "the IoPtr's drop retired the other class's entry: $ptr_entry"
+wait_for "IoOwn use after the type swap; what = ioptr-other-class-after-drop" || fail "the IoOwn was not used after the IoPtr's drop"
+ptr_after=$(grep -o "IoOwn use after the type swap; what = ioptr-other-class-after-drop.*" "$log" | head -n1)
+echo "22. the IoOwn's holder after the IoPtr's drop: ${ptr_after#*verdict = }"
+echo "$ptr_after" | grep -q "read magic 0x$type_b_magic" || fail "the IoPtr's drop cost the IoOwn its object: $ptr_after"
+
 s=$(status "$hello/")
-echo "21. GET $hello/            -> $s (other isolates must still serve)"
+echo "23. GET $hello/            -> $s (other isolates must still serve)"
 [ "$s" = 200 ] || fail "hello stopped serving after the record fault"
 kill -0 "$pid" 2>/dev/null || fail "workerd died"
 
-echo "PASS: an IoOwn handle rewritten from inside a turn to an address the turn chose was refused by the next turn's dereference and by the host's drain of the delete queue, reaching neither the chosen buffer nor its magic; the isolate kept serving; a handle rewritten to another isolate's live handle was refused although the entry was live -- the host resolved the very same handle to that isolate's object -- and was refused again once that isolate's context had ended; a turn's write into the owned node behind a handle faulted at the node, and the host's teardown walk disposed of the object through the node's own disposer, never the chosen one; an IoOwn's context handle rewritten to another isolate's live context queued nothing there, since the dropped handle names an object of this context's list, and one rewritten to a buffer the turn chose queued nothing and reached nothing at the buffer, with both objects disposed of by their own context's teardown; a turn's write into the context record behind a handle faulted at the record, and the host's teardown locked the record and disposed of the object without calling the fulfiller the turn chose, after which the host queued and ran an action for another context through its record; and a handle written over another of the same isolate's, of an unrelated class, was refused at the use -- the call never reached the other class's vtable -- and at the drop, leaving that object with its own holder"
+echo "PASS: an IoOwn handle rewritten from inside a turn to an address the turn chose was refused by the next turn's dereference and by the host's drain of the delete queue, reaching neither the chosen buffer nor its magic; the isolate kept serving; a handle rewritten to another isolate's live handle was refused although the entry was live -- the host resolved the very same handle to that isolate's object -- and was refused again once that isolate's context had ended; a turn's write into the owned node behind a handle faulted at the node, and the host's teardown walk disposed of the object through the node's own disposer, never the chosen one; an IoOwn's context handle rewritten to another isolate's live context queued nothing there, since the dropped handle names an object of this context's list, and one rewritten to a buffer the turn chose queued nothing and reached nothing at the buffer, with both objects disposed of by their own context's teardown; a turn's write into the context record behind a handle faulted at the record, and the host's teardown locked the record and disposed of the object without calling the fulfiller the turn chose, after which the host queued and ran an action for another context through its record; and a handle written over another of the same isolate's, of an unrelated class, was refused at the use -- the call never reached the other class's vtable -- and at the drop, leaving that object with its own holder; and an IoOwn's handle written over an IoPtr's and dropped on the event loop, outside any turn, retired nothing, leaving the IoOwn's entry resolving and its holder reaching its object"

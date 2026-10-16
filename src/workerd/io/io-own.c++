@@ -474,6 +474,24 @@ bool wrongType(hostMemory::ResolveHandle handle, uint64_t type) {
 }
 }  // namespace
 
+void DeleteQueue::releaseReference(hostMemory::ResolveHandle handle, uint64_t tag) {
+#ifdef WORKERD_GK_NEG_IOPTR_TYPE
+  // WORKERD_GK_NEG_IOPTR_TYPE is a negative-test build, never shipped: the handle is retired
+  // whatever class it names, which is what an IoPtr's drop did before the class was compared.
+  // The guest kernel's ioown-test.sh must then fail -- with an IoOwn of another class left
+  // resolving nothing after an IoPtr of this isolate was dropped on the event loop with that
+  // IoOwn's handle in it; this is the check that the test tests the comparison.
+  hostMemory::unregisterResolve(handle);
+#else
+  if (wrongType(handle, tag)) {
+    KJ_LOG(ERROR, "an IoPtr handle names an object of another class; nothing is retired",
+        kj::hex(handle));
+    return;
+  }
+  hostMemory::unregisterResolve(handle);
+#endif
+}
+
 void OwnedObjectList::drop(
     hostMemory::ResolveHandle handle, uint64_t type, const OwnedDisposal& disposal) {
   if (hostMemory::inTurn()) {

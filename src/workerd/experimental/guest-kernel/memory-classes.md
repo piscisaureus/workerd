@@ -1036,7 +1036,13 @@ word is for: it carries a constant derived from the C++ class of the object
 the pointer names (`hostMemory::resolveTypeTag`), the lookup hands it back
 beside the pointer, and a holder resolves only an entry of the class it was
 built for -- at the use and at the drop, since releasing another holder's
-entry frees an object that holder still names. The comparison is made in the
+entry frees an object that holder still names. An `IoPtr`'s drop compares it
+too (`DeleteQueue::releaseReference`), although an `IoPtr` owns its entry
+rather than the object the entry names: retiring another holder's entry
+leaves that holder resolving nothing, and an `IoPtr` is dropped wherever its
+JS wrapper's C++ object is destroyed, which is often the event loop, outside
+any turn, where there is no arena for the host to compare the handle
+against. The comparison is made in the
 runtime rather than at ring 0, against a constant the compiler materializes
 into text a turn cannot write and cannot have remapped
 (`gk_mapping_change_ok`); it therefore binds a turn with a write primitive
