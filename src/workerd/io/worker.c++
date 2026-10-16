@@ -1225,6 +1225,12 @@ Worker::Isolate::Isolate(kj::Own<Api> apiParam,
     KJ_DASSERT(lock->v8Isolate->GetData(jsg::SET_DATA_ISOLATE) == nullptr);
     lock->v8Isolate->SetData(jsg::SET_DATA_ISOLATE, this);
 
+    // The isolate's arena, kept for host code that must name this isolate later (see
+    // getGuestArena()).
+    KJ_IF_SOME(arena, jsg::IsolateBase::from(lock->v8Isolate).getGuestArena()) {
+      guestArena = arena.get();
+    }
+
     lock->setCaptureThrowsAsRejections(features.getCaptureThrowsAsRejections());
     // TODO(cleanup): Now that this list has grown significantly, we should probably
     // refactor to pass all of the options in a single call instead of one by one.

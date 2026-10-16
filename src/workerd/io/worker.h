@@ -23,6 +23,7 @@
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/modules-new.h>
 #include <workerd/jsg/modules.h>
+#include <workerd/util/host-memory.h>
 #include <workerd/util/strong-bool.h>
 #include <workerd/util/weak-refs.h>
 
@@ -425,6 +426,16 @@ class Worker::Isolate: public kj::AtomicRefcounted {
     return *api;
   }
 
+  // The guest-kernel arena this isolate's memory lives in, as hostMemory's opaque handle, or
+  // null when the isolate has none (every isolate, unless guest-kernel isolation is enabled).
+  // It is read while the isolate is created, where the only thing that has run in the isolate
+  // is this constructor, and kept here so that host code which must name the isolate -- a
+  // resolve entry registered for it from a thread that is not locked into it, see
+  // hostMemory::registerResolveFor -- does not have to consult the isolate itself.
+  inline hostMemory::IsolateArena getGuestArena() const {
+    return guestArena;
+  }
+
   // Returns the number of threads currently blocked trying to lock this isolate's mutex (using
   // takeAsyncLock()).
   uint getCurrentLoad() const;
@@ -568,6 +579,9 @@ class Worker::Isolate: public kj::AtomicRefcounted {
   kj::MutexGuarded<kj::Maybe<kj::Function<void(void)>>> cpuLimitNearlyExceededCallback;
   kj::Own<Api> api;
   LoggingOptions loggingOptions;
+
+  // See getGuestArena(). Set once, in the constructor.
+  hostMemory::IsolateArena guestArena = nullptr;
 
   // If non-null, a serialized JSON object with a single "flags" property, which is a list of
   // compatibility enable-flags that are relevant to FL.

@@ -478,7 +478,7 @@ long gk_hostcall(unsigned idx);
 // to ring 3 with the pointer, or 0, in RAX. The whole path is a few dozen
 // instructions of gk's own handler text, touching no stack and no memory but
 // the table, and runs at guest ring 0 with the VM never exited: the round
-// trip is about 19 ns on the test machine, against 6.4 us for a hostcall
+// trip is about 27 ns on the test machine, against 6.4 us for a hostcall
 // (measured by resolve_check in gk_test.c, which also proves the no-exit
 // claim from KVM's own per-vCPU exit counter). The operation is fixed, not a
 // handler the embedder registers: embedder code run at guest ring 0 would
@@ -494,7 +494,8 @@ long gk_hostcall(unsigned idx);
 // bypassing gk_resolve, would be returned to ring 3, which is a trusted
 // caller's own doing).
 //
-// The table. GK_RESOLVE_SLOTS entries of {pointer, generation}, fixed; the
+// The table. GK_RESOLVE_SLOTS entries of {pointer, generation, owner},
+// fixed; the
 // table is gk's own, registered GK_PROT_SUPER: mapped with U clear in every
 // root, so the trampoline reaches it at ring 0 and a ring-3 access faults.
 // SUPER is a weaker class than the GK_PROT_REFUSE that host memory
@@ -520,23 +521,64 @@ long gk_hostcall(unsigned idx);
 // on both sides of the pointer and answers only if both agree, so the
 // pointer it returns was the entry's under that generation.
 //
+// Whose entry it is. The generation says an entry is live; the owner says
+// which tenant may resolve it at ring 3. The entry records the page-table
+// root the host registered or committed it under -- an arena's root for a
+// registration made while that isolate's arena is the thread's active one,
+// the base root for one made with no arena active -- and the trampoline
+// compares it against CR3, the root the calling turn is running under. CR3
+// is the one piece of caller identity at ring 0 that is not memory: ring 3
+// can neither read it nor load it, and the host alone decides which root a
+// turn enters with (enter_guest), so unlike the handle word itself, or the
+// context handle beside it, it is not something a turn with a write
+// primitive can change. A turn that rewrites its own handle to another
+// isolate's live handle therefore gets 0, the same answer a stale handle
+// gets, rather than that isolate's object. The base root is a root like any
+// other, not a wildcard: an entry registered with no arena active resolves
+// at ring 3 only under the base root, because resolving for everyone would
+// leave exactly the long-lived runtime entries, the ones registered outside
+// any turn, open to the rewrite the owner is there to refuse. A reserved
+// entry has no pointer and no owner and resolves to nothing until it is
+// committed. The comparison costs two instructions and no further memory.
+//
+// Only ring 3 is compared. gk_resolve at guest ring 0 and on the host reads
+// the table directly, with the generation check and no owner check: host
+// code is the party the tag protects, not a party it is protected from, and
+// it resolves on behalf of whichever context it is serving -- a delete-queue
+// drain, a teardown walk, a hostcall handler -- from threads that are
+// usually on no arena at all. The consequence for the runtime is that an
+// entry a turn must resolve has to be registered under that isolate's arena,
+// which for a turn's own registrations is where they happen anyway (the
+// reservation is committed on the thread that ran the turn, before it leaves
+// the isolate's lock) and for a registration made outside a turn is a
+// requirement on the caller.
+//
 // Capacity. The table is process-wide, one for every isolate in the
 // process, and it is sized for its runtime tenant: workerd registers one
 // entry per object an IoOwn owns (io/io-own.h), and a loaded process holds
 // many of those at once -- measured at five per in-flight request parked on
 // a timer or on a subrequest, so that one worker with a few thousand such
 // requests outgrows a 2^16-entry table (see memory-classes.md, Cost). 2^20
-// entries hold about two hundred thousand of them. The table's 16 MiB are
-// static and untouched until an entry is written, so the capacity costs
-// page-table entries at init and nothing per unused page; the free list is
-// threaded through the free entries themselves, so the control block does
-// not grow with it. Exhaustion is a registration refused with 0, which the
+// entries hold about two hundred thousand of them. An entry is 32 bytes --
+// the three words plus the padding that keeps the index a shift and an entry
+// inside one cache line -- so the table's 32 MiB are static and untouched
+// until an entry is written: the capacity costs page-table entries at init
+// (8192 of them, in the base root every arena shares) and nothing per unused
+// page; the free list is threaded through the free entries themselves, so the
+// control block does not grow with it. Exhaustion is a registration refused with 0, which the
 // runtime turns into a failed request, never a fault.
 //
 // gk_resolve_register places `ptr` in a free slot and returns its handle, or
 // 0 when the table is full (exhaustion is a refusal, never fatal), for a
 // pointer the table will not hold (below), or before gk_init has succeeded;
-// 0 is never a valid handle. gk_resolve_unregister retires the slot: the
+// 0 is never a valid handle. The entry is owned by the root the calling
+// thread is on. gk_resolve_register_for is the same registration for an
+// arena the caller names rather than the one it is in, for an entry a host
+// thread makes on behalf of an isolate it is not locked into; `a` is
+// validated against gk's arena pool as gk_arena_enter validates it, and a
+// pointer that is not a live arena is refused unread, with a report and 0.
+// NULL names the base root, which is what gk_resolve_register uses when the
+// calling thread has no arena. gk_resolve_unregister retires the slot: the
 // handle resolves to nothing from then on, and the slot is free for a later
 // registration under a new generation. A handle that fails validation
 // unregisters nothing, is reported on stderr (as a host slot handle is) and
@@ -581,10 +623,12 @@ long gk_hostcall(unsigned idx);
 // is in host memory, and which the owner must therefore still protect as an
 // address: the lookup makes a handle safe to keep in guest memory, it does not
 // make the object safe to reach from there. The operation must be safe for
-// arbitrary input, and is: it reads the table and nothing else. And a handle
-// rewritten to another live entry's names that entry, which the table cannot
-// tell from a legitimate use -- the ownership residual that gk_arena_enter and
-// the host slot table carry too (see the README's limitations). Nor does the
+// arbitrary input, and is: it reads the table and nothing else. A handle
+// rewritten to another live entry of the same arena still names that entry:
+// the owner is the isolate, not the object, so the table tells one isolate's
+// handles from another's but not one of an isolate's objects from another of
+// its own -- the ownership residual that gk_arena_enter and the host slot
+// table still carry (see the README's limitations). Nor does the
 // table know what it points at: an object unregistered and freed while a
 // resolve of its handle is in flight on another thread is the owner's race to
 // avoid, as it is for every lock-free table; in the runtime the entries of an
@@ -593,6 +637,7 @@ long gk_hostcall(unsigned idx);
 #define GK_RESOLVE_SLOTS (1 << GK_RESOLVE_INDEX_BITS)
 typedef uint64_t gk_resolve_handle;
 gk_resolve_handle gk_resolve_register(void *ptr);
+gk_resolve_handle gk_resolve_register_for(gk_arena *a, void *ptr);
 int gk_resolve_reserve(gk_resolve_handle *handles, int n);
 int gk_resolve_commit(gk_resolve_handle handle, void *ptr);
 int gk_resolve_unregister(gk_resolve_handle handle);

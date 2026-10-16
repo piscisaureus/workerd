@@ -365,7 +365,10 @@ inline ReverseIoOwn<T> DeleteQueue::addObjectReverse(
 // name an object of that context's own list.
 class DeleteQueueOwner {
  public:
-  DeleteQueueOwner();
+  // `arena` is the guest-kernel arena of the isolate whose turns will resolve the context's
+  // handle (hostMemory::IsolateArena): a context is created on the event loop, outside the
+  // isolate lock, so the entry names the isolate rather than inheriting the thread's.
+  explicit DeleteQueueOwner(hostMemory::IsolateArena arena);
   KJ_DISALLOW_COPY_AND_MOVE(DeleteQueueOwner);
   ~DeleteQueueOwner() noexcept(false);
 

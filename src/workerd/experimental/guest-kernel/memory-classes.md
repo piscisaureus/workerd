@@ -246,9 +246,9 @@ Two crossings exist. The hostcall is a VM exit: **6.4 us per round trip,
 measured** (`hostcall_check` in `gk_test.c`), which is affordable for an
 operation a turn makes a few times (an actor id) and not for the bulk of its
 crossings. The ring-0 resolve (`gk_resolve`) is a ring 3 to ring 0 transition
-inside the guest, not an exit: **18.8 ns per round trip, measured**
+inside the guest, not an exit: **26.8 ns per round trip, measured**
 (`resolve_check` in `gk_test.c`, which proves from KVM's per-vCPU exit
-counter that the resolves ran with no exit), 340 times cheaper than the
+counter that the resolves ran with no exit), 240 times cheaper than the
 hostcall and in line with the 22 ns the bare trap measured in the benchmark
 suite (`m10_ringtrap`), where the explicit trap was also 9.5 times cheaper
 than servicing a demand fault, which is why the interface is a call into
@@ -264,7 +264,7 @@ hello-world request is one turn with **6 `IoOwn` dereferences** and no
 and a request that instantiates 1000 Wasm modules are also 6 each; a SQLite
 Durable Object `/get` through a service binding (`disk-sqlite-test.capnp`)
 is 3 turns with 15 `IoOwn` and 1 `IoPtr`, and a `/put` 4 turns with 25 and
-2. `ReverseIoOwn` is never dereferenced in a turn. At 18.8 ns each that is
+2. `ReverseIoOwn` is never dereferenced in a turn. At 26.8 ns each that is
 0.1 to 0.5 us per request, against a hello-world request latency of about
 620 us under the guest kernel (p50 over one connection on the same machine):
 the dereference is not where a turn's time goes. (The ~43 foreign accesses a
@@ -318,13 +318,15 @@ an open WebSocket on a plain worker holds **8**; hello-world under `oha` at
 returns to 0 after each load. So the live count is the in-flight concurrency
 times a small constant, and the original 2^16 entries were exhausted by one
 worker with 3300 parked requests; the table holds 2^20 (`GK_RESOLVE_SLOTS`),
-about 200000 such requests, in 16 MiB of static memory that costs nothing
-until written, with the reserved pools taking 256 per thread of it. The
+about 200000 such requests, in 32 MiB of static memory that costs nothing
+until written (an entry is 32 bytes: the pointer, the generation, the owner
+and the padding that keeps the index a shift and an entry inside one cache
+line), with the reserved pools taking 256 per thread of it. The
 table stays process-wide: a per-isolate table would move the same sizing
-question to each isolate and need the ring-0 lookup to find the thread's
-isolate through a per-vCPU record it does not have today (see "What remains"
-below). Exhaustion is a refused registration, which fails the request that
-made it, never a fault.
+question to each isolate, and the ring-0 lookup needs no per-isolate table
+to tell the isolates apart -- each entry records the page-table root it was
+registered under, which the lookup compares against CR3. Exhaustion is a
+refused registration, which fails the request that made it, never a fault.
 
 Most of the foreign accesses a hello turn makes -- roughly seven in ten of
 the recorded hits -- are to the allocator's global state, which per-isolate
@@ -830,18 +832,26 @@ the commit unvalidated, so a turn that lies about its own object's disposer
 sends the host's disposal of that object to a function of its choosing --
 the same exposure the `T`'s vtable and members carry until the `T` is
 placed by the host, and the same one a queued action's closure carries when
-the host destroys it. Placing the `T` is the next step there. And the table
-cannot tell one tenant's handle from another's: a handle rewritten to
-another isolate's live handle names that isolate's object (the
-cross-isolate form in `ioown-test.sh`, stated there as the residual),
-because `checkFarGet` compares the `IoOwn`'s own context handle -- as
-writable as the object's -- with the current context's, and the ring-0
-lookup has no host-decided notion of the calling isolate: closing it needs
-an owner tag in the table entry compared, at ring 0, against the thread's
-arena read from a per-vCPU record (a `GS` base gk does not set today). The
-delete queue's side of that residual is closed: a dropped handle is queued
-only for the context whose list holds its node, whatever context handle
-the holder carries.
+the host destroys it. Placing the `T` is the next step there. The table tells one
+tenant's handle from another's: each entry records the page-table root the
+host registered it under and the ring-0 lookup compares that against CR3,
+the root the calling turn runs under, so a handle rewritten to another
+isolate's live handle resolves to nothing (the cross-isolate form in
+`ioown-test.sh`, which also shows the host resolving the same handle to
+that isolate's object, so the refusal is about who asked). CR3 is the
+caller identity, rather than the `checkFarGet` comparison of the `IoOwn`'s
+own context handle, which is as writable as the object's, or a per-vCPU
+record gk does not keep: ring 3 can neither read CR3 nor load it, and the
+host alone decides which root a turn enters with. The base root counts as a
+root rather than a wildcard, so an entry a host thread registers outside a
+turn has to name the isolate it belongs to
+(`hostMemory::registerResolveFor`); the context's own entry, created on the
+event loop, is the one such entry today. The delete queue's side of the
+residual is closed too: a dropped handle is queued only for the context
+whose list holds its node, whatever context handle the holder carries. What
+the owner does not tell apart is two entries of the same isolate: a handle
+rewritten to another live handle of its own isolate still names that
+entry's object.
 
 ## What is in H memory
 
@@ -883,9 +893,13 @@ what is waiting on the same facility:
   entries a turn will need reserved ahead of it and committed after it from
   the turn's journal, and the host's record of what it reserved for each
   thread (`ThreadPool` in `util/host-memory.c++`) in H memory, found through
-  gk's per-thread words. `ioown-test.sh` shows a handle rewritten from inside
+  gk's per-thread words. Each entry also records the page-table root it was
+  registered under, which the ring-0 lookup compares against CR3, so an
+  entry resolves at ring 3 only for the isolate it belongs to.
+  `ioown-test.sh` shows a handle rewritten from inside
   a turn resolving to nothing, with the next turn's dereference and the
-  host's delete-queue drain both refusing it.
+  host's delete-queue drain both refusing it, and a handle rewritten to
+  another isolate's live handle refused while the host still resolves it.
 - **In H memory, beside the resolve table:** the companions
   (`hostMemory::resolveCompanion`), one host-only record per entry in chunks
   mapped as entries come into use, reached through a host slot handle, and

@@ -361,7 +361,7 @@ typedef struct {
 _Static_assert(GK_SIGNAL_FIELDS <= (1 << GK_HOST_SLOT_INDEX_BITS), "a field index must fit a handle");
 
 // The ring-0 resolve table (see gk_resolve in gk.h): GK_RESOLVE_SLOTS entries
-// of {pointer, generation}, read at guest ring 0 by gk_resolve_tramp
+// of {pointer, generation, owner}, read at guest ring 0 by gk_resolve_tramp
 // (gk_asm.S) and on the host by gk_resolve, written only by the host under
 // G->lock. It is a separate page-aligned object rather than a member of the
 // control block so that the trampoline can address it RIP-relative by symbol;
@@ -369,20 +369,37 @@ _Static_assert(GK_SIGNAL_FIELDS <= (1 << GK_HOST_SLOT_INDEX_BITS), "a field inde
 // every arena root shares, before the first guest entry, so the lookup never
 // takes a demand fault. An entry is live while its generation is nonzero; a
 // handle's generation is never 0. The order of the stores is what the
-// lock-free reader relies on (see gk_resolve_tramp): publish stores the
-// pointer, then the generation; retire stores a zero generation, then a NULL
-// pointer. A free entry's pointer word holds the free-list link (the next
-// free index + 1, 0 ending the list) rather than a pointer: the reader never
-// returns the word of an entry whose generation is 0, so the list costs no
-// space outside the table, which matters at this capacity. The counters are
-// in the control block.
+// lock-free reader relies on (see gk_resolve_tramp): publish stores the owner
+// and the pointer, then the generation; a commit into a reserved entry stores
+// the owner and then the pointer, which is the word the reader gates on;
+// retire stores a zero generation, then a NULL pointer, and leaves the owner
+// for the next registration to overwrite. A free entry's pointer word holds
+// the free-list link (the next free index + 1, 0 ending the list) rather than
+// a pointer: the reader never returns the word of an entry whose generation
+// is 0, so the list costs no space outside the table, which matters at this
+// capacity. The counters are in the control block.
+//
+// The owner is the page-table root of the arena the entry was registered or
+// committed under -- the base root for a registration made with no arena
+// active -- and the trampoline compares it against CR3, the root the calling
+// turn is running under, so that one isolate's handle resolves to nothing at
+// another isolate's ring 3 (see gk_resolve in gk.h). It is an address of gk's
+// own, never one the caller supplies, and a reserved entry's is 0, which is no
+// root at all; the host side does not compare it, since host code resolves on
+// behalf of whichever context it is serving and is the party the tag protects.
+//
+// An entry is 32 bytes rather than the 24 the three words need: the trampoline
+// indexes by a shift, and a 24-byte entry would straddle a cache line two
+// times in three. The fourth word is unused. The capacity's reservation is
+// 32 MiB, untouched until an entry is written.
 //
 // A handle is the entry's index in its low GK_RESOLVE_INDEX_BITS bits and the
 // generation above them. The capacity is exactly 2^GK_RESOLVE_INDEX_BITS, so
 // masking the index bounds it and every 64-bit value decomposes into one
 // (generation, index) pair; the trampoline relies on both.
-typedef struct { void *ptr; uint64_t gen; } gk_resolve_entry;
-_Static_assert(sizeof(gk_resolve_entry) == 16, "gk_resolve_tramp indexes 16-byte entries");
+typedef struct { void *ptr; uint64_t gen; uint64_t owner; uint64_t unused; } gk_resolve_entry;
+_Static_assert(sizeof(gk_resolve_entry) == 32, "gk_resolve_tramp indexes 32-byte entries");
+_Static_assert(offsetof(gk_resolve_entry, owner) == 16, "gk_resolve_tramp reads the owner at 16");
 _Static_assert(GK_RESOLVE_INDEX_BITS == 20, "gk_resolve_tramp splits a handle at bit 20");
 _Static_assert(GK_RESOLVE_SLOTS == (1 << GK_RESOLVE_INDEX_BITS), "gk_resolve_tramp bounds the index by masking");
 #define GK_RESOLVE_GEN_BITS (64 - GK_RESOLVE_INDEX_BITS)
@@ -3721,6 +3738,21 @@ long gk_hostcall(unsigned idx) {
 // through the handle, no lock, no write, no allocation (it runs under the
 // allocation guard so the guard build checks the last).
 
+// The root a registration made on this thread belongs to: the thread's active
+// arena's root, or the base root when it has none. It is the value the guest's
+// CR3 holds while a turn of that arena runs (see sync_cr3), which is what the
+// trampoline compares against. Caller holds G->lock.
+static uint64_t resolve_owner_now(void) {
+  gk_thread *t = thread_cur();
+  gk_arena *a = t ? t->active_arena : NULL;
+  return (uint64_t)(uintptr_t)(a ? a->pml4 : G->pml4);
+}
+
+// The lookup the host and guest ring 0 take. It does not compare the owner:
+// the tag says which arena's ring 3 may resolve the entry, and host code
+// resolves on behalf of whichever context it is serving -- the delete queue's
+// drain, a teardown walk, a hostcall handler -- from threads that are often on
+// no arena at all.
 static void *resolve_lookup(gk_resolve_handle h) {
   uint64_t idx = h & ((1ULL << GK_RESOLVE_INDEX_BITS) - 1), gen = h >> GK_RESOLVE_INDEX_BITS;
   if (gen == 0) return NULL;
@@ -3750,8 +3782,10 @@ static int resolve_ptr_ok(const void *ptr) {
 
 // Takes a free entry, gives it a fresh generation and publishes it with `ptr`
 // (NULL for a reservation). Returns the handle, or 0 when the table is full.
-// Caller holds G->lock.
-static gk_resolve_handle resolve_take(void *ptr) {
+// A registration is owned by the root it is made under; a reservation is owned
+// by no root until gk_resolve_commit places a pointer in it, and resolves to
+// nothing meanwhile. Caller holds G->lock.
+static gk_resolve_handle resolve_take(void *ptr, uint64_t owner) {
   int idx;
   if (G->resolve_free) {
     idx = G->resolve_free - 1;
@@ -3765,22 +3799,43 @@ static gk_resolve_handle resolve_take(void *ptr) {
   uint64_t gen = ++G->resolve_gen;
   if (gen >> GK_RESOLVE_GEN_BITS) gen = G->resolve_gen = 1;
   gk_resolve_entry *e = &gk_resolve_table.e[idx];
-  // Publish: the pointer first, the generation last (see gk_resolve_tramp).
+  // Publish: the owner and the pointer first, the generation last (see
+  // gk_resolve_tramp).
+  __atomic_store_n(&e->owner, owner, __ATOMIC_RELEASE);
   __atomic_store_n(&e->ptr, ptr, __ATOMIC_RELEASE);
   __atomic_store_n(&e->gen, gen, __ATOMIC_RELEASE);
   G->resolve_live++;
   return (gen << GK_RESOLVE_INDEX_BITS) | (uint64_t)idx;
 }
 
+// The body of both registrations: the pointer check and a taken entry owned
+// by `owner`. Caller holds G->lock.
+static gk_resolve_handle resolve_register_locked(void *ptr, uint64_t owner, const char *who) {
+  if (resolve_ptr_ok(ptr)) return resolve_take(ptr, owner);
+  fprintf(stderr, "[gk] %s: %p is not ordinary user memory; nothing is registered\n", who, ptr);
+  return 0;
+}
+
 gk_resolve_handle gk_resolve_register(void *ptr) {
   if (!ptr || !G->initialized) return 0;
   pthread_mutex_lock(&G->lock);
+  gk_resolve_handle h = resolve_register_locked(ptr, resolve_owner_now(), "gk_resolve_register");
+  pthread_mutex_unlock(&G->lock);
+  return h;
+}
+
+gk_resolve_handle gk_resolve_register_for(gk_arena *a, void *ptr) {
+  if (!ptr || !G->initialized) return 0;
+  pthread_mutex_lock(&G->lock);
   gk_resolve_handle h = 0;
-  if (resolve_ptr_ok(ptr)) {
-    h = resolve_take(ptr);
+  if (a != NULL && !arena_live_locked(a)) {
+    // As gk_arena_enter does: the pointer comes from an ordinary heap object,
+    // so it is checked against gk's own pool before anything is read through it.
+    fprintf(stderr, "[gk] gk_resolve_register_for: %p is not a live arena; nothing is "
+            "registered\n", (void *)a);
   } else {
-    fprintf(stderr, "[gk] gk_resolve_register: %p is not ordinary user memory; nothing is "
-            "registered\n", ptr);
+    h = resolve_register_locked(ptr, (uint64_t)(uintptr_t)(a ? a->pml4 : G->pml4),
+                                "gk_resolve_register_for");
   }
   pthread_mutex_unlock(&G->lock);
   return h;
@@ -3791,7 +3846,7 @@ int gk_resolve_reserve(gk_resolve_handle *handles, int n) {
   pthread_mutex_lock(&G->lock);
   int got = 0;
   while (got < n) {
-    gk_resolve_handle h = resolve_take(NULL);
+    gk_resolve_handle h = resolve_take(NULL, 0);
     if (!h) break;
     handles[got++] = h;
   }
@@ -3815,8 +3870,11 @@ int gk_resolve_commit(gk_resolve_handle h, void *ptr) {
             "unresolvable\n", ptr, (unsigned long long)h);
     return -GK_EINVAL;
   }
-  // The generation is already published; the pointer becomes visible with
-  // this store, and a lookup that read NULL before it answered nothing.
+  // The generation is already published; the owner goes first and the pointer
+  // becomes visible with the store after it, which is the word the trampoline
+  // gates the owner comparison on, so a lookup that saw the pointer saw the
+  // owner too. A lookup that read NULL before either answered nothing.
+  __atomic_store_n(&e->owner, resolve_owner_now(), __ATOMIC_RELEASE);
   __atomic_store_n(&e->ptr, ptr, __ATOMIC_RELEASE);
   pthread_mutex_unlock(&G->lock);
   return 0;
@@ -3835,7 +3893,9 @@ int gk_resolve_unregister(gk_resolve_handle h) {
   }
   // Retire: the generation first, so a lookup in flight fails its second
   // read, then the pointer word, which becomes the free-list link (see
-  // gk_resolve_tramp and the table).
+  // gk_resolve_tramp and the table). The owner is left as it was; a free
+  // entry's generation is 0, which refuses every handle, and the next
+  // registration to take the entry writes its own.
   __atomic_store_n(&e->gen, 0, __ATOMIC_RELEASE);
   __atomic_store_n(&e->ptr, (void *)(uintptr_t)G->resolve_free, __ATOMIC_RELEASE);
   G->resolve_free = idx + 1;

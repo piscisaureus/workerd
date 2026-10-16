@@ -54,7 +54,9 @@ bool contains(const void* ptr);
 // before resolving it, reading nothing through the handle's value. Without the guest kernel a
 // table of the same shape and the same checks backs the handles on the ordinary heap, so the
 // handle semantics, including the refusal of a stale or foreign handle, are the same in both
-// builds and are exercised by the ordinary test suite.
+// builds and are exercised by the ordinary test suite. The one semantic the fallback cannot
+// have is the owner check below, which is a ring distinction: without the guest kernel there
+// is no ring 3 to refuse.
 //
 // A handle is 0 only when it names nothing. allocateSlot() throws when the table or host memory
 // is exhausted. resolveSlot() returns nullptr for any handle that does not name a live slot --
@@ -87,10 +89,11 @@ void freeSlot(SlotHandle handle);
 // operation. Registration and unregistration take a lock and are host-side; resolve() takes no
 // lock and allocates nothing. The pointer resolve() returns is for immediate use, resolved
 // again for each use rather than kept, and names an object the caller must still be entitled
-// to: a handle rewritten to another live entry's names that entry's object, which the table
-// cannot tell from a legitimate use (the ownership residual the host slot table carries too).
-// unregisterResolve() refuses a handle that does not name a live entry, with a report, and
-// retires nothing.
+// to: a handle rewritten to another live entry of the same isolate names that entry's object,
+// which the table cannot tell from a legitimate use (the ownership residual the host slot
+// table carries too). Another isolate's entry is refused, by the owner the entry records
+// (below). unregisterResolve() refuses a handle that does not name a live entry, with a
+// report, and retires nothing.
 //
 // A registration may carry RESOLVE_AUX_WORDS words of the registrant's own beside the pointer.
 // Inside a turn they are journaled with it and handed, host-side, to the turn's committed hook
@@ -101,6 +104,23 @@ constexpr size_t RESOLVE_CAPACITY = size_t{1} << 20;
 constexpr size_t RESOLVE_AUX_WORDS = 4;
 ResolveHandle registerResolve(void* ptr);
 ResolveHandle registerResolve(void* ptr, const uint64_t (&aux)[RESOLVE_AUX_WORDS]);
+
+// Which isolate an entry belongs to. The guest kernel records, in the entry, the page-table
+// root of the isolate it was registered under, and a turn that resolves a handle at guest
+// ring 3 gets nothing unless the entry is its own isolate's: that is what keeps a turn from
+// rewriting its handle to another isolate's and reaching that isolate's object (gk_resolve in
+// experimental/guest-kernel/gk.h). registerResolve() takes the isolate whose arena the calling
+// thread is in, which inside a turn, and anywhere under the isolate lock, is the right one.
+//
+// A host thread that registers an entry for an isolate it is not locked into has no arena, and
+// an entry registered that way would resolve for no turn at all. Such a caller names the
+// isolate instead: IsolateArena is that isolate's arena as an opaque pointer, which
+// Worker::Isolate::getGuestArena() hands out, and registerResolveFor() registers the entry
+// under it. A null arena is the base root, which is what registerResolve() would have used.
+// Host-side only: inside a turn the entries come from the turn's reserved pool, which is the
+// turn's isolate's already.
+using IsolateArena = void*;
+ResolveHandle registerResolveFor(IsolateArena arena, void* ptr);
 void* resolve(ResolveHandle handle);
 void unregisterResolve(ResolveHandle handle);
 

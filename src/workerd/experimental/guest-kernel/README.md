@@ -138,7 +138,8 @@ long  gk_hostcall(unsigned idx);             // call handler idx synchronously (
 gk_resolve_handle gk_resolve_register(void *ptr); // a pointer named by a handle, in gk's supervisor table
 int   gk_resolve_unregister(gk_resolve_handle);
 void *gk_resolve(gk_resolve_handle);         // handle -> pointer or NULL; at ring 3 a ring-0 trap
-                                             // inside the guest, no VM exit (about 19 ns)
+                                             // inside the guest, no VM exit (about 27 ns), and
+                                             // only for the arena the entry was registered under
 
 int   gk_signal_field_register(uintptr_t off, size_t len, uint32_t field, unsigned kind,
                                gk_signal_handle *h); // a word in the thread's arena a signal handler may write
@@ -342,7 +343,7 @@ hardware:
   at guest ring 0 would need its data mapped supervisor, where any ring-0
   code the guest reaches could read it: the only thing that runs at ring 0 is
   gk's lookup. The table is `GK_RESOLVE_SLOTS` (2^20) entries of `{pointer,
-  generation}`, registered `GK_PROT_SUPER` -- a weaker class than the
+  generation, owner}`, registered `GK_PROT_SUPER` -- a weaker class than the
   `GK_PROT_REFUSE` of host memory and the page tables, since a SUPER page is
   in every root with `U` clear while a REFUSE page is in none, and the right
   one here because the lookup has to run inside the guest; host memory stays
@@ -350,7 +351,22 @@ hardware:
   is the handle's low 20 bits, which the capacity of exactly 2^20 bounds by
   masking, the entry must be live and its generation the handle's, so a
   handle to an unregistered or recycled entry resolves to nothing and
-  nothing is ever read through the handle's own value. The lookup takes no
+  nothing is ever read through the handle's own value. The owner says whose
+  entry it is: the page-table root the host registered it under, compared at
+  ring 0 against `CR3`, the root the calling turn runs under, so an entry
+  resolves at ring 3 only for the isolate it belongs to. `CR3` is the one
+  caller identity at ring 0 that is not memory -- ring 3 can neither read it
+  nor load it, and the host alone decides which root a turn enters with --
+  so a turn that rewrites its handle word to another isolate's live handle
+  gets 0, the answer a stale handle gets, and not that isolate's object. The
+  base root is a root like any other rather than a wildcard, so an entry
+  registered with no arena active resolves at ring 3 only on the base root;
+  a host thread that registers an entry for an isolate it is not locked into
+  names the isolate instead (`gk_resolve_register_for`,
+  `hostMemory::registerResolveFor`, used for a context's own entry, which is
+  created on the event loop). Guest ring 0 and the host are not compared:
+  host code resolves on behalf of whichever context it is serving, from
+  threads that are usually on no arena at all. The lookup takes no
   lock and writes nothing: it reads the generation on both sides of the
   pointer and answers only if both match, and the host publishes an entry
   pointer-first and retires it generation-first, so a pointer seen between
@@ -384,8 +400,9 @@ hardware:
   and cannot aim the host at gk's state, host memory or another arena. The
   capacity is set from the measured live count: five entries per in-flight
   request parked on a timer, eight per open WebSocket (memory-classes.md,
-  Cost), so 2^20 holds about two hundred thousand such requests, in 16 MiB
-  that cost nothing until written. The test registers an entry and resolves it
+  Cost), so 2^20 holds about two hundred thousand such requests, in 32 MiB
+  that cost nothing until written (an entry is 32 bytes: three words and the
+  padding that keeps the index a shift and an entry inside one cache line). The test registers an entry and resolves it
   from ring 3 on both kinds of stack, from ring 0 and from the host; feeds
   the lookup a zero handle, an index at and past capacity, generations never
   issued, a slot never taken, the pointer itself, a heap address, a
@@ -400,12 +417,21 @@ hardware:
   without returning to gk): a kept sub-run is one whose counter moved by
   exactly the one exit that ends the turn, so its 8000 resolves provably
   stayed inside the guest, and the sub-runs that moved by more were host
-  timer interrupts (`irq_exits`) and are discarded. **18.8 ns per resolve**
+  timer interrupts (`irq_exits`) and are discarded. **26.8 ns per resolve**
   on the test machine, the median over kept sub-runs with the empty turn's
-  cost subtracted, against 6.4 us for a hostcall: 340 times cheaper. A
-  negative build (`GK_NEG_RESOLVE`, in `gk_test_neg`) removes the generation
-  check and the case fails on the never-issued generations and the recycled
-  slot. It also reserves three entries, sees them resolve to nothing from
+  cost subtracted, against 6.4 us for a hostcall: 240 times cheaper. The
+  owner comparison is 8.1 ns of that, and most of it is not the comparison
+  itself: the same build without the `MOV` from `CR3` measures 25.3 ns and
+  without the owner word 20.4 ns, while reorderings of the same semantics
+  span 26.8 to 33.3 ns, so the path is dominated by instruction placement
+  around the SYSCALL/SYSRET pair rather than by the work added. It also
+  registers an entry under each of two arenas and one on the base root and
+  resolves all three from ring 3 under each root in turn: each answers in
+  its own and nothing in the others, while the host resolves all three.
+  Negative builds (`gk_test_neg`) remove the generation check
+  (`GK_NEG_RESOLVE`), so the case fails on the never-issued generations and
+  the recycled slot, and the owner check (`GK_NEG_RESOLVE_OWNER`), so it
+  fails on all six off-diagonal resolves. It also reserves three entries, sees them resolve to nothing from
   ring 3 until committed, commits one and sees it take once, and sees a
   commit refused for a committed, retired or never-issued handle and for a
   NULL, supervisor, refused or arena pointer, from commit and from register
@@ -414,10 +440,13 @@ hardware:
   can resolve as often as it likes with any handle, and learns only the
   pointer behind a live handle it holds, which the lookup makes safe to keep
   in guest memory but does not make safe to reach from there -- the object's
-  own placement does that -- and a handle rewritten to another live entry's
-  names that entry, the ownership residual the arena and host slot facilities
-  carry too (see `memory-classes.md`, Cost, for what a turn's dereference
-  count implies).
+  own placement does that -- and a handle rewritten to another live entry of
+  the same isolate names that entry: the owner is the isolate, not the
+  object, so the table tells one isolate's handles from another's but not
+  one of an isolate's objects from another of its own. That narrower
+  residual is the one the arena and host slot facilities still carry whole
+  (see `memory-classes.md`, Cost, for what a turn's dereference count
+  implies).
 - **Signal fields.** A runtime that tells a Wasm module its CPU budget is
   nearly spent does so by writing a constant into the module's linear memory
   from the handler of a per-thread CPU timer, while the turn runs. The
@@ -754,7 +783,7 @@ exit plus the exchange-frame copies and the handler). The switch is roughly
 two orders of magnitude cheaper than an exit, so batching the dominant
 syscalls is what decides the overall cost, and a hostcall is for an operation
 rare enough to pay for an exit each time. A ring-0 resolve (`gk_resolve`),
-which stays inside the guest, costs about 19 ns on the Zen 5 test machine,
+which stays inside the guest, costs about 27 ns on the Zen 5 test machine,
 so a crossing a turn makes on every dereference belongs on that path.
 
 ## Limitations (remaining work)
@@ -814,10 +843,14 @@ so a crossing a turn makes on every dereference belongs on that path.
   heap, and the disposer the node records is the one the turn journaled
   when it created the object.
   What a rewritten handle can still do is name another live host slot, or
-  another isolate's live resolve entry: the
-  table turns "any address" into "one of the live tenants", and telling a
-  legitimate use from a swapped one is an ownership question the table cannot
-  answer, as with arenas below. Every other object listed above is still in
+  another live resolve entry of the turn's own isolate: a host slot table
+  turns "any address" into "one of the live tenants", and telling a
+  legitimate use from a swapped one is an ownership question it cannot
+  answer, as with arenas below. The resolve table answers half of it: an
+  entry records the page-table root it was registered under and the ring-0
+  lookup compares that against `CR3`, so another isolate's entry is refused
+  (see "Ring-0 resolve" above); what it does not tell apart is two entries
+  of the same isolate. Every other object listed above is still in
   the shared heap. Moving the malloc'd objects into the arena needs a
   per-isolate allocator arena, which means an allocator with extent hooks;
   workerd uses tcmalloc, which has none.

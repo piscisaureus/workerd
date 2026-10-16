@@ -37,10 +37,12 @@ gk_user_syscall_resume:
 // R11 the ring-3 return RIP and RFLAGS that SYSCALL saved. Looks the handle up
 // in gk_resolve_table (gk.c; supervisor memory, mapped in every root) and
 // SYSRETs to ring 3 with the entry's pointer in RAX, or 0 for a handle that
-// names nothing: a zero generation (never issued) or an entry whose
-// generation is not the handle's. The index is the handle's low 20 bits and
-// the table holds exactly 2^20 entries, so the mask bounds it. Runs
-// on whatever RSP ring 3 had and never touches it, so a ring-3 stack that is
+// names nothing: a zero generation (never issued), an entry whose generation
+// is not the handle's, an entry reserved and not yet committed, or an entry
+// owned by a page-table root other than the one this caller runs under. The
+// index is the handle's low 20 bits and the table holds exactly 2^20 entries,
+// so the mask bounds it. Runs on whatever RSP ring 3 had and never touches
+// it, so a ring-3 stack that is
 // unmapped or garbage costs nothing here; reads only the table, so no value
 // in the handle is ever used as an address; writes nothing, so the table is
 // as the host left it and the path needs no lock. The generation is read
@@ -50,12 +52,32 @@ gk_user_syscall_resume:
 // a pointer seen between two matching reads was the entry's under that
 // generation. Every scratch register is cleared before SYSRET, so ring 3 gets
 // the pointer and nothing else; RCX and R11 are untouched for SYSRET to use.
-// The entry layout is {void *ptr; uint64_t gen}, 16 bytes, index * 16.
+// The entry layout is {void *ptr; uint64_t gen; uint64_t owner; uint64_t},
+// 32 bytes, index * 32.
 // Keep the split at bit 20 in sync with GK_RESOLVE_INDEX_BITS in gk.h.
+//
+// The owner is the arena root the host registered the entry under, and CR3 is
+// the root the caller is running under: the one piece of caller identity that
+// is not memory, since ring 3 can neither read nor load CR3 and the host
+// alone decides which root a turn enters with. Comparing the two is what
+// makes a handle one isolate's: a turn that rewrites its own handle word to
+// another isolate's live handle gets 0, exactly as it does for a stale one.
+// A reserved entry is refused by its missing pointer before the owner is
+// looked at, so that it resolves to nothing whatever the tag holds; the host
+// commits the owner before the pointer and the pointer is read first, so an
+// owner read behind a committed pointer is the one the entry was committed
+// with. The owner is read between the two generation reads, as the pointer
+// is: the generations entries are registered under run consecutively, so a
+// caller can hold the next one before it is issued, and an owner read
+// outside that window could be the next registration's rather than this
+// one's. CR3 is read into RSI, which is already a scratch register the exit
+// clears, so the root never reaches ring 3 and no further register is used.
 //
 // GK_NEG_RESOLVE (a negative-test build, never shipped) removes the
 // generation check, so a handle to a freed or recycled entry resolves to
-// whatever the slot holds; gk_test's resolve case must then fail.
+// whatever the slot holds; GK_NEG_RESOLVE_OWNER removes the owner check, so
+// another arena's live handle resolves to its object. gk_test's resolve case
+// must fail under either.
     .globl gk_resolve_tramp
     .type gk_resolve_tramp, @function
 gk_resolve_tramp:
@@ -63,7 +85,7 @@ gk_resolve_tramp:
     shrq $20, %rax                      /* rax = the handle's generation */
     jz 1f
     andl $0xfffff, %edi                 /* edi = the handle's index, below the table's capacity */
-    shlq $4, %rdi
+    shlq $5, %rdi
     leaq gk_resolve_table(%rip), %rsi
     addq %rsi, %rdi                     /* rdi = &table[index] */
     movq 8(%rdi), %rsi                  /* generation, before */
@@ -71,6 +93,15 @@ gk_resolve_tramp:
 #ifndef GK_NEG_RESOLVE
     cmpq %rsi, %rax
     jne 1f
+#endif
+    testq %rdx, %rdx                    /* a reserved entry has no pointer */
+    jz 1f
+    movq %cr3, %rsi                     /* the root this caller runs under */
+#ifndef GK_NEG_RESOLVE_OWNER
+    cmpq 16(%rdi), %rsi                 /* the root the entry was registered under */
+    jne 1f
+#endif
+#ifndef GK_NEG_RESOLVE
     cmpq 8(%rdi), %rax                  /* generation, after */
     jne 1f
 #endif

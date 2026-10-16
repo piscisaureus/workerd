@@ -764,8 +764,11 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   }
   if (probeEnabled && url.endsWith("/__gk_ioown_steal")) {
     // From inside this isolate's turn, rewrite an IoOwn of its own to the other isolate's live
-    // handle: the table cannot tell the two tenants apart (the ownership residual), so the use
-    // names the other isolate's object.
+    // handle. The entry carries the page-table root it was registered under, which the ring-0
+    // lookup compares against the root this turn runs under, so the use is refused: the handle
+    // is the other isolate's. The host-side resolve logged after it, which makes no such
+    // comparison, reaches the object through the same handle, so the refusal is about who
+    // asked and not about the entry having gone.
     KJ_REQUIRE(announcedIoOwnHandle != 0, "no IoOwn announced");
     auto& context = IoContext::current();
     static kj::Maybe<kj::Own<IoOwnProbeHolder>> thief;
@@ -780,7 +783,13 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
     // The thief is never destroyed, so the stolen handle is never handed to a delete queue; its
     // own entry is retired with its context. The use runs now, and again when asked for later.
     thief = kj::mv(holder);
-    context.addWaitUntil(useIoOwnLater(context, "cross-isolate", h));
+    context.addWaitUntil(useIoOwnLater(context, "cross-isolate", h).then([addr]() {
+      return kj::evalLater([addr]() {
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the stolen handle, resolved host-side",
+            kj::str("0x", kj::hex(announcedIoOwnHandle)),
+            addr(hostMemory::resolve(announcedIoOwnHandle)));
+      });
+    }));
   }
   if (probeEnabled && url.endsWith("/__gk_ioown_steal_again")) {
     // The same stolen handle, used after the other isolate's request, and so its context, has

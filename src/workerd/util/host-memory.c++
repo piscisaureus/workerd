@@ -621,6 +621,17 @@ ResolveHandle registerResolve(void* ptr) {
   return registerResolve(ptr, aux);
 }
 
+ResolveHandle registerResolveFor(IsolateArena arena, void* ptr) {
+  KJ_REQUIRE(ptr != nullptr);
+  KJ_REQUIRE(!inTurn(), "registerResolveFor is host-side; a turn registers from its own pool");
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (guestKernelActive()) {
+    return gk_resolve_register_for(static_cast<gk_arena*>(arena), ptr);
+  }
+#endif
+  return fallbackRegisterResolve(ptr);
+}
+
 ResolveHandle registerResolve(void* ptr, const uint64_t (&aux)[RESOLVE_AUX_WORDS]) {
   KJ_REQUIRE(ptr != nullptr);
   if (TurnJournal* journal = activeJournal()) {

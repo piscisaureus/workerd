@@ -3,10 +3,10 @@
 # host validates rather than by a pointer: a JS turn that rewrites the handle inside its own
 # object leaves the runtime refusing the later uses -- the next turn's dereference, and the
 # host's unlink when the object's holder is destroyed -- rather than reaching the address the
-# turn chose; and that a handle rewritten to another isolate's live handle names that isolate's
-# object, which is the ownership residual the table cannot close. With WORKERD_GK_TEST_PROBE set
-# three request paths drive this from inside the turn (see maybeForceGuestFaultForTest in
-# src/workerd/api/global-scope.c++):
+# turn chose; and that a handle rewritten to another isolate's live handle is refused too, since
+# an entry resolves at ring 3 only under the page-table root it was registered under. With
+# WORKERD_GK_TEST_PROBE set three request paths drive this from inside the turn (see
+# maybeForceGuestFaultForTest in src/workerd/api/global-scope.c++):
 #
 # /__gk_ioown_corrupt creates an IoOwn in the turn, inside a heap holder that stands in for the
 # JS wrapper's C++ object. A later turn of the same request first dereferences it as it is (the
@@ -33,10 +33,15 @@
 # context's; the worker's JS keeps that request open for three seconds, so its context, which
 # owns the object and retires the entry when it ends, outlives the next steps. /__gk_ioown_steal,
 # on the victim, rewrites one of its own IoOwns to that handle and dereferences it in a later
-# turn. The table validates the handle and finds it live, so the use reads the other isolate's
-# magic: the residual, stated here so that a change which closes it (an owner check the host
-# decides) is a deliberate change to this expectation. Once the announcing request has ended,
-# /__gk_ioown_steal_again shows the same stolen handle refused: the entry went with the context.
+# turn. The entry is live and its generation is the handle's, but it was registered under the
+# other isolate's page-table root, and the ring-0 lookup compares that root against the one the
+# calling turn runs under (CR3, which ring 3 can neither read nor load): the use is refused. The
+# same handle, resolved host-side right afterwards, still names the other isolate's object --
+# the host makes no such comparison -- so the refusal is about which isolate asked and not about
+# the entry having gone. (Where the comparison is taken out of gk_resolve_tramp, the use reads
+# the other isolate's magic and this script fails.) Once the announcing request has ended,
+# /__gk_ioown_steal_again shows the same handle refused for the second reason as well: the entry
+# went with the context.
 #
 # The delete queue is the other half of an IoOwn: the context the object belongs to, which the
 # holder names by the context's handle, and whose queue -- the handles of holders dropped off
@@ -194,8 +199,17 @@ echo "6. GET $victim/__gk_ioown_steal -> $s (victim rewrites one of its IoOwns t
 wait_for "IoOwn use after the overwrite; what = cross-isolate" || fail "the later turn did not use the stolen handle"
 use=$(grep -o "IoOwn use after the overwrite; what = cross-isolate.*" "$log" | head -n1)
 echo "7. the next turn's use of the stolen handle: ${use#*verdict = }"
-echo "$use" | grep -q "read magic 0x$other_magic at $ann_obj" ||
-  fail "the cross-isolate rewrite did not name the other isolate's object (the documented residual): $use"
+echo "$use" | grep -q "verdict = refused" ||
+  fail "the cross-isolate rewrite was not refused; it named the other isolate's object: $use"
+echo "$use" | grep -q "$other_magic" && fail "the use read the other isolate's magic"
+echo "$use" | grep -q "does not name a live owned object" || fail "the refusal is not the handle check: $use"
+# The refusal is the owner check, not a dead entry: the host, which does not compare the owner,
+# reaches the other isolate's object through the very handle the turn was refused.
+wait_for "the stolen handle, resolved host-side" || fail "the host did not resolve the stolen handle"
+live=$(grep -o "the stolen handle, resolved host-side.*" "$log" | head -n1)
+echo "   the same handle resolved host-side: ${live#*host-side; }"
+echo "$live" | grep -q "$ann_obj" ||
+  fail "the entry was not live when the turn was refused, so the refusal proves nothing: $live"
 
 s=$(status "$victim/__gk_queue_steal")
 echo "7a. GET $victim/__gk_queue_steal -> $s (victim rewrites an IoOwn's context handle to other's context $ann_ctx and drops the holder on the event loop)"
@@ -336,4 +350,4 @@ echo "19. GET $hello/            -> $s (other isolates must still serve)"
 [ "$s" = 200 ] || fail "hello stopped serving after the record fault"
 kill -0 "$pid" 2>/dev/null || fail "workerd died"
 
-echo "PASS: an IoOwn handle rewritten from inside a turn to an address the turn chose was refused by the next turn's dereference and by the host's drain of the delete queue, reaching neither the chosen buffer nor its magic; the isolate kept serving; a handle rewritten to another isolate's live handle named that isolate's object (the ownership residual, not closed by the handle check) and was refused once that isolate's context had ended; a turn's write into the owned node behind a handle faulted at the node, and the host's teardown walk disposed of the object through the node's own disposer, never the chosen one; an IoOwn's context handle rewritten to another isolate's live context queued nothing there, since the dropped handle names an object of this context's list, and one rewritten to a buffer the turn chose queued nothing and reached nothing at the buffer, with both objects disposed of by their own context's teardown; a turn's write into the context record behind a handle faulted at the record, and the host's teardown locked the record and disposed of the object without calling the fulfiller the turn chose, after which the host queued and ran an action for another context through its record"
+echo "PASS: an IoOwn handle rewritten from inside a turn to an address the turn chose was refused by the next turn's dereference and by the host's drain of the delete queue, reaching neither the chosen buffer nor its magic; the isolate kept serving; a handle rewritten to another isolate's live handle was refused although the entry was live -- the host resolved the very same handle to that isolate's object -- and was refused again once that isolate's context had ended; a turn's write into the owned node behind a handle faulted at the node, and the host's teardown walk disposed of the object through the node's own disposer, never the chosen one; an IoOwn's context handle rewritten to another isolate's live context queued nothing there, since the dropped handle names an object of this context's list, and one rewritten to a buffer the turn chose queued nothing and reached nothing at the buffer, with both objects disposed of by their own context's teardown; a turn's write into the context record behind a handle faulted at the record, and the host's teardown locked the record and disposed of the object without calling the fulfiller the turn chose, after which the host queued and ran an action for another context through its record"

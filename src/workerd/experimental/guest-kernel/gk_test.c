@@ -2650,12 +2650,56 @@ static int resolve_check(void) {
   gk_get_stats(&s5);
   int reserve_freed = s5.resolve_entries == s3.resolve_entries && gk_resolve(rsv[0]) == NULL &&
                       gk_resolve(rsv[2]) == NULL;
+
+  // The owner: an entry resolves at ring 3 only under the page-table root it
+  // was registered under. Two arenas and the base root, one registration
+  // made under each, and every combination resolved from ring 3 on the
+  // caller's stack -- the production path -- so that each handle answers in
+  // its own arena and nothing anywhere else. The host resolves all three
+  // from no arena at all: the owner names which turn may resolve the entry,
+  // not which code may, and host code serves every context. A turn that
+  // rewrites its handle to another isolate's live handle is the ring-3
+  // off-diagonal here.
+  static int oa, ob, obase;
+  gk_arena *OA = gk_arena_create(1UL << 20), *OB = gk_arena_create(1UL << 20);
+  gk_resolve_handle ha = 0, hb = 0, hbase = 0;
+  long wrong_in_a = -1, wrong_in_b = -1, wrong_on_base = -1;
+  int owner_ok = OA != NULL && OB != NULL;
+  if (owner_ok) {
+    gk_arena_enter(OA);
+    ha = gk_resolve_register(&oa);
+    gk_arena_enter(OB);
+    hb = gk_resolve_register(&ob);
+    gk_arena_enter(NULL);
+    hbase = gk_resolve_register(&obase);
+    gk_resolve_handle three[3] = {ha, hb, hbase};
+    void *in_a[3] = {&oa, NULL, NULL};
+    void *in_b[3] = {NULL, &ob, NULL};
+    void *on_base[3] = {NULL, NULL, &obase};
+    struct rs_all ra_a = {three, in_a, 3}, ra_b = {three, in_b, 3},
+                  ra_base = {three, on_base, 3};
+    gk_arena_enter(OA);
+    wrong_in_a = gk_run_here_user(rs_resolve_all, &ra_a);
+    gk_arena_enter(OB);
+    wrong_in_b = gk_run_here_user(rs_resolve_all, &ra_b);
+    gk_arena_enter(NULL);
+    wrong_on_base = gk_run_here_user(rs_resolve_all, &ra_base);
+    owner_ok = ha != 0 && hb != 0 && hbase != 0 && wrong_in_a == 0 && wrong_in_b == 0 &&
+               wrong_on_base == 0 && gk_resolve(ha) == &oa && gk_resolve(hb) == &ob &&
+               gk_resolve(hbase) == &obase;
+    gk_resolve_unregister(ha);
+    gk_resolve_unregister(hb);
+    gk_resolve_unregister(hbase);
+  }
+  if (OA) gk_arena_destroy(OA);
+  if (OB) gk_arena_destroy(OB);
+
   if (rarena) gk_arena_destroy(rarena);
   long cpl = gk_run_user(user_cpl, NULL);  // the process survived the faults above
 
   int ok = reg_bad && resolves && user_ok && here_ok && ring0_ok && host_ok && garbage_ok &&
            walled && bench_ok && freed && recycled && capacity_ok && fresh && reserve_ok &&
-           commit_ok && committed_wrong == 0 && reserve_freed && cpl == 3;
+           commit_ok && committed_wrong == 0 && reserve_freed && owner_ok && cpl == 3;
   printf("ring-0 resolve: NULL refused %s; handle %#llx -> %p (host %s); ring 3 %s, caller's "
          "stack %s, ring 0 %s, host %s; %d garbage handles and 0 -> nothing at every ring (%s, "
          "caller's memory untouched %s); ring-3 read of the table -> %s (fault %#lx == %#lx), "
@@ -2666,7 +2710,10 @@ static int resolve_check(void) {
          "slot %s, old handle -> nothing %s, new -> %p %s); capacity %d: filled %d, next -> "
          "%#llx, %ld mismatched from ring 3, emptied %s; reusable %s; reserved 3 -> nothing "
          "until committed %s, commits once and refuses NULL, supervisor, refused and arena "
-         "pointers %s (%ld wrong from ring 3), released %s; CPL %ld [%s]\n",
+         "pointers %s (%ld wrong from ring 3), released %s; three entries registered under "
+         "arena A, arena B and the base root: %ld, %ld and %ld of the three resolved wrongly "
+         "from ring 3 under A, under B and on the base root, all three resolve host-side %s; "
+         "CPL %ld [%s]\n",
          reg_bad ? "yes" : "NO", (unsigned long long)h, (void *)&obj, resolves ? "ok" : "BROKEN",
          user_ok ? "ok" : "BROKEN", here_ok ? "ok" : "BROKEN", ring0_ok ? "ok" : "BROKEN",
          host_ok ? "ok" : "BROKEN", RS_BAD, garbage_ok && user_ok && host_ok ? "yes" : "NO",
@@ -2678,7 +2725,8 @@ static int resolve_check(void) {
          GK_RESOLVE_SLOTS, n, (unsigned long long)over, mismatched,
          s5.resolve_entries == s3.resolve_entries ? "yes" : "NO", fresh ? "yes" : "NO",
          reserve_ok ? "yes" : "NO", commit_ok ? "yes" : "NO", committed_wrong,
-         reserve_freed ? "yes" : "NO", cpl, ok ? "OK" : "FAIL");
+         reserve_freed ? "yes" : "NO", wrong_in_a, wrong_in_b, wrong_on_base,
+         owner_ok ? "yes" : "NO", cpl, ok ? "OK" : "FAIL");
   free(p);
   free(heap);
   munmap(none, 4096);

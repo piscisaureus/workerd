@@ -763,17 +763,21 @@ void ReverseIoOwnValidity::checkValid() const {
       isValid(), Error, "Couldn't complete operation because the execution context has ended.");
 }
 
-DeleteQueueOwner::DeleteQueueOwner() {
+DeleteQueueOwner::DeleteQueueOwner(hostMemory::IsolateArena arena) {
   // The entry's pointer is this owner, in the context, which nothing dereferences through the
   // table; what the entry is for is its companion, the record in host memory. Registered inside
   // a turn, the record is built by the committed hook after the turn; the holders the turn
-  // creates meanwhile need only the handle.
+  // creates meanwhile need only the handle. Outside a turn -- the usual case, since a context
+  // is created on the event loop -- the registration names the isolate the context belongs to,
+  // because the turns that resolve this handle (isDefunct, tryScheduleAction, a holder dropped
+  // inside a turn) run under that isolate's arena and an entry resolves at ring 3 only under
+  // the root it was registered with.
   hostMemory::ResolveHandle handle;
   if (hostMemory::inTurn()) {
     uint64_t aux[hostMemory::RESOLVE_AUX_WORDS] = {CONTEXT, 0, 0, 0};
     handle = hostMemory::registerResolve(this, aux);
   } else {
-    handle = hostMemory::registerResolve(this);
+    handle = hostMemory::registerResolveFor(arena, this);
     if (handle != 0 && !hostMemory::setResolveCompanion(handle, {CONTEXT, allocateRecord()})) {
       hostMemory::unregisterResolve(handle);
       handle = 0;
