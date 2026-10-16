@@ -1220,21 +1220,21 @@ every arena -- so it would narrow nothing that is not already open.
 
 ### Disposing of an owned object inside a turn
 
-Placing the object out of a turn's reach is the one direction; the other is
-to stop the host reaching the object. The host would schedule disposal
-instead of performing it, and the destructor would run at guest ring 3 in a
-turn of the owning isolate, where a vtable that isolate has corrupted costs
-it only itself. Counted with per-site counters on
-`DeleteQueue::registerOwned`, `OwnedObjectList::drop`, `release`, `take` and
-the teardown walk, over the `api/tests` and `io` suites (768 tests, 16,006 `IoContext`s,
-283,648 turns; one context per stateless request): of 554,798 disposals,
-432,736 (78.0%) already run inside a turn, through the holder's own disposal
-record, and 115,510 (20.8%) run host-side -- 68,706 the delete-queue drain,
-38,732 the context's teardown walk, 8,064 an immediate drop made under the
-isolate lock but outside the guest, and 8 a host-side `take`. Of the
-remainder, 2,820 are the teardown path that already runs in a turn and 3,732
-are an in-turn `take`, which hands the object out of the family. That is 7.2
-host-side disposals per context against 27.0 in-turn ones.
+Placing the object out of a turn's reach is the one direction; the other is to
+stop the host reaching the object. The host would schedule disposal instead of
+performing it, and the destructor would run at guest ring 3 in a turn of the
+owning isolate, where a vtable that isolate has corrupted costs it only
+itself. Counted with per-site counters on `DeleteQueue::registerOwned`,
+`OwnedObjectList::drop`, `release`, `take` and the teardown walk, over the
+`api/tests` and `io` suites (768 tests, 16,006 `IoContext`s, 283,648 turns;
+one context per stateless request): of 554,798 disposals, 432,736 (78.0%)
+already run inside a turn, through the holder's own disposal record, and
+115,510 (20.8%) run host-side -- 68,706 the delete-queue drain, 38,732 the
+context's teardown walk, 8,064 an immediate drop made under the isolate lock
+but outside the guest, and 8 a host-side `take`. Of the remainder, 2,820 are
+the teardown path that already runs in a turn and 3,732 are an in-turn `take`,
+which hands the object out of the family. That is 7.2 host-side disposals per
+context against 27.0 in-turn ones.
 
 **The drain is already under the lock, in the arena, and needs no crossing.**
 `DeleteQueueOwner::drainDeletions` runs inside `runInContextScope`, whose one
@@ -1267,19 +1267,16 @@ memory either (below).
 **"In a turn" does not say whose turn, and the paths that exist today do not
 ask.** `~OwnedObjectList`, `ReverseIoOwn::drop` and `IoOwn::operator
 kj::Own` all branch on `hostMemory::inTurn()`, which is a property of the
-thread. A context destroyed inside another worker's turn -- the nested
-destructor case `runInContextScope` describes -- disposes of its objects at
-ring 3 under whichever isolate's arena is active, and a `ReverseIoOwn`
-dropped by a KJ I/O object inside a turn does the same (9,814 of 17,690
-reverse drops in the suite were inside a turn). The whole point of in-turn
-disposal is that a corrupted vtable reaches only the isolate that corrupted
-it, and a turn chosen by the thread rather than by the object gives the
-opposite: one isolate's object running code of its choosing inside another
-isolate's arena. The suite does not exercise it -- all 18 of its in-turn
-context teardowns were of the isolate whose turn was running -- but nothing
-checks, and any widening of in-turn disposal widens this with it. Closing it
-wants the owner the resolve entry already records, compared against the turn,
-as `hostMemory::ownedByTurn` does for the handles a journal carries.
+thread, so a disposal it admits can be of an object of an isolate other than
+the one whose arena the turn runs under: 9,814 of the suite's 17,690
+`ReverseIoOwn` drops are inside a turn, and 2,016 of those are of another
+isolate. The whole point of in-turn disposal is that a corrupted vtable
+reaches only the isolate that corrupted it, and a turn chosen by the thread
+rather than by the object gives the opposite. The next section works that
+case out: it is reached at seven of the nine sites and refused there by
+checks the sites do not make themselves, and the two sites nothing checks are
+the two the runtime never reaches. Any widening of in-turn disposal has to
+carry the comparison itself.
 
 **A destructor at ring 3 cannot touch host memory.** A `gk_host_alloc` block
 is mapped into no root and `gk_host_slot_free` writes gk's supervisor block,
@@ -1318,6 +1315,98 @@ shared heap leaving the arena. Until then the cheapest honest step is the
 drain, which costs nothing because the lock, the arena and the crossing are
 already there, and which is worth taking when the surrounding placement work
 makes it the last route rather than one of several.
+
+### Disposing another isolate's object inside a turn
+
+`hostMemory::inTurn()` is a property of the thread. Nine places in
+`io/io-own.{h,c++}` branch on it to register, release or dispose of an owned
+object inside the turn instead of host-side, and not one of them compares the
+object's isolate with the turn's. If any of them ran for an object of isolate
+A while a turn of isolate B was on the thread, the disposal -- an indirect
+call through a vtable in the shared heap, which A can write -- would run at
+guest ring 3 under B's page-table root.
+
+That would not fault. `arena_sync_root` (`gk.c`) copies every top-level entry
+outside an arena's own slots from the base root into that arena's root, so the
+shared C++/KJ heap, glibc and the runtime's text are mapped at the same
+addresses with the same permissions under every root; arenas are placed from
+`GK_FIRST_CAGE_SLOT` (slot 64, 32 TiB) upward, clear of all of it. A's object
+would be read, A's vtable word followed, and the call would land wherever A
+aimed it among the pages executable under B's root -- the runtime image and
+B's own code range, since A's JIT pages are in A's arena and unmapped there.
+That is a gadget call with a `this` A controls, made inside the arena the
+isolation exists to protect: a cross-isolate escape rather than the host-side
+one the shared heap already carries. So the question is only whether a
+foreign-arena disposal can be reached, and the answer differs between the
+sites that resolve a handle and the sites that do not.
+
+**Seven of the nine are entered with a foreign isolate and refused, by checks
+that are not their own.** `OwnedObjectList::drop` -- and so `ReverseIoOwn`'s
+destructor, which calls it directly with no context of its own to compare --
+resolves the handle before disposing, and at ring 3 `gk_resolve` compares the
+entry's owner root against CR3, so a foreign entry resolves to nothing and
+nothing is disposed; the journal fallback in `resolveOfType` cannot stand in
+for it, since the journal holds only handles this turn reserved.
+`ReverseIoOwn::operator kj::Own` resolves the same way and throws.
+`IoOwn::operator kj::Own` goes through `checkFarGet`, which requires the
+holder's context to be the current one. `scheduleDeletion` and
+`tryScheduleAction` resolve the context handle before noting anything, and
+`noted()` checks `hostMemory::ownedByTurn` host-side as well.
+`OwnedObjectList::add` registers from the turn's reserved pool, whose entries
+are the turn's own arena's, and its commit hook refuses a registration whose
+context is another isolate's. Measured with a two-service reproducer in which
+the caller drops, inside its turn, the stubs a callee returned (each export
+makes a `TransientJsRpcTarget` holding a `ReverseIoOwn<Handles>` of the
+callee's context): 1,102 in-turn drops, 400 of them of the other isolate.
+Without the guest kernel all 1,102 resolve and dispose. With it, 702 resolve
+and **the 400 foreign ones resolve to nothing** -- exactly the cross-isolate
+set -- and the same run logs the commit hook refusing registrations that name
+another isolate's context. The suite agrees on the frequency: 2,016 of 5,494
+in-turn `ReverseIoOwn` drops across `api/tests` and `io` are of another
+isolate.
+
+**The two that nothing checks are the two teardown hostcalls, and nothing
+reaches them.** `~OwnedObjectList` and `~DeleteQueueOwner`, when they run
+inside a turn, take the owned objects and the queued action boxes from the
+`IO_CONTEXT` hostcall rather than from a resolve: the handler finds the
+context through the companion directory, which is host-side and makes no
+owner comparison by design, and hands the turn raw `{disposal, disposer}`
+pairs to call. Nothing there compares arenas, so a context of another isolate
+torn down inside a turn would dispose of its objects under the running
+isolate's root. No path does that. Of the 16,006 context destructions the
+suite makes, 18 are inside a turn, and a run that compared the isolates
+found all 18 to be of the isolate whose turn was running; five constructed
+abandonment patterns against a service binding -- a
+streaming response dropped unread, cancelled, never awaited, aborted through
+an `AbortSignal`, and twenty held and dropped together under GC pressure --
+produced no in-turn context teardown at all. The reason is deliberate rather
+than incidental: a child worker's stub is "typically destroyed while some
+other isolate is current, and so we cannot enter the dynamic worker's isolate
+to tear it down", so `~WorkerStubImpl` (`server/server.c++`) defers the
+unlink and destruction of the `WorkerService` to the next turn of the event
+loop, a fix made for a crash of exactly this shape.
+
+**So the invariant is the runtime's, not the guest kernel's: a context is
+torn down only outside a turn, or inside a turn of its own isolate.** It
+holds today, it is load-bearing for the two unchecked sites, and nothing in
+`io-own.{h,c++}` states or enforces it. What would enforce it is the
+comparison the other seven sites get for free -- `gk_arena_current()`
+(`gk.h`) against the owner the context's resolve entry already records -- with
+the disposal done host-side when they differ, trading the host-side indirect
+call the whole file already carries for a cross-arena ring-3 one. It is not
+written because there is no way to make it fail: a guard for a case nothing
+produces is a guard no probe can test.
+
+What the refusals cost, which is the part to watch. A foreign in-turn drop
+under the guest kernel disposes of nothing and retires nothing, so the object
+stays on its own context's list until that context is torn down, where the
+same drop without the guest kernel disposes of it at once. A foreign in-turn
+registration is worse: `registerOwned` has already disowned the object by the
+time the commit hook refuses it, so no node is ever built and nothing owns
+it -- the reproducer leaks 400 `TraceContextParent`s that way, one per
+cross-isolate stub. Both refusals are silent at the call site, which is why
+neither was visible until it was counted, and both are the guest kernel's
+build differing from the ordinary one on paths the ordinary suite covers.
 
 ## What is in H memory
 
