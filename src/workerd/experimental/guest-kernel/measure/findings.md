@@ -494,15 +494,13 @@ rounds (`stall-resident.json`). The VMSCAPE mitigation read `Mitigation:
 IBPB before exit to userspace` before and after, as the script records.
 The build measured predates three corrections to the park loop that touch
 nothing on a turn's path (the order of the launch's stores, the root a
-parked loop walks, the NMI's window); a repeat of the one-connection hello
-latency on the final build gave 27.1 to 27.2 us spinning and 30.2 to 30.4 us
-sleeping, against 25.8 to 26.7 us with the guest kernel off and 139.5 us
-with it on. A one-connection figure moves by 10 to 20 us with where the
-scheduler puts the client relative to the server's two pinned CPUs (the
-same sleeping arrangement measures 30 us in most launches and 49 us in
-some; with the client pinned to a far CPU, 37 to 40 us in every launch),
-which every arrangement is subject to alike and the interleaving averages
-out.
+parked loop walks, the NMI's window) and the choice of the runner's CPU
+described under "Where the runner sits" below. On the final build the
+one-connection hello latency is 24.5 to 24.8 us spinning and 27.8 to
+28.9 us sleeping, launch after launch, against 23.1 to 23.5 us with the
+guest kernel off (`haltpoll-*.json`). A client pinned to a CPU far from
+the server's two adds about 10 us (37 to 40 us sleeping), which every
+arrangement is subject to alike.
 
 | hello                            | p50      | rps, one connection | CPU per request | logical CPUs busy | guest cycles | guest IPC | event loop's host cycles | its mispredicts | exits to userspace | exits, all | kicks | context switches |
 | -------------------------------- | -------- | ------------------- | --------------- | ----------------- | ------------ | --------- | ------------------------ | --------------- | ------------------ | ---------- | ----- | ---------------- |
@@ -584,6 +582,78 @@ or mapping granularity changed. The library's own empty turn costs
 that still return -- a forwarded syscall, a hostcall, a demand fault, a
 fatal fault -- cost what they did: the runner takes the IBPB on its
 return and the guest re-enters cold for that turn, once per event.
+
+### Where the runner sits
+
+`GK_RUNNER_PIN=other` pins the owner to the CPU it is on when its vCPU is
+created and the runner to the next CPU up on another core that shares the
+owner's last-level cache. The cache is the condition that matters: the
+owner builds the request on its CPU and the vCPU runs the turn on the
+runner's, and the two hand the request's working set to each other through
+it, the turn's input one way and its response the other. On the EPYC 9255
+the last-level cache is a CCD's: four of them, CPUs 0-5 with 24-29, 6-11
+with 30-35, 12-17 with 36-41 and 18-23 with 42-47 (sysfs
+`cache/index3/shared_cpu_list`). With the owner pinned by `taskset` and the
+runner by number (`haltpoll.py`; one connection, three launches each,
+sleeping; `haltpoll-pin-*.json`):
+
+| hello, resident sleeping              | p50, three launches | rps, one connection | CPU per request | vCPU thread's CPU per request | successful halt poll per request |
+| ------------------------------------- | ------------------- | ------------------- | --------------- | ----------------------------- | -------------------------------- |
+| owner 11, runner 12 (another CCD)     | 50.6, 50.2, 50.5 us | 16.8k to 16.9k      | 88 us           | 58 us                         | 27.4 us                          |
+| owner 12, runner 11 (another CCD)     | 50.6, 50.6, 50.4 us | 16.8k to 16.9k      | 88 us           | 58 us                         | 26.7 us                          |
+| owner 11, runner 10 (same CCD)        | 28.2, 28.1, 28.2 us | 28.8k to 29.0k      | 51 us           | 34 us                         | 14.7 us                          |
+| owner 12, runner 13 (same CCD)        | 28.1, 27.9, 28.0 us | 28.5k to 29.4k      | 50 us           | 34 us                         | 14.4 us                          |
+| owner 11, runner 35 (its SMT sibling) | 33.1, 33.1, 33.3 us | 25.1k to 25.3k      | 61 us           | 39 us                         | 19.4 us                          |
+
+Across CCDs the same request costs 50 us against 28, and 37 us more CPU;
+on the owner's SMT sibling 33 us, with the halt-polling runner on the
+owner's own core. KVM's halt statistics for the VM (debugfs:
+`halt_exits`, `halt_attempted_poll`, `halt_successful_poll`,
+`halt_wakeup`, `halt_poll_success_ns`, `halt_poll_fail_ns`) say the halt
+poll is not what differs. In every launch, slow or fast, each request
+halts the vCPU once, the poll is attempted once and succeeds once, and
+the vCPU's thread is never woken from a sleep (15 to 57 `halt_wakeup`
+per round of 130k to 230k requests, the idle moments at the round's
+edges; 4 to 12 ns of `halt_poll_fail_ns` per request): the next turn
+always arrives inside the 200 us budget. What differs is how long the
+successful poll lasts, 14.5 us per request on the same CCD against 27 us
+across: that is the owner's time from the turn's end to the next launch
+(the response, the client's round trip, the next request), lengthened by
+the cross-CCD transfer of every line the turn wrote, and the turn is
+lengthened the same way by the lines the owner wrote.
+
+The next CPU up without the cache condition is on another CCD for 8 of
+the 48 CPUs an owner may start on (5, 11, 17, 23 and their siblings 29,
+35, 41, 47), so one launch in six is a slow one. Sleeping, one
+connection, eight launches of two rounds each, p50 per round
+(`haltpoll-before.json`, `haltpoll-after.json`):
+
+- the next CPU up on another core, whatever its cache: 50.5 and 50.6 us
+  (owner 11, runner 12), then 28.1, 28.1, 28.2, 28.1, 28.0, 28.1, 27.9,
+  28.0, 28.2, 28.4, 27.9, 28.1, 28.1 and 28.3 us; 16.9k and 17.2k
+  requests per second in the slow launch, 28.0k to 29.1k in the others;
+- the next CPU up on another core in the owner's cache domain: 27.9,
+  28.3, 28.3, 28.3, 28.4, 28.5, 28.2, 28.0, 27.8, 28.1, 28.2, 28.3, 28.4,
+  28.9, 28.0 and 27.9 us; 27.4k to 29.2k requests per second. The owner
+  that started on CPU 5 got its runner on 24 (the sibling of 0, in its
+  domain) rather than 6. Forced onto CPU 11 by `taskset`, three launches
+  measure 28.4, 28.2 and 28.6 us with the runner on 30; onto CPU 5, 28.3
+  and 28.3 us with the runner on 24 (`haltpoll-after-cpu11.json`,
+  `haltpoll-after-cpu5.json`).
+
+So the sleeping arrangement's hello figure is 28 us, 27.8 to 28.9 us
+over sixteen rounds, and the spinning arrangement's 24.5 to 24.8 us
+(three launches, `haltpoll-spin.json`), against 23.1 to 23.5 us with the
+guest kernel off (`haltpoll-off.json`). The CPU per request, same runs:
+sleeping, 50 to 53 us on 1.37 logical CPUs, of which the vCPU's thread is
+33.5 to 35.5 us -- the whole of the request's 34 to 36 us period, since
+between turns it polls in the kernel (the 14.5 us of successful poll per
+request) and during the turn it runs the guest -- and the owner's thread
+with V8's the remaining 16 to 18 us; spinning, 63 to 64 us on 1.94 CPUs;
+guest kernel off, 32 us on 1.00 CPU (76 us on 2.07 in one launch of
+three, with V8's background threads awake). The VMSCAPE mitigation read
+`Mitigation: IBPB before exit to userspace` and the host's `halt_poll_ns`
+200000 before and after every run, as the script records.
 
 ### Two tenants alternating
 
@@ -701,10 +771,14 @@ realistic worker mix that decides both axes.
    resident runner leaves hello at 28.5 us against 24.1, but at 52.5 us of
    CPU per request against 30.0, and the difference is the vCPU's thread
    polling in the kernel between turns for a wake that always comes within
-   KVM's 200 us halt-poll budget. `KVM_CAP_HALT_POLL` sets that budget per
-   VM, from the process, so the trade between the poll's CPU and a
-   scheduler wakeup's latency (the runner handoff's 9 us) can be made per
-   deployment without touching the host; it was not measured here. The
+   KVM's 200 us halt-poll budget: 14.5 us of successful poll per hello
+   request at one connection, the owner's time between turns, and never
+   a wakeup from sleep (see "Where the runner sits"). `KVM_CAP_HALT_POLL`
+   sets that budget per VM, from the process, so the trade between the
+   poll's CPU and a scheduler wakeup's latency (the runner handoff's
+   9 us) can be made per deployment without touching the host; a budget
+   below the gap makes every wake a scheduler wakeup. It was not measured
+   here. The
    exits that still return to userspace -- a forwarded syscall, a hostcall,
    a demand fault -- each cost the turn a cold re-entry as before, so a
    worker that makes syscalls inside its turn pays per syscall; hello makes

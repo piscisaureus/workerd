@@ -2185,8 +2185,12 @@ static void thread_key_dtor(void *p) {
 // the spin budget per wait, -1 for unbounded, default 0; GK_RUNNER_PIN:
 // "sibling" pins the owner to the CPU it is on when its vCPU is created and
 // the runner to that CPU's SMT sibling, "other" pins the owner likewise and
-// the runner to the next CPU on another core, a number pins the runner to
-// that CPU). The runner and its record follow the vCPU through the pool, and
+// the runner to the next CPU on another core that shares the owner's
+// last-level cache, a number pins the runner to that CPU). The owner and the
+// vCPU hand the turn's working set to each other through the cache, so the
+// two must share one: across last-level caches (the CCDs of an EPYC) the
+// same hello request costs 50 us against 28 (see measure/findings.md). The
+// runner and its record follow the vCPU through the pool, and
 // stop when the vCPU is closed. The records live in refused memory, which
 // no root maps, so a turn cannot rewrite the words its owner waits on.
 //
@@ -2405,6 +2409,35 @@ static int sibling_cpu(int cpu) {
   return -1;
 }
 
+// Whether CPUs `a` and `b` share a last-level cache, from sysfs: the
+// shared_cpu_list of the highest cache index `a` lists. 1 when sysfs does
+// not say, so that a pinning that needs the answer still picks a CPU.
+static int shares_llc(int a, int b) {
+  char path[128], buf[1024];
+  ssize_t n = 0;
+  for (int i = 0;; i++) {
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cache/index%d/shared_cpu_list", a, i);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) break;
+    ssize_t m = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (m <= 0) break;
+    n = m;
+  }
+  if (n <= 0) return 1;
+  buf[n] = 0;
+  for (char *p = buf; *p;) {
+    char *end;
+    long lo = strtol(p, &end, 10);
+    if (end == p) break;
+    long hi = lo;
+    if (*end == '-') hi = strtol(end + 1, &end, 10);
+    if (b >= lo && b <= hi) return 1;
+    p = (*end == ',') ? end + 1 : end;
+  }
+  return 0;
+}
+
 // Start a runner for the vCPU `fd`, on the calling (owning) thread's behalf.
 // NULL, with G->err set, if it cannot be started.
 static gk_runner *runner_start(int fd) {
@@ -2431,10 +2464,16 @@ static gk_runner *runner_start(int fd) {
       CPU_ZERO(&set);
       CPU_SET(here, &set);
       sched_setaffinity(0, sizeof set, &set);
-      // The next CPU up that is not on this core (wrapping at the top).
-      int n = (int)sysconf(_SC_NPROCESSORS_ONLN), sib = sibling_cpu(here);
-      for (int c = (here + 1) % n; c != here; c = (c + 1) % n)
-        if (c != sib) { r->cpu = c; break; }
+      // The next CPU up (wrapping at the top) that is not on this core and
+      // shares its last-level cache; failing that, the next on any other
+      // core.
+      int n = (int)sysconf(_SC_NPROCESSORS_ONLN), sib = sibling_cpu(here), other = -1;
+      for (int c = (here + 1) % n; c != here; c = (c + 1) % n) {
+        if (c == sib) continue;
+        if (other < 0) other = c;
+        if (shares_llc(here, c)) { r->cpu = c; break; }
+      }
+      if (r->cpu < 0) r->cpu = other;
     }
   } else if (G->runner_pin >= GK_RUNNER_PIN_CPU) {
     r->cpu = G->runner_pin - GK_RUNNER_PIN_CPU;

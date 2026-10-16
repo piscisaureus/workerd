@@ -604,7 +604,10 @@ hardware:
   and the owner keeps its predictions across the turn. The guest still
   enters cold, so the runner recovers the host side's share. The runner has
   to be on another core: `GK_RUNNER_PIN=other` pins the owner where it is
-  and the runner to the next CPU on a different core, and hello world then
+  and the runner to the next CPU on a different core that shares the
+  owner's last-level cache (the two exchange the turn's working set through
+  it; across CCDs a resident runner's hello costs 50 us against 28, see
+  `measure/findings.md`), and hello world then
   costs 68 us with both sides sleeping on a futex through the handoff
   (`GK_RUNNER_SPIN=0`, the default; two wakeups per turn, one logical CPU
   busy, 83 us of CPU per request against 118 to 144 with the guest kernel
