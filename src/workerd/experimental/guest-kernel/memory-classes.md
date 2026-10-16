@@ -1218,6 +1218,107 @@ block at all -- and a registration's object pointer can already be such an
 address, since gk admits any ordinary user memory outside its own ranges and
 every arena -- so it would narrow nothing that is not already open.
 
+### Disposing of an owned object inside a turn
+
+Placing the object out of a turn's reach is the one direction; the other is
+to stop the host reaching the object. The host would schedule disposal
+instead of performing it, and the destructor would run at guest ring 3 in a
+turn of the owning isolate, where a vtable that isolate has corrupted costs
+it only itself. Counted with per-site counters on
+`DeleteQueue::registerOwned`, `OwnedObjectList::drop`, `release`, `take` and
+the teardown walk, over the `api/tests` and `io` suites (768 tests, 16,006 `IoContext`s,
+283,648 turns; one context per stateless request): of 554,798 disposals,
+432,736 (78.0%) already run inside a turn, through the holder's own disposal
+record, and 115,510 (20.8%) run host-side -- 68,706 the delete-queue drain,
+38,732 the context's teardown walk, 8,064 an immediate drop made under the
+isolate lock but outside the guest, and 8 a host-side `take`. Of the
+remainder, 2,820 are the teardown path that already runs in a turn and 3,732
+are an in-turn `take`, which hands the object out of the family. That is 7.2
+host-side disposals per context against 27.0 in-turn ones.
+
+**The drain is already under the lock, in the arena, and needs no crossing.**
+`DeleteQueueOwner::drainDeletions` runs inside `runInContextScope`, whose one
+caller always goes on to enter the guest (`runImpl`), so the objects can be
+handed to that turn instead: the host detaches the node, retires the entry
+and frees the node before the turn, as `release()` does, and leaves the turn
+the `{disposal, disposer}` pairs to dispose of at its start, which is what
+the teardown's `DRAIN` hostcall already hands over. Doing it as a hostcall
+instead would not be affordable: 67,766 of the 283,648 turns find a non-empty
+queue and nearly always find exactly one object in it (68,706 objects in
+67,766 drains), so it would be 4.2 hostcalls per context at 6.4 us each
+against a hello request's 25.4 us (`measure/findings.md`).
+
+**The teardown walk has neither a turn nor a lock, and cannot be given one
+later.** 15,988 of the 16,006 contexts are destroyed outside any turn with no
+isolate lock on the thread, and 11,706 of those still own objects. Deferring
+their disposal past `~IoContext` is not available: the objects point back at
+the context, which is why `runInContextScope` refuses to delay destruction to
+a later event-loop turn and why `IoContext` declares `worker` above
+`ownedObjects`. So the destructors have to run while the context is still
+there, which means entering the guest synchronously from `~IoContext`.
+That much is mechanically possible without the isolate lock, since
+`gk_arena_enter` is per thread and nests (`gk.h`) and the isolate outlives
+the list, at one guest entry per non-empty teardown -- 0.73 per context, 2.75
+to 6.77 us each. What it is not is a smaller claim than the host-side walk
+makes: the walk runs today with no isolate lock either, so its destructors
+already must not touch V8; what it would add is that they must not touch host
+memory either (below).
+
+**"In a turn" does not say whose turn, and the paths that exist today do not
+ask.** `~OwnedObjectList`, `ReverseIoOwn::drop` and `IoOwn::operator
+kj::Own` all branch on `hostMemory::inTurn()`, which is a property of the
+thread. A context destroyed inside another worker's turn -- the nested
+destructor case `runInContextScope` describes -- disposes of its objects at
+ring 3 under whichever isolate's arena is active, and a `ReverseIoOwn`
+dropped by a KJ I/O object inside a turn does the same (9,814 of 17,690
+reverse drops in the suite were inside a turn). The whole point of in-turn
+disposal is that a corrupted vtable reaches only the isolate that corrupted
+it, and a turn chosen by the thread rather than by the object gives the
+opposite: one isolate's object running code of its choosing inside another
+isolate's arena. The suite does not exercise it -- all 18 of its in-turn
+context teardowns were of the isolate whose turn was running -- but nothing
+checks, and any widening of in-turn disposal widens this with it. Closing it
+wants the owner the resolve entry already records, compared against the turn,
+as `hostMemory::ownedByTurn` does for the handles a journal carries.
+
+**A destructor at ring 3 cannot touch host memory.** A `gk_host_alloc` block
+is mapped into no root and `gk_host_slot_free` writes gk's supervisor block,
+so an owned object whose destructor frees host memory or releases a
+`HostSlot` would fault instead of being disposed of. None of the 36 classes
+does today, which the 432,736 in-turn drops and the 2,816 objects the
+existing teardown hands to a turn are the evidence for, but nothing enforces
+it; and the rest of the work moves runtime state *into* host memory, so
+in-turn disposal and host placement pull against each other object by object.
+
+**What it would close is a route, not the capability.** The host goes on
+destroying objects a turn allocated in the shared heap, through their own
+vtables, at a higher rate than the disposals being moved and with nothing to
+hang a deferral on: in the same suite the turns made 175,756 `awaitIo` calls
+and 204,588 `addTask` calls, 11.0 and 12.8 per context against 7.2 host-side
+owned-object disposals, and each builds a `kj::Promise` continuation chain
+and a `TaskSet` task in the shared heap inside the turn which the KJ event
+loop destroys, through `PromiseNode`'s virtual destructor, when the promise
+settles or is cancelled. Those carry no handle, no registration and no
+owning context; the event loop destroys a promise node as part of resolving
+it, at a moment when the isolate may be locked by another thread, so there
+is no turn to defer them to short of changing KJ's event loop. 3,740 owned
+objects also leave the family outright through `IoOwn::operator kj::Own`,
+3,634 of them `api::ReadableStreamSource`, after which the object is an
+ordinary `kj::Own` with no context, no handle and no isolate.
+
+So the conclusion is the one the journaled disposer reached, from the other
+side: disposing of an object that sits in the arena's shared heap is an
+indirect call through guest-writable memory however the host reaches it, and
+taking the host out of one family of those calls leaves the capability
+intact. Not destroying the objects at all -- letting the arena's memory go
+with the isolate -- is not the alternative either, since the destructors
+close descriptors, cancel I/O and release locks, and the arena's lifetime is
+the isolate's rather than the request's. What closes the class is still the
+shared heap leaving the arena. Until then the cheapest honest step is the
+drain, which costs nothing because the lock, the arena and the crossing are
+already there, and which is worth taking when the surrounding placement work
+makes it the last route rather than one of several.
+
 ## What is in H memory
 
 H memory exists: `gk_host_alloc` with `HostOwn<T>` over it, and the host slot
