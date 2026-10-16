@@ -225,8 +225,9 @@ static_assert(RESOLVE_CAPACITY == (size_t{1} << RESOLVE_INDEX_BITS));
 struct FallbackResolveEntry {
   std::atomic<void*> ptr{nullptr};
   std::atomic<uint64_t> gen{0};
+  std::atomic<uint64_t> type{RESOLVE_TYPE_NONE};
 };
-static_assert(sizeof(FallbackResolveEntry) == 16);
+static_assert(sizeof(FallbackResolveEntry) == 24);
 
 // Static and never touched until an entry is written, like gk's table, so the capacity costs
 // nothing per unused page.
@@ -246,7 +247,7 @@ kj::MutexGuarded<FallbackResolveState>& fallbackResolveState() {
 
 // Takes a free entry under a fresh generation and publishes it with `ptr` (null for a
 // reservation). 0 when the table is full. The caller holds the lock.
-ResolveHandle fallbackTake(FallbackResolveState& state, void* ptr) {
+ResolveHandle fallbackTake(FallbackResolveState& state, void* ptr, uint64_t type) {
   uint32_t idx;
   if (state.freeHead != 0) {
     idx = state.freeHead - 1;
@@ -261,29 +262,30 @@ ResolveHandle fallbackTake(FallbackResolveState& state, void* ptr) {
   uint64_t gen = ++state.gen;
   if (gen >> RESOLVE_GEN_BITS) gen = state.gen = 1;
   auto& entry = fallbackResolveEntries[idx];
+  entry.type.store(type, std::memory_order_release);
   entry.ptr.store(ptr, std::memory_order_release);
   entry.gen.store(gen, std::memory_order_release);
   state.live++;
   return (gen << RESOLVE_INDEX_BITS) | idx;
 }
 
-ResolveHandle fallbackRegisterResolve(void* ptr) {
+ResolveHandle fallbackRegisterResolve(void* ptr, uint64_t type) {
   auto lock = fallbackResolveState().lockExclusive();
-  return fallbackTake(*lock, ptr);
+  return fallbackTake(*lock, ptr, type);
 }
 
 uint32_t fallbackReserveResolve(ResolveHandle* handles, uint32_t n) {
   auto lock = fallbackResolveState().lockExclusive();
   uint32_t got = 0;
   while (got < n) {
-    ResolveHandle handle = fallbackTake(*lock, nullptr);
+    ResolveHandle handle = fallbackTake(*lock, nullptr, RESOLVE_TYPE_NONE);
     if (handle == 0) break;
     handles[got++] = handle;
   }
   return got;
 }
 
-bool fallbackCommitResolve(ResolveHandle handle, void* ptr) {
+bool fallbackCommitResolve(ResolveHandle handle, void* ptr, uint64_t type) {
   uint64_t idx = handle & ((uint64_t{1} << RESOLVE_INDEX_BITS) - 1);
   uint64_t gen = handle >> RESOLVE_INDEX_BITS;
   auto lock = fallbackResolveState().lockExclusive();
@@ -298,19 +300,28 @@ bool fallbackCommitResolve(ResolveHandle handle, void* ptr) {
     KJ_LOG(ERROR, "a null pointer cannot be committed to a resolve entry", kj::hex(handle));
     return false;
   }
+  entry.type.store(type, std::memory_order_release);
   entry.ptr.store(ptr, std::memory_order_release);
   return true;
 }
 
-void* fallbackResolve(ResolveHandle handle) {
+void* fallbackResolveTyped(ResolveHandle handle, uint64_t* type) {
+  if (type != nullptr) *type = RESOLVE_TYPE_NONE;
   uint64_t idx = handle & ((uint64_t{1} << RESOLVE_INDEX_BITS) - 1);
   uint64_t gen = handle >> RESOLVE_INDEX_BITS;
   if (gen == 0) return nullptr;
   auto& entry = fallbackResolveEntries[idx];  // the mask bounds idx
   uint64_t g1 = entry.gen.load(std::memory_order_acquire);
   void* ptr = entry.ptr.load(std::memory_order_acquire);
+  uint64_t tag = entry.type.load(std::memory_order_acquire);
   uint64_t g2 = entry.gen.load(std::memory_order_acquire);
-  return (g1 == gen && g2 == gen) ? ptr : nullptr;
+  if (g1 != gen || g2 != gen) return nullptr;
+  if (type != nullptr) *type = tag;
+  return ptr;
+}
+
+void* fallbackResolve(ResolveHandle handle) {
+  return fallbackResolveTyped(handle, nullptr);
 }
 
 void fallbackUnregisterResolve(ResolveHandle handle) {
@@ -340,11 +351,11 @@ void* tableResolve(ResolveHandle handle);
 void clearCompanion(ResolveHandle handle);
 void tableUnregister(ResolveHandle handle);
 
-ResolveHandle tableRegister(void* ptr) {
+ResolveHandle tableRegister(void* ptr, uint64_t type) {
 #ifdef WORKERD_HAS_GUEST_KERNEL
-  if (guestKernelActive()) return gk_resolve_register(ptr);
+  if (guestKernelActive()) return gk_resolve_register(ptr, type);
 #endif
-  return fallbackRegisterResolve(ptr);
+  return fallbackRegisterResolve(ptr, type);
 }
 uint32_t tableReserve(ResolveHandle* handles, uint32_t n) {
 #ifdef WORKERD_HAS_GUEST_KERNEL
@@ -355,17 +366,22 @@ uint32_t tableReserve(ResolveHandle* handles, uint32_t n) {
 #endif
   return fallbackReserveResolve(handles, n);
 }
-bool tableCommit(ResolveHandle handle, void* ptr) {
+bool tableCommit(ResolveHandle handle, void* ptr, uint64_t type) {
 #ifdef WORKERD_HAS_GUEST_KERNEL
-  if (guestKernelActive()) return gk_resolve_commit(handle, ptr) == 0;
+  if (guestKernelActive()) return gk_resolve_commit(handle, ptr, type) == 0;
 #endif
-  return fallbackCommitResolve(handle, ptr);
+  return fallbackCommitResolve(handle, ptr, type);
+}
+// The lookup, with the entry's tag when the caller wants it. The guest kernel returns it beside
+// the pointer, which at ring 3 costs the instruction that otherwise zeroes the register.
+void* tableResolveTyped(ResolveHandle handle, uint64_t* type) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (guestKernelActive()) return gk_resolve_typed(handle, type);
+#endif
+  return fallbackResolveTyped(handle, type);
 }
 void* tableResolve(ResolveHandle handle) {
-#ifdef WORKERD_HAS_GUEST_KERNEL
-  if (guestKernelActive()) return gk_resolve(handle);
-#endif
-  return fallbackResolve(handle);
+  return tableResolveTyped(handle, nullptr);
 }
 // The arena the calling thread is on, as gk records it: the arena a turn on this thread runs
 // under, whatever the turn wrote in its own memory. Null without the guest kernel.
@@ -375,6 +391,17 @@ void* currentArena() {
 #endif
   return nullptr;
 }
+
+#ifdef WORKERD_GK_NEG_RESOLVE_TYPE
+// WORKERD_GK_NEG_RESOLVE_TYPE is a negative-test build, never shipped: a resolve answers with
+// the entry's pointer whatever class the entry holds, as it did before the tag existed, so a
+// handle a turn has written over another of its own isolate's resolves to an object of the
+// wrong type. The guest kernel's ioown-test.sh must then fail, a turn reaching an object of
+// another class through a handle of its own.
+constexpr bool CHECK_RESOLVE_TYPE = false;
+#else
+constexpr bool CHECK_RESOLVE_TYPE = true;
+#endif
 
 #ifdef WORKERD_GK_NEG_RESOLVE_RETIRE
 // WORKERD_GK_NEG_RESOLVE_RETIRE is a negative-test build, never shipped: a handle out of a
@@ -505,6 +532,7 @@ struct TurnJournal {
   ResolveHandle handles[POOL_CAPACITY];            // the turn's copy of the pool, to hand out
   void* ptr[POOL_CAPACITY];                        // the pointer each handed-out position names
   uint64_t aux[POOL_CAPACITY][RESOLVE_AUX_WORDS];  // the words each registration carried
+  uint64_t type[POOL_CAPACITY];                    // the tag each registration carried
   State state[POOL_CAPACITY];
   uint32_t count = 0;                     // positions available (the pool's count, copied)
   uint32_t next = 0;                      // positions handed out
@@ -684,23 +712,23 @@ TurnJournal* activeJournal() {
 
 }  // namespace
 
-ResolveHandle registerResolve(void* ptr) {
+ResolveHandle registerResolve(void* ptr, uint64_t type) {
   uint64_t aux[RESOLVE_AUX_WORDS] = {};
-  return registerResolve(ptr, aux);
+  return registerResolve(ptr, type, aux);
 }
 
-ResolveHandle registerResolveFor(IsolateArena arena, void* ptr) {
+ResolveHandle registerResolveFor(IsolateArena arena, void* ptr, uint64_t type) {
   KJ_REQUIRE(ptr != nullptr);
   KJ_REQUIRE(!inTurn(), "registerResolveFor is host-side; a turn registers from its own pool");
 #ifdef WORKERD_HAS_GUEST_KERNEL
   if (guestKernelActive()) {
-    return gk_resolve_register_for(static_cast<gk_arena*>(arena), ptr);
+    return gk_resolve_register_for(static_cast<gk_arena*>(arena), ptr, type);
   }
 #endif
-  return fallbackRegisterResolve(ptr);
+  return fallbackRegisterResolve(ptr, type);
 }
 
-ResolveHandle registerResolve(void* ptr, const uint64_t (&aux)[RESOLVE_AUX_WORDS]) {
+ResolveHandle registerResolve(void* ptr, uint64_t type, const uint64_t (&aux)[RESOLVE_AUX_WORDS]) {
   KJ_REQUIRE(ptr != nullptr);
   if (TurnJournal* journal = activeJournal()) {
     if (journal->next >= journal->count) {
@@ -712,24 +740,35 @@ ResolveHandle registerResolve(void* ptr, const uint64_t (&aux)[RESOLVE_AUX_WORDS
     }
     uint32_t i = journal->next++;
     journal->ptr[i] = ptr;
+    journal->type[i] = type;
     for (size_t w = 0; w < RESOLVE_AUX_WORDS; w++) journal->aux[i][w] = aux[w];
     journal->state[i] = TurnJournal::USED;
     return journal->handles[i];
   }
-  return tableRegister(ptr);
+  return tableRegister(ptr, type);
 }
 
-void* resolve(ResolveHandle handle) {
+void* resolveOfType(ResolveHandle handle, uint64_t type) {
   if (handle == 0) return nullptr;
-  void* ptr = tableResolve(handle);
-  if (ptr != nullptr) return ptr;
+  uint64_t actual = RESOLVE_TYPE_NONE;
+  void* ptr = tableResolveTyped(handle, &actual);
+  if (ptr != nullptr) {
+    if (type == RESOLVE_TYPE_NONE || actual == type || !CHECK_RESOLVE_TYPE) return ptr;
+    // A live entry of this isolate, holding something else: a handle the caller did not get
+    // from the registration it thinks it is using.
+    return nullptr;
+  }
   // Not in the table: an entry this turn handed out and has not yet committed, if the journal
   // says so. The journal is the turn's own memory, trusted only by the turn itself, and only
-  // until the host commits it.
+  // until the host commits it -- including the tag, so this path's comparison is the turn's
+  // own word against itself, and what it catches is a swap and not a lie.
   if (TurnJournal* journal = activeJournal()) {
     for (uint32_t i = kj::min(journal->next, journal->count); i-- > 0;) {
       if (journal->handles[i] == handle && journal->state[i] == TurnJournal::USED) {
-        return journal->ptr[i];
+        if (type == RESOLVE_TYPE_NONE || journal->type[i] == type || !CHECK_RESOLVE_TYPE) {
+          return journal->ptr[i];
+        }
+        return nullptr;
       }
     }
   }
@@ -742,6 +781,10 @@ void* resolve(ResolveHandle handle) {
 #else
   return nullptr;
 #endif
+}
+
+void* resolve(ResolveHandle handle) {
+  return resolveOfType(handle, RESOLVE_TYPE_NONE);
 }
 
 void unregisterResolve(ResolveHandle handle) {
@@ -862,7 +905,7 @@ ResolveTurn::~ResolveTurn() noexcept(false) {
   for (uint32_t i = 0; i < next; i++) {
     ResolveHandle handle = threadPool.handles[i];
     if (journal.state[i] == TurnJournal::USED) {
-      if (tableCommit(handle, journal.ptr[i])) {
+      if (tableCommit(handle, journal.ptr[i], journal.type[i])) {
         if (hooks.committed == nullptr || hooks.committed(handle, journal.ptr[i], journal.aux[i])) {
           continue;
         }

@@ -101,7 +101,11 @@ isolate's JS turn at guest ring 3.
   dropped -- the holder destroyed inside a turn, which asks the host to
   retire that isolate's entry and unlink the node behind it -- refused by
   the journal flush, leaving the entry naming its object, the node linked
-  and the other isolate dereferencing it afterwards; a turn's write into
+  and the other isolate dereferencing it afterwards; a handle written over
+  another of the *same* isolate's, naming an object of an unrelated class
+  with a virtual of its own, refused at the use -- so the call never reaches
+  the other class's vtable -- and at the drop, leaving that object with its
+  own holder; a turn's write into
   the owned-list node behind a handle -- the links the host's walk follows
   and the disposer it calls, in host memory -- faults at the node, after
   which the context's teardown, host-side, disposes of the object through
@@ -359,7 +363,7 @@ hardware:
   at guest ring 0 would need its data mapped supervisor, where any ring-0
   code the guest reaches could read it: the only thing that runs at ring 0 is
   gk's lookup. The table is `GK_RESOLVE_SLOTS` (2^20) entries of `{pointer,
-  generation, owner}`, registered `GK_PROT_SUPER` -- a weaker class than the
+  generation, owner, chain, type}`, registered `GK_PROT_SUPER` -- a weaker class than the
   `GK_PROT_REFUSE` of host memory and the page tables, since a SUPER page is
   in every root with `U` clear while a REFUSE page is in none, and the right
   one here because the lookup has to run inside the guest; host memory stays
@@ -397,6 +401,34 @@ hardware:
   a gk one: an object registered under an isolate has outlived that isolate.
   The runtime's entries go with the objects that hold them, and the isolate
   outlives every context that registers one, so the count should stay 0. The
+  The owner says whose entry it is; it does not say what the entry is, and
+  a handle rewritten to another live entry of the *same* isolate resolves,
+  after which the caller casts the pointer to the class it expected. So the
+  entry carries a type word as well: a constant the registrant derives from
+  the C++ class (`hostMemory::resolveTypeTag`, an FNV-1a hash of the class's
+  spelling, folded at compile time), which the lookup hands back beside the
+  pointer -- at ring 3 in `RDX`, which costs the instruction that otherwise
+  zeroes it, leaving the trampoline at the 26.8 ns it cost before -- for the
+  caller to
+  compare against the class it was built for. `IoOwn<T>`, `IoPtr<T>` and
+  `ReverseIoOwn<T>` register and resolve under their own `T`, and refuse a
+  handle naming another class at the use and at the drop, where releasing
+  would free an object its real holder still names. The comparison is the
+  caller's rather than the trampoline's because the runtime's text is mapped
+  without `W` and `gk_mapping_change_ok` will not let a forwarded `mprotect`
+  make it writable, so a comparison against a constant the compiler
+  materializes is one a turn with a write primitive can neither rewrite nor
+  edit the expectation of. What it is not proof against is a turn that
+  reaches control flow of its own inside the runtime, which skips it as it
+  would skip any check the runtime makes -- the owner, compared at ring 0,
+  still holds there -- nor against a swap between two live entries of the
+  same class, which no tag can tell apart. The tag is also the turn's own
+  word for a registration it journals, so it binds a turn that swaps handles
+  and not one that lies about its own registration; that one waits on the
+  journal moving out of the shared heap, as the disposer beside it does.
+  Tagging is a hash, so two classes whose spellings collide share a tag,
+  which costs a catch and never a false refusal.
+
   The retire side needs the same question answered and cannot ask it the
   same way. A drop is not a use: a holder's destructor releases its entry
   whatever the resolve answered, and inside a turn that release goes into
@@ -460,9 +492,10 @@ hardware:
   capacity is set from the measured live count: five entries per in-flight
   request parked on a timer, eight per open WebSocket (memory-classes.md,
   Cost), so 2^20 holds about two hundred thousand such requests, in 32 MiB
-  that cost nothing until written (an entry is 32 bytes: three words and the
-  chain word that puts it on its arena's list, whose size also keeps the
-  index a shift and an entry inside one cache line). The test registers an entry and resolves it
+  that cost nothing until written (an entry is 64 bytes: the pointer, the
+  generation, the owner, the chain word that puts it on its arena's list and
+  the type word, with the shift the trampoline indexes by and one cache line
+  per entry deciding the rest). The test registers an entry and resolves it
   from ring 3 on both kinds of stack, from ring 0 and from the host; feeds
   the lookup a zero handle, an index at and past capacity, generations never
   issued, a slot never taken, the pointer itself, a heap address, a
@@ -477,9 +510,14 @@ hardware:
   without returning to gk): a kept sub-run is one whose counter moved by
   exactly the one exit that ends the turn, so its 8000 resolves provably
   stayed inside the guest, and the sub-runs that moved by more were host
-  timer interrupts (`irq_exits`) and are discarded. **26.8 ns per resolve**
+  timer interrupts (`irq_exits`) and are discarded. **27.7 ns per resolve**
   on the test machine, the median over kept sub-runs with the empty turn's
-  cost subtracted, against 6.4 us for a hostcall: 240 times cheaper. The
+  cost subtracted, against 6.4 us for a hostcall: 230 times cheaper. What is
+  timed is the resolve as the runtime makes it, with the entry's type word
+  taken back and compared as well; the trampoline alone, timed with that
+  comparison removed, is 26.8 ns, so the type costs 0.9 ns, which is the
+  caller's own store and compare and not the trampoline, whose instruction
+  count is unchanged. The
   owner comparison is 8.1 ns of that, and most of it is not the comparison
   itself: the same build without the `MOV` from `CR3` measures 25.3 ns and
   without the owner word 20.4 ns, while reorderings of the same semantics
@@ -500,7 +538,10 @@ hardware:
   the recycled slot, the owner check (`GK_NEG_RESOLVE_OWNER`), so it
   fails on all six off-diagonal resolves, and the retirement at destroy
   (`GK_NEG_RESOLVE_ORPHAN`), so the stale handle resolves to the dead
-  isolate's object from the next arena's ring 3 and host-side. It also reserves three entries, sees them resolve to nothing from
+  isolate's object from the next arena's ring 3 and host-side. It also
+  registers two entries under types of its own and sees each answer with its
+  own word, host-side and from ring 3, with a reserved entry carrying none
+  until it is committed and a retired one none again. It also reserves three entries, sees them resolve to nothing from
   ring 3 until committed, commits one and sees it take once, and sees a
   commit refused for a committed, retired or never-issued handle and for a
   NULL, supervisor, refused or arena pointer, from commit and from register
@@ -510,9 +551,10 @@ hardware:
   pointer behind a live handle it holds, which the lookup makes safe to keep
   in guest memory but does not make safe to reach from there -- the object's
   own placement does that -- and a handle rewritten to another live entry of
-  the same isolate names that entry: the owner is the isolate, not the
-  object, so the table tells one isolate's handles from another's but not
-  one of an isolate's objects from another of its own. That narrower
+  the same isolate and the same class names that entry: the owner is the
+  isolate and the type word is the class, so the table tells one isolate's
+  handles from another's, and one class's from another's, but not one of an
+  isolate's objects of a class from another of the same class. That narrower
   residual is the one the arena and host slot facilities still carry whole
   (see `memory-classes.md`, Cost, for what a turn's dereference count
   implies).
@@ -852,7 +894,7 @@ exit plus the exchange-frame copies and the handler). The switch is roughly
 two orders of magnitude cheaper than an exit, so batching the dominant
 syscalls is what decides the overall cost, and a hostcall is for an operation
 rare enough to pay for an exit each time. A ring-0 resolve (`gk_resolve`),
-which stays inside the guest, costs about 27 ns on the Zen 5 test machine,
+which stays inside the guest, costs about 28 ns on the Zen 5 test machine,
 so a crossing a turn makes on every dereference belongs on that path.
 
 ## Limitations (remaining work)

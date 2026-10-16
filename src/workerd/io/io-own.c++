@@ -307,15 +307,15 @@ TakenQueue takeQueue(CrossThreadQueue& queue) {
 }  // namespace
 
 hostMemory::ResolveHandle OwnedObjectList::add(
-    void* object, void* disposal, const kj::Disposer& disposer) {
+    void* object, uint64_t type, void* disposal, const kj::Disposer& disposer) {
   KJ_REQUIRE(context != 0, "the owned list has no context");
   uint64_t aux[hostMemory::RESOLVE_AUX_WORDS] = {
     NODE, reinterpret_cast<uintptr_t>(&disposer), context, reinterpret_cast<uintptr_t>(disposal)};
   hostMemory::ResolveHandle result;
   if (hostMemory::inTurn()) {
-    result = hostMemory::registerResolve(object, aux);
+    result = hostMemory::registerResolve(object, type, aux);
   } else {
-    result = hostMemory::registerResolve(object);
+    result = hostMemory::registerResolve(object, type);
     if (result != 0 && !committed(result, object, aux)) {
       hostMemory::unregisterResolve(result);
       result = 0;
@@ -463,19 +463,42 @@ void OwnedObjectList::releaseInTurn(hostMemory::ResolveHandle handle) {
   hostMemory::unregisterResolve(handle);
 }
 
-void OwnedObjectList::drop(hostMemory::ResolveHandle handle, const OwnedDisposal& disposal) {
+namespace {
+// Whether `handle` names something other than an object of class `type`: a live entry of this
+// isolate holding another class, which is a holder's handle written over another of its own.
+// A handle that names nothing is not this case; the operation refuses it in its own terms.
+bool wrongType(hostMemory::ResolveHandle handle, uint64_t type) {
+  if (type == hostMemory::RESOLVE_TYPE_NONE) return false;
+  if (hostMemory::resolveOfType(handle, type) != nullptr) return false;
+  return hostMemory::resolve(handle) != nullptr;
+}
+}  // namespace
+
+void OwnedObjectList::drop(
+    hostMemory::ResolveHandle handle, uint64_t type, const OwnedDisposal& disposal) {
   if (hostMemory::inTurn()) {
     // Inside the turn, where the list cannot be reached: dispose of the object here and release
     // the entry through the journal; the host frees the node after the turn.
-    void* object = hostMemory::resolve(handle);
+    void* object = hostMemory::resolveOfType(handle, type);
+    if (object == nullptr && hostMemory::resolve(handle) != nullptr) {
+      KJ_LOG(ERROR, "an IoOwn handle names an object of another class; nothing is released",
+          kj::hex(handle));
+      return;
+    }
     releaseInTurn(handle);
     if (object != nullptr) disposal.dispose(object, *disposal.disposer);
   } else {
-    release(handle, DestroyOwnedObject::YES);
+    release(handle, type, DestroyOwnedObject::YES);
   }
 }
 
-void OwnedObjectList::release(hostMemory::ResolveHandle handle, DestroyOwnedObject destroy) {
+void OwnedObjectList::release(
+    hostMemory::ResolveHandle handle, uint64_t type, DestroyOwnedObject destroy) {
+  if (wrongType(handle, type)) {
+    KJ_LOG(ERROR, "an IoOwn handle names an object of another class; nothing is released",
+        kj::hex(handle));
+    return;
+  }
   OwnedNode* node = nodeOf(handle);
   if (node == nullptr) {
     KJ_LOG(ERROR, "IoOwn handle does not name a live owned object; nothing is released",
@@ -487,7 +510,12 @@ void OwnedObjectList::release(hostMemory::ResolveHandle handle, DestroyOwnedObje
   if (destroy) node->disposer->dispose(node->disposal);
 }
 
-const kj::Disposer& OwnedObjectList::take(hostMemory::ResolveHandle handle) {
+const kj::Disposer& OwnedObjectList::take(hostMemory::ResolveHandle handle, uint64_t type) {
+  if (wrongType(handle, type)) {
+    KJ_LOG(ERROR, "an IoOwn handle names an object of another class; nothing is taken",
+        kj::hex(handle));
+    KJ_FAIL_REQUIRE("IoOwn handle names an object of another class", kj::hex(handle));
+  }
   OwnedNode* node = nodeOf(handle);
   if (node == nullptr) {
     KJ_LOG(
@@ -684,8 +712,9 @@ OwnedObjectList::NodeForTest OwnedObjectList::nodeForTest(hostMemory::ResolveHan
   return {node, reinterpret_cast<void**>(&node->prev), &node->disposer};
 }
 
-void* DeleteQueue::resolveOwned(hostMemory::ResolveHandle handle, const std::type_info& type) {
-  void* object = hostMemory::resolve(handle);
+void* DeleteQueue::resolveOwned(
+    hostMemory::ResolveHandle handle, uint64_t tag, const std::type_info& type) {
+  void* object = hostMemory::resolveOfType(handle, tag);
   if (object == nullptr) {
     KJ_LOG(ERROR, "IoOwn handle does not name a live owned object; the use is refused",
         kj::hex(handle), type.name());
@@ -695,11 +724,11 @@ void* DeleteQueue::resolveOwned(hostMemory::ResolveHandle handle, const std::typ
 }
 
 void DeleteQueue::scheduleDeletion(
-    hostMemory::ResolveHandle handle, const OwnedDisposal& disposal) const {
+    hostMemory::ResolveHandle handle, uint64_t type, const OwnedDisposal& disposal) const {
   if (isCurrentIoContext()) {
     // Deletion from the owning context on its own thread. No need to enqueue.
     kj::AllowAsyncDestructorsScope scope;
-    OwnedObjectList::drop(handle, disposal);
+    OwnedObjectList::drop(handle, type, disposal);
     return;
   }
   if (hostMemory::inTurn()) {
@@ -790,6 +819,10 @@ void ReverseIoOwnValidity::checkValid() const {
       isValid(), Error, "Couldn't complete operation because the execution context has ended.");
 }
 
+// A context's own entry names the owner, which is not an owned object: tagging it keeps a
+// holder's typed resolve from reaching it, beside the companion's kind, which already does.
+constexpr uint64_t CONTEXT_TYPE = hostMemory::resolveTypeTag<DeleteQueueOwner>();
+
 DeleteQueueOwner::DeleteQueueOwner(hostMemory::IsolateArena arena) {
   // The entry's pointer is this owner, in the context, which nothing dereferences through the
   // table; what the entry is for is its companion, the record in host memory. Registered inside
@@ -802,9 +835,9 @@ DeleteQueueOwner::DeleteQueueOwner(hostMemory::IsolateArena arena) {
   hostMemory::ResolveHandle handle;
   if (hostMemory::inTurn()) {
     uint64_t aux[hostMemory::RESOLVE_AUX_WORDS] = {CONTEXT, 0, 0, 0};
-    handle = hostMemory::registerResolve(this, aux);
+    handle = hostMemory::registerResolve(this, CONTEXT_TYPE, aux);
   } else {
-    handle = hostMemory::registerResolveFor(arena, this);
+    handle = hostMemory::registerResolveFor(arena, this, CONTEXT_TYPE);
     if (handle != 0 && !hostMemory::setResolveCompanion(handle, {CONTEXT, allocateRecord()})) {
       hostMemory::unregisterResolve(handle);
       handle = 0;
@@ -920,8 +953,11 @@ void DeleteQueueOwner::drainDeletions() {
   }
   // Released with no lock held: disposing of an object may queue more, for this context or
   // another.
-  consumeChain(
-      chain, [](uint64_t handle) { OwnedObjectList::release(handle, DestroyOwnedObject::YES); });
+  consumeChain(chain, [](uint64_t handle) {
+    // From the context's own queue, which queueDeletionHost checked against the list: the
+    // class is the node's business from here, not a holder's claim.
+    OwnedObjectList::release(handle, hostMemory::RESOLVE_TYPE_NONE, DestroyOwnedObject::YES);
+  });
 }
 
 kj::Vector<kj::Own<Action>> DeleteQueueOwner::takeActions() {

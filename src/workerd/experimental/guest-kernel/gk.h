@@ -486,7 +486,8 @@ long gk_hostcall(unsigned idx);
 // to ring 3 with the pointer, or 0, in RAX. The whole path is a few dozen
 // instructions of gk's own handler text, touching no stack and no memory but
 // the table, and runs at guest ring 0 with the VM never exited: the round
-// trip is about 27 ns on the test machine, against 6.4 us for a hostcall
+// trip is about 27 ns on the test machine, and 28 with the caller comparing
+// the type word it gets back, against 6.4 us for a hostcall
 // (measured by resolve_check in gk_test.c, which also proves the no-exit
 // claim from KVM's own per-vCPU exit counter). The operation is fixed, not a
 // handler the embedder registers: embedder code run at guest ring 0 would
@@ -588,6 +589,37 @@ long gk_hostcall(unsigned idx);
 // is left loud rather than fatal because the entries are gone by then and the
 // process can still be read for what leaked.
 //
+// The type word. The owner says whose entry it is; it does not say what the
+// entry is. A handle rewritten to another live entry of the same isolate
+// resolves, and the caller casts the pointer to the class it expected, so a
+// turn that writes one of its own handles over another of its own gets an
+// object of the wrong class: a call through the wrong vtable, and a drop that
+// frees an object another holder still names. The entry therefore carries a
+// word the registrant chooses -- in the runtime, a constant derived from the
+// C++ type (hostMemory::resolveTypeTag) -- which the lookup hands back
+// beside the pointer, at ring 3 in RDX and host-side through
+// gk_resolve_typed's out-parameter, for the caller to compare against the
+// type it expected. gk never interprets it; 0 is "none" by convention
+// between registrant and resolver.
+//
+// Why the comparison is the caller's and not the trampoline's. The guest's
+// capability here is an arbitrary write within the memory ring 3 can reach,
+// which is the arena and the runtime's writable image -- not the text, which
+// is mapped without W and which gk_mapping_change_ok will not let a
+// forwarded mprotect make writable, nor the table, which is supervisor
+// memory. A comparison compiled into the runtime, against a constant the
+// compiler materializes rather than a global, is therefore one the guest can
+// neither rewrite nor edit the expectation of, and it costs the trampoline
+// the one instruction that otherwise zeroes RDX. What it is not proof
+// against is a turn that achieves control flow of its own inside the
+// runtime, since the C++ stack is memory ring 3 can write: such a turn skips
+// the comparison, as it would skip any comparison the runtime makes, while
+// the owner comparison at ring 0 still holds. The type word raises a handle
+// swap from eight bytes to code execution; it does not make the runtime's
+// own checks unskippable. Moving the comparison into the trampoline, with
+// the expected type in a register, is a two-instruction change if that is
+// ever wanted.
+//
 // The retire side needs the same question answered and cannot ask it the
 // same way. A handle a turn hands to the host -- in a journal the turn
 // writes, in an object of its own the host later reads -- is acted on by host
@@ -624,17 +656,20 @@ long gk_hostcall(unsigned idx);
 // many of those at once -- measured at five per in-flight request parked on
 // a timer or on a subrequest, so that one worker with a few thousand such
 // requests outgrows a 2^16-entry table (see memory-classes.md, Cost). 2^20
-// entries hold about two hundred thousand of them. An entry is 32 bytes --
-// the three words plus the chain word that puts the entry on its arena's
-// list, whose size also keeps the index a shift and an entry inside one cache
-// line -- so the table's 32 MiB are static and untouched
+// entries hold about two hundred thousand of them. An entry is 64 bytes --
+// the pointer, the generation, the owner, the chain word that puts the entry
+// on its arena's list and the type word, with the shift the trampoline
+// indexes by and one cache line per entry deciding the rest -- so the table's
+// 64 MiB are static and untouched
 // until an entry is written: the capacity costs page-table entries at init
-// (8192 of them, in the base root every arena shares) and nothing per unused
-// page; the free list is threaded through the free entries themselves, so the
+// (16384 of them, in the base root every arena shares) and nothing per unused
+// page, while an entry in use costs 64 resident bytes, so the measured
+// working set of 200000 live entries is 12.8 MiB; the free list is threaded through the free entries themselves, so the
 // control block does not grow with it. Exhaustion is a registration refused with 0, which the
 // runtime turns into a failed request, never a fault.
 //
-// gk_resolve_register places `ptr` in a free slot and returns its handle, or
+// gk_resolve_register places `ptr` in a free slot under the type word `type`
+// and returns its handle, or
 // 0 when the table is full (exhaustion is a refusal, never fatal), for a
 // pointer the table will not hold (below), or before gk_init has succeeded;
 // 0 is never a valid handle. The entry is owned by the root the calling
@@ -662,9 +697,9 @@ long gk_hostcall(unsigned idx);
 // them after it: gk_resolve_reserve takes up to n free entries, each under a
 // fresh generation and with no pointer, and returns their handles (fewer
 // than n, down to 0, when the table runs out); a reserved handle resolves to
-// nothing until gk_resolve_commit places a pointer in it, after which it
-// resolves as a registered one, and gk_resolve_unregister retires it either
-// way. The runtime hands reserved handles out inside the turn and keeps the
+// nothing until gk_resolve_commit places a pointer and a type word in it,
+// after which it resolves as a registered one, and gk_resolve_unregister
+// retires it either way. The runtime hands reserved handles out inside the turn and keeps the
 // pointers in a journal of its own, and the host commits them from that
 // journal once the turn has returned (util/host-memory.h, ResolveTurn). A
 // commit is refused, with a report and -EINVAL, for a handle that does not
@@ -702,10 +737,10 @@ long gk_hostcall(unsigned idx);
 #define GK_RESOLVE_INDEX_BITS 20
 #define GK_RESOLVE_SLOTS (1 << GK_RESOLVE_INDEX_BITS)
 typedef uint64_t gk_resolve_handle;
-gk_resolve_handle gk_resolve_register(void *ptr);
-gk_resolve_handle gk_resolve_register_for(gk_arena *a, void *ptr);
+gk_resolve_handle gk_resolve_register(void *ptr, uint64_t type);
+gk_resolve_handle gk_resolve_register_for(gk_arena *a, void *ptr, uint64_t type);
 int gk_resolve_reserve(gk_resolve_handle *handles, int n);
-int gk_resolve_commit(gk_resolve_handle handle, void *ptr);
+int gk_resolve_commit(gk_resolve_handle handle, void *ptr, uint64_t type);
 int gk_resolve_unregister(gk_resolve_handle handle);
 // Whether `handle` names a live committed entry that arena `a` owns (NULL
 // names the base root), which is the owner check for host code acting on a
@@ -717,6 +752,9 @@ int gk_resolve_owned_by(gk_arena *a, gk_resolve_handle handle);
 // for a handle that is not a live entry of `a`.
 int gk_resolve_unregister_for(gk_arena *a, gk_resolve_handle handle);
 void *gk_resolve(gk_resolve_handle handle);
+// gk_resolve, and the entry's type word through `type` when it is not NULL;
+// 0 there for a lookup that resolved to nothing.
+void *gk_resolve_typed(gk_resolve_handle handle, uint64_t *type);
 
 // Signal fields: 4-byte words inside an arena that the host writes from a
 // signal handler, found through a table in gk's supervisor memory rather than

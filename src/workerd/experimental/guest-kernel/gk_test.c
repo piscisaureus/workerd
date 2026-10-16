@@ -2403,6 +2403,7 @@ static int hostcall_check(void) {
 // ring-0 path is asm.
 
 enum { RS_N = 8000, RS_SUBRUNS = 64, RS_BAD = 13 };
+#define RS_BENCH_TYPE 0x5e5e5e5e5e5e5e5eULL
 
 struct rs_probe {
   gk_resolve_handle h, h2;   // a live handle, and the recycled slot's new one
@@ -2422,13 +2423,28 @@ static long rs_guest(void *arg) {
   return 0;
 }
 
+// Runs in the guest (ring 3) and on the host: resolves two handles with their
+// type words, which the trampoline returns beside the pointer.
+struct rs_type { gk_resolve_handle h[2]; void *p[2]; uint64_t t[2]; };
+static long rs_resolve_types(void *arg) {
+  struct rs_type *r = arg;
+  for (int i = 0; i < 2; i++) r->p[i] = gk_resolve_typed(r->h[i], &r->t[i]);
+  return 0;
+}
+
 // Runs in the guest (ring 3): RS_N resolves of one live handle, counting the
 // ones that answered with the registered pointer.
-struct rs_bench { gk_resolve_handle h; void *want; };
+// The resolve as the runtime makes it: the pointer and the entry's type word
+// back from the trampoline, both compared (hostMemory::resolveOfType), with
+// the type in a stack slot as it is for a caller in another object.
+struct rs_bench { gk_resolve_handle h; void *want; uint64_t type; };
 static long rs_bench(void *arg) {
   struct rs_bench *b = arg;
   long acc = 0;
-  for (int i = 0; i < RS_N; i++) acc += gk_resolve(b->h) == b->want;
+  for (int i = 0; i < RS_N; i++) {
+    uint64_t type = 0;
+    acc += gk_resolve_typed(b->h, &type) == b->want && type == b->type;
+  }
   return acc;
 }
 static long rs_empty(void *arg) { (void)arg; return 0; }
@@ -2452,8 +2468,8 @@ static int resolve_check(void) {
   gk_stats s0, s1, s2, s3, s4, s5;
   gk_get_stats(&s0);
   static int obj, obj2;
-  int reg_bad = gk_resolve_register(NULL) == 0;
-  gk_resolve_handle h = gk_resolve_register(&obj);
+  int reg_bad = gk_resolve_register(NULL, 0) == 0;
+  gk_resolve_handle h = gk_resolve_register(&obj, RS_BENCH_TYPE);
   if (!h) { printf("ring-0 resolve: gk_resolve_register failed [FAIL]\n"); return 0; }
   gk_get_stats(&s1);
   int resolves = gk_resolve(h) == &obj && s1.resolve_entries == s0.resolve_entries + 1;
@@ -2528,7 +2544,7 @@ static int resolve_check(void) {
   gk_stats rs_st;
   gk_get_stats(&rs_st);
   long e_allow = rs_st.resident_vcpus > 0 ? 2 : 0;
-  struct rs_bench b = {h, &obj};
+  struct rs_bench b = {h, &obj, RS_BENCH_TYPE};
   gk_run_here_user(rs_bench, &b);  // warm up: pages, the vCPU's TLB
   long e_empty = -1;
   double t_empty = 0;
@@ -2576,7 +2592,7 @@ static int resolve_check(void) {
   for (int i = 0; i < RS_BAD; i++) if (gk_resolve_unregister(bad[i]) != -EINVAL) freed = 0;
   gk_get_stats(&s3);
   freed = freed && s3.resolve_entries == s0.resolve_entries;
-  gk_resolve_handle h2 = gk_resolve_register(&obj2);
+  gk_resolve_handle h2 = gk_resolve_register(&obj2, 0);
   p->h2 = h2;
   memset(p->r_bad, 0x11, sizeof p->r_bad); p->r_h = &obj; p->r_h2 = NULL;
   long rr = gk_run_user(rs_guest, p);
@@ -2596,11 +2612,11 @@ static int resolve_check(void) {
   double t_fill = now_ns();
   for (; n <= GK_RESOLVE_SLOTS; n++) {
     want[n] = &objs[n];
-    all[n] = gk_resolve_register(want[n]);
+    all[n] = gk_resolve_register(want[n], 0);
     if (!all[n]) break;
   }
   double ns_register = (now_ns() - t_fill) / (n ? n : 1);
-  gk_resolve_handle over = n <= GK_RESOLVE_SLOTS ? all[n] : gk_resolve_register(&objs[0]);
+  gk_resolve_handle over = n <= GK_RESOLVE_SLOTS ? all[n] : gk_resolve_register(&objs[0], 0);
   gk_get_stats(&s4);
   struct rs_all ra = {all, want, n};
   long mismatched = gk_run_user(rs_resolve_all, &ra);
@@ -2613,7 +2629,7 @@ static int resolve_check(void) {
                     s4.resolve_entries == GK_RESOLVE_SLOTS && mismatched == 0 &&
                     s5.resolve_entries == s3.resolve_entries && gk_resolve(all[0]) == NULL &&
                     gk_resolve(all[n - 1]) == NULL;
-  gk_resolve_handle h3 = gk_resolve_register(&obj);
+  gk_resolve_handle h3 = gk_resolve_register(&obj, 0);
   int fresh = h3 != 0 && (h3 >> 20) > (all[n - 1] >> 20) && gk_resolve(h3) == &obj;
   gk_resolve_unregister(h3);
 
@@ -2631,7 +2647,7 @@ static int resolve_check(void) {
     int m = 0;
     double t0 = now_ns();
     for (; m <= GK_RESOLVE_SLOTS; m++) {
-      all[m] = gk_resolve_register(&objs[m]);
+      all[m] = gk_resolve_register(&objs[m], 0);
       if (!all[m]) break;
     }
     ns_register_arena = (now_ns() - t0) / (m ? m : 1);
@@ -2662,20 +2678,20 @@ static int resolve_check(void) {
   gk_debug_control_addrs(&super_addr, &refuse_addr);
   gk_arena *rarena = gk_arena_create(1UL << 20);
   void *arena_ptr = rarena ? gk_arena_base(rarena) : NULL;
-  int commit_ok = gk_resolve_commit(rsv[0], &objs3[0]) == 0 && gk_resolve(rsv[0]) == &objs3[0] &&
-                  gk_resolve_commit(rsv[0], &objs3[1]) == -EINVAL &&   // committed once
+  int commit_ok = gk_resolve_commit(rsv[0], &objs3[0], 0) == 0 && gk_resolve(rsv[0]) == &objs3[0] &&
+                  gk_resolve_commit(rsv[0], &objs3[1], 0) == -EINVAL &&   // committed once
                   gk_resolve(rsv[0]) == &objs3[0] &&
-                  gk_resolve_commit(rsv[1], NULL) == -EINVAL &&
-                  gk_resolve_commit(rsv[1], (void *)super_addr) == -EINVAL &&
-                  gk_resolve_commit(rsv[1], (void *)refuse_addr) == -EINVAL &&
-                  (!arena_ptr || gk_resolve_commit(rsv[1], arena_ptr) == -EINVAL) &&
+                  gk_resolve_commit(rsv[1], NULL, 0) == -EINVAL &&
+                  gk_resolve_commit(rsv[1], (void *)super_addr, 0) == -EINVAL &&
+                  gk_resolve_commit(rsv[1], (void *)refuse_addr, 0) == -EINVAL &&
+                  (!arena_ptr || gk_resolve_commit(rsv[1], arena_ptr, 0) == -EINVAL) &&
                   gk_resolve(rsv[1]) == NULL &&                          // still reserved
-                  gk_resolve_commit(h3, &objs3[2]) == -EINVAL &&         // retired
-                  gk_resolve_commit(bad[3], &objs3[2]) == -EINVAL &&     // never issued
-                  gk_resolve_register((void *)super_addr) == 0 &&
-                  gk_resolve_register((void *)refuse_addr) == 0 &&
-                  (!arena_ptr || gk_resolve_register(arena_ptr) == 0) &&
-                  gk_resolve_commit(rsv[1], &objs3[1]) == 0 && gk_resolve(rsv[1]) == &objs3[1];
+                  gk_resolve_commit(h3, &objs3[2], 0) == -EINVAL &&         // retired
+                  gk_resolve_commit(bad[3], &objs3[2], 0) == -EINVAL &&     // never issued
+                  gk_resolve_register((void *)super_addr, 0) == 0 &&
+                  gk_resolve_register((void *)refuse_addr, 0) == 0 &&
+                  (!arena_ptr || gk_resolve_register(arena_ptr, 0) == 0) &&
+                  gk_resolve_commit(rsv[1], &objs3[1], 0) == 0 && gk_resolve(rsv[1]) == &objs3[1];
   struct rs_all rrb = {rsv, (void *[]){&objs3[0], &objs3[1], NULL}, 3};
   long committed_wrong = gk_run_user(rs_resolve_all, &rrb);  // ring 3 sees the two commits
   for (int i = 0; i < 3; i++) gk_resolve_unregister(rsv[i]);
@@ -2699,11 +2715,11 @@ static int resolve_check(void) {
   int owner_ok = OA != NULL && OB != NULL;
   if (owner_ok) {
     gk_arena_enter(OA);
-    ha = gk_resolve_register(&oa);
+    ha = gk_resolve_register(&oa, 0);
     gk_arena_enter(OB);
-    hb = gk_resolve_register(&ob);
+    hb = gk_resolve_register(&ob, 0);
     gk_arena_enter(NULL);
-    hbase = gk_resolve_register(&obase);
+    hbase = gk_resolve_register(&obase, 0);
     gk_resolve_handle three[3] = {ha, hb, hbase};
     void *in_a[3] = {&oa, NULL, NULL};
     void *in_b[3] = {NULL, &ob, NULL};
@@ -2750,9 +2766,9 @@ static int resolve_check(void) {
   int recycle_ok = RA != NULL;
   if (RA) {
     gk_arena_enter(RA);
-    hstale = gk_resolve_register(&oc);
+    hstale = gk_resolve_register(&oc, 0);
     gk_arena_enter(NULL);
-    hstale_for = gk_resolve_register_for(RA, &oc2);
+    hstale_for = gk_resolve_register_for(RA, &oc2, 0);
     root_a = gk_debug_arena_root(RA);
     gk_get_stats(&sd0);
     gk_arena_destroy(RA);  // the entry is left registered on purpose
@@ -2783,17 +2799,19 @@ static int resolve_check(void) {
   // on the base root and one reserved, asked about from both arenas and from
   // no arena, and a retire of XA's entry attempted as XB's.
   static int ox, oxb;
+  static int ta, tb;
+  enum { RS_TYPE_A = 0xA10000A1, RS_TYPE_B = 0xB20000B2 };
   gk_arena *XA = gk_arena_create(1UL << 20), *XB = gk_arena_create(1UL << 20);
   gk_resolve_handle hx = 0, hxb = 0, xrsv[1] = {0};
   gk_arena *cur_in = NULL, *cur_out = NULL;
   int owned_ok = XA != NULL && XB != NULL;
   if (owned_ok) {
     gk_arena_enter(XA);
-    hx = gk_resolve_register(&ox);
+    hx = gk_resolve_register(&ox, 0);
     cur_in = gk_arena_current();
     gk_arena_enter(NULL);
     cur_out = gk_arena_current();
-    hxb = gk_resolve_register(&oxb);  // the base root's
+    hxb = gk_resolve_register(&oxb, 0);  // the base root's
     gk_resolve_reserve(xrsv, 1);
     owned_ok = hx != 0 && hxb != 0 && xrsv[0] != 0 && cur_in == XA && cur_out == NULL &&
                gk_resolve_owned_by(XA, hx) == 1 &&      // its own arena
@@ -2814,13 +2832,45 @@ static int resolve_check(void) {
   if (XA) gk_arena_destroy(XA);
   if (XB) gk_arena_destroy(XB);
 
+  // The type word. The owner says whose entry it is and nothing about what
+  // it is, so an entry carries a word the registrant chooses and the lookup
+  // hands back beside the pointer, for the caller to compare against what it
+  // expected (see the type word in gk.h). Two entries of different types, on
+  // the base root, resolved from the host and from ring 3: each answers with
+  // its own word, a retired handle and a reserved one answer 0, and a commit
+  // sets the word the committer gives.
+  gk_resolve_handle hta = gk_resolve_register(&ta, RS_TYPE_A);
+  gk_resolve_handle htb = gk_resolve_register(&tb, RS_TYPE_B);
+  gk_resolve_handle trsv[1] = {0};
+  gk_resolve_reserve(trsv, 1);
+  uint64_t t1 = ~0ULL, t2 = ~0ULL, t3 = ~0ULL, t4 = ~0ULL;
+  int type_ok = hta != 0 && htb != 0 && trsv[0] != 0 &&
+                gk_resolve_typed(hta, &t1) == &ta && t1 == RS_TYPE_A &&
+                gk_resolve_typed(htb, &t2) == &tb && t2 == RS_TYPE_B &&
+                gk_resolve_typed(trsv[0], &t3) == NULL && t3 == 0 &&  // reserved: no type yet
+                gk_resolve_commit(trsv[0], &objs3[0], RS_TYPE_B) == 0 &&
+                gk_resolve_typed(trsv[0], &t3) == &objs3[0] && t3 == RS_TYPE_B;
+  // From ring 3, where the trampoline returns the word in RDX.
+  static struct rs_type guest_types;
+  guest_types.h[0] = hta;
+  guest_types.h[1] = htb;
+  gk_arena_enter(NULL);
+  gk_run_here_user(rs_resolve_types, &guest_types);
+  type_ok = type_ok && guest_types.p[0] == &ta && guest_types.t[0] == RS_TYPE_A &&
+            guest_types.p[1] == &tb && guest_types.t[1] == RS_TYPE_B;
+  // Retired: the handle resolves to nothing and carries no type.
+  gk_resolve_unregister(hta);
+  type_ok = type_ok && gk_resolve_typed(hta, &t4) == NULL && t4 == 0;
+  gk_resolve_unregister(htb);
+  gk_resolve_unregister(trsv[0]);
+
   if (rarena) gk_arena_destroy(rarena);
   long cpl = gk_run_user(user_cpl, NULL);  // the process survived the faults above
 
   int ok = reg_bad && resolves && user_ok && here_ok && ring0_ok && host_ok && garbage_ok &&
            walled && bench_ok && freed && recycled && capacity_ok && fresh && reserve_ok &&
            commit_ok && committed_wrong == 0 && reserve_freed && owner_ok && recycle_ok &&
-           owned_ok && cost_ok && cpl == 3;
+           owned_ok && type_ok && cost_ok && cpl == 3;
   printf("ring-0 resolve: NULL refused %s; handle %#llx -> %p (host %s); ring 3 %s, caller's "
          "stack %s, ring 0 %s, host %s; %d garbage handles and 0 -> nothing at every ring (%s, "
          "caller's memory untouched %s); ring-3 read of the table -> %s (fault %#lx == %#lx), "
@@ -2839,7 +2889,8 @@ static int resolve_check(void) {
          "arena %s, stale handles resolved %ld times from its ring 3, host-side %s) %s; %.0f ns per register and %.0f ns per retire on the base root, "
          "%.0f and %.0f in an arena %s; an entry is owned by its own arena and by no other, "
          "and a retire for another arena, for the base root or of a base-root entry is refused "
-         "%s; CPL %ld [%s]\n",
+         "%s; an entry's type word comes back with the pointer, host-side and at ring 3, and "
+         "a reserved, committed or retired entry carries what it should %s; CPL %ld [%s]\n",
          reg_bad ? "yes" : "NO", (unsigned long long)h, (void *)&obj, resolves ? "ok" : "BROKEN",
          user_ok ? "ok" : "BROKEN", here_ok ? "ok" : "BROKEN", ring0_ok ? "ok" : "BROKEN",
          host_ok ? "ok" : "BROKEN", RS_BAD, garbage_ok && user_ok && host_ok ? "yes" : "NO",
@@ -2856,8 +2907,8 @@ static int resolve_check(void) {
          gk_resolve(hstale) == NULL && gk_resolve(hstale_for) == NULL ? "nothing" : "AN OBJECT",
          recycle_ok ? "yes" : "NO",
          ns_register, ns_unregister, ns_register_arena,
-         ns_unregister_arena, cost_ok ? "ok" : "BROKEN", owned_ok ? "yes" : "NO", cpl,
-         ok ? "OK" : "FAIL");
+         ns_unregister_arena, cost_ok ? "ok" : "BROKEN", owned_ok ? "yes" : "NO",
+         type_ok ? "yes" : "NO", cpl, ok ? "OK" : "FAIL");
   free(p);
   free(heap);
   munmap(none, 4096);

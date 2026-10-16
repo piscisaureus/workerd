@@ -73,6 +73,10 @@ gk_user_syscall_resume:
 // one's. CR3 is read into RSI, which is already a scratch register the exit
 // clears, so the root never reaches ring 3 and no further register is used.
 //
+// RDX carries the entry's type word back to ring 3 (see the type word in
+// gk.h), which costs the instruction that otherwise zeroes it; a refused
+// lookup leaves 0 there, as it does in RAX.
+//
 // GK_NEG_RESOLVE (a negative-test build, never shipped) removes the
 // generation check, so a handle to a freed or recycled entry resolves to
 // whatever the slot holds; GK_NEG_RESOLVE_OWNER removes the owner check, so
@@ -85,7 +89,7 @@ gk_resolve_tramp:
     shrq $20, %rax                      /* rax = the handle's generation */
     jz 1f
     andl $0xfffff, %edi                 /* edi = the handle's index, below the table's capacity */
-    shlq $5, %rdi
+    shlq $6, %rdi
     leaq gk_resolve_table(%rip), %rsi
     addq %rsi, %rdi                     /* rdi = &table[index] */
     movq 8(%rdi), %rsi                  /* generation, before */
@@ -106,7 +110,7 @@ gk_resolve_tramp:
     jne 1f
 #endif
     movq %rdx, %rax
-    xorl %edx, %edx
+    movq 32(%rdi), %rdx                 /* the entry's type, for the caller to compare */
     xorl %esi, %esi
     xorl %edi, %edi
     sysretq

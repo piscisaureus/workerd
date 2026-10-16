@@ -444,6 +444,9 @@ void checkWasmDescriptorsForTest(kj::StringPtr url) {
 // isolate's entry and unlink its node, and the announcing request, still in flight, uses its
 // object again once the host has answered.
 //
+// /__gk_ioown_type_swap is the same-isolate half: a turn writes one of its own IoOwn handles
+// over another of its own, of an unrelated class, then calls a virtual through it and drops it.
+//
 // With the same variable set, a request whose path is /__gk_corrupt_handle overwrites, from
 // inside the JS turn, the handle through which the tenant's owner reaches it (registered through
 // hostMemory::setHandleProbeForTest()) with the address of a buffer this code chose, which is
@@ -665,6 +668,8 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   constexpr uint64_t IOOWN_CHOSEN_MAGIC = 0xbadbadbadbadbad0;
   constexpr uint64_t IOOWN_OTHER_MAGIC = 0x0e7e70e7e70e7e70;
   constexpr uint64_t IOOWN_NODE_MAGIC = 0x0de0de0de0de0de0;
+  constexpr uint64_t IOOWN_TYPE_A_MAGIC = 0x0a11a11a11a11a10;
+  constexpr uint64_t IOOWN_TYPE_B_MAGIC = 0x0b22b22b22b22b20;
   // The IoOwn's first word is the context's handle (its DeleteQueue) and its second the object's
   // handle, before the disposal record; a write primitive aiming at either writes exactly there.
   static_assert(
@@ -859,6 +864,91 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
           f->fulfill();  // the announcing request uses its object again, if it is still running
         }
       });
+    }));
+  }
+  // Type confusion inside one isolate (see the type word in experimental/guest-kernel/gk.h).
+  // The owner says whose entry a handle names and says nothing about what it names, so a turn
+  // that writes one of its own IoOwn handles over another of its own reaches an object of the
+  // wrong class: a call through the wrong vtable, and a drop that frees an object its real
+  // holder still names. Two unrelated classes, each with a virtual that answers with its own
+  // magic, so the swap is visible as a wrong answer rather than only as a null.
+  struct TypeProbeA {
+    virtual ~TypeProbeA() = default;
+    virtual uint64_t magic() const {
+      return IOOWN_TYPE_A_MAGIC;
+    }
+  };
+  struct TypeProbeB {
+    virtual ~TypeProbeB() = default;
+    virtual uint64_t magic() const {
+      return IOOWN_TYPE_B_MAGIC;
+    }
+  };
+  struct TypeProbeHolder {
+    IoOwn<TypeProbeA> a;
+    IoOwn<TypeProbeB> b;
+  };
+  static_assert(sizeof(IoOwn<TypeProbeA>) == sizeof(IoOwn<TypeProbeB>));
+  // Reads or writes the handle word of any IoOwn, which is the word after its DeleteQueue, as
+  // a write primitive aiming at it would.
+  auto ownHandle = [](auto& own) {
+    uint64_t word;
+    memcpy(&word, reinterpret_cast<byte*>(&own) + IOOWN_HANDLE_OFFSET, sizeof(word));
+    return word;
+  };
+  auto setOwnHandle = [](auto& own, uint64_t handle) {
+    memcpy(reinterpret_cast<byte*>(&own) + IOOWN_HANDLE_OFFSET, &handle, sizeof(handle));
+  };
+  // Calls the virtual through one of the two holders and reports what came back.
+  auto callMagic = [](IoContext& context, kj::StringPtr what, auto& own) {
+    return context.run([what, &own](Worker::Lock&) {
+      kj::String verdict;
+      KJ_IF_SOME(e, kj::runCatchingExceptions([&]() {
+        verdict = kj::str("read magic 0x", kj::hex(own->magic()));
+      })) {
+        verdict = kj::str("refused: ", e.getDescription());
+      }
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: IoOwn use after the type swap", what, verdict);
+    });
+  };
+  if (probeEnabled && url.endsWith("/__gk_ioown_type_swap")) {
+    auto& context = IoContext::current();
+    auto holder =
+        kj::heap<TypeProbeHolder>(TypeProbeHolder{.a = context.addObject(kj::heap<TypeProbeA>()),
+          .b = context.addObject(kj::heap<TypeProbeB>())});
+    TypeProbeHolder& h = *holder;
+    uint64_t ha = ownHandle(h.a), hb = ownHandle(h.b);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: created an IoOwn of each of two classes inside the JS turn", url,
+        kj::str("0x", kj::hex(ha)), kj::str("0x", kj::hex(hb)));
+    context.addWaitUntil(
+        // The control: each holder reaches its own class's object.
+        callMagic(context, "control-a", h.a)
+            .then([&context, &h, callMagic]() { return callMagic(context, "control-b", h.b); })
+            .then([&context, &h, hb, setOwnHandle, url = kj::str(url)]() mutable {
+      return context.run([&h, hb, setOwnHandle, url = kj::mv(url)](Worker::Lock&) {
+        // The turn's own act: the A holder now names the B entry, which is live and this
+        // isolate's, so the owner has nothing to say about it.
+        setOwnHandle(h.a, hb);
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: overwrote an IoOwn's handle from inside the JS turn with one "
+            "of another class",
+            url, kj::str("0x", kj::hex(hb)));
+      });
+    })
+            .then([&context, &h, callMagic]() { return callMagic(context, "type-swap", h.a); })
+            .then([&context, &h]() {
+      // The drop half: the swapped holder is released inside a turn, which would hand the
+      // host the other class's entry to retire and its node to free.
+      return context.run([&h](Worker::Lock&) {
+        h.a = nullptr;
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: dropped the swapped IoOwn inside the JS turn");
+      });
+    })
+            .then([&context, &h, callMagic]() {
+      return callMagic(context, "other-class-after-drop", h.b);
+    }).then([holder = kj::mv(holder)]() mutable {
+      return kj::evalLater([holder = kj::mv(holder)]() mutable { holder = nullptr; });
     }));
   }
   // The owned node (see OwnedObjectList in io/io-own.h): the record the host keeps about the

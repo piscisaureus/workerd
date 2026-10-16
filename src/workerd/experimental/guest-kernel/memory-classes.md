@@ -246,7 +246,7 @@ Two crossings exist. The hostcall is a VM exit: **6.4 us per round trip,
 measured** (`hostcall_check` in `gk_test.c`), which is affordable for an
 operation a turn makes a few times (an actor id) and not for the bulk of its
 crossings. The ring-0 resolve (`gk_resolve`) is a ring 3 to ring 0 transition
-inside the guest, not an exit: **26.8 ns per round trip, measured**
+inside the guest, not an exit: **27.7 ns per round trip, measured**
 (`resolve_check` in `gk_test.c`, which proves from KVM's per-vCPU exit
 counter that the resolves ran with no exit), 240 times cheaper than the
 hostcall and in line with the 22 ns the bare trap measured in the benchmark
@@ -264,7 +264,7 @@ hello-world request is one turn with **6 `IoOwn` dereferences** and no
 and a request that instantiates 1000 Wasm modules are also 6 each; a SQLite
 Durable Object `/get` through a service binding (`disk-sqlite-test.capnp`)
 is 3 turns with 15 `IoOwn` and 1 `IoPtr`, and a `/put` 4 turns with 25 and
-2. `ReverseIoOwn` is never dereferenced in a turn. At 26.8 ns each that is
+2. `ReverseIoOwn` is never dereferenced in a turn. At 27.7 ns each that is
 0.1 to 0.5 us per request, against a hello-world request latency of about
 620 us under the guest kernel (p50 over one connection on the same machine):
 the dereference is not where a turn's time goes. (The ~43 foreign accesses a
@@ -319,9 +319,10 @@ returns to 0 after each load. So the live count is the in-flight concurrency
 times a small constant, and the original 2^16 entries were exhausted by one
 worker with 3300 parked requests; the table holds 2^20 (`GK_RESOLVE_SLOTS`),
 about 200000 such requests, in 32 MiB of static memory that costs nothing
-until written (an entry is 32 bytes: the pointer, the generation, the owner
-and the chain word that puts the entry on its arena's list, whose size also
-keeps the index a shift and an entry inside one cache line), with the reserved pools taking 256 per thread of it. The
+until written (an entry is 64 bytes: the pointer, the generation, the owner,
+the chain word that puts the entry on its arena's list and the type word,
+with the shift the trampoline indexes by and one cache line per entry
+deciding the rest), with the reserved pools taking 256 per thread of it. The
 table stays process-wide: a per-isolate table would move the same sizing
 question to each isolate, and the ring-0 lookup needs no per-isolate table
 to tell the isolates apart -- each entry records the page-table root it was
@@ -1025,8 +1026,20 @@ outlives every context that registers an entry under it, but gk does not
 rest on that: each arena carries the list of its own entries, and
 `gk_arena_destroy` retires whatever is left before the root goes, on stderr
 and counted in `gk_stats.resolve_orphans`. What the owner does not tell
-apart is two entries of the same isolate: a handle rewritten to another
-live handle of its own isolate still names that entry's object.
+apart is two entries of the same isolate, and that is what the entry's type
+word is for: it carries a constant derived from the C++ class of the object
+the pointer names (`hostMemory::resolveTypeTag`), the lookup hands it back
+beside the pointer, and a holder resolves only an entry of the class it was
+built for -- at the use and at the drop, since releasing another holder's
+entry frees an object that holder still names. The comparison is made in the
+runtime rather than at ring 0, against a constant the compiler materializes
+into text a turn cannot write and cannot have remapped
+(`gk_mapping_change_ok`); it therefore binds a turn with a write primitive
+and not one that has reached control flow of its own, where the owner's
+ring-0 comparison still holds. What is left is a swap between two live
+entries of the same isolate *and* the same class, which no tag distinguishes,
+and a turn that lies about the class in its own journal, which waits on the
+journal leaving the shared heap along with the disposer beside it.
 
 ## What is in H memory
 

@@ -102,8 +102,51 @@ void freeSlot(SlotHandle handle);
 using ResolveHandle = uint64_t;
 constexpr size_t RESOLVE_CAPACITY = size_t{1} << 20;
 constexpr size_t RESOLVE_AUX_WORDS = 4;
-ResolveHandle registerResolve(void* ptr);
-ResolveHandle registerResolve(void* ptr, const uint64_t (&aux)[RESOLVE_AUX_WORDS]);
+
+// What the entry's pointer points at. The owner says whose entry it is and says nothing about
+// what it is, so a handle rewritten to another live entry of the same isolate resolves and the
+// caller casts the pointer to the class it expected: a turn that writes one of its own handles
+// over another of its own gets an object of the wrong class, calls through the wrong vtable,
+// and on a drop has the host free an object another holder still names. So an entry carries a
+// tag, which the guest kernel keeps in the entry beside the owner and hands back with the
+// pointer, and resolveOfType() refuses a pointer whose tag is not the one asked for.
+//
+// resolveTypeTag<T>() is the tag for a C++ type: a constant folded from T's spelling at compile
+// time, so that the comparison is against an immediate in the runtime's text rather than a
+// value in writable memory -- a turn can write the runtime's data but not its text, which is
+// mapped without W and which the guest kernel will not let a forwarded mprotect change
+// (gk_mapping_change_ok). It is derived from the name rather than from an address or a counter
+// because neither is reliably one value per type across the shared objects workerd links, and a
+// tag that differed between them would refuse a legitimate use. Two types whose spellings
+// collide share a tag, which costs a check that would have caught the swap and never a false
+// refusal; RESOLVE_TYPE_NONE is the tag of an entry registered without one, which a typed
+// resolve refuses and an untyped one accepts.
+//
+// What this does not cover: a swap between two live entries of the *same* type, which no tag
+// can tell apart, and a turn that reaches code execution inside the runtime, which skips the
+// comparison as it would skip any the runtime makes -- unlike the owner, which is compared at
+// ring 0. See the type word in experimental/guest-kernel/gk.h.
+constexpr uint64_t RESOLVE_TYPE_NONE = 0;
+namespace _ {
+constexpr uint64_t fnv1a64(const char* s) {
+  uint64_t hash = 0xcbf29ce484222325ull;
+  for (; *s != '\0'; ++s) {
+    hash ^= static_cast<unsigned char>(*s);
+    hash *= 0x100000001b3ull;
+  }
+  return hash;
+}
+}  // namespace _
+template <typename T>
+constexpr uint64_t resolveTypeTag() {
+  // __PRETTY_FUNCTION__ spells T out inside this template, so the hash is of T's name and is
+  // the same wherever T is named, in this shared object or another.
+  constexpr uint64_t tag = _::fnv1a64(__PRETTY_FUNCTION__);
+  return tag == RESOLVE_TYPE_NONE ? 1 : tag;
+}
+
+ResolveHandle registerResolve(void* ptr, uint64_t type);
+ResolveHandle registerResolve(void* ptr, uint64_t type, const uint64_t (&aux)[RESOLVE_AUX_WORDS]);
 
 // Which isolate an entry belongs to. The guest kernel records, in the entry, the page-table
 // root of the isolate it was registered under, and a turn that resolves a handle at guest
@@ -120,8 +163,13 @@ ResolveHandle registerResolve(void* ptr, const uint64_t (&aux)[RESOLVE_AUX_WORDS
 // Host-side only: inside a turn the entries come from the turn's reserved pool, which is the
 // turn's isolate's already.
 using IsolateArena = void*;
-ResolveHandle registerResolveFor(IsolateArena arena, void* ptr);
+ResolveHandle registerResolveFor(IsolateArena arena, void* ptr, uint64_t type);
 void* resolve(ResolveHandle handle);
+
+// resolve(), for a caller that knows what the entry should be: null unless the entry's tag is
+// `type` (see resolveTypeTag above). RESOLVE_TYPE_NONE asks for no comparison, which is what
+// resolve() does.
+void* resolveOfType(ResolveHandle handle, uint64_t type);
 void unregisterResolve(ResolveHandle handle);
 
 // Retires a live entry through the table directly, for host code that runs while a turn's

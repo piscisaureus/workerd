@@ -811,7 +811,9 @@ void sweepCells(kj::Vector<kj::Arc<T>>& cells, SlotOf slotOf) {
 }  // namespace
 
 void AbortSignal::disarmNativeRegistration(NativeRegistration& reg) {
-  if (reg.armed != 0 && hostMemory::resolve(reg.armed) == &reg) {
+  if (reg.armed != 0 &&
+      hostMemory::resolveOfType(reg.armed, hostMemory::resolveTypeTag<NativeRegistration>()) ==
+          &reg) {
     hostMemory::unregisterResolve(reg.armed);
   }
   reg.armed = 0;
@@ -821,7 +823,9 @@ void AbortSignal::sweepNativeRegistrations() {
   size_t dst = 0;
   for (size_t i = 0; i < nativeRegistrations.size(); i++) {
     auto& reg = *nativeRegistrations[i];
-    bool dead = reg.action == kj::none || hostMemory::resolve(reg.armed) != &reg ||
+    bool dead = reg.action == kj::none ||
+        hostMemory::resolveOfType(reg.armed, hostMemory::resolveTypeTag<NativeRegistration>()) !=
+            &reg ||
         reg.executor.isTargetDestroyed();
     if (dead) {
       disarmNativeRegistration(reg);
@@ -846,7 +850,8 @@ kj::Own<void> AbortSignal::addAbortAction(
    public:
     Registration(hostMemory::ResolveHandle handle): handle(handle) {}
     ~Registration() noexcept(false) {
-      void* record = hostMemory::resolve(handle);
+      void* record =
+          hostMemory::resolveOfType(handle, hostMemory::resolveTypeTag<NativeRegistration>());
       if (record == nullptr) {
         // The signal retired the entry first, with the record it named.
         return;
@@ -890,7 +895,8 @@ kj::Own<void> AbortSignal::addAbortAction(
   sweepNativeRegistrations();
 
   auto reg = kj::heap<NativeRegistration>(ioContext.getCrossContextExecutor(), kj::mv(action));
-  hostMemory::ResolveHandle handle = hostMemory::registerResolve(reg.get());
+  hostMemory::ResolveHandle handle =
+      hostMemory::registerResolve(reg.get(), hostMemory::resolveTypeTag<NativeRegistration>());
   JSG_REQUIRE(handle != 0, Error,
       "Too many outstanding AbortSignal registrations; cannot register another.");
   reg->armed = handle;

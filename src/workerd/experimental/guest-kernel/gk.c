@@ -398,16 +398,30 @@ _Static_assert(GK_SIGNAL_FIELDS <= (1 << GK_HOST_SLOT_INDEX_BITS), "a field inde
 // root at all; the host side does not compare it, since host code resolves on
 // behalf of whichever context it is serving and is the party the tag protects.
 //
-// An entry is 32 bytes rather than the 24 the three words need: the trampoline
-// indexes by a shift, and a 24-byte entry would straddle a cache line two
-// times in three. The fourth word is the chain word, which the trampoline
-// never reads: the arena an entry belongs to and the entry's neighbours in
-// that arena's list, so that gk_arena_destroy can retire an arena's entries
-// without walking the table (see gk_resolve in gk.h and the arena's
-// resolve_head). All three are 0 for an entry the base root owns, which is
-// on no list because the base root is never destroyed, and for a reserved
-// entry, which joins its owner's list when it is committed. The capacity's
-// reservation is 32 MiB, untouched until an entry is written.
+// The fourth word is the chain word, which the trampoline never reads: the
+// arena an entry belongs to and the entry's neighbours in that arena's list,
+// so that gk_arena_destroy can retire an arena's entries without walking the
+// table (see gk_resolve in gk.h and the arena's resolve_head). All three are
+// 0 for an entry the base root owns, which is on no list because the base
+// root is never destroyed, and for a reserved entry, which joins its owner's
+// list when it is committed.
+//
+// The fifth is the type word, which the caller gives at registration and the
+// lookup hands back with the pointer (see the type word in gk.h). gk does not
+// interpret it; 0 is "none" by convention between registrant and resolver.
+// It has a word of its own rather than bits borrowed from another so that
+// the trampoline can return it with one load and no masking, and so that the
+// chain, which the host rewrites while ring 3 may be reading, shares no word
+// with something a reader compares.
+//
+// An entry is therefore 64 bytes, up from 32: the five words need 40, the
+// trampoline indexes by a shift, and an entry inside one cache line is what
+// makes the lookup one line. The cost is the capacity's reservation, 64 MiB
+// rather than 32, untouched until an entry is written, and twice the page
+// tables at init (16384 PTEs rather than 8192, in the base root every arena
+// shares). An entry in use costs 64 resident bytes rather than 32, so the
+// measured working set of 200000 live entries is 12.8 MiB rather than 6.4.
+// The three words after the type are unused.
 //
 // A handle is the entry's index in its low GK_RESOLVE_INDEX_BITS bits and the
 // generation above them. The capacity is exactly 2^GK_RESOLVE_INDEX_BITS, so
@@ -418,9 +432,12 @@ typedef struct {
   uint64_t gen;
   uint64_t owner;
   uint64_t aidx : 13, prev : 21, next : 21;  // the chain word, as index + 1 each
+  uint64_t type;
+  uint64_t unused[3];
 } gk_resolve_entry;
-_Static_assert(sizeof(gk_resolve_entry) == 32, "gk_resolve_tramp indexes 32-byte entries");
+_Static_assert(sizeof(gk_resolve_entry) == 64, "gk_resolve_tramp indexes 64-byte entries");
 _Static_assert(offsetof(gk_resolve_entry, owner) == 16, "gk_resolve_tramp reads the owner at 16");
+_Static_assert(offsetof(gk_resolve_entry, type) == 32, "gk_resolve_tramp reads the type at 32");
 _Static_assert(GK_RESOLVE_INDEX_BITS == 20, "gk_resolve_tramp splits a handle at bit 20");
 _Static_assert(GK_RESOLVE_SLOTS == (1 << GK_RESOLVE_INDEX_BITS), "gk_resolve_tramp bounds the index by masking");
 _Static_assert(GK_MAX_ARENAS < (1 << 13), "an arena's pool index must fit the chain word");
@@ -3817,7 +3834,8 @@ static void resolve_chain_remove(int idx) {
 // resolves on behalf of whichever context it is serving -- the delete queue's
 // drain, a teardown walk, a hostcall handler -- from threads that are often on
 // no arena at all.
-static void *resolve_lookup(gk_resolve_handle h) {
+static void *resolve_lookup(gk_resolve_handle h, uint64_t *type) {
+  if (type) *type = 0;
   uint64_t idx = h & ((1ULL << GK_RESOLVE_INDEX_BITS) - 1), gen = h >> GK_RESOLVE_INDEX_BITS;
   if (gen == 0) return NULL;
   gk_resolve_entry *e = &gk_resolve_table.e[idx];  // the mask bounds idx (see the table)
@@ -3826,12 +3844,16 @@ static void *resolve_lookup(gk_resolve_handle h) {
   // a check that the pointer was the entry's under that generation.
   uint64_t g1 = __atomic_load_n(&e->gen, __ATOMIC_ACQUIRE);
   void *p = __atomic_load_n(&e->ptr, __ATOMIC_ACQUIRE);
+  uint64_t t = __atomic_load_n(&e->type, __ATOMIC_ACQUIRE);
   uint64_t g2 = __atomic_load_n(&e->gen, __ATOMIC_ACQUIRE);
 #ifdef GK_NEG_RESOLVE
   (void)g1; (void)g2; (void)gen;
+  if (type) *type = t;
   return p;
 #else
-  return (g1 == gen && g2 == gen) ? p : NULL;
+  if (g1 != gen || g2 != gen) return NULL;
+  if (type) *type = t;
+  return p;
 #endif
 }
 
@@ -3850,7 +3872,7 @@ static int resolve_ptr_ok(const void *ptr) {
 // the root it is made under; a reservation is owned by no root until
 // gk_resolve_commit places a pointer in it, and resolves to nothing meanwhile.
 // Caller holds G->lock.
-static gk_resolve_handle resolve_take(void *ptr, uint64_t owner, gk_arena *a) {
+static gk_resolve_handle resolve_take(void *ptr, uint64_t owner, gk_arena *a, uint64_t type) {
   int idx;
   if (G->resolve_free) {
     idx = G->resolve_free - 1;
@@ -3865,8 +3887,9 @@ static gk_resolve_handle resolve_take(void *ptr, uint64_t owner, gk_arena *a) {
   uint64_t gen = ++G->resolve_gen;
   if (gen >> GK_RESOLVE_GEN_BITS) gen = G->resolve_gen = 1;
   gk_resolve_entry *e = &gk_resolve_table.e[idx];
-  // Publish: the owner and the pointer first, the generation last (see
-  // gk_resolve_tramp).
+  // Publish: the type, the owner and the pointer first, the generation last
+  // (see gk_resolve_tramp).
+  __atomic_store_n(&e->type, type, __ATOMIC_RELEASE);
   __atomic_store_n(&e->owner, owner, __ATOMIC_RELEASE);
   __atomic_store_n(&e->ptr, ptr, __ATOMIC_RELEASE);
   __atomic_store_n(&e->gen, gen, __ATOMIC_RELEASE);
@@ -3877,22 +3900,23 @@ static gk_resolve_handle resolve_take(void *ptr, uint64_t owner, gk_arena *a) {
 
 // The body of both registrations: the pointer check and a taken entry owned by
 // arena `a`, or by the base root when `a` is NULL. Caller holds G->lock.
-static gk_resolve_handle resolve_register_locked(void *ptr, gk_arena *a, const char *who) {
-  if (resolve_ptr_ok(ptr)) return resolve_take(ptr, resolve_root_of(a), a);
+static gk_resolve_handle resolve_register_locked(void *ptr, gk_arena *a, uint64_t type,
+                                                const char *who) {
+  if (resolve_ptr_ok(ptr)) return resolve_take(ptr, resolve_root_of(a), a, type);
   fprintf(stderr, "[gk] %s: %p is not ordinary user memory; nothing is registered\n", who, ptr);
   return 0;
 }
 
-gk_resolve_handle gk_resolve_register(void *ptr) {
+gk_resolve_handle gk_resolve_register(void *ptr, uint64_t type) {
   if (!ptr || !G->initialized) return 0;
   pthread_mutex_lock(&G->lock);
   gk_resolve_handle h =
-      resolve_register_locked(ptr, resolve_arena_now(), "gk_resolve_register");
+      resolve_register_locked(ptr, resolve_arena_now(), type, "gk_resolve_register");
   pthread_mutex_unlock(&G->lock);
   return h;
 }
 
-gk_resolve_handle gk_resolve_register_for(gk_arena *a, void *ptr) {
+gk_resolve_handle gk_resolve_register_for(gk_arena *a, void *ptr, uint64_t type) {
   if (!ptr || !G->initialized) return 0;
   pthread_mutex_lock(&G->lock);
   gk_resolve_handle h = 0;
@@ -3902,7 +3926,7 @@ gk_resolve_handle gk_resolve_register_for(gk_arena *a, void *ptr) {
     fprintf(stderr, "[gk] gk_resolve_register_for: %p is not a live arena; nothing is "
             "registered\n", (void *)a);
   } else {
-    h = resolve_register_locked(ptr, a, "gk_resolve_register_for");
+    h = resolve_register_locked(ptr, a, type, "gk_resolve_register_for");
   }
   pthread_mutex_unlock(&G->lock);
   return h;
@@ -3913,7 +3937,7 @@ int gk_resolve_reserve(gk_resolve_handle *handles, int n) {
   pthread_mutex_lock(&G->lock);
   int got = 0;
   while (got < n) {
-    gk_resolve_handle h = resolve_take(NULL, 0, NULL);
+    gk_resolve_handle h = resolve_take(NULL, 0, NULL, 0);
     if (!h) break;
     handles[got++] = h;
   }
@@ -3921,7 +3945,7 @@ int gk_resolve_reserve(gk_resolve_handle *handles, int n) {
   return got;
 }
 
-int gk_resolve_commit(gk_resolve_handle h, void *ptr) {
+int gk_resolve_commit(gk_resolve_handle h, void *ptr, uint64_t type) {
   uint64_t idx = h & ((1ULL << GK_RESOLVE_INDEX_BITS) - 1), gen = h >> GK_RESOLVE_INDEX_BITS;
   pthread_mutex_lock(&G->lock);
   gk_resolve_entry *e = &gk_resolve_table.e[idx];  // the mask bounds idx (see the table)
@@ -3942,6 +3966,7 @@ int gk_resolve_commit(gk_resolve_handle h, void *ptr) {
   // gates the owner comparison on, so a lookup that saw the pointer saw the
   // owner too. A lookup that read NULL before either answered nothing.
   gk_arena *a = resolve_arena_now();
+  __atomic_store_n(&e->type, type, __ATOMIC_RELEASE);
   __atomic_store_n(&e->owner, resolve_root_of(a), __ATOMIC_RELEASE);
   __atomic_store_n(&e->ptr, ptr, __ATOMIC_RELEASE);
   resolve_chain_add((int)idx, a);
@@ -4053,7 +4078,7 @@ int gk_resolve_unregister_for(gk_arena *a, gk_resolve_handle h) {
   return 0;
 }
 
-void *gk_resolve(gk_resolve_handle h) {
+void *gk_resolve_typed(gk_resolve_handle h, uint64_t *type) {
   // The caller's ring, from CS: at guest ring 3 the selector is the one
   // SYSRET loads, and the lookup is the trap. At guest ring 0 (CS 0x08) and on
   // the host (the kernel's user selector) the table is read directly. Nothing
@@ -4062,17 +4087,24 @@ void *gk_resolve(gk_resolve_handle h) {
   __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
   if (cs == GK_USER_CS) {
     void *p;
-    uint64_t rdi = h;
+    uint64_t rdi = h, rdx;
+    // The trampoline returns the entry's type in RDX, where it otherwise
+    // returns 0; a refused lookup returns 0 in both.
     __asm__ __volatile__("syscall"
-                         : "=a"(p), "+D"(rdi)
+                         : "=a"(p), "+D"(rdi), "=d"(rdx)
                          : "a"((long)GK_RESOLVE_SYSCALL)
-                         : "rcx", "r11", "rsi", "rdx", "cc");
+                         : "rcx", "r11", "rsi", "cc");
+    if (type) *type = rdx;
     return p;
   }
   GK_HANDLER_ENTER();
-  void *p = resolve_lookup(h);
+  void *p = resolve_lookup(h, type);
   GK_HANDLER_LEAVE();
   return p;
+}
+
+void *gk_resolve(gk_resolve_handle h) {
+  return gk_resolve_typed(h, NULL);
 }
 
 // ---- signal fields -----------------------------------------------------------
