@@ -1147,6 +1147,77 @@ able to write. What closes them is the shared heap leaving the arena,
 which is the placement work the inventories above describe, and not an
 `IoOwn` change.
 
+### The disposer a registration journals
+
+The provenance rule says a pointer the host dereferences comes from H memory,
+while an index into an H-owned table may come from anywhere because the host
+validates it against the table. The disposer a node records is a pointer the
+host *calls*, and it comes from the turn's journal, so it is the rule's
+clearest open case. Turning it into an index wants a table the host can fill
+with the disposers that may legitimately be called; the measurement says
+there is no such table to fill, because the disposer of a `kj::Own<T>` is not
+a property of `T`.
+
+Counted with a per-class counter on `DeleteQueue::registerOwned`, classifying
+each registration's disposer against `kj::_::HeapDisposer<T>::instance`,
+`kj::NullDisposer::instance`, the owned object's own extent and `dladdr`, over
+the `api/tests` and `io` suites: of 1771 registrations in 34 classes, 542
+carry `kj::_::HeapDisposer<D>::instance`, 34 carry `kj::NullDisposer::
+instance`, 33 carry another static the binary holds without a symbol `dladdr`
+can name, and **1162 carry a subobject of the owned object itself**.
+`kj::Refcounted` inherits `kj::Disposer` privately and `kj::refcounted<T>()`
+hands the object to `kj::Own` as its own disposer (`kj/refcount.h`), so every
+refcounted object is its own; `kj::_::WeakFulfiller` inherits `kj::Disposer`
+through `WeakFulfillerBase` (`kj/async-inl.h`) and so is its own at offset 8,
+which is what `kj::newPromiseAndFulfiller` hands `IoContext::awaitJs` -- 934
+of the 1162, the commonest registration in the runtime and reachable from any
+`await` of a JS promise.
+
+Three things follow.
+
+**The index cannot be minted where the registration is made.** The disposer a
+`kj::Own<T>` carries is the one its *dynamic* type was created with: an
+`Own<D>` converted to `Own<T>` keeps `HeapDisposer<D>::instance`, which is why
+26 of the 33 unnamed statics arrive as `api::ReadableStreamSource`. `D` is not
+known at `addObject`, and the only site that knows it is the `kj::heap<D>` or
+`kj::refcounted<D>` that made the `Own`, far from the registration and not
+reachable from it. A compile-time table keyed on `T`, as the type word is
+(`hostMemory::resolveTypeTag`), cannot hold the entry such a registration
+needs.
+
+**Validating the pointer does not stand in for an index.** The two shapes a
+legitimate disposer takes are a static in the image and a subobject of the
+owned object. A static's own vtable pointer is in a relocation-read-only page,
+which a turn cannot write and cannot have remapped
+(`gk_mapping_change_ok`), so admitting only those would be a real bound. The
+object's is not: the owned object is in the shared C++ heap, which gk maps
+writable into every arena, so for the 1162 the host's call goes through a
+vtable word the turn can write whether the pointer was checked or not.
+Bounding the pointer to the object's extent confines the host to the object it
+was about to dispose of and nothing further, which is worth having, but it
+does not reduce what a turn can make the host do.
+
+**The journaled pointer is not the only route to the same call.** A disposal
+through a correct `HeapDisposer<D>` runs `~D()` over members the turn
+controls; a context that ends before a turn does destroys a queued action,
+which is a `kj::Function` the turn allocated in the shared heap, through that
+closure's own vtable. Disposing of an object that sits in the arena's shared
+heap is an indirect call through guest-writable memory however the host
+reaches it. So closing the journaled disposer would remove one of several
+equivalent routes and leave the capability itself intact, which is why the
+`T`'s placement, not the disposer, is what the residual waits on -- and why
+the previous section's conclusion stands: what closes the class is the object
+and the heap it sits in leaving the arena.
+
+The `kj::Function` box an `ACTION` note names (`words[2]` in
+`OwnedObjectList::noted`) is the same case. The box is allocated by the turn,
+in the shared heap, so a box whose pointer the host had validated would still
+be destroyed through a vtable the turn can write. The one thing a check would
+add is to keep the host from `operator delete`-ing an address that is not a
+block at all -- and a registration's object pointer can already be such an
+address, since gk admits any ordinary user memory outside its own ranges and
+every arena -- so it would narrow nothing that is not already open.
+
 ## What is in H memory
 
 H memory exists: `gk_host_alloc` with `HostOwn<T>` over it, and the host slot
