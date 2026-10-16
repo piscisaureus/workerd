@@ -26,6 +26,9 @@
 # /__gk_refused_registration is the refusal path itself: an owned object registered against a
 # context that no longer exists. The hook refuses it, and because registerOwned() has already
 # given the object away, the refusal has to dispose of it; the object says so when it dies.
+# /__gk_refused_in_refill makes that refusal many times over in one turn, interleaved with
+# enough ordinary registrations that the refusals are found by the refill hostcall rather than
+# by the end of the turn, where the hook that disposes of the object cannot run.
 #
 # Negative builds (never shipped), each failing this script:
 #   --copt=-DWORKERD_GK_NEG_CONTEXT_ADOPT  the context keeps the entry its creating turn's
@@ -159,14 +162,32 @@ grep -q "the object of a refused registration was disposed of" "$log" ||
 echo "   the refusal disposed of the object: nothing else could still reach it"
 
 counts
+before_refused=$refused
+s=$(status "$caller/__gk_refused_in_refill")
+echo "8. GET $caller/__gk_refused_in_refill -> $s (refusals found by the refill hostcall"
+echo "   rather than at the end of the turn)"
+for _ in $(seq 1 200); do
+  grep -q "registrations refused across refills" "$log" && break
+  sleep 0.1
+done
+line=$(grep "registrations refused across refills" "$log" | tail -1)
+[ -n "$line" ] || fail "the probe did not run"
+rounds=$(echo "$line" | sed -n 's/.*rounds = \([0-9]*\).*/\1/p')
+[ -n "$rounds" ] && [ "$rounds" -gt 0 ] || fail "could not read the round count from: $line"
+echo "   $rounds refused registrations made in one turn; $line"
+
+counts
+[ "$((refused - before_refused))" = "$rounds" ] ||
+  fail "$rounds refusals were made and $((refused - before_refused)) counted"
+echo "   all $rounds were counted as refused"
 [ "$disposed" -gt 0 ] || fail "the refusal was not counted"
-echo "8. $refused registrations refused in all, $disposed of their objects disposed of"
+echo "9. $refused registrations refused in all, $disposed of their objects disposed of"
 [ "$refused" = "$disposed" ] ||
   fail "$((refused - disposed)) refused registrations did not dispose of their object"
 
 s=$(status "$caller/")
-echo "9. GET $caller/             -> $s (both workers must still serve)"
+echo "10. GET $caller/            -> $s (both workers must still serve)"
 [ "$s" = 200 ] || fail "the caller stopped serving"
 kill -0 "$pid" 2>/dev/null || fail "workerd died"
 
-echo "PASS: a worker whose IoContext was built inside another worker's turn registered 120 requests' worth of owned objects against that context with none refused, and the nodes and records went away with the requests; $((foreign_drops - base_drops)) holders of the callee's objects were dropped inside the caller's turn, which left them for their own context's teardown rather than disposing of them under the wrong arena; and a registration refused because its context had ended disposed of its object instead of orphaning it"
+echo "PASS: a worker whose IoContext was built inside another worker's turn registered 120 requests' worth of owned objects against that context with none refused, and the nodes and records went away with the requests; $((foreign_drops - base_drops)) holders of the callee's objects were dropped inside the caller's turn, which left them for their own context's teardown rather than disposing of them under the wrong arena; and $disposed registrations refused because the context they named had ended disposed of their object instead of orphaning it, $rounds of them made in one turn so that a refill rather than the turn's end found them"

@@ -260,18 +260,27 @@ bool noteInTurn(const uint64_t (&words)[NOTE_WORDS]);
 // sees it. Without the guest kernel there are no arenas and it is true.
 bool ownedByTurn(ResolveHandle handle);
 
-// What the host does, after a turn, with the entries the turn registered and released and the
-// notes it made. All run host-side, with the table already updated for the entry: committed()
-// once the table has taken a registration's pointer, with the words the registration carried,
-// and may refuse it, after which the entry is retired and resolves to nothing; released() for a
-// committed entry the turn released, before the entry is retired; noted() for each note, after
-// the commits and the releases, so that a note about an entry the turn registered finds it
-// committed and one about an entry the turn released finds it gone. released() and noted() may
-// also run inside a hostcall (a turn that outruns its retire list or its notes), so they must
-// not take the process heap; noted() is told when it does (`inHandler`) and returns whether it
-// consumed the note, and one it could not consume there is handed to it again at the end of the
-// turn, where it must. refused() runs for a registration the entry does not keep, at
-// the end of the turn, where it may dispose of what the registration named.
+// What the host does with the entries a turn registered and released and the notes it made.
+// All run host-side, with the table already updated for the entry: committed() once the table
+// has taken a registration's pointer, with the words the registration carried, and may refuse
+// it, after which the entry is retired and resolves to nothing; released() for a committed
+// entry the turn released, before the entry is retired; noted() for each note, after the
+// commits and the releases, so that a note about an entry the turn registered finds it
+// committed and one about an entry the turn released finds it gone.
+//
+// committed(), released() and noted() may also run inside a hostcall -- a turn that outruns
+// its reserved entries, its retire list or its notes -- so they must not take the process heap
+// and must not make a hostcall of their own; what they may take is host memory and the guest
+// kernel's own locks. noted() is told when it runs there (`inHandler`) and returns whether it
+// consumed the note, and one it could not consume there is handed to it again at the end of
+// the turn, where it must.
+//
+// refused() runs for a registration the entry does not keep, and always at the end of the
+// turn, where it may dispose of what the registration named: a disposer may do either of the
+// things a handler must not, so a refusal a settle inside a hostcall found is held until the
+// turn returns. The entry is retired when the refusal is found, not when the hook runs, so
+// nothing resolves the handle in between, and a turn that outruns the refusals the host can
+// hold is refused its next registration rather than losing one of them.
 struct ResolveTurnHooks {
   bool (*committed)(ResolveHandle handle, void* ptr, const uint64_t* aux);
   void (*released)(ResolveHandle handle);
@@ -295,9 +304,20 @@ struct ResolveTurnHooks {
 // and words, resolve() falls back to the journal for a handle the table does not yet hold, and
 // unregisterResolve() marks a journaled entry released or lists a committed one for retirement
 // at the end, and noteInTurn() records what the host is to do once the turn has returned; a
-// turn that outruns its reserved entries, its retire list or its notes refills or flushes
-// through one hostcall. Nested in a turn, a ResolveTurn does nothing: the outermost frame
-// commits.
+// turn that outruns its retire list or its notes flushes it through one hostcall. Nested in a
+// turn, a ResolveTurn does nothing: the outermost frame commits.
+//
+// A turn that outruns its reserved entries refills through one hostcall too, but a refill is
+// not a top-up: the positions the turn has spent each still hold an entry of the pool, so
+// there is nothing to top up until they are settled. The handler therefore does there what
+// the end of the turn does -- commits each spent position and runs the hooks for it -- and
+// starts the journal again over fresh reservations. A turn pays one exit per pool's worth of
+// registrations and is bounded by the table rather than by the pool, and a registration made
+// before a refill is committed, and so resolvable through the table, from that refill on
+// rather than from the end of the turn. What the table will not take, or the hook will not
+// keep, is retired there and handed to refused() when the turn returns; a refill that has
+// more of those than it can hold settles no further, which leaves the turn out of entries
+// and its next registration refused.
 //
 // What the host trusts. The pool -- which handles it reserved for this thread, and the hooks --
 // is in host memory and found through the guest kernel's per-thread words, never through

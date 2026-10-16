@@ -1331,6 +1331,42 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
     KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: registered an owned object naming no live context",
         kj::hex(handle));
   }
+  if (probeEnabled && url.endsWith("/__gk_refused_in_refill")) {
+    // The same refusal, found inside the refill hostcall rather than at the end of the turn.
+    // The hook that disposes of the object cannot run in a handler, so the host holds the
+    // refusal until the turn returns and holds a bounded number of them; a turn with more of
+    // them settles no further and is refused its next registration. Either way every refused
+    // registration reaches the hook, which is what the refused and disposed counts say. Each
+    // round
+    // registers one object against a context that no longer exists and then enough objects
+    // against this one to spend a pool, so that a later round's refill is what settles it.
+    struct Probe {
+      ~Probe() noexcept(false) {
+        KJ_LOG(
+            WARNING, "WORKERD_GK_TEST_PROBE: the object of a refused registration was disposed of");
+      }
+    };
+    struct Filler {};
+    constexpr size_t ROUNDS = 40;
+    constexpr size_t FILL = 300;
+    auto& context = IoContext::current();
+    kj::Vector<IoOwn<Filler>> fillers(ROUNDS * FILL);
+    size_t rounds = 0;
+    kj::Maybe<kj::Exception> stopped = kj::runCatchingExceptions([&]() {
+      while (rounds < ROUNDS) {
+        auto obj = kj::heap<Probe>();
+        const kj::Disposer& disposer = obj.getDisposer();
+        Probe* object = obj.get();
+        OwnedObjectList::registerRefusedForTest(object, kj::_::castToVoid(object), disposer);
+        obj.disown(&disposer);
+        rounds++;
+        for (size_t i = 0; i < FILL; i++) fillers.add(context.addObject(kj::heap<Filler>()));
+      }
+    });
+    kj::StringPtr outcome =
+        stopped == kj::none ? "every round ran"_kj : "the turn ran out of entries"_kj;
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: registrations refused across refills", rounds, outcome);
+  }
   if (probeEnabled && url.endsWith("/__gk_ioown_counts")) {
     // The host-memory block and resolve-entry counts, for a leak check across a load: read on
     // the event loop, since the entry count is the guest kernel's, which a turn cannot read.

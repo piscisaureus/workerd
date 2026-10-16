@@ -487,7 +487,8 @@ CompanionDirectory* companionDirectory() {
 
 // The companion record of a live committed entry, or none: the handle is validated against the
 // table, and the record found by the entry's index. With `map`, a chunk not yet mapped is
-// mapped first (host-side allocation, never from a hostcall handler).
+// mapped first, out of host memory, which a hostcall handler may take (the commit hook runs in
+// one for a turn that refills its reserved entries).
 kj::Maybe<ResolveCompanion&> companionOf(ResolveHandle handle, bool map) {
   if (tableResolve(handle) == nullptr) return kj::none;
   CompanionDirectory* dir = companionDirectory();
@@ -543,10 +544,33 @@ struct TurnJournal {
   bool active = false;  // a turn is running on this thread
 };
 
+// A registration the host could not keep, waiting for the end of the turn. A settle inside the
+// refill hostcall cannot tell the owner about one on the spot: refused() may dispose of what
+// the registration named, and a hostcall handler must neither take the process heap nor make a
+// hostcall of its own, which a disposer may do either of (see the handler rules in
+// experimental/guest-kernel/gk.h). The entry itself is retired at the settle; only the hook is
+// deferred, so nothing resolves the handle in between.
+//
+// The list is short because a refusal is an error path -- the table refusing a pointer, or the
+// owner refusing the words -- and a turn producing this many of them is not going to succeed.
+// It is a turn's own words that decide, so a turn can make refusals happen as often as it
+// likes; what it cannot do is outrun the list. A settle that fills it stops there, leaving the
+// positions it has not reached spent and the pool with nothing to hand back, so the turn's
+// next registration is refused as it is when the table is full, and every refusal still
+// reaches the owner when the turn returns. Nothing is dropped and nothing is left unowned.
+constexpr uint32_t REFUSAL_CAPACITY = 32;
+struct DeferredRefusal {
+  ResolveHandle handle;
+  void* ptr;
+  uint64_t aux[RESOLVE_AUX_WORDS];
+};
+
 struct ThreadPool {
   ResolveHandle handles[POOL_CAPACITY];
   uint32_t count = 0;
   kj::Own<TurnJournal> journal;
+  DeferredRefusal refusals[REFUSAL_CAPACITY];
+  uint32_t refusalCount = 0;
   ResolveTurnHooks hooks = {
     nullptr, nullptr, nullptr};  // the current turn's, written by the host at entry
   // The arena the current turn runs under, written by the host at entry from gk's own record of
@@ -601,18 +625,25 @@ struct PoolReleaser {
   }
 };
 
-// Reserves entries until the pool holds POOL_CAPACITY, or the table runs out, and copies the
-// new ones into the journal. Host-side. Returns how many were added.
+// Reserves entries until the pool holds POOL_CAPACITY, or the table runs out. Host-side.
+// Returns how many were added.
 uint32_t refillPool(ThreadPool& pool) {
   uint32_t before = pool.count;
   pool.count += tableReserve(pool.handles + pool.count, POOL_CAPACITY - pool.count);
+  return pool.count - before;
+}
+
+// Gives the journal the entries of the pool that no position of it holds, as unspent
+// positions above the ones a settle left behind. Host-side; leaves the retire list and the
+// notes alone, so that a turn restarted over a refilled pool keeps what it has not yet handed
+// over.
+void startJournal(ThreadPool& pool) {
   TurnJournal& journal = *pool.journal;
-  for (uint32_t i = before; i < pool.count; i++) {
+  for (uint32_t i = journal.next; i < pool.count; i++) {
     journal.handles[i] = pool.handles[i];
     journal.state[i] = TurnJournal::UNUSED;
   }
   journal.count = pool.count;
-  return pool.count - before;
 }
 
 ThreadPool& ensurePoolOfThread() {
@@ -673,6 +704,86 @@ void replayNotes(TurnJournal& journal, const ResolveTurnHooks& hooks, bool inHan
   journal.noteCount = kept;
 }
 
+// Settles the positions the turn has spent: each registration is committed with the pointer
+// and tag the turn journaled for it and handed to the committed hook, and a position the turn
+// released, never used, or whose registration the table or the hook would not keep has its
+// entry retired. The entries the turn did not reach stay reserved, compacted to the front of
+// the pool for the next journal. Host-side; `next` is bounded by the pool's own count, so a
+// turn that overstates it settles nothing beyond what was reserved for it.
+//
+// `inHandler` says this is the refill hostcall rather than the end of the turn, where the
+// refused hook is deferred (see DeferredRefusal).
+void settleJournal(ThreadPool& pool, bool inHandler) {
+  TurnJournal& journal = *pool.journal;
+  const ResolveTurnHooks hooks = pool.hooks;
+  uint32_t next = kj::min(journal.next, pool.count);
+  uint32_t done = 0;  // positions settled; the rest are left spent for the end of the turn
+  for (; done < next; done++) {
+    uint32_t i = done;
+    ResolveHandle handle = pool.handles[i];
+    if (journal.state[i] == TurnJournal::USED) {
+      // A refusal found here has to wait for the end of the turn, and the list of those it
+      // waits in is finite (see DeferredRefusal): with the list full there is no settling a
+      // position that might refuse, so this one and the ones after it stay as they are.
+      if (inHandler && pool.refusalCount >= REFUSAL_CAPACITY) break;
+      if (tableCommit(handle, journal.ptr[i], journal.type[i])) {
+        if (hooks.committed == nullptr || hooks.committed(handle, journal.ptr[i], journal.aux[i])) {
+          continue;
+        }
+        KJ_LOG(ERROR, "a turn's resolve entry was refused by the commit hook; it is retired",
+            kj::hex(handle), journal.ptr[i]);
+      } else {
+        KJ_LOG(ERROR, "a turn's resolve entry could not be committed; it resolves to nothing",
+            kj::hex(handle), journal.ptr[i]);
+      }
+      // The entry is about to be retired with nothing of the turn's left naming it, so the
+      // owner is told before the handle stops meaning anything.
+      if (hooks.refused != nullptr) {
+        if (inHandler) {
+          DeferredRefusal& refusal = pool.refusals[pool.refusalCount++];
+          refusal.handle = handle;
+          refusal.ptr = journal.ptr[i];
+          for (size_t w = 0; w < RESOLVE_AUX_WORDS; w++) refusal.aux[w] = journal.aux[i][w];
+        } else {
+          hooks.refused(handle, journal.ptr[i], journal.aux[i]);
+        }
+      }
+    }
+    // Retired by the turn, never used, or refused: the entry resolves to nothing from now on,
+    // and so does any holder of it.
+    tableUnregister(handle);
+  }
+  // The settled positions go, and what is left -- the spent positions a stopped settle did not
+  // reach, then the entries no position holds -- moves down to meet the front of the pool. The
+  // journal's own words move with the pool's handles, which is the pairing the settle reads.
+  for (uint32_t i = done; i < pool.count; i++) {
+    pool.handles[i - done] = pool.handles[i];
+  }
+  for (uint32_t i = done; i < next; i++) {
+    journal.handles[i - done] = journal.handles[i];
+    journal.ptr[i - done] = journal.ptr[i];
+    journal.type[i - done] = journal.type[i];
+    journal.state[i - done] = journal.state[i];
+    for (size_t w = 0; w < RESOLVE_AUX_WORDS; w++) journal.aux[i - done][w] = journal.aux[i][w];
+  }
+  pool.count -= done;
+  journal.next = next - done;
+  journal.count = journal.next;
+}
+
+// Tells the owner about the registrations a settle inside a hostcall could not keep. Host-side,
+// at the end of the turn, where the hook may dispose of what the registration named.
+void flushRefusals(ThreadPool& pool) {
+  const ResolveTurnHooks hooks = pool.hooks;
+  uint32_t n = kj::min(pool.refusalCount, REFUSAL_CAPACITY);
+  pool.refusalCount = 0;
+  if (hooks.refused == nullptr) return;
+  for (uint32_t i = 0; i < n; i++) {
+    DeferredRefusal& refusal = pool.refusals[i];
+    hooks.refused(refusal.handle, refusal.ptr, refusal.aux);
+  }
+}
+
 // The RESOLVE hostcall: a turn whose journal has run out of reserved entries, or whose retire
 // list or notes are full, asks the host to refill or flush it. The handler finds the thread's
 // pool and journal through the host's own record, never through the frame.
@@ -683,7 +794,14 @@ long resolveHostcall(hostcall::Frame& frame) {
   if (pool == nullptr || !pool->journal->active) return -EINVAL;
   switch (static_cast<ResolveOp>(frame.args[0])) {
     case ResolveOp::REFILL:
-      return static_cast<long>(refillPool(*pool));
+      // The pool is spent, not merely low: topping it up would add nothing while every entry
+      // in it is still held by a position of the journal. So the spent positions are settled
+      // first, which commits what the turn registered through them and gives the entries it
+      // did not keep back to the table, and the turn goes on over fresh reservations.
+      settleJournal(*pool, true);
+      refillPool(*pool);
+      startJournal(*pool);
+      return static_cast<long>(pool->journal->count);
     case ResolveOp::RETIRE:
       flushRetired(*pool->journal, pool->hooks, pool->turnArena);
       return 0;
@@ -904,13 +1022,10 @@ ResolveTurn::ResolveTurn(ResolveTurnHooks hooks): pool(nullptr) {
   if (threadPool.count < POOL_LOW) refillPool(threadPool);
   threadPool.hooks = hooks;
   threadPool.turnArena = currentArena();
+  threadPool.refusalCount = 0;
   TurnJournal& journal = *threadPool.journal;
-  for (uint32_t i = 0; i < threadPool.count; i++) {
-    journal.handles[i] = threadPool.handles[i];
-    journal.state[i] = TurnJournal::UNUSED;
-  }
-  journal.count = threadPool.count;
   journal.next = 0;
+  startJournal(threadPool);
   journal.retireCount = 0;
   journal.noteCount = 0;
   journal.active = true;
@@ -925,32 +1040,9 @@ ResolveTurn::~ResolveTurn() noexcept(false) {
   ThreadPool& threadPool = *static_cast<ThreadPool*>(pool);
   TurnJournal& journal = *threadPool.journal;
   const ResolveTurnHooks hooks = threadPool.hooks;
-  uint32_t next = kj::min(journal.next, threadPool.count);
-  for (uint32_t i = 0; i < next; i++) {
-    ResolveHandle handle = threadPool.handles[i];
-    if (journal.state[i] == TurnJournal::USED) {
-      if (tableCommit(handle, journal.ptr[i], journal.type[i])) {
-        if (hooks.committed == nullptr || hooks.committed(handle, journal.ptr[i], journal.aux[i])) {
-          continue;
-        }
-        KJ_LOG(ERROR, "a turn's resolve entry was refused by the commit hook; it is retired",
-            kj::hex(handle), journal.ptr[i]);
-      } else {
-        KJ_LOG(ERROR, "a turn's resolve entry could not be committed; it resolves to nothing",
-            kj::hex(handle), journal.ptr[i]);
-      }
-      // The entry is about to be retired with nothing of the turn's left naming it, so the
-      // owner is told before the handle stops meaning anything.
-      if (hooks.refused != nullptr) hooks.refused(handle, journal.ptr[i], journal.aux[i]);
-    }
-    // Retired by the turn, never used, or refused: the entry resolves to nothing from now on,
-    // and so does any holder of it.
-    tableUnregister(handle);
-  }
-  for (uint32_t i = next; i < threadPool.count; i++) {
-    threadPool.handles[i - next] = threadPool.handles[i];
-  }
-  threadPool.count -= next;
+  settleJournal(threadPool, false);
+  // What a settle inside a refill hostcall could not hand to the owner there.
+  flushRefusals(threadPool);
   flushRetired(journal, hooks, threadPool.turnArena);
   // The notes last: one about an entry registered above finds it committed, one about an entry
   // released above finds it gone.
@@ -958,8 +1050,6 @@ ResolveTurn::~ResolveTurn() noexcept(false) {
   threadPool.hooks = {nullptr, nullptr, nullptr};
   threadPool.turnArena = nullptr;
   journal.active = false;
-  journal.next = 0;
-  journal.count = 0;
   currentJournal = nullptr;
 }
 
