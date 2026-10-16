@@ -913,11 +913,27 @@ int gk_thread_words_get(unsigned first, unsigned n, uint64_t *values);
 // Which case it is comes from CS, the caller's ring, as it does for
 // gk_resolve: no value in memory decides it.
 //
-// A bucket is the process's and not an isolate's, so a tenant forcing
-// refusals spends a site's budget for the second it is in and another
-// tenant's report at that site waits for the next second. Evidence is delayed
-// by that, not lost: the first report of every window passes. A bucket per
-// arena would close it, at an array of them per arena.
+// The buckets belong to an arena, not to the process, and gk takes the arena
+// from the calling thread's own record rather than from the caller. That
+// matters because reaching the budget is something a turn can do -- the
+// runtime's ring-3 reports ask the host for a verdict, and a turn can ask
+// without having any report to make. One set of buckets for the process would
+// make that a way to spend silence on every other tenant's behalf: burn a
+// site's burst at the start of each window and the reports that site would
+// have made anywhere in the process survive only as a count. Per arena, a
+// turn can spend its own isolate's budget and no one else's. A thread with no
+// arena active -- the event loop, a teardown, startup -- counts in a set of
+// buckets in the block itself, which no ring 3 reaches at all.
+//
+// Two things that leaves. A turn can still spend its own budget, turning the
+// detail of its own refusals -- which handle, which context -- into a number
+// for as long as it keeps asking; the number still rises, so the site is not
+// quiet and the rate is visible, but the detail is gone, and no partition
+// fixes that, since the attacker and the tenant whose evidence it is are the
+// same. And the bound on the process is now GK_LOG_BURST a second per site
+// per live arena rather than per site: each isolate is held to its own burst,
+// which is what bounds the flood one worker can make, but a process full of
+// isolates all forcing refusals adds up, to at most GK_MAX_ARENAS times it.
 //
 // Sites are addressed by a small id, validated before anything is counted. An
 // id at or past GK_LOG_SITES answers 1 rather than 0, since an id gk does not
@@ -944,6 +960,30 @@ enum {
   GK_LOG_SIGNAL_FIELD_UNREG,    // the handle names no field of the thread's arena
 };
 long gk_log_budget(unsigned site);
+
+// Whether the calling thread is running the embedder's hostcall handler: the
+// host side of a guest's exit, where that handler runs with host privilege.
+// A handler must not take the process heap -- the guest chose the moment of
+// the call and may be inside the allocator with its lock held, and that lock
+// is not reentrant -- so embedder code on a path a handler reaches, which
+// would otherwise allocate, asks this and does something else instead. The
+// runtime's refusal reports do: a report made under a handler is composed
+// into a fixed buffer and written once the turn has returned
+// (util/host-memory.c++).
+//
+// Unlike gk_in_guest_hint this is not a hint. The flag is in the thread's
+// record in the supervisor control block, set by gk around the call into the
+// handler, so no ring-3 code can clear it to put the allocation back inside
+// one. A call at guest ring 3 is answered 0 with the record untouched, which
+// is the truth there; which case it is comes from CS, as it does for
+// gk_resolve. Costs a gettid on the host side, so it belongs on a path that
+// is already doing something out of the ordinary.
+//
+// The GK_GUARD_HANDLER_ALLOC build keeps a bracket of its own over a wider
+// set of paths -- the fault path and the signal-time field write as well --
+// and aborts on an allocation inside it. The two agree about hostcall
+// handlers, which is the only part the embedder's code runs in.
+int gk_in_handler(void);
 
 // Whether the calling thread is inside the guest, as gk's own per-thread
 // flag says. The flag is thread-local storage: gk sets it from a constant

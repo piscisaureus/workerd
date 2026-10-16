@@ -437,6 +437,57 @@ enum class LogSite : unsigned {
 // refusing something calls it.
 uint32_t logBudget(LogSite site);
 
+// Whether the calling thread is running a hostcall handler, as the guest kernel's record of
+// the thread says (gk_in_handler). A handler runs with host privilege at a moment the guest
+// chose, which may be the middle of the allocator with its lock held, so it must not take the
+// process heap -- and KJ_LOG formats, which does. A refusal report made under one is therefore
+// composed where the refusal was found and written when the turn returns. False without the
+// guest kernel, where a hostcall is a direct call on the host side with no guest stopped
+// anywhere.
+bool inHandler();
+
+namespace _ {
+
+// The most a deferred report's text runs to. What does not fit is dropped: the message and the
+// first of its values are what name the refusal, and the alternative here is an allocation.
+constexpr size_t REPORT_TEXT = 240;
+
+// Appends as much of `chars` as `buf` has room for.
+void appendReportChars(char* buf, size_t& n, kj::ArrayPtr<const char> chars);
+
+// Takes the next argument name off `macroArgs` -- KJ_LOG's `"" #__VA_ARGS__`, split on
+// top-level commas as kj splits it -- and appends the delimiter, and `name = ` for a name that
+// needs one. A string literal stands on its own, as it does in a line KJ_LOG writes.
+void appendReportLabel(char* buf, size_t& n, const char*& macroArgs, bool first);
+
+template <typename T>
+void appendReportArg(char* buf, size_t& n, const char*& macroArgs, bool& first, T&& value) {
+  appendReportLabel(buf, n, macroArgs, first);
+  first = false;
+  auto chars = kj::toCharSequence(kj::fwd<T>(value));
+  appendReportChars(buf, n, kj::arrayPtr(chars.begin(), chars.size()));
+}
+
+}  // namespace _
+
+// Holds a report for the end of the turn, where it is written as the refusal would have
+// written it. Takes the text rendered, so nothing it does allocates.
+void deferReport(const char* file, int line, kj::ArrayPtr<const char> text, uint32_t suppressed);
+
+// Renders a report the way KJ_LOG would and hands it to deferReport. The values are rendered
+// here rather than kept, because what they name -- a handle, a pointer the turn supplied -- may
+// name nothing by the time the turn ends; kj renders every type these reports carry without
+// allocating, and the buffer is on the stack.
+template <typename... Params>
+void deferReportArgs(
+    const char* file, int line, const char* macroArgs, uint32_t suppressed, Params&&... params) {
+  char buf[_::REPORT_TEXT];
+  size_t n = 0;
+  bool first = true;
+  (_::appendReportArg(buf, n, macroArgs, first, kj::fwd<Params>(params)), ...);
+  deferReport(file, line, kj::arrayPtr(buf, n), suppressed);
+}
+
 // The words of the note the turn on this thread recorded last (noteInTurn), where it recorded
 // them: the journal, which is the turn's own memory. A test rewrites a note through this from
 // inside the turn that made it, as a write primitive would, for the check that the host
@@ -454,15 +505,22 @@ kj::Maybe<kj::Function<void()>&> hostUseForTest(kj::StringPtr name);
 
 }  // namespace hostMemory
 
-// A refusal report, budgeted (see hostMemory::logBudget). The line carries `suppressedSinceLast`,
-// the number of reports this site held back since the last one it made, so a run that was mostly
-// held back is still visible as a number.
+// A refusal report, budgeted (see hostMemory::logBudget) and safe on a path a hostcall handler
+// reaches (see hostMemory::inHandler). The line carries `suppressedSinceLast`, the number of
+// reports this site held back since the last one it made, so a run that was mostly held back is
+// still visible as a number. Under a handler the line is rendered on the spot and written when
+// the turn returns: the same line, from the same place, a moment later.
 #define WD_LOG_REFUSAL(site, ...)                                                                  \
   do {                                                                                             \
     uint32_t wdRefusalBudget = ::workerd::hostMemory::logBudget(site);                             \
     if (wdRefusalBudget != 0) {                                                                    \
       uint32_t suppressedSinceLast KJ_UNUSED = wdRefusalBudget - 1;                                \
-      KJ_LOG(ERROR, __VA_ARGS__, suppressedSinceLast);                                             \
+      if (::workerd::hostMemory::inHandler()) {                                                    \
+        ::workerd::hostMemory::deferReportArgs(                                                    \
+            __FILE__, __LINE__, "" #__VA_ARGS__, suppressedSinceLast, __VA_ARGS__);                \
+      } else {                                                                                     \
+        KJ_LOG(ERROR, __VA_ARGS__, suppressedSinceLast);                                           \
+      }                                                                                            \
     }                                                                                              \
   } while (false)
 

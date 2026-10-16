@@ -28,15 +28,18 @@
 #   defaults to bazel-bin/src/workerd/server/workerd in the repo root. Needs /dev/kvm and curl.
 #   GK_LOG_FLOOD_TEST_PORT overrides the port (8879).
 #
-# Not for the handler-allocation guard build
-# (--//src/workerd/experimental/guest-kernel:handler_alloc_guard=True). A report the budget
-# lets through from inside the refill hostcall is still a KJ_LOG, which formats and so
-# allocates, and a handler must not take the heap -- the guest chose the moment of the call and
-# may hold the allocator. The budget bounds how often that happens; it does not remove it.
-# rpc-context-test.sh's /__gk_refused_in_refill aborts that build for the same reason. Moving
-# the reports a handler makes to the end of the turn is the fix, and is not this one.
+# Worth running against the handler-allocation guard build as well
+# (--//src/workerd/experimental/guest-kernel:handler_alloc_guard=True with
+# --//src/workerd/server:use_tcmalloc=False), where any allocation inside a hostcall handler
+# aborts the process: the reports the refill hostcall finds are rendered there and written once
+# the turn has returned, so the flood must pass that build too.
 #
-# The negative build, which shows the flood this bounds:
+# The negative builds:
+#
+#   --copt=-DWORKERD_GK_NEG_REPORT_DEFER makes a report under a handler format on the spot,
+#   where the guard build aborts on the first refusal the refill hostcall finds.
+#
+# The one that shows the flood this bounds:
 #   bazel build -c opt --platform_suffix=_neg_logcap \
 #     --copt=-DWORKERD_GK_NEG_LOG_CAP //src/workerd/server:workerd
 #   ./log-flood-test.sh bazel-out/k8-opt-_neg_logcap/bin/src/workerd/server/workerd

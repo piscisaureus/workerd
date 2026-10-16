@@ -570,12 +570,33 @@ struct DeferredRefusal {
   uint64_t aux[RESOLVE_AUX_WORDS];
 };
 
+// A refusal report a hostcall handler made, waiting for the end of the turn for the same
+// reason the refusals above do: a handler may not take the process heap, and KJ_LOG formats.
+// So the line is rendered where the refusal was found, into this, and written when the turn
+// returns. The text is a copy, not a reference: it names a handle or a pointer the turn
+// supplied, and by the end of the turn neither may name anything.
+//
+// The list is short because the budget is spent before anything reaches it -- a report held
+// back costs no slot -- so what can arrive here in one turn is bounded by the burst and not by
+// the flood. A turn that fills it anyway has the overflow counted and said so.
+constexpr uint32_t REPORT_CAPACITY = 16;
+struct DeferredReport {
+  const char* file;  // __FILE__ where the refusal was found; a literal, so holding it is safe
+  int line;
+  uint32_t suppressed;
+  uint32_t length;
+  char text[_::REPORT_TEXT];
+};
+
 struct ThreadPool {
   ResolveHandle handles[POOL_CAPACITY];
   uint32_t count = 0;
   kj::Own<TurnJournal> journal;
   DeferredRefusal refusals[REFUSAL_CAPACITY];
   uint32_t refusalCount = 0;
+  DeferredReport reports[REPORT_CAPACITY];
+  uint32_t reportCount = 0;
+  uint32_t reportsDropped = 0;
   ResolveTurnHooks hooks = {
     nullptr, nullptr, nullptr};  // the current turn's, written by the host at entry
   // The arena the current turn runs under, written by the host at entry from gk's own record of
@@ -792,6 +813,34 @@ void flushRefusals(ThreadPool& pool) {
   }
 }
 
+// Writes the reports the turn's hostcalls could not write themselves, in the order they were
+// made. Host-side, at the end of the turn, where formatting is allowed again.
+void flushReports(ThreadPool& pool) {
+  uint32_t n = kj::min(pool.reportCount, REPORT_CAPACITY);
+  uint32_t dropped = pool.reportsDropped;
+  pool.reportCount = 0;
+  pool.reportsDropped = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    DeferredReport& report = pool.reports[i];
+    kj::ArrayPtr<const char> text(report.text, kj::min(report.length, _::REPORT_TEXT));
+    uint32_t suppressedSinceLast = report.suppressed;
+    // Logged at the refusal's own file and line, not at this one, and wrapped in kj::str() so
+    // that kj leaves the text unlabelled: the line then reads exactly as the one the refusal
+    // would have written on the spot.
+    const struct {
+      const char* fileName;
+      int lineNumber;
+    } location = {report.file, report.line};
+    KJ_LOG_AT(ERROR, location, kj::str(text), suppressedSinceLast);
+  }
+  if (dropped != 0) {
+    KJ_LOG(ERROR,
+        "a turn's hostcalls made more refusal reports than the turn holds; the rest "
+        "are lost",
+        dropped);
+  }
+}
+
 // The RESOLVE hostcall: a turn whose journal has run out of reserved entries, or whose retire
 // list or notes are full, asks the host to refill or flush it. The handler finds the thread's
 // pool and journal through the host's own record, never through the frame.
@@ -875,6 +924,84 @@ uint32_t fallbackLogBudget(unsigned site) {
 }
 
 }  // namespace
+
+bool inHandler() {
+#ifdef WORKERD_GK_NEG_REPORT_DEFER
+  // WORKERD_GK_NEG_REPORT_DEFER is a negative-test build, never shipped: a report made under a
+  // hostcall handler is formatted there, which is what these paths did before they waited for
+  // the end of the turn. The handler_alloc_guard build must then abort on the first refusal a
+  // handler finds; this is the check that the guard build tests the waiting.
+  return false;
+#endif
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (guestKernelActive()) return gk_in_handler() != 0;
+#endif
+  return false;
+}
+
+void _::appendReportChars(char* buf, size_t& n, kj::ArrayPtr<const char> chars) {
+  size_t room = kj::min(chars.size(), _::REPORT_TEXT - n);
+  memcpy(buf + n, chars.begin(), room);
+  n += room;
+}
+
+void _::appendReportLabel(char* buf, size_t& n, const char*& macroArgs, bool first) {
+  const char* start = macroArgs;
+  while (*start == ' ') ++start;
+  // The end of this name: the next comma outside brackets and outside a string.
+  const char* pos = start;
+  unsigned depth = 0;
+  bool quoted = false;
+  for (; *pos != '\0'; ++pos) {
+    if (quoted) {
+      if (*pos == '\\' && pos[1] != '\0')
+        ++pos;
+      else if (*pos == '"')
+        quoted = false;
+    } else if (*pos == '(')
+      ++depth;
+    else if (*pos == ')')
+      --depth;
+    else if (*pos == '"')
+      quoted = true;
+    else if (*pos == ',' && depth == 0)
+      break;
+  }
+  macroArgs = *pos == ',' ? pos + 1 : pos;
+  if (!first) appendReportChars(buf, n, "; "_kj);
+  // kj's rule: a string literal, and anything already run through kj::str(), carries its value
+  // alone; everything else is named.
+  kj::ArrayPtr<const char> name(start, pos - start);
+  if (name.size() > 0 && name[0] != '"' && !name.startsWith("kj::str("_kjc)) {
+    appendReportChars(buf, n, name);
+    appendReportChars(buf, n, " = "_kj);
+  }
+}
+
+void deferReport(const char* file, int line, kj::ArrayPtr<const char> text, uint32_t suppressed) {
+  ThreadPool* pool = poolOfThread();
+  if (pool == nullptr) {
+    // No pool is no turn to wait for, which the handlers that reach these paths are always in.
+    // Writing it here is the allocation this exists to avoid, and losing the report is worse.
+    uint32_t suppressedSinceLast = suppressed;
+    const struct {
+      const char* fileName;
+      int lineNumber;
+    } location = {file, line};
+    KJ_LOG_AT(ERROR, location, kj::str(text), suppressedSinceLast);
+    return;
+  }
+  if (pool->reportCount >= REPORT_CAPACITY) {
+    pool->reportsDropped++;
+    return;
+  }
+  DeferredReport& report = pool->reports[pool->reportCount++];
+  report.file = file;
+  report.line = line;
+  report.suppressed = suppressed;
+  report.length = kj::min(text.size(), _::REPORT_TEXT);
+  memcpy(report.text, text.begin(), report.length);
+}
 
 uint32_t logBudget(LogSite site) {
 #ifdef WORKERD_GK_NEG_LOG_CAP
@@ -1125,6 +1252,9 @@ ResolveTurn::~ResolveTurn() noexcept(false) {
   ThreadPool& threadPool = *static_cast<ThreadPool*>(pool);
   TurnJournal& journal = *threadPool.journal;
   const ResolveTurnHooks hooks = threadPool.hooks;
+  // What the turn's hostcalls found and could not say there, first, so that the reports read
+  // in the order the refusals happened: everything below runs host-side and writes its own.
+  flushReports(threadPool);
   settleJournal(threadPool, false);
   // What a settle inside a refill hostcall could not hand to the owner there.
   flushRefusals(threadPool);

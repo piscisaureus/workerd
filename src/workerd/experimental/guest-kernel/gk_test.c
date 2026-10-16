@@ -3561,12 +3561,65 @@ static int thread_word_check(void) {
   return ok;
 }
 
+// ---- the handler flag ------------------------------------------------------------
+// Whether the embedder's hostcall handler is running, from the thread's record
+// rather than from anything ring 3 can write (see gk_in_handler in gk.h).
+// Checks: a handler called from the host and a handler called from a ring-3
+// turn both see it set; a bracketed call made from inside one leaves it set,
+// so an inner call does not unguard the rest of the handler; host code outside
+// a handler sees it clear, and so does the handler's caller afterwards; and a
+// ring-3 turn is answered 0 without the record being touched.
+
+enum { HF_IDX = GK_HOSTCALLS - 2 };
+static volatile int hf_inside, hf_after_inner;
+static long hf_handler(void *ctx, gk_hostcall_frame *f) {
+  (void)ctx; (void)f;
+  hf_inside = gk_in_handler();
+  // A host-side resolve takes a bracket of its own; the flag must still say
+  // handler once it returns.
+  gk_resolve(0);
+  hf_after_inner = gk_in_handler();
+  return 0;
+}
+// Runs in the guest (ring 3): the flag here, then a hostcall whose handler
+// reads it on the host side of the exit.
+static long hf_guest(void *arg) {
+  (void)arg;
+  long here = gk_in_handler();
+  gk_hostcall(HF_IDX);
+  return here;
+}
+
+static int handler_flag_check(void) {
+  int reg = gk_hostcall_register(HF_IDX, hf_handler, NULL) == 0;
+  hf_inside = hf_after_inner = -1;
+  long host_call = gk_hostcall(HF_IDX);
+  int from_host = hf_inside == 1 && hf_after_inner == 1;
+  int outside = gk_in_handler() == 0;
+  hf_inside = hf_after_inner = -1;
+  long r3 = gk_run_here_user(hf_guest, NULL);
+  int from_guest = hf_inside == 1 && hf_after_inner == 1;
+  int clear_after = gk_in_handler() == 0;
+  gk_hostcall_unregister(HF_IDX);
+
+  int ok = reg && host_call == 0 && from_host && outside && r3 == 0 && from_guest && clear_after;
+  printf("handler flag: a handler called from the host sees it set %s, one called from a ring-3 "
+         "turn %s, and an inner bracketed call leaves it set %s; outside one %s; from ring 3 "
+         "-> %ld %s [%s]\n",
+         from_host ? "yes" : "NO", from_guest ? "yes" : "NO", hf_after_inner == 1 ? "yes" : "NO",
+         outside && clear_after ? "clear" : "NOT CLEAR", r3, r3 == 0 ? "ok" : "WRONG",
+         ok ? "OK" : "FAIL");
+  return ok;
+}
+
 // ---- the report budget ----------------------------------------------------------
 // What a refusal path may say, per site and per second (see gk_log_budget in
 // gk.h). Checks: the first report at a site passes with nothing before it; a
 // burst is capped; the reports held back are counted and handed to the next
 // one that passes; a site gk does not know passes rather than goes silent;
-// and a call from a ring-3 turn decides nothing and answers -EPERM.
+// one arena's budget is not another's, so a turn spending its own takes no
+// other isolate's report with it; and a call from a ring-3 turn decides
+// nothing and answers -EPERM.
 
 // Runs in the guest (ring 3): asks for a report budget, which the caller's
 // ring refuses before the block is touched.
@@ -3605,6 +3658,26 @@ static int log_budget_check(void) {
   int unknown = gk_log_budget(GK_LOG_SITES) == 1 && gk_log_budget(~0u) == 1;
   // Sites are counted apart: the one above is spent and this one is not.
   int apart = gk_log_budget(other) >= 1;
+  // So are arenas. A thread with an arena active counts in that arena's
+  // buckets, so a turn that spends a site's burst leaves another isolate's
+  // first report at that site to pass as it always would.
+  const unsigned shared = GK_LOG_SITES - 3;
+  gk_arena *a1 = gk_arena_create(1 << 20), *a2 = gk_arena_create(1 << 20);
+  int arenas = 0;
+  if (a1 && a2 && gk_arena_enter(a1) == 0) {
+    int mine = gk_log_budget(shared) == 1;
+    for (int i = 0; i < 4 * GK_LOG_BURST; i++) gk_log_budget(shared);
+    int spent = gk_log_budget(shared) == 0;
+    gk_arena_leave();
+    int theirs = gk_arena_enter(a2) == 0 && gk_log_budget(shared) == 1;
+    gk_arena_leave();
+    // And the block's own buckets, which a thread with no arena uses, are
+    // untouched by either.
+    int neither = gk_log_budget(shared) == 1;
+    arenas = mine && spent && theirs && neither;
+  }
+  if (a1) gk_arena_destroy(a1);
+  if (a2) gk_arena_destroy(a2);
   // From a ring-3 turn: no decision and no fault -- a turn that faulted would
   // have ended as GK_EFAULT rather than returning gk's refusal.
   long r3 = gk_run_here_user(lb_guest, (void *)(uintptr_t)other);
@@ -3616,13 +3689,15 @@ static int log_budget_check(void) {
   for (int i = 0; i < LB_N; i++) acc += gk_log_budget(site);
   double per = (now_ns() - t1) / LB_N;
 
-  int ok = first && passed && capped && counted && unknown && apart && walled && per > 0;
+  int ok = first && passed && capped && counted && unknown && apart && arenas && walled &&
+           per > 0;
   printf("report budget: first report passes %s; burst of %d capped %s; %ld held back came back "
-         "as %ld %s; unknown site passes %s; sites counted apart %s; from a ring-3 turn -> %ld "
-         "%s; host-side call %.0f ns (%ld passed of %d) [%s]\n",
+         "as %ld %s; unknown site passes %s; sites counted apart %s; arenas counted apart %s; "
+         "from a ring-3 turn -> %ld %s; host-side call %.0f ns (%ld passed of %d) [%s]\n",
          first ? "yes" : "NO", GK_LOG_BURST, capped ? "yes" : "NO", held, next,
-         counted ? "yes" : "NO", unknown ? "yes" : "NO", apart ? "yes" : "NO", r3,
-         walled ? "refused" : "NOT REFUSED", per, acc, LB_N, ok ? "OK" : "FAIL");
+         counted ? "yes" : "NO", unknown ? "yes" : "NO", apart ? "yes" : "NO",
+         arenas ? "yes" : "NO", r3, walled ? "refused" : "NOT REFUSED", per, acc, LB_N,
+         ok ? "OK" : "FAIL");
   return ok;
 }
 
@@ -4589,6 +4664,12 @@ int main(void) {
   // turn, unreachable from ring 3 (see thread_word_check).
   int ok32 = thread_word_check() == 1;
 
+  // ---- the handler flag -------------------------------------------------------
+  // The embedder's handler runs with the flag set, in the thread's record and
+  // not where ring 3 could clear it; a nested bracketed call leaves it set,
+  // and a ring-3 turn is answered no (see handler_flag_check).
+  int ok37 = handler_flag_check() == 1;
+
   // ---- the report budget ------------------------------------------------------
   // What a refusal path may say is capped per site and per second, counted in
   // the control block where ring 3 cannot reset it; the first report at a
@@ -4639,7 +4720,7 @@ int main(void) {
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
             ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28 && ok29 && ok30 && ok31 &&
-            ok32 && ok33 && ok34 && ok36;
+            ok32 && ok33 && ok34 && ok36 && ok37;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

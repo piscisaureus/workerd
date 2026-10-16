@@ -157,7 +157,10 @@ isolate's JS turn at guest ring 3.
   draw two dozen lines rather than 45000; the first report of each kind is
   still made, and one in the next window carries the number held back.
   Negative build: `--copt=-DWORKERD_GK_NEG_LOG_CAP`, where every report is
-  made and the script fails on the volume.
+  made and the script fails on the volume. Worth running against the
+  handler-allocation guard build too, where the reports the refill hostcall
+  finds would otherwise format inside a handler;
+  `--copt=-DWORKERD_GK_NEG_REPORT_DEFER` puts that back and aborts it.
 
 ## API
 
@@ -678,9 +681,29 @@ hardware:
   which allocates and takes stdio's lock; workerd's use it through
   `WD_LOG_REFUSAL` (`util/host-memory.h`), and at ring 3 ask the host for the
   verdict through the hostcall their journal already uses.
-  A bucket is the process's and not an isolate's, so one tenant forcing
-  refusals delays another's report at the same site to the next second.
-  `gk_test.c`'s `log_budget_check` and `log-flood-test.sh` cover it.
+  The buckets are an arena's, taken from the calling thread's own record:
+  asking for a verdict is something a turn can do without having a report to
+  make, so shared buckets would be one tenant's to spend on every other
+  tenant's behalf. A turn can still spend its own isolate's budget, turning
+  the detail of its own refusals into a number that still rises; and the
+  bound on the process becomes the burst per site per live arena rather than
+  per site. `gk_test.c`'s `log_budget_check` and `log-flood-test.sh` cover
+  it.
+- **Reports a handler makes wait for the end of the turn.** A hostcall
+  handler runs with host privilege at a moment the guest chose, which may be
+  the middle of the allocator with its lock held, so it must not take the
+  heap -- and `KJ_LOG` formats, which does. `gk_in_handler` says whether the
+  calling thread is in one, from the thread's record in the supervisor
+  control block rather than from a thread-local a turn could clear, and
+  answers no at ring 3 without reading the record. A report made under a
+  handler is rendered into a fixed buffer where the refusal was found, kept
+  in the thread's pool (host memory, and a copy, since the handle or pointer
+  it names may name nothing by then), and written from `~ResolveTurn` at its
+  own file and line -- the same line, a moment later. The list is short
+  because the budget is spent first, so a report held back costs no slot; a
+  turn that fills it anyway has the overflow counted and said so.
+  `gk_test.c`'s `handler_flag_check` covers the flag, and the whole probe set
+  under the guard build covers the rest.
 - **Thread words.** Per-thread state the host or a signal handler must read
   from memory no ring-3 code can write -- the opposite of thread-local
   storage, which a turn can rewrite -- lives in `GK_THREAD_WORDS` 64-bit words

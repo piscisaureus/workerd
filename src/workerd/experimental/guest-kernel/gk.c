@@ -244,6 +244,11 @@ typedef struct gk_thread {
   // identity of the directory it named when it was set, so a descriptor the
   // guest has since closed and reused names nothing. turn_dir_set is cleared
   // at every guest entry, so a turn starts with no directory.
+  // Whether the embedder's hostcall handler is running on this thread (see
+  // gk_in_handler in gk.h). Here, in supervisor memory, and not in a
+  // thread-local: a turn that could clear it would put an allocation back
+  // inside a handler, which is the thing the flag exists to keep out.
+  int in_hostcall;
   int turn_dir;
   int turn_dir_set;
   uint64_t turn_dir_dev, turn_dir_ino;
@@ -271,6 +276,16 @@ static __thread gk_hostcall_frame *tls_hostcall_region;
 #define GK_SLOT_BITS 39
 #define GK_SLOT_BYTES (1UL << GK_SLOT_BITS)
 #define GK_MAX_ARENA_SLOTS 8   // 4TiB per arena; V8's largest sandbox reservation is ~1.34TB
+
+// One report site's budget (see gk_log_budget in gk.h). Twelve bytes, because
+// every arena carries GK_LOG_SITES of them: the window is a coarse monotonic
+// second, which fits 32 bits for 136 years of uptime.
+typedef struct {
+  _Atomic uint32_t window;      // the coarse monotonic second it is counting in
+  _Atomic uint32_t allowed;     // reports let through in that second
+  _Atomic uint32_t suppressed;  // reports held back since the last one let through
+} gk_log_bucket;
+
 #define GK_USER_SLOTS 256      // PML4 slots 0..255 are the 47-bit user address space
 #define GK_FIRST_CAGE_SLOT 64  // arenas are placed from here up
 #define GK_MAX_ARENAS 4096
@@ -308,6 +323,13 @@ struct gk_arena {
   // arena is handed that same root (see gk_resolve in gk.h). Guarded by G->lock.
   int resolve_head;
   int resolve_live;
+  // What each report site may still say about this arena (see gk_log_budget
+  // in gk.h). Per arena and not per process because the budget is reachable
+  // from a turn -- which can ask for a verdict it has no report to make --
+  // and a shared bucket is one tenant's to spend on every other tenant's
+  // behalf. Zeroed with the rest of the struct when it is taken from the
+  // pool, so a recycled arena starts with a budget of its own.
+  gk_log_bucket log_budget[GK_LOG_SITES];
   gk_arena *next_free;        // free-list link while the struct is unused
 };
 
@@ -492,13 +514,6 @@ typedef struct { uintptr_t start, end; } gk_span;
 
 #define GK_CPUID_ENTRIES 128
 
-// One report site's budget (see gk_log_budget in gk.h).
-typedef struct {
-  _Atomic uint64_t window;      // the coarse monotonic second it is counting in
-  _Atomic unsigned allowed;     // reports let through in that second
-  _Atomic unsigned suppressed;  // reports held back since the last one let through
-} gk_log_bucket;
-
 struct gk_ctl {
   // Platform state, set once by gk_init.
   int kvm, vmfd;
@@ -671,9 +686,11 @@ struct gk_ctl {
   gk_span image[GK_MAX_IMAGE_RANGES];
   int image_n;
 
-  // What each report site may still say (see gk_log_budget in gk.h). Here
-  // rather than in process memory because a counter the guest can reset is
-  // not a cap, and the block is the one place ring 3 cannot write.
+  // What each report site may still say outside any arena -- on the event
+  // loop, in a teardown, before the first isolate exists (see gk_log_budget
+  // in gk.h). A thread with an arena active counts in the arena's buckets
+  // instead. No ring-3 code can reach this one at all: reaching the budget
+  // takes a thread with an arena, which is what a turn is.
   gk_log_bucket log_budget[GK_LOG_SITES];
 
   // A word for tests to read and write through the guest (gk_debug_ctl_addr).
@@ -787,12 +804,14 @@ static void db_flush(gk_dbuf *d) {
 // syscall so the path allocates nothing and takes no lock the guest thread
 // could be holding (see the note above write_stderr). A clock that will not
 // answer leaves every report in window 0, where the burst alone bounds them.
-static uint64_t log_window_now(void) {
+static gk_thread *thread_cur_lockfree(void);  // defined with the thread records
+
+static uint32_t log_window_now(void) {
   struct timespec ts;
   if (host_syscall(SYS_clock_gettime, CLOCK_MONOTONIC_COARSE, (long)(uintptr_t)&ts, 0, 0, 0, 0) <
       0)
     return 0;
-  return (uint64_t)ts.tv_sec;
+  return (uint32_t)ts.tv_sec;
 }
 
 long gk_log_budget(unsigned site) {
@@ -805,9 +824,15 @@ long gk_log_budget(unsigned site) {
   // An id gk does not know is the caller's mistake, and the safe answer to a
   // mistake is the report, not silence.
   if (site >= GK_LOG_SITES) return 1;
-  gk_log_bucket *b = &G->log_budget[site];
-  uint64_t now = log_window_now();
-  uint64_t was = atomic_load_explicit(&b->window, memory_order_relaxed);
+  // The arena the calling thread has active, from gk's own record of it and
+  // never from the caller: a turn counts against its own isolate's budget and
+  // against no other's. A thread with no arena -- the event loop, a teardown
+  // -- counts in the block's own buckets, which no ring 3 reaches.
+  gk_thread *t = thread_cur_lockfree();
+  gk_arena *a = t ? __atomic_load_n(&t->active_arena, __ATOMIC_ACQUIRE) : NULL;
+  gk_log_bucket *b = a ? &a->log_budget[site] : &G->log_budget[site];
+  uint32_t now = log_window_now();
+  uint32_t was = atomic_load_explicit(&b->window, memory_order_relaxed);
   if (now != was && atomic_compare_exchange_strong_explicit(&b->window, &was, now,
                         memory_order_relaxed, memory_order_relaxed)) {
     // A window of its own for this report. A bucket starts at window 0 with
@@ -3826,12 +3851,22 @@ static long hostcall_dispatch(gk_thread *t, uint64_t idx) {
   pthread_mutex_unlock(&G->lock);
   if (!e.fn) return -GK_ENOSYS;
   int guard = GK_HANDLER_ENTER();
+  // What gk_in_handler answers for the embedder's code from here on. Restored
+  // rather than cleared, as the guard's bracket is: gk refuses a hostcall
+  // made from inside a handler, but a leave that cleared would be wrong the
+  // moment that stops being true.
+  int was_handler = t->in_hostcall;
+  t->in_hostcall = 1;
   // The region is the guest's; every field is read once, into the host frame,
   // and the copy is bounded by the frame, not by anything the guest wrote.
   volatile gk_hostcall_frame *g = hostcall_region_of(t);
   gk_hostcall_frame *h = t->hostcall_frame;
   uint64_t in_len = g->in_len;
-  if (in_len > GK_HOSTCALL_BYTES) { GK_HANDLER_LEAVE(guard); return -GK_E2BIG; }
+  if (in_len > GK_HOSTCALL_BYTES) {
+    t->in_hostcall = was_handler;
+    GK_HANDLER_LEAVE(guard);
+    return -GK_E2BIG;
+  }
   for (int i = 0; i < 4; i++) h->args[i] = g->args[i];
   h->in_len = in_len;
   h->out_len = 0;
@@ -3852,6 +3887,7 @@ static long hostcall_dispatch(gk_thread *t, uint64_t idx) {
   memset(h->args, 0, sizeof h->args);
   h->in_len = h->out_len = 0;
   __asm__ __volatile__("" : : "r"(h) : "memory");
+  t->in_hostcall = was_handler;
   GK_HANDLER_LEAVE(guard);
   return r;
 }
@@ -4360,6 +4396,17 @@ static gk_thread *thread_cur_lockfree(void) {
   for (int j = 0; j < n; j++)
     if (__atomic_load_n(&G->threads[j].tid, __ATOMIC_RELAXED) == tid) return &G->threads[j];
   return NULL;
+}
+
+int gk_in_handler(void) {
+  // The caller's ring, from CS, as gk_resolve reads it. At guest ring 3 the
+  // record is unreachable, and the answer there is no: a handler runs on the
+  // host side of an exit, never in the guest.
+  unsigned short cs;
+  __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
+  if (cs == GK_USER_CS) return 0;
+  gk_thread *t = thread_cur_lockfree();
+  return t ? t->in_hostcall : 0;
 }
 
 // The entry a handle names, or NULL if the handle is not one gk issued for a
