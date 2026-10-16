@@ -52,8 +52,8 @@ gk_user_syscall_resume:
 // a pointer seen between two matching reads was the entry's under that
 // generation. Every scratch register is cleared before SYSRET, so ring 3 gets
 // the pointer and nothing else; RCX and R11 are untouched for SYSRET to use.
-// The entry layout is {void *ptr; uint64_t gen; uint64_t owner; uint64_t},
-// 32 bytes, index * 32.
+// The entry layout is {void *ptr; uint64_t gen; uint64_t owner; uint64_t
+// chain; uint64_t type; ...}, 64 bytes, index * 64 (see the table in gk.c).
 // Keep the split at bit 20 in sync with GK_RESOLVE_INDEX_BITS in gk.h.
 //
 // The owner is the arena root the host registered the entry under, and CR3 is
