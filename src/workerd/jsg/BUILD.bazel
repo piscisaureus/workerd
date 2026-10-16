@@ -113,6 +113,7 @@ wd_cc_library(
     # Some JSG headers can't be compiled on their own
     features = ["-parse_headers"],
     implementation_deps = [
+        "//src/workerd/util:alloc-census",
         "//src/workerd/util:entropy",
         "@simdutf",
         "@ssl",

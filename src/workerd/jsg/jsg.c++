@@ -10,6 +10,7 @@
 #include <workerd/jsg/modules-new.h>
 #include <workerd/jsg/modules.h>
 #include <workerd/jsg/util.h>
+#include <workerd/util/alloc-census.h>
 #include <workerd/util/thread-scopes.h>
 
 #ifdef WORKERD_HAS_GUEST_KERNEL
@@ -143,6 +144,7 @@ void Data::moveFromTraced(Data& other, v8::TracedReference<v8::Data>& otherTrace
 }
 
 GuestArenaScope::GuestArenaScope(v8::Isolate* isolate) {
+  allocCensus::enterIsolate(isolate);
 #ifdef WORKERD_HAS_GUEST_KERNEL
   KJ_IF_SOME(arena, IsolateBase::from(isolate).getGuestArena()) {
     int result = gk_arena_enter(arena.get());
@@ -153,6 +155,7 @@ GuestArenaScope::GuestArenaScope(v8::Isolate* isolate) {
 }
 
 GuestArenaScope::~GuestArenaScope() noexcept(false) {
+  allocCensus::leaveIsolate();
 #ifdef WORKERD_HAS_GUEST_KERNEL
   if (entered) {
     // Leaves what gk recorded this thread as having entered, whatever this object says.

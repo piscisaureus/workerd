@@ -205,6 +205,9 @@ Three layers, each catching what the one before cannot.
 
 1. **Placement.** The allocator decides the class in practice: an I object has
    to come from the isolate's arena and an H object from memory no arena maps.
+   What the sites actually are is counted rather than derived, in "Placing the
+   shared heap per isolate" below, which also says why this layer's enforcement
+   is a run-time counter and not the static check.
    Per-isolate heap arenas are the mechanism for I (`jsg::HeapArena`); for H
    it is `gk_host_alloc` behind `HostOwn<T>` for an owner that is itself in
    H memory and `gk_host_slot_alloc` behind `HostSlot<T>` for one that is
@@ -1481,6 +1484,266 @@ refusals and no orphans across 120 subrequests. Both refusals are silent at
 the call site, which is why neither was visible until it was counted, and both
 are the guest kernel's build differing from the ordinary one on paths the
 ordinary suite covers.
+
+## Placing the shared heap per isolate
+
+The three sections above each end at the same sentence -- what closes the
+class is the shared heap leaving the arena -- and that sentence has two
+readings. Read as *out of a turn's reach*, it means H memory, and the
+sections that reach it are right that nothing smaller closes what they
+name: the host following a disposer, a `T`'s vtable or a queued action's
+closure is unaffected by which arena the object sits in, because the host
+runs on the base root, from which every arena is mapped. Read as *not one
+heap shared by every arena*, it is a different step, and that is the one
+the order of work needs.
+
+Which reading the placement work takes is settled by the first of the three
+conclusions above rather than chosen. An object a turn legitimately
+dereferences after the turn that created it has to stay mapped in that
+isolate's arena -- 23 of the 36 `IoOwn` classes are read that way, and
+`resolve_ptr_ok` will not admit a host-memory pointer into the table at all
+-- so for the shared heap the target is **per-arena, not out-of-arena**: an
+allocation the classification calls I goes to the owning isolate's arena,
+and one it calls H or B goes to a heap every arena maps. That closes one
+half of the exposure: A's objects become unmapped under B's page-table
+root, so a ring-3 escape in B can neither read nor write them. Of the other
+half it closes nothing. The host-side indirect call stands, the three
+residuals the `IoOwn` holders carry stand (each is the owning isolate
+forging values in its own holder, which stays writable wherever it is
+placed), and same-isolate corruption is out of scope by construction. So
+per-arena placement is a precondition for the host-side work and not a
+substitute for it, and the two must not be reported as one thing.
+
+### What an allocation census measures, and what it cannot
+
+Which allocations are I and which are H or B has been argued from the rules
+above and never counted. `--//src/workerd/util:alloc_census=True`
+(`util/alloc-census.{h,c++}`) counts it. The build replaces every form of
+`operator new` and `operator delete` and wraps `malloc`, `calloc`,
+`realloc` and `free`, and records for each block:
+
+- the allocation site, as the ten return addresses above the interposer,
+  walked from the frame pointer with each frame validated so that a caller
+  built without one truncates the site instead of faulting
+  (`--copt=-fno-omit-frame-pointer`, `--copt=-g1`, symbolized offline);
+- the isolate whose lock was held when the block was allocated, taken from
+  `jsg::GuestArenaScope`, which is the window in which that isolate's arena
+  is the thread's active one, and whether the thread was at ring 3 inside a
+  turn;
+- the isolate whose lock was held when the block was freed, through a
+  16M-entry open-addressed table keyed on the pointer;
+
+and aggregates per site into counters: allocations by context, frees split
+into same-isolate, **cross-isolate**, no-lock and owner-less, the set of
+isolates that allocated and freed there, and what is still live. It needs
+no guest kernel -- the isolate lock is the identity either way -- so it
+runs at ordinary speed, and it runs with `use_tcmalloc=False` because
+tcmalloc defines `operator new` without going through `malloc`.
+
+What it sees is where a block's *ownership* ends up. A cross-isolate free is
+a fault under per-arena placement and not merely a smell, because
+`operator delete` is reached through the object's destructor: isolate B
+running `~T` over a `T` in A's arena faults at the object. What it does not
+see is a cross-isolate *read* that transfers no ownership -- isolate B's
+`jsg::Deserializer` reading bytes isolate A allocated for the shared memory
+cache is invisible to it -- nor process-wide state that is allocated once
+and never freed, for which the phase experiment below is the instrument.
+It also misses an allocation libc makes internally and a direct `mmap`:
+1,339 frees in the run below were of a pointer it had never recorded.
+
+### The population
+
+One workerd process, six workers -- a plain one, two that use `Intl`, one
+that uses `setTimeout`, and a service-binding pair whose caller makes JS
+RPC calls, service-binding `fetch`es and RPC calls returning a 4 KiB
+`Uint8Array` -- driven 60 rounds through all six endpoints with the guest
+kernel on:
+
+- **5,458 distinct allocation sites, 324,877 allocations.** 201,526 of them
+  (62.0%) were made under an isolate lock, 182,351 of those at ring 3
+  inside a turn and 19,175 under the lock but outside the guest. The
+  remaining 123,351 were made with no lock held at all. So the arena switch
+  has to span the whole isolate lock and not the turn: a tenth of what an
+  isolate allocates it allocates host-side under its own lock.
+- **Frees: 82,703 under the allocating isolate's own lock, 5,700 under
+  another isolate's, 174,116 with no lock held, 4,798 of an owner-less
+  block under some lock.** Two thirds of all frees happen on the base root,
+  which is why the allocator's free path must not touch the freed block --
+  it is the property the parked branch gets from jemalloc's
+  `metadata_use_hooks = false`, and the measurement is what makes it a
+  requirement rather than a convenience.
+- **The 5,700 cross-isolate frees fall in 25 sites, and every one of them
+  has a Cap'n Proto frame in its stack.** 5,400 also carry a workerd JS-RPC
+  frame. The named allocations are `capnp::MallocMessageBuilder::
+  allocateSegment`, `BuilderArena::MultiSegmentState`, the
+  `SegmentBuilder`s and the three `kj::Vector`s `BuilderArena` grows,
+  `LocalCallContext`'s `LocalResponse`, `Capability::Client::
+  makeLocalClient`'s `LocalClient`, `MembranePolicy::exportInternal`'s
+  `MembraneHook` with the membrane's `HashMap<ClientHook*, ClientHook*>`
+  and its rehash buckets, and on workerd's side
+  `api::TransientJsRpcTarget`, its `Handles`, the `kj::Function` box
+  `JsRpcTargetBase` holds, and `IoContext::makeReentryCallback`'s lambda
+  with its `kj::Deferred`. 300 are `IoContext::PendingEvent`, which
+  `registerPendingEvent` makes on every turn and which a callee's context
+  releases under the caller's lock.
+- **The `jsg::Object` family is clean.** Over the same run, the 58 sites
+  that reach `jsg::Lock::alloc` or `jsg::wrapOpaque` account for 21,871
+  allocations -- 10.9% of everything allocated under a lock -- with 3,533
+  frees, **every one under the allocating isolate's own lock**: no
+  cross-isolate free and not one free with no lock held.
+- **The owned-list nodes are already out of the heap.** The census records
+  no `hostMemory::allocate` at all under the guest kernel, against 14,011
+  allocations at 10 sites without it, 2,000 of them freed cross-isolate.
+  That is `gk_host_alloc` doing what it is for, and it is the shape the
+  rest of the H population wants.
+
+The same workload with the guest kernel off and 200 rounds gives the same
+picture at scale: 977,777 allocations, 61.5% under a lock, and 24,254
+cross-isolate frees over 31 sites, again all on the Cap'n Proto path, plus
+two the guest-kernel configuration does not produce (below).
+
+The site count is a lower bound on the work, not an estimate of it. This is
+one workload; the cross-isolate list above names a dozen mechanisms it does
+not exercise -- streams over RPC, hibernatable WebSockets, the shared
+memory cache, Pyodide bundles, `WorkerLoader`, replica storage, `AbortSignal`
+over RPC -- and the census is blind to the reads among them.
+
+### What breaks first
+
+Four classes, in the order the measurements put them.
+
+**1. The in-process Cap'n Proto call, which is every service binding and
+every JS RPC.** It is the whole of the measured cross-isolate set. The
+caller builds a `MallocMessageBuilder` under its own lock, the callee's
+turn reads and extends the same arena, and the stubs and membrane hooks
+that carry the capability are destroyed under whichever isolate drops them
+last. No scope around workerd code reaches the segments: they are allocated
+inside `capnp::_::BuilderArena::allocate`, called from the callee's turn.
+Either the message arena is allocated from a heap both isolates map --
+which is a shared-heap scope at `LocalClient::call` and at the
+`JsRpcTargetBase`/`TransientJsRpcTarget` constructors, spanning the callee's
+turn -- or the message is copied at the boundary, which is the B form the
+inventory above asks for and which this measurement prices: 3,816 segment
+allocations and 1,200 `LocalResponse`s per 12,000 RPC calls.
+
+**2. Process-wide state established inside the first turn that needs it,
+which no free reveals.** Measured by phases: 100 requests to the first
+`Intl` worker, a dump, 100 to the second, another dump, and then the sites
+that did not grow for the second isolate although it did the same work.
+**46 sites and 7,386 allocations**, all allocated under the first isolate's
+lock, all still live, none re-allocated by the second. 35 of the 46 are
+inside ICU, at the shapes that name the cause: `umtx_initOnce`,
+`entryOpen`/`init_entry` and `uprv_strdup` for the resource-bundle cache,
+`UDataMemory_createNewInstance`, `UnifiedCache::_get`,
+`LikelySubtags::initLikelySubtags`, `getStaticMacroregions`. ICU has
+`u_setMemoryFunctions`, so one hook covers all 35.
+
+The other nine are not ICU and not reachable by a hook: 1,290
+`std::set<std::string>::insert` nodes, reached from
+`v8::internal::JSDateTimeFormat::New` (`js-date-time-format.cc:2585`)
+through `builtins-intl.cc:281`, allocated with the plain global
+`operator new` inside V8 and never freed. They are V8's own process-wide
+locale sets, built by whichever isolate first constructs an
+`Intl.DateTimeFormat`. Nothing in workerd can place them; it takes a V8
+change, which is why the parked branch needed a patch running the `Intl`
+builtins under an embedder shared-allocation scope, and this is the
+measurement that says such a patch is not avoidable.
+
+**3. The event loop's timer set, grown at ring 3.** `kj::TimerImpl`'s
+`std::multimap` node appears as `__emplace_multi<TimerImpl::
+TimerPromiseAdapter*>`, 60 allocations in the run, every one inside a turn
+and every one freed with no lock held. The container is the thread's, so
+one isolate's `setTimeout` puts a node of a process-wide tree in that
+isolate's arena, and the next isolate's insert rebalances across it. The
+workload has one worker using timers, so it produces the allocation and not
+the fault; the parked branch produced the fault with two.
+
+**4. V8's page-allocator bookkeeping -- not in this configuration.**
+Without the guest kernel, `v8::base::RegionAllocator`'s region map
+contributes 1,252 cross-isolate frees over 117 sites, and
+`v8::internal::PooledPage` two more: process-wide allocator state grown and
+shrunk under whichever isolate's lock is held. Under the guest kernel both
+go to zero, because each isolate already gets its own `v8::IsolateGroup`
+with an `ArenaPageAllocator` over its arena's tail (`jsg/setup.h`), so the
+region map is per isolate. It is listed because it is the shape of hazard
+to expect from V8 and because the zero depends on that configuration, not
+because it is open.
+
+What the parked branch hit is therefore 1, 2 and 3, and the census locates
+each one at the allocation site that produces it. What it adds is that the
+second class has a V8 half the ICU hook does not reach, and that the first
+class is not a handful of workerd objects but Cap'n Proto's message arena.
+
+### What a check can enforce, and what it cannot
+
+The `workerd-memory-class` check cannot carry placement, and the reason is
+not that it is unfinished. It decides by type, over the data members and
+base classes of an annotated class; placement is a property of the code
+path that allocates, and what the measurement says must be placed in the
+shared heap is almost never an allocation of a class that could carry an
+annotation. Of the 5,700 cross-isolate frees, about 1,900 are of a type
+declared in workerd (`TransientJsRpcTarget` and its `Handles`, the
+`JsRpcTargetBase` function box, the reentry callback and its `kj::Deferred`,
+`PendingEvent`); the rest are `capnp::_::SegmentBuilder`, `MultiSegmentState`,
+`LocalResponse`, `LocalClient`, `MembraneHook`, `kj::Vector` growth and
+`kj::_::rehash` buckets, and the three classes of process-wide state are
+inside ICU, inside V8 and inside KJ. None of those can be annotated here,
+and even for the ones that can, an annotation that reached `operator new`
+would place the object and not the transitive allocations its constructor
+makes, which is what a scope does.
+
+So the three layers under "Enforcing it" above divide differently than the
+list there suggests. The static check keeps the type-level rules honest and
+should not be extended to placement. Placement is enforced at run time, by
+two things that cost almost nothing:
+
+- **the hardware, for reads**: a cross-arena read is already a fault, and
+  the fault reports the address and the faulting RIP;
+- **a cross-arena-free counter, for ownership**: the allocator knows the
+  freed block's arena and the thread's, so the comparison is free, and the
+  census is the evidence that the counter is informative -- it is what
+  found all four classes above. A per-arena build whose counter stays at
+  zero over the suite is a placement claim that can be checked; one that
+  does not is a list of sites to fix.
+
+Measurement, the third layer, is what the census is: it has to come before
+the placement rather than after it, because the sites that need a scope are
+not derivable from the class rules.
+
+### The smallest honest slice, and why it is not small
+
+The `jsg::Object` family is the best candidate the census found: 232
+`JSG_RESOURCE_TYPE` classes, one allocation choke point (`jsg::Lock::alloc`
+and `jsg::wrapOpaque`, both reaching `kj::refcounted<T>`), 10.9% of what a
+turn allocates, and in the measured run every free under the allocating
+isolate's own lock. Placing it would need: a size-class allocator over a
+region of the isolate's arena whose metadata is out of the arena, since a
+free must not touch the block and the owner has to be derivable from the
+address -- which it is, because gk places arenas in whole 512 GiB
+page-table slots from `GK_FIRST_CAGE_SLOT` up, so the slot index names the
+owner; `operator new`/`operator delete` on `jsg::Object`, so that every
+subclass is placed by inheritance; and a negative build in which another
+isolate reads a placed object and faults.
+
+That is not a small change. It is a new allocator on the path of every JSG
+wrapper, and the parked branch's two unresolved defects were both in an
+allocator of exactly that kind (an extent jemalloc believed committed and
+was not; ICU data outliving the arena it was placed in). It also does not
+stand on its own: a placed `jsg::Object` whose members are `kj::Vector`s,
+`kj::String`s and `kj::HashMap`s leaves those sub-allocations in the shared
+heap, so the family is placed and the memory it owns is not, and the first
+thing the negative build would measure is the reads it still allows rather
+than the ones it stops.
+
+The order the measurements imply is therefore the allocator first and the
+families second, and in the allocator the three things the parked branch
+did not have: the free path proven not to touch the block (66% of frees are
+off any lock), the shared scope placed at the Cap'n Proto call rather than
+at workerd's own objects, and the ICU and V8 `Intl` hooks in place before
+any second `Intl` worker runs. Until those exist there is no slice that
+demonstrates the property without carrying the whole mechanism, and the
+honest step is the census itself, which turns each of the four classes from
+an argument into a site list.
 
 ## What is in H memory
 

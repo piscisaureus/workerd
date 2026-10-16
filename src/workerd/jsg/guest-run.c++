@@ -4,6 +4,8 @@
 
 #include "guest-run.h"
 
+#include <workerd/util/alloc-census.h>
+
 #ifdef WORKERD_HAS_GUEST_KERNEL
 #include <workerd/experimental/guest-kernel/gk.h>
 
@@ -102,7 +104,9 @@ void runTrampolineInGuest(
   // turn to tell a recursive lock from a bare v8::Locker (see saveLockDepthForGuestTurn).
   uint lockDepth = saveLockDepthForGuestTurn();
 
+  allocCensus::enterTurn();
   long result = gk_run_here_user(fn, arg);
+  allocCensus::leaveTurn();
 
   for (uint i = 0; i < SET_DATA_SLOTS_IN_USE; i++) {
     isolate->SetData(i, dataSlots[i]);
