@@ -166,13 +166,28 @@ GuestArenaScope::~GuestArenaScope() noexcept(false) {
 
 namespace {
 
-// A Lock on an isolate this thread already holds locked would be a recursive isolate lock, which
-// is not supported: the lock slot (SET_DATA_LOCK) names one Lock, and releasing the inner one
-// would leave the outer one unnamed. Whether this thread holds the isolate's lock is V8's thread
-// manager's to say, so the check runs before `locker` is constructed and does not consult the
-// lock slot, which is memory a guest turn can write (see Lock::from).
+// How many Locks are alive on this thread, for the recursion check below. It is a count kept
+// here rather than the lock slot, which is memory a guest turn can write and which the
+// constructor therefore must not read (see Lock::from); the host puts it back after a turn as
+// it does the slots (runTrampolineInGuest in guest-run.c++).
+thread_local uint locksHeld = 0;
+
+// A second Lock on an isolate this thread already has a Lock for is not supported: the lock
+// slot (SET_DATA_LOCK) names one Lock, and the inner one's destructor clears the slot rather
+// than restoring the outer one, which would leave the outer one unnamed and Lock::from()
+// returning null. That is what this refuses, in release as well as debug, because the slot
+// cannot represent it in any build.
+//
+// It takes both halves to say it. v8::Locker::IsLocked() -- V8's thread manager, asked before
+// `locker` is constructed -- says this thread holds this isolate's lock, but says nothing about
+// what holds it: an embedder may hold a bare v8::Locker, which V8 supports and which leaves the
+// slot alone (src/rust/jsg-test's harness holds one for the life of the harness and takes one
+// Lock at a time inside it). The count says a Lock on this thread holds one, but not of which
+// isolate, so a Lock held for another isolate makes it nonzero on its own. Together they are
+// true of a recursive Lock and, short of a Lock on one isolate taken while another isolate this
+// thread has a bare Locker on is locked, of nothing else.
 v8::Isolate* requireNotLockedByThisThread(v8::Isolate* isolate) {
-  if (v8::Locker::IsLocked(isolate)) {
+  if (v8::Locker::IsLocked(isolate) && locksHeld != 0) {
 #ifdef KJ_DEBUG
     // In debug mode, abort immediately. This makes it a little easier to debug than if we threw
     // an exception.
@@ -186,12 +201,26 @@ v8::Isolate* requireNotLockedByThisThread(v8::Isolate* isolate) {
 
 }  // namespace
 
+uint saveLockDepthForGuestTurn() {
+  return locksHeld;
+}
+void restoreLockDepthAfterGuestTurn(uint depth) {
+  locksHeld = depth;
+}
+uint lockDepthForTest() {
+  return locksHeld;
+}
+void setLockDepthForTest(uint depth) {
+  locksHeld = depth;
+}
+
 Lock::Lock(v8::Isolate* v8Isolate)
     : v8Isolate(requireNotLockedByThisThread(v8Isolate)),
       locker(v8Isolate),
       isolateScope(v8Isolate),
       guestArenaScope(v8Isolate),
       warningsLogged(IsolateBase::from(v8Isolate).areWarningsLogged()) {
+  ++locksHeld;
   v8Isolate->SetData(SET_DATA_LOCK, this);
 }
 Lock::~Lock() noexcept(false) {
@@ -199,6 +228,7 @@ Lock::~Lock() noexcept(false) {
   // back, and a value kept for that in this object would be a pointer the host writes into the
   // slot from heap memory a guest turn can write.
   v8Isolate->SetData(SET_DATA_LOCK, nullptr);
+  --locksHeld;
 }
 
 #ifdef WORKERD_ASAN

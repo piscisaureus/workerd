@@ -578,6 +578,9 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   static v8::Isolate* announcedIsolate = nullptr;
   auto addr = [](const void* p) { return kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(p))); };
   static void* const LOCK_SENTINEL = reinterpret_cast<void*>(0x1);
+  // A count of held locks no thread reaches, for asking the same question of the thread-local
+  // count that LOCK_SENTINEL asks of the slot.
+  constexpr uint LOCK_DEPTH_SENTINEL = 0x5a5a;
   if (probeEnabled && url.endsWith("/__gk_lock_announce")) {
     jsg::Lock& js = lock;
     announcedIsolate = js.v8Isolate;
@@ -606,14 +609,19 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
       // at ring 3, and a sentinel there would fault the turn before the host got to read it.
       v8::Isolate* isolate = js.v8Isolate;
       jsg::Lock* held = &js;
-      jsg::setGuestTurnTailHookForTest([isolate, held, addr, url = kj::str(url)]() {
+      jsg::setGuestTurnTailHookForTest(
+          [isolate, held, addr, sentinel = LOCK_DEPTH_SENTINEL, url = kj::str(url)]() {
         isolate->SetData(jsg::SET_DATA_LOCK, LOCK_SENTINEL);
+        // The count of locks this thread holds is thread-local storage the turn can write too,
+        // and the host's next lock on this isolate reads it (see jsg::saveLockDepthForGuestTurn).
+        jsg::setLockDepthForTest(sentinel);
         KJ_LOG(WARNING,
             "WORKERD_GK_TEST_PROBE: overwrote this isolate's lock slot from inside the JS turn",
-            url, addr(isolate), addr(held), addr(LOCK_SENTINEL));
+            url, addr(isolate), addr(held), addr(LOCK_SENTINEL), sentinel);
       });
     }
-    Worker::Lock::runAtNextReleaseForTest([addr](Worker::Lock& released) {
+    Worker::Lock::runAtNextReleaseForTest(
+        [addr, sentinel = LOCK_DEPTH_SENTINEL](Worker::Lock& released) {
       // Host-side, after the turn, with the isolate still locked: what jsg::Lock::from hands host
       // code now, against the lock this frame holds.
       jsg::Lock& held = released;
@@ -623,6 +631,14 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
                                             : "other"_kj;
       KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: jsg::Lock::from on the host after the turn",
           addr(from), addr(&held), verdict);
+      // The same question of the lock count: the host holds this one lock, so the count it
+      // reads must be 1, not what the turn left.
+      uint depth = jsg::lockDepthForTest();
+      kj::StringPtr depthVerdict = depth == 1 ? "restored"_kj
+          : depth == sentinel                 ? "leaked"_kj
+                                              : "other"_kj;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the lock count on the host after the turn", depth,
+          depthVerdict);
     });
     v8::Isolate* isolate = js.v8Isolate;
     IoContext::current().addTask(kj::evalLater([isolate, addr]() {

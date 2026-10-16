@@ -97,12 +97,24 @@ void runTrampolineInGuest(
   for (uint i = 0; i < SET_DATA_SLOTS_IN_USE; i++) {
     dataSlots[i] = isolate->GetData(i);
   }
+  // The count of jsg::Locks alive on this thread gets the same treatment for the same reason:
+  // it is thread-local storage the turn can write, and the Lock constructor reads it after the
+  // turn to tell a recursive lock from a bare v8::Locker (see saveLockDepthForGuestTurn).
+  uint lockDepth = saveLockDepthForGuestTurn();
 
   long result = gk_run_here_user(fn, arg);
 
   for (uint i = 0; i < SET_DATA_SLOTS_IN_USE; i++) {
     isolate->SetData(i, dataSlots[i]);
   }
+#ifndef WORKERD_GK_NEG_LOCK_DEPTH
+  // WORKERD_GK_NEG_LOCK_DEPTH is a negative-test build, never shipped: the count the turn left
+  // stands, which is what it did before the count was saved here. lock-slot-test.sh must then
+  // fail -- the host reads the turn's sentinel back after the turn.
+  restoreLockDepthAfterGuestTurn(lockDepth);
+#else
+  (void)lockDepth;
+#endif
   if (result != 0) {
     // The guest faulted (or gk otherwise could not complete the turn) and control is back here
     // without the turn's frames ever returning. gk_run_here_user() is an ordinary host-side call

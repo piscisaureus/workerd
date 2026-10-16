@@ -3378,6 +3378,22 @@ class Lock {
   virtual v8::Local<v8::Object> getPrototypeFor(const std::type_info& type) = 0;
 };
 
+// How many jsg::Locks are alive on this thread. The Lock constructor consults it, together with
+// V8's own thread manager, to tell a second Lock on an isolate this thread already has one for
+// -- which the lock slot cannot represent -- from a bare v8::Locker an embedder holds, which it
+// can. The count is in thread-local storage, which a JS turn at guest ring 3 can write, so the
+// host saves it before a turn and puts it back after, as it does the isolate's data slots (see
+// runTrampolineInGuest in guest-run.c++). It is only ever compared, never dereferenced, and
+// never on its own: a decision needs V8's thread manager to agree.
+uint saveLockDepthForGuestTurn();
+void restoreLockDepthAfterGuestTurn(uint depth);
+
+// Test-only, for the guest kernel's end-to-end check of that save and restore
+// (experimental/guest-kernel/lock-slot-test.sh): a turn writes the count and the host reads it
+// back once the turn has returned.
+uint lockDepthForTest();
+void setLockDepthForTest(uint depth);
+
 template <typename T>
 inline WeakV8Ref<T> V8Ref<T>::getWeakRef(jsg::Lock& js) const {
   return getWeakRef(js.v8Isolate);

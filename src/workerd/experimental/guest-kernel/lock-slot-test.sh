@@ -18,6 +18,12 @@
 # returns against the lock it holds: it must be that lock ("restored"), not the sentinel
 # ("leaked"). An event-loop callback then logs the slot once the lock is gone: it must be 0x0.
 #
+# The same turn also overwrites the count of jsg::Locks this thread holds -- thread-local
+# storage, which a turn can write as it can the slot, and which the lock's constructor reads to
+# tell a second lock on an isolate this thread already has one for from a bare v8::Locker an
+# embedder holds. The host saves and puts that back too (runTrampolineInGuest), so the same
+# host-side report must find 1, the lock it holds, rather than the turn's sentinel.
+#
 # /__gk_lock_announce on the victim records the victim's isolate; /__gk_lock_poison_other on the
 # "attacker" worker then overwrites that isolate's lock slot from inside the attacker's own turn,
 # and an event-loop callback logs the slot to show the write landed (the isolate object is in the
@@ -30,6 +36,10 @@
 #   defaults to bazel-bin/src/workerd/server/workerd in the repo root. Needs /dev/kvm and curl.
 #   GK_LOCK_TEST_HELLO_PORT / GK_LOCK_TEST_VICTIM_PORT / GK_LOCK_TEST_ATTACKER_PORT override the
 #   ports (8835 / 8834 / 8833).
+#
+# Negative builds, never shipped, which this script must fail:
+#   --copt=-DWORKERD_GK_NEG_LOCK_DEPTH  the count of locks the thread holds is not put back
+#       after a turn, so the host reads the count the turn left.
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -85,6 +95,11 @@ from=$(wait_line "jsg::Lock::from on the host after the turn" 1)
 echo "2. $from"
 [ "$(last_field "$from")" = restored ] ||
   fail "host code holding the lock after the turn got the turn's value from jsg::Lock::from ($(last_field "$from"))"
+depth=$(wait_line "the lock count on the host after the turn" 1)
+[ -n "$depth" ] || fail "the host-side lock-count check after the turn did not run"
+echo "   $depth"
+[ "$(last_field "$depth")" = restored ] ||
+  fail "host code after the turn read the lock count the turn left ($(last_field "$depth"))"
 after=$(wait_line "the lock slot on the event loop after the lock" 1)
 [ -n "$after" ] || fail "the event-loop check did not run"
 echo "3. $after"
@@ -136,4 +151,4 @@ echo "12. GET $hello/ -> $s (the other worker keeps serving)"
 [ "$s" = 200 ] || fail "the other worker stopped serving"
 kill -0 "$pid" 2>/dev/null || fail "workerd died"
 
-echo "PASS: a turn's overwrite of its own lock slot, and another isolate's turn's overwrite of it, did not reach the host: jsg::Lock::from on the host after each turn returned the lock the host held, the slot was clear once each lock was released, no lock was refused as recursive, and the process kept serving"
+echo "PASS: a turn's overwrite of its own lock slot and of its thread's count of held locks, and another isolate's turn's overwrite of the slot, did not reach the host: jsg::Lock::from on the host after each turn returned the lock the host held, the count it read was its own, the slot was clear once each lock was released, no lock was refused as recursive, and the process kept serving"
