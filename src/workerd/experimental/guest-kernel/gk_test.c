@@ -2776,13 +2776,51 @@ static int resolve_check(void) {
                  sd1.resolve_orphans == sd0.resolve_orphans + 2;
   }
 
+  // The owner check host code makes about a handle a turn supplied. The
+  // ring-3 comparison cannot serve here: the host's own lookup answers for
+  // every context it serves, so a host path that retires an entry on one
+  // isolate's behalf has to name that isolate. One entry under arena XA, one
+  // on the base root and one reserved, asked about from both arenas and from
+  // no arena, and a retire of XA's entry attempted as XB's.
+  static int ox, oxb;
+  gk_arena *XA = gk_arena_create(1UL << 20), *XB = gk_arena_create(1UL << 20);
+  gk_resolve_handle hx = 0, hxb = 0, xrsv[1] = {0};
+  gk_arena *cur_in = NULL, *cur_out = NULL;
+  int owned_ok = XA != NULL && XB != NULL;
+  if (owned_ok) {
+    gk_arena_enter(XA);
+    hx = gk_resolve_register(&ox);
+    cur_in = gk_arena_current();
+    gk_arena_enter(NULL);
+    cur_out = gk_arena_current();
+    hxb = gk_resolve_register(&oxb);  // the base root's
+    gk_resolve_reserve(xrsv, 1);
+    owned_ok = hx != 0 && hxb != 0 && xrsv[0] != 0 && cur_in == XA && cur_out == NULL &&
+               gk_resolve_owned_by(XA, hx) == 1 &&      // its own arena
+               gk_resolve_owned_by(XB, hx) == 0 &&      // another isolate's
+               gk_resolve_owned_by(NULL, hx) == 0 &&    // the base root is a root like any other
+               gk_resolve_owned_by(NULL, hxb) == 1 && gk_resolve_owned_by(XA, hxb) == 0 &&
+               gk_resolve_owned_by(NULL, xrsv[0]) == 0 &&  // reserved: owned by no root yet
+               gk_resolve_owned_by(XA, 0) == 0 && gk_resolve_owned_by(XA, bad[3]) == 0 &&
+               gk_resolve_unregister_for(XB, hx) == -EINVAL &&   // the cross-isolate retire
+               gk_resolve(hx) == &ox &&                          // which retired nothing
+               gk_resolve_unregister_for(NULL, hx) == -EINVAL && gk_resolve(hx) == &ox &&
+               gk_resolve_unregister_for(XA, hxb) == -EINVAL && gk_resolve(hxb) == &oxb &&
+               gk_resolve_unregister_for(XA, hx) == 0 &&         // its owner's retire
+               gk_resolve(hx) == NULL && gk_resolve_unregister_for(XA, hx) == -EINVAL;
+    gk_resolve_unregister(hxb);
+    gk_resolve_unregister(xrsv[0]);
+  }
+  if (XA) gk_arena_destroy(XA);
+  if (XB) gk_arena_destroy(XB);
+
   if (rarena) gk_arena_destroy(rarena);
   long cpl = gk_run_user(user_cpl, NULL);  // the process survived the faults above
 
   int ok = reg_bad && resolves && user_ok && here_ok && ring0_ok && host_ok && garbage_ok &&
            walled && bench_ok && freed && recycled && capacity_ok && fresh && reserve_ok &&
            commit_ok && committed_wrong == 0 && reserve_freed && owner_ok && recycle_ok &&
-           cost_ok && cpl == 3;
+           owned_ok && cost_ok && cpl == 3;
   printf("ring-0 resolve: NULL refused %s; handle %#llx -> %p (host %s); ring 3 %s, caller's "
          "stack %s, ring 0 %s, host %s; %d garbage handles and 0 -> nothing at every ring (%s, "
          "caller's memory untouched %s); ring-3 read of the table -> %s (fault %#lx == %#lx), "
@@ -2799,7 +2837,9 @@ static int resolve_check(void) {
          "two entries left registered on a destroyed arena, one made under it and one "
          "made for it by name, are retired by the destroy (root %#lx recycled into the next "
          "arena %s, stale handles resolved %ld times from its ring 3, host-side %s) %s; %.0f ns per register and %.0f ns per retire on the base root, "
-         "%.0f and %.0f in an arena %s; CPL %ld [%s]\n",
+         "%.0f and %.0f in an arena %s; an entry is owned by its own arena and by no other, "
+         "and a retire for another arena, for the base root or of a base-root entry is refused "
+         "%s; CPL %ld [%s]\n",
          reg_bad ? "yes" : "NO", (unsigned long long)h, (void *)&obj, resolves ? "ok" : "BROKEN",
          user_ok ? "ok" : "BROKEN", here_ok ? "ok" : "BROKEN", ring0_ok ? "ok" : "BROKEN",
          host_ok ? "ok" : "BROKEN", RS_BAD, garbage_ok && user_ok && host_ok ? "yes" : "NO",
@@ -2816,7 +2856,8 @@ static int resolve_check(void) {
          gk_resolve(hstale) == NULL && gk_resolve(hstale_for) == NULL ? "nothing" : "AN OBJECT",
          recycle_ok ? "yes" : "NO",
          ns_register, ns_unregister, ns_register_arena,
-         ns_unregister_arena, cost_ok ? "ok" : "BROKEN", cpl, ok ? "OK" : "FAIL");
+         ns_unregister_arena, cost_ok ? "ok" : "BROKEN", owned_ok ? "yes" : "NO", cpl,
+         ok ? "OK" : "FAIL");
   free(p);
   free(heap);
   munmap(none, 4096);

@@ -1000,6 +1000,23 @@ turn has to name the isolate it belongs to
 event loop, is the one such entry today. The delete queue's side of the
 residual is closed too: a dropped handle is queued only for the context
 whose list holds its node, whatever context handle the holder carries. The
+owner closes the cross-isolate read; the cross-isolate *retire* is a
+separate question, because a drop is not a use. A holder's destructor
+releases its entry whatever the resolve answered, and inside a turn that
+release goes into the turn's journal for the host to act on afterwards,
+where the lookup compares no owner. So every handle the host takes out of a
+journal -- the retire list, the notes, the context an owned object's
+registration names -- is checked against the arena the turn ran under,
+which the host records at the turn's entry from gk's record of the thread
+and keeps in the pool, in host memory (`hostMemory::ownedByTurn`, over
+`gk_resolve_owned_by`); a handle that is another isolate's retires nothing,
+unlinks nothing and queues nothing. What that does not reach is a holder
+dropped outside a turn: there is no `CR3` to appeal to there, the handle
+and the context handle in the holder are both the turn's to rewrite, and a
+holder carrying another isolate's context *and* an object of that same
+context agrees with itself and so passes the node-to-context check that
+catches the mismatched pair. Closing that one wants the holder itself out
+of the shared heap, which is the same step the `T` is waiting on. The
 tag names a root, and roots are recycled -- a destroyed arena's root is the
 next arena's, that being the first page the page-table allocator hands out
 -- so an entry that outlived its arena would resolve for whichever isolate

@@ -214,6 +214,12 @@ int gk_arena_leave(void);
 // rather than recycled, with a message on stderr.
 void gk_arena_destroy(gk_arena *a);
 
+// The arena the calling thread is running under, or NULL when it is on the
+// base root. gk's own record of it, from the thread's record in supervisor
+// memory, never from anything the caller holds, so it is the arena a turn on
+// this thread ran under whatever that turn wrote in its own memory.
+gk_arena *gk_arena_current(void);
+
 // Resource counters, for tests and diagnostics.
 typedef struct {
   int memslots;         // live KVM memslots
@@ -512,9 +518,17 @@ long gk_hostcall(unsigned idx);
 // slot was registered with above them, and it is validated like a host slot
 // handle: the entry must be live and its generation must be the handle's,
 // so a handle to an unregistered entry resolves to nothing even after the
-// slot has been reused -- every registration takes a fresh generation from
-// a counter that does not repeat within 2^44 registrations. The capacity is
-// exactly 2^GK_RESOLVE_INDEX_BITS, so masking the index bounds it: every
+// slot has been reused. The generation comes from a counter that every
+// registration advances and that wraps back to 1 after 2^44 of them, so
+// generations do eventually repeat: a handle retired before a wrap resolves
+// again if the wrap lands the repeated generation on the slot it named, which
+// is the ABA the generation is there to prevent. What that costs is bounded
+// by how long the wrap takes -- 2^44 registrations is about two hundred days
+// at a million a second, years at the rates a worker actually registers at --
+// and by what else the revived handle has to survive: it must still be held,
+// and it must still pass the owner check, which a handle from a dead isolate
+// no longer does. It is not zero, though, and the counter is not endless.
+// The capacity is exactly 2^GK_RESOLVE_INDEX_BITS, so masking the index bounds it: every
 // 64-bit value decomposes into one (generation, index) pair, and a value gk
 // did not issue (a pointer, a stale handle, random bits) names a generation
 // that no entry holds. Nothing is read through the handle itself, at either
@@ -543,6 +557,15 @@ long gk_hostcall(unsigned idx);
 // entry has no pointer and no owner and resolves to nothing until it is
 // committed. The comparison costs two instructions and no further memory.
 //
+// The comparison is against CR3 as the register reads, which is the root's
+// address and nothing else only while CR4.PCIDE is clear, as gk leaves it
+// (vcpu_init enables PAE, PGE, OSFXSR, OSXMMEXCPT, OSXSAVE and PKE, and no
+// PCIDE). Whoever enables PCID must mask the trampoline's comparison down to
+// the root bits first: with PCIDE set, CR3 carries the PCID in bits 11:0 and
+// the no-flush bit in 63, so a raw comparison refuses every resolve, and a
+// guest that could choose its own PCID would be comparing a value it picked
+// against a root address.
+//
 // No entry outlives its arena, and gk enforces it. The tag is a page-table
 // root, and a destroyed arena's root goes back to the allocator that the next
 // gk_arena_create takes its root from -- the root is that call's first
@@ -564,6 +587,24 @@ long gk_hostcall(unsigned idx);
 // registered under an isolate has outlived that isolate -- not a gk one, and
 // is left loud rather than fatal because the entries are gone by then and the
 // process can still be read for what leaked.
+//
+// The retire side needs the same question answered and cannot ask it the
+// same way. A handle a turn hands to the host -- in a journal the turn
+// writes, in an object of its own the host later reads -- is acted on by host
+// code, where gk_resolve makes no owner comparison and must not, since the
+// host resolves for whichever context it is serving. So a successful lookup
+// is not evidence that the handle was the caller's, and a host path that
+// retires an entry, or follows it, on one isolate's behalf has to name that
+// isolate: gk_resolve_owned_by answers whether an entry is a given arena's,
+// and gk_resolve_unregister_for retires one only if it is, in a single step
+// under gk's lock. gk_resolve_unregister stays the unchecked retire, for
+// teardown the host does on its own account -- an arena's drop above, a
+// thread's pool of reserved entries, a context's own walk -- which runs from
+// threads on no arena and legitimately retires entries of any owner. Which
+// of the two a call site wants follows from where its handle came from and
+// not from which ring it runs at: a handle the guest supplied is checked
+// against the arena it was supplied by, one the host kept in its own memory
+// is not.
 //
 // Only ring 3 is compared. gk_resolve at guest ring 0 and on the host reads
 // the table directly, with the generation check and no owner check: host
@@ -666,6 +707,15 @@ gk_resolve_handle gk_resolve_register_for(gk_arena *a, void *ptr);
 int gk_resolve_reserve(gk_resolve_handle *handles, int n);
 int gk_resolve_commit(gk_resolve_handle handle, void *ptr);
 int gk_resolve_unregister(gk_resolve_handle handle);
+// Whether `handle` names a live committed entry that arena `a` owns (NULL
+// names the base root), which is the owner check for host code acting on a
+// handle a turn supplied. 0 for a handle that names nothing, for a reserved
+// entry, and for an `a` that is not a live arena, which is reported.
+int gk_resolve_owned_by(gk_arena *a, gk_resolve_handle handle);
+// gk_resolve_unregister for an entry arena `a` owns and no other: the owner
+// check and the retire in one step under gk's lock. -EINVAL, with a report,
+// for a handle that is not a live entry of `a`.
+int gk_resolve_unregister_for(gk_arena *a, gk_resolve_handle handle);
 void *gk_resolve(gk_resolve_handle handle);
 
 // Signal fields: 4-byte words inside an arena that the host writes from a

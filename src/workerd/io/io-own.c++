@@ -341,6 +341,15 @@ bool OwnedObjectList::committed(hostMemory::ResolveHandle handle, void* ptr, con
         return false;
       }
       hostMemory::ResolveHandle context = aux[AUX_CONTEXT];
+      if (!hostMemory::ownedByTurn(context)) {
+        // The words are the turn's own memory: a context handle in them is a value the turn
+        // chose, and one belonging to another isolate would link this object into that
+        // isolate's list, to be disposed of by its teardown through the disposer named here.
+        KJ_LOG(ERROR,
+            "an owned object's registration names a context of another isolate; it is refused",
+            kj::hex(handle), kj::hex(context));
+        return false;
+      }
       ContextRecord* record = recordOf(context);
       if (record == nullptr) {
         KJ_LOG(ERROR, "an owned object's registration names no live context; it is refused",
@@ -409,13 +418,31 @@ void OwnedObjectList::released(hostMemory::ResolveHandle handle) {
 }
 
 bool OwnedObjectList::noted(const uint64_t* words, bool inHandler) {
+  // A note is the turn's own memory, so the handles in one are values the turn chose. Both
+  // the context a note names and the object it names have to belong to the isolate whose turn
+  // made it; a note naming another isolate's queues nothing there. The context's own check is
+  // what keeps a forged pair -- another isolate's context and an object of that same context,
+  // which agree with each other and so pass queueDeletionHost -- from releasing that isolate's
+  // object early.
   switch (words[0]) {
     case DELETION:
+      if (!hostMemory::ownedByTurn(words[1]) || !hostMemory::ownedByTurn(words[2])) {
+        KJ_LOG(ERROR, "a turn's note names a handle of another isolate; nothing is queued",
+            kj::hex(words[1]), kj::hex(words[2]));
+        return true;
+      }
       queueDeletionHost(words[1], words[2]);
       return true;
     case ACTION: {
       auto* box = reinterpret_cast<Action*>(static_cast<uintptr_t>(words[2]));
       if (box == nullptr) return true;
+      if (!hostMemory::ownedByTurn(words[1])) {
+        // The box is left alone: a note that lies about its context may lie about the pointer
+        // too, and destroying it would be the host following the turn's choice of address.
+        KJ_LOG(ERROR, "a turn's note names a context of another isolate; nothing is queued",
+            kj::hex(words[1]));
+        return true;
+      }
       if (queueActionHost(words[1], box)) return true;
       // The context ended before the turn did: the action is dropped. Destroying it runs the
       // closure's destructor, which may take the heap, so not inside a hostcall; the note waits

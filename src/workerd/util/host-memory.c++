@@ -338,6 +338,7 @@ size_t fallbackLiveResolveEntries() {
 // below.
 void* tableResolve(ResolveHandle handle);
 void clearCompanion(ResolveHandle handle);
+void tableUnregister(ResolveHandle handle);
 
 ResolveHandle tableRegister(void* ptr) {
 #ifdef WORKERD_HAS_GUEST_KERNEL
@@ -366,6 +367,55 @@ void* tableResolve(ResolveHandle handle) {
 #endif
   return fallbackResolve(handle);
 }
+// The arena the calling thread is on, as gk records it: the arena a turn on this thread runs
+// under, whatever the turn wrote in its own memory. Null without the guest kernel.
+void* currentArena() {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (guestKernelActive()) return gk_arena_current();
+#endif
+  return nullptr;
+}
+
+#ifdef WORKERD_GK_NEG_RESOLVE_RETIRE
+// WORKERD_GK_NEG_RESOLVE_RETIRE is a negative-test build, never shipped: a handle out of a
+// turn's journal is acted on without asking whose entry it is, as it was before this check
+// existed, so the host runs the released hook over whatever entry the turn named and retires
+// it. The guest kernel's ioown-test.sh must then fail, a turn's drop of a stolen handle
+// unlinking another isolate's object from its list and leaving that isolate unable to reach it.
+constexpr bool CHECK_TURN_OWNER = false;
+#else
+constexpr bool CHECK_TURN_OWNER = true;
+#endif
+
+// Whether `handle` names a live committed entry that `arena` owns. This is the comparison the
+// ring-0 lookup makes for a turn and that the host's own lookup makes for nobody.
+bool tableOwnedBy(void* arena, ResolveHandle handle) {
+  if (!CHECK_TURN_OWNER) return true;
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (guestKernelActive()) {
+    return gk_resolve_owned_by(static_cast<gk_arena*>(arena), handle) != 0;
+  }
+#endif
+  // No guest kernel: one address space, no arenas, and every live entry is the one tenant's.
+  return fallbackResolve(handle) != nullptr;
+}
+
+// Retires an entry that `arena` owns and refuses one it does not, the check and the retire in
+// one step under gk's lock so that nothing comes between them. The caller has established the
+// owner already -- that is what decides whether the released hook runs at all -- and this is
+// where the check is atomic with the retire. The companion goes first, as in tableUnregister.
+void tableUnregisterFor(void* arena, ResolveHandle handle) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (CHECK_TURN_OWNER && guestKernelActive()) {
+    clearCompanion(handle);
+    gk_resolve_unregister_for(static_cast<gk_arena*>(arena), handle);
+    return;
+  }
+#endif
+  if (!tableOwnedBy(arena, handle)) return;
+  tableUnregister(handle);
+}
+
 void tableUnregister(ResolveHandle handle) {
   // The companion goes first, while the entry is still this handle's: once the entry is free a
   // later registration may take its index.
@@ -471,6 +521,12 @@ struct ThreadPool {
   kj::Own<TurnJournal> journal;
   ResolveTurnHooks hooks = {
     nullptr, nullptr, nullptr};  // the current turn's, written by the host at entry
+  // The arena the current turn runs under, written by the host at entry from gk's own record of
+  // the thread and cleared once the journal has been processed. It is what every handle the
+  // host takes out of the journal is checked against (see ownedByTurn), and it is here, in the
+  // pool, which is host memory the turn cannot write, rather than in a thread-local, which it
+  // can.
+  void* turnArena = nullptr;
 };
 
 // The turn's way to its journal. Guest-writable, and a lie costs only the liar: the host
@@ -544,13 +600,25 @@ ThreadPool& ensurePoolOfThread() {
 }
 
 // Retires the journal's committed-entry retire list, running the released hook for each entry
-// first. Host-side; bounded by the list's capacity whatever the journal says.
-void flushRetired(TurnJournal& journal, const ResolveTurnHooks& hooks) {
+// first. The list is the turn's own memory, so a handle in it is a value the turn chose and not
+// necessarily one of its own: each is checked against the arena the turn ran under, and one that
+// is another isolate's is reported and left alone, entry, companion and all. Host-side; bounded
+// by the list's capacity whatever the journal says.
+void flushRetired(TurnJournal& journal, const ResolveTurnHooks& hooks, void* arena) {
   uint32_t n = kj::min(journal.retireCount, RETIRE_CAPACITY);
   for (uint32_t i = 0; i < n; i++) {
     ResolveHandle handle = journal.retire[i];
-    if (hooks.released != nullptr && tableResolve(handle) != nullptr) hooks.released(handle);
-    tableUnregister(handle);
+    if (!tableOwnedBy(arena, handle)) {
+      // Either the entry has gone -- a turn may release what it never committed -- or it is
+      // another isolate's, which is a turn naming a handle it was not given.
+      if (tableResolve(handle) != nullptr) {
+        KJ_LOG(ERROR, "a turn released a resolve entry of another isolate; nothing is retired",
+            kj::hex(handle));
+      }
+      continue;
+    }
+    if (hooks.released != nullptr) hooks.released(handle);
+    tableUnregisterFor(arena, handle);
   }
   journal.retireCount = 0;
 }
@@ -589,7 +657,7 @@ long resolveHostcall(hostcall::Frame& frame) {
     case ResolveOp::REFILL:
       return static_cast<long>(refillPool(*pool));
     case ResolveOp::RETIRE:
-      flushRetired(*pool->journal, pool->hooks);
+      flushRetired(*pool->journal, pool->hooks, pool->turnArena);
       return 0;
     case ResolveOp::NOTES:
       replayNotes(*pool->journal, pool->hooks, true);
@@ -738,6 +806,16 @@ bool inTurn() {
   return activeJournal() != nullptr;
 }
 
+bool ownedByTurn(ResolveHandle handle) {
+  ThreadPool* pool = poolOfThread();
+  // No journal is being processed, so the handle did not come out of one and there is nothing
+  // to distrust: a hook the host runs for its own registration sees this.
+  if (pool == nullptr || !pool->journal->active) return true;
+  if (tableOwnedBy(pool->turnArena, handle)) return true;
+  // Not the turn's, but it names nothing either: the operation refuses it in its own terms.
+  return tableResolve(handle) == nullptr;
+}
+
 void releaseJournaled(
     kj::FunctionParam<bool(ResolveHandle handle, void* ptr, const uint64_t* aux)> fn) {
   TurnJournal* journal = activeJournal();
@@ -758,6 +836,7 @@ ResolveTurn::ResolveTurn(ResolveTurnHooks hooks): pool(nullptr) {
   ThreadPool& threadPool = ensurePoolOfThread();
   if (threadPool.count < POOL_LOW) refillPool(threadPool);
   threadPool.hooks = hooks;
+  threadPool.turnArena = currentArena();
   TurnJournal& journal = *threadPool.journal;
   for (uint32_t i = 0; i < threadPool.count; i++) {
     journal.handles[i] = threadPool.handles[i];
@@ -802,11 +881,12 @@ ResolveTurn::~ResolveTurn() noexcept(false) {
     threadPool.handles[i - next] = threadPool.handles[i];
   }
   threadPool.count -= next;
-  flushRetired(journal, hooks);
+  flushRetired(journal, hooks, threadPool.turnArena);
   // The notes last: one about an entry registered above finds it committed, one about an entry
   // released above finds it gone.
   replayNotes(journal, hooks, false);
   threadPool.hooks = {nullptr, nullptr, nullptr};
+  threadPool.turnArena = nullptr;
   journal.active = false;
   journal.next = 0;
   journal.count = 0;

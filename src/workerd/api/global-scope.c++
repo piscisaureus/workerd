@@ -439,6 +439,11 @@ void checkWasmDescriptorsForTest(kj::StringPtr url) {
 // reached the host's next draw on that path, and the nonce must not be, showing the token's
 // nonce comes from somewhere else. The buffer is then discarded so later draws are fresh.
 //
+// /__gk_ioown_steal_drop is the retire side of the cross-isolate rewrite: the thief destroys
+// the holder carrying the stolen handle inside a turn, which asks the host to retire another
+// isolate's entry and unlink its node, and the announcing request, still in flight, uses its
+// object again once the host has answered.
+//
 // With the same variable set, a request whose path is /__gk_corrupt_handle overwrites, from
 // inside the JS turn, the handle through which the tenant's owner reaches it (registered through
 // hostMemory::setHandleProbeForTest()) with the address of a buffer this code chose, which is
@@ -702,6 +707,10 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   };
   static uint64_t announcedIoOwnHandle = 0;
   static uint64_t announcedIoOwnContext = 0;
+  // Fulfilled by /__gk_ioown_steal_drop once the host has acted on the thief's release, so that
+  // the announcing request, which is still in flight, uses its own object again afterwards --
+  // on its own context, which is the only context that may dereference its IoOwn.
+  static kj::Maybe<kj::Own<kj::PromiseFulfiller<void>>> announcedIoOwnRecheck;
   if (probeEnabled && url.endsWith("/__gk_ioown_corrupt")) {
     auto& context = IoContext::current();
     auto holder = kj::heap<IoOwnProbeHolder>(
@@ -760,7 +769,15 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
         kj::str("0x", kj::hex(announcedIoOwnContext)));
     IoOwnProbeHolder& announcedHolder = *holder;
     announced = kj::mv(holder);
-    context.addWaitUntil(useIoOwnLater(context, "announced-own", announcedHolder));
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    announcedIoOwnRecheck = kj::mv(paf.fulfiller);
+    context.addWaitUntil(useIoOwnLater(context, "announced-own", announcedHolder)
+                             .then([&context, &announcedHolder, useIoOwnLater,
+                                       recheck = kj::mv(paf.promise)]() mutable {
+      return recheck.then([&context, &announcedHolder, useIoOwnLater]() {
+        return useIoOwnLater(context, "announced-own-after-theft", announcedHolder);
+      });
+    }));
   }
   if (probeEnabled && url.endsWith("/__gk_ioown_steal")) {
     // From inside this isolate's turn, rewrite an IoOwn of its own to the other isolate's live
@@ -802,6 +819,47 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
     setIoOwnHandle(h, announcedIoOwnHandle);
     thief2 = kj::mv(holder);
     context.addWaitUntil(useIoOwnLater(context, "cross-isolate-after-release", h));
+  }
+  if (probeEnabled && url.endsWith("/__gk_ioown_steal_drop")) {
+    // The retire side of the same theft. The owner check the ring-0 lookup makes refuses a
+    // stolen handle a *use*, but a drop is not a use: OwnedObjectList::drop releases the entry
+    // whatever the resolve answered, and the release goes into the turn's journal for the host
+    // to act on after the turn, where the host's own lookup compares no owner. So this turn
+    // rewrites one of its own IoOwns to the other isolate's live handle and then destroys the
+    // holder inside a turn, which is the host being asked to retire that isolate's entry and
+    // unlink the node behind it. The journal flush must refuse it; the announcing isolate then
+    // uses its object again, on its own context.
+    KJ_REQUIRE(announcedIoOwnHandle != 0, "no IoOwn announced");
+    auto& context = IoContext::current();
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_GOOD_MAGIC))});
+    uint64_t own = ioOwnHandle(*holder);
+    setIoOwnHandle(*holder, announcedIoOwnHandle);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: overwrote an IoOwn's handle with another isolate's, to drop it "
+        "inside a turn",
+        url, kj::str("0x", kj::hex(own)), kj::str("0x", kj::hex(announcedIoOwnHandle)));
+    context.addWaitUntil(context
+                             .run([holder = kj::mv(holder)](Worker::Lock&) mutable {
+      // Inside the turn: ~IoOwn hands the stolen handle to OwnedObjectList::drop, which
+      // releases it through the journal. The host flushes the journal once this turn returns.
+      holder = nullptr;
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: destroyed the thief's holder inside the JS turn, with the "
+          "stolen handle in it");
+    }).then([addr]() {
+      return kj::evalLater([addr]() {
+        // Host-side, after the flush: the entry and the node behind it, as the host sees them.
+        auto node = OwnedObjectList::nodeForTest(announcedIoOwnHandle);
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the stolen handle after the thief's drop",
+            kj::str("0x", kj::hex(announcedIoOwnHandle)),
+            addr(hostMemory::resolve(announcedIoOwnHandle)),
+            kj::str("node ", node.node == nullptr ? "gone"_kj : "intact"_kj));
+        KJ_IF_SOME(f, announcedIoOwnRecheck) {
+          f->fulfill();  // the announcing request uses its object again, if it is still running
+        }
+      });
+    }));
   }
   // The owned node (see OwnedObjectList in io/io-own.h): the record the host keeps about the
   // object behind an IoOwn's handle, in host memory. The turn creates an IoOwn; after the turn

@@ -40,6 +40,17 @@
 # the host makes no such comparison -- so the refusal is about which isolate asked and not about
 # the entry having gone. (Where the comparison is taken out of gk_resolve_tramp, the use reads
 # the other isolate's magic and this script fails.) Once the announcing request has ended,
+# /__gk_ioown_steal_drop is the retire side of the same theft. A drop is not a use: the holder's
+# destructor releases the entry whatever the resolve answered, and inside a turn that release
+# goes into the turn's journal, which is the turn's own memory, for the host to act on once the
+# turn has returned -- host-side, where the lookup compares no owner. So the victim rewrites
+# another of its IoOwns to the other isolate's handle and destroys the holder inside a turn. The
+# host checks every handle it takes out of the journal against the arena the turn ran under and
+# refuses this one: the other isolate's entry still names its object, the node behind it is
+# still linked, and the announcing request, still in flight, dereferences the object again on
+# its own context. (In the WORKERD_GK_NEG_RESOLVE_RETIRE build the check is not made, the host
+# unlinks and frees the other isolate's node and retires its entry, and this script fails.)
+#
 # /__gk_ioown_steal_again shows the same handle refused for the second reason as well: the entry
 # went with the context.
 #
@@ -211,8 +222,31 @@ echo "   the same handle resolved host-side: ${live#*host-side; }"
 echo "$live" | grep -q "$ann_obj" ||
   fail "the entry was not live when the turn was refused, so the refusal proves nothing: $live"
 
+s=$(status "$victim/__gk_ioown_steal_drop")
+echo "7a. GET $victim/__gk_ioown_steal_drop -> $s (victim rewrites another IoOwn to other's handle $ann_handle and destroys the holder inside a turn)"
+[ "$s" = 200 ] || fail "the steal-drop request failed"
+wait_for "destroyed the thief's holder inside the JS turn, with the stolen handle in it" ||
+  fail "the thief's holder was not destroyed inside a turn"
+refused=$(grep -o "a turn released a resolve entry of another isolate; nothing is retired.*" "$log" | head -n1)
+echo "    the host's answer to the release: ${refused:-NOT REFUSED}"
+[ -n "$refused" ] || fail "the host did not refuse the cross-isolate release"
+echo "$refused" | grep -qi "${ann_handle#0x}" || fail "the refused handle is not the stolen one: $refused"
+wait_for "the stolen handle after the thief's drop" || fail "the host did not report the entry after the drop"
+after=$(grep -o "the stolen handle after the thief's drop.*" "$log" | head -n1)
+echo "    the entry afterwards: ${after#*drop; }"
+echo "$after" | grep -q "$ann_obj" ||
+  fail "the other isolate's entry no longer names its object after the thief's drop: $after"
+echo "$after" | grep -q "node intact" ||
+  fail "the other isolate's owned node was unlinked by the thief's drop: $after"
+wait_for "IoOwn use after the overwrite; what = announced-own-after-theft" ||
+  fail "the announcing isolate did not use its object again"
+use=$(grep -o "IoOwn use after the overwrite; what = announced-own-after-theft.*" "$log" | head -n1)
+echo "    the announcing isolate's own use afterwards: ${use#*verdict = }"
+echo "$use" | grep -q "read magic 0x$other_magic at $ann_obj" ||
+  fail "the thief's drop cost the other isolate its object: $use"
+
 s=$(status "$victim/__gk_queue_steal")
-echo "7a. GET $victim/__gk_queue_steal -> $s (victim rewrites an IoOwn's context handle to other's context $ann_ctx and drops the holder on the event loop)"
+echo "7b. GET $victim/__gk_queue_steal -> $s (victim rewrites an IoOwn's context handle to other's context $ann_ctx and drops the holder on the event loop)"
 [ "$s" = 200 ] || fail "the queue steal request failed"
 created=$(grep -o "created an IoOwn for the queue steal probe inside the JS turn.*" "$log" | head -n1)
 steal_ctx=$(echo "$created" | grep -o '0x[0-9a-f]*' | sed -n 1p)
@@ -234,7 +268,7 @@ disposed_line=$(grep -n "disposed of through its own disposer.*0x$steal_magic" "
 echo "    nothing was queued; the object stayed the victim context's and its teardown disposed of it (log line $disposed_line, after the request's last turn at $after_line)"
 
 s=$(status "$victim/__gk_queue_rewrite")
-echo "7b. GET $victim/__gk_queue_rewrite -> $s (victim rewrites an IoOwn's context handle to a buffer it chose and drops the holder on the event loop)"
+echo "7c. GET $victim/__gk_queue_rewrite -> $s (victim rewrites an IoOwn's context handle to a buffer it chose and drops the holder on the event loop)"
 [ "$s" = 200 ] || fail "the queue rewrite request failed"
 wait_for "overwrote the IoOwn's context handle from inside the JS turn; " || fail "the context handle was not overwritten"
 over=$(grep -o "overwrote the IoOwn's context handle from inside the JS turn; .*" "$log" | head -n1)

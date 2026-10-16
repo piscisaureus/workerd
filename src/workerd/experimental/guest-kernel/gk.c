@@ -3860,7 +3860,8 @@ static gk_resolve_handle resolve_take(void *ptr, uint64_t owner, gk_arena *a) {
   } else {
     return 0;  // the table is full: reported, never fatal
   }
-  // A generation is never 0 and never reused: the counter has 44 bits.
+  // A generation is never 0. The counter has 44 bits and wraps back to 1, so
+  // generations do repeat after 2^44 registrations (see gk_resolve in gk.h).
   uint64_t gen = ++G->resolve_gen;
   if (gen >> GK_RESOLVE_GEN_BITS) gen = G->resolve_gen = 1;
   gk_resolve_entry *e = &gk_resolve_table.e[idx];
@@ -4002,6 +4003,49 @@ int gk_resolve_unregister(gk_resolve_handle h) {
     if (h)
       fprintf(stderr, "[gk] gk_resolve_unregister: %#llx is not the handle of a live resolve "
               "entry; nothing is unregistered\n", (unsigned long long)h);
+    return -GK_EINVAL;
+  }
+  resolve_retire_locked((int)idx);
+  pthread_mutex_unlock(&G->lock);
+  return 0;
+}
+
+// The owner check host code makes about a handle a turn supplied (see
+// gk_resolve in gk.h): whether the entry is live, committed, and arena `a`'s.
+// A reserved entry is owned by no root and answers no.
+int gk_resolve_owned_by(gk_arena *a, gk_resolve_handle h) {
+  if (!G->initialized) return 0;
+  uint64_t idx = h & ((1ULL << GK_RESOLVE_INDEX_BITS) - 1), gen = h >> GK_RESOLVE_INDEX_BITS;
+  pthread_mutex_lock(&G->lock);
+  int ok = 0;
+  if (a != NULL && !arena_live_locked(a)) {
+    // As gk_arena_enter does: an arena pointer from an ordinary heap object is
+    // checked against gk's pool before anything is read through it.
+    fprintf(stderr, "[gk] gk_resolve_owned_by: %p is not a live arena; no entry is its\n",
+            (void *)a);
+  } else if (gen != 0) {
+    gk_resolve_entry *e = &gk_resolve_table.e[idx];  // the mask bounds idx (see the table)
+    ok = e->gen == gen && e->ptr != NULL && e->owner == resolve_root_of(a);
+  }
+  pthread_mutex_unlock(&G->lock);
+  return ok;
+}
+
+int gk_resolve_unregister_for(gk_arena *a, gk_resolve_handle h) {
+  uint64_t idx = h & ((1ULL << GK_RESOLVE_INDEX_BITS) - 1), gen = h >> GK_RESOLVE_INDEX_BITS;
+  pthread_mutex_lock(&G->lock);
+  if (a != NULL && !arena_live_locked(a)) {
+    pthread_mutex_unlock(&G->lock);
+    fprintf(stderr, "[gk] gk_resolve_unregister_for: %p is not a live arena; nothing is "
+            "unregistered\n", (void *)a);
+    return -GK_EINVAL;
+  }
+  gk_resolve_entry *e = &gk_resolve_table.e[idx];  // the mask bounds idx (see the table)
+  if (gen == 0 || e->gen != gen || e->ptr == NULL || e->owner != resolve_root_of(a)) {
+    pthread_mutex_unlock(&G->lock);
+    if (h)
+      fprintf(stderr, "[gk] gk_resolve_unregister_for: %#llx is not the handle of a live resolve "
+              "entry of this arena; nothing is unregistered\n", (unsigned long long)h);
     return -GK_EINVAL;
   }
   resolve_retire_locked((int)idx);
@@ -5760,6 +5804,13 @@ size_t gk_arena_size(const gk_arena *a) {
   size_t size = arena_live_locked(a) ? a->size : 0;
   pthread_mutex_unlock(&G->lock);
   return size;
+}
+gk_arena *gk_arena_current(void) {
+  if (!G->initialized) return NULL;
+  pthread_mutex_lock(&G->lock);
+  gk_arena *a = resolve_arena_now();
+  pthread_mutex_unlock(&G->lock);
+  return a;
 }
 unsigned long gk_debug_arena_root(const gk_arena *a) {
   if (!a) return 0;

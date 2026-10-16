@@ -175,6 +175,25 @@ void flushReleasedInTurn();
 constexpr size_t NOTE_WORDS = 4;
 bool noteInTurn(const uint64_t (&words)[NOTE_WORDS]);
 
+// Whether the words of the turn being finished on this thread may name `handle`. The journal
+// is the turn's own memory, so every handle the host takes out of it -- the retire list, the
+// notes, the context an owned object's registration names -- is a value the turn chose, and a
+// handle that resolves is not thereby the turn's: the host's own lookup answers for whichever
+// context it serves and makes no owner comparison (see gk_resolve in
+// experimental/guest-kernel/gk.h). This is that comparison, against the arena the turn ran
+// under, which the host recorded at the turn's entry from gk's own record of the thread. The
+// ResolveTurnHooks call it for the handles their words carry; the retire list is checked for
+// them.
+//
+// It answers the cross-isolate question and only that. A handle that names nothing -- a context
+// that ended before the turn did, an entry released earlier in the same turn -- is allowed
+// through, for the operation to refuse in its own terms, as it did before this check existed;
+// what is refused here is a live entry of another isolate. Outside the processing of a journal
+// it is true throughout: nothing came from a turn, so there is nothing to distrust, which is
+// how a hook run for a registration the host makes itself (OwnedObjectList::add outside a turn)
+// sees it. Without the guest kernel there are no arenas and it is true.
+bool ownedByTurn(ResolveHandle handle);
+
 // What the host does, after a turn, with the entries the turn registered and released and the
 // notes it made. All run host-side, with the table already updated for the entry: committed()
 // once the table has taken a registration's pointer, with the words the registration carried,

@@ -97,7 +97,11 @@ isolate's JS turn at guest ring 3.
   the host's drain of the delete queue refusing the handle rather than
   reaching the buffer, with the isolate still serving; a handle rewritten to
   another isolate's live handle names that isolate's object, the ownership
-  residual the table cannot close, stated as such; a turn's write into
+  residual the table cannot close, stated as such; the same stolen handle
+  dropped -- the holder destroyed inside a turn, which asks the host to
+  retire that isolate's entry and unlink the node behind it -- refused by
+  the journal flush, leaving the entry naming its object, the node linked
+  and the other isolate dereferencing it afterwards; a turn's write into
   the owned-list node behind a handle -- the links the host's walk follows
   and the disposer it calls, in host memory -- faults at the node, after
   which the context's teardown, host-side, disposes of the object through
@@ -363,7 +367,15 @@ hardware:
   is the handle's low 20 bits, which the capacity of exactly 2^20 bounds by
   masking, the entry must be live and its generation the handle's, so a
   handle to an unregistered or recycled entry resolves to nothing and
-  nothing is ever read through the handle's own value. The owner says whose
+  nothing is ever read through the handle's own value. The generation's
+  counter has 44 bits and wraps back to 1, so generations do eventually
+  repeat: a handle retired before a wrap resolves again if the wrap lands
+  the repeated generation on the slot it named. 2^44 registrations is about
+  two hundred days at a million a second and years at the rates a worker
+  registers at, and the revived handle must still be held and must still
+  pass the owner check, so the window is narrow -- but the counter is not
+  endless, and the comment that once said a generation is never reused was
+  wrong. The owner says whose
   entry it is: the page-table root the host registered it under, compared at
   ring 0 against `CR3`, the root the calling turn runs under, so an entry
   resolves at ring 3 only for the isolate it belongs to. `CR3` is the one
@@ -385,6 +397,27 @@ hardware:
   a gk one: an object registered under an isolate has outlived that isolate.
   The runtime's entries go with the objects that hold them, and the isolate
   outlives every context that registers one, so the count should stay 0. The
+  The retire side needs the same question answered and cannot ask it the
+  same way. A drop is not a use: a holder's destructor releases its entry
+  whatever the resolve answered, and inside a turn that release goes into
+  the turn's journal, which is the turn's own memory, for the host to act on
+  once the turn has returned -- host-side, where the lookup compares no
+  owner and must not, since the host resolves for whichever context it is
+  serving. A successful lookup is therefore not evidence that the handle was
+  the caller's, and a host path that retires an entry, or follows it, on one
+  isolate's behalf has to name that isolate: `gk_resolve_owned_by` answers
+  whether an entry is a given arena's and `gk_resolve_unregister_for`
+  retires one only if it is, while `gk_resolve_unregister` stays the
+  unchecked retire for teardown the host does on its own account. Every
+  handle the host takes out of a turn's journal -- the retire list, the
+  notes, the context an owned object's registration names -- is checked
+  against the arena the turn ran under, which the host records at the turn's
+  entry from gk's record of the thread
+  (`hostMemory::ownedByTurn`). The comparison is against `CR3` as the
+  register reads, which is the root's address and nothing else only while
+  `CR4.PCIDE` is clear, as gk leaves it; whoever enables PCID must mask the
+  trampoline's comparison down to the root bits first, since `CR3` would
+  then carry the PCID in bits 11:0 and the no-flush bit in 63. The
   base root is a root like any other rather than a wildcard, so an entry
   registered with no arena active resolves at ring 3 only on the base root;
   a host thread that registers an entry for an isolate it is not locked into
