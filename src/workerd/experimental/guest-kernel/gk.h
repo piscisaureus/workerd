@@ -720,10 +720,11 @@ long gk_hostcall(unsigned idx);
 //
 // What this does not give. Ring 3 can resolve as often as it likes, with any
 // handle it likes, and the only thing it learns is the pointer behind a live
-// handle it holds -- a pointer it could not dereference anyway if the object
-// is in host memory, and which the owner must therefore still protect as an
-// address: the lookup makes a handle safe to keep in guest memory, it does not
-// make the object safe to reach from there. The operation must be safe for
+// handle it holds -- an address the owner must still protect, since the table
+// holds only ordinary user memory (above) and so names only objects ring 3 can
+// already reach: the lookup makes a handle safe to keep in guest memory, it
+// does not make the object safe to reach from there, and an object in host
+// memory cannot be named by an entry at all. The operation must be safe for
 // arbitrary input, and is: it reads the table and nothing else. A handle
 // rewritten to another live entry of the same arena still names that entry:
 // the owner is the isolate, not the object, so the table tells one isolate's

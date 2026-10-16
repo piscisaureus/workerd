@@ -264,7 +264,11 @@ hello-world request is one turn with **6 `IoOwn` dereferences** and no
 and a request that instantiates 1000 Wasm modules are also 6 each; a SQLite
 Durable Object `/get` through a service binding (`disk-sqlite-test.capnp`)
 is 3 turns with 15 `IoOwn` and 1 `IoPtr`, and a `/put` 4 turns with 25 and
-2. `ReverseIoOwn` is never dereferenced in a turn. At 27.7 ns each that is
+2. A `ReverseIoOwn` is dereferenced in a turn too, though rarely: the
+functor `IoContext::makeReentryCallbackImpl` holds is read inside the
+`ctx.run` it wraps, and over the test suite the three `ReverseIoOwn`
+classes that appear are read in a later turn three times against 48
+registrations. At 27.7 ns each that is
 0.1 to 0.5 us per request, against a hello-world request latency of about
 620 us under the guest kernel (p50 over one connection on the same machine):
 the dereference is not where a turn's time goes. (The ~43 foreign accesses a
@@ -984,7 +988,8 @@ the commit unvalidated, so a turn that lies about its own object's disposer
 sends the host's disposal of that object to a function of its choosing --
 the same exposure the `T`'s vtable and members carry until the `T` is
 placed by the host, and the same one a queued action's closure carries when
-the host destroys it. Placing the `T` is the next step there. The table tells one
+the host destroys it. Placing the `T` is not the step that follows, for the
+reasons below. The table tells one
 tenant's handle from another's: each entry records the page-table root the
 host registered it under and the ring-0 lookup compares that against CR3,
 the root the calling turn runs under, so a handle rewritten to another
@@ -1040,6 +1045,101 @@ ring-0 comparison still holds. What is left is a swap between two live
 entries of the same isolate *and* the same class, which no tag distinguishes,
 and a turn that lies about the class in its own journal, which waits on the
 journal leaving the shared heap along with the disposer beside it.
+
+### Placing an `IoOwn`'s `T` in host memory
+
+Host memory is unreachable from inside the guest at either ring: a
+`gk_host_alloc` block is registered `GK_PROT_REFUSE` and mapped into no
+root, so a guest access to it faults "at ring 3 or at ring 0, inside an
+arena or on the base root" (`gk_host_alloc` in `gk.h`). An object placed
+there can therefore be constructed, read, written and destroyed only
+outside `gk_run_user` -- on the host, where the event loop runs -- and a
+turn that touches it faults at the address it touched. That is the
+protection; it is also the whole of the constraint. Three facts about the
+`IoOwn` population decide what the constraint leaves.
+
+**Every object an `IoOwn`, `IoPtr` or `ReverseIoOwn` names is created
+inside a turn.** Counted with a per-class counter on `IoContext::addObject`,
+`addObjectReverse` and the `IoPtr` constructor, each recording whether
+`hostMemory::inTurn()` held, over the `api/tests` and `io` test suites (768
+tests) and four end-to-end guest-kernel workloads (`disk-sqlite-test`,
+`surface-test`, `abort-signal-test`, `ioown-test`): of the 36 classes that
+appear, every registration was made inside a turn and none outside one, the
+only exception being `io-own-test`'s own fixture, which registers from the
+test's event loop. The single entry the host registers for itself is the
+context's own (`DeleteQueueOwner`, through `registerResolveFor`), and it
+names the owner rather than an owned object. So no `IoOwn`'s `T` can simply
+be allocated by `hostOwned<T>` at its allocation site: the site runs at ring
+3, where neither `gk_host_alloc` nor a constructor writing the block can
+run.
+
+**Nearly every one is read inside a turn after the turn that made it.** The
+same counters, distinguishing a dereference made in the turn that registered
+the object from one made in a later turn, leave 13 of the 36 never read in a
+later turn. Three of those are not candidates anyway:
+`jsg::JsRef<jsg::JsValue>` is an I class by rule R2,
+`Worker::Actor::FacetManager` is named by an `IoPtr`, which owns nothing and
+so decides no placement, and the `kj::Promise<api::DeferredProxy<void>>` an
+entrypoint's response becomes is read and disposed of inside the turn that
+makes it -- `awaitJs` moves out of it with `kj::mv(*result)` in the same
+microtask drain -- so placing it would protect nothing. The ten that remain
+could live in host memory from the end of their first turn onward:
+`TraceContext` and `TraceContextParent` (`io-context.c++`, the spans a
+subrequest client is handed and never reads),
+`api::JsRpcReplayMemoryTracker`, `rpc::JsRpcTarget::CallResults::Pipeline`,
+`api::LegacyWebSocketAdapter::AutoResponse`,
+`api::WritableStreamInternalController::Writable` and four continuation
+functors. Everything else is read at ring 3 after its first turn and would
+fault there: `kj::PromiseFulfiller<void>` (947 registrations in the suite,
+every read a late one), the `awaitJs` fulfiller (168), `SpanParent` and
+`UserTraceAsyncContext` (84 each), `api::Fetcher::OutgoingFactory`,
+`api::ReadableStreamSource`, `ActorCacheInterface` and the rest.
+
+**A resolve entry cannot name host memory.** `gk_resolve_register`,
+`gk_resolve_register_for` and `gk_resolve_commit` all run the pointer
+through `resolve_ptr_ok` (`gk.c`), which admits only `GK_PROT_KEEP` memory
+outside every arena; a registration naming a `gk_host_alloc` block is
+refused and returns handle 0, which the library confirms directly -- an
+ordinary heap pointer registers, a `gk_host_alloc` pointer is refused with
+"is not ordinary user memory". The check is right for the commit, whose
+pointer comes out of a turn's journal, but it forbids the host-side
+registration a placed `T` would need as well, and there is no way to move a
+committed entry's pointer afterwards. (The lookup's own description in
+`gk.h` supposes an entry whose object is in host memory; no such entry can
+exist while the check stands.)
+
+Together these say what the mechanism would have to be. The allocation site
+marks the class, which is a compile-time property of `T` so that the
+holder's `operator->` and destructor can be compiled differently for it; the
+turn still constructs the `T` with `kj::heap` in guest memory and registers
+it as now; the host, at the commit that follows the turn, move-constructs
+the `T` into a `gk_host_alloc` block, destroys the guest shell, and points
+the entry at the block through a gk entry point that admits a host-memory
+pointer from a host-side caller and only from one; the node's disposer
+becomes a host-memory disposer so that the host's own disposal frees the
+block; a holder dropped inside a turn is noted for the host instead of
+disposing of the object itself, since the turn cannot run the destructor;
+and the `IO_CONTEXT` hostcall's drain keeps such an object host-side rather
+than handing it to the turn with its disposer. The cost is one host-memory
+allocation and one move per object, no hostcall, and the protection starts
+at the end of the turn that created the object rather than at its
+construction.
+
+What it buys does not justify it yet. It covers ten classes, none of them
+on a request's common path and together about a hundred registrations
+across the whole test suite against the roughly 1600 it does not cover, and
+it closes none of the three residuals the handles still carry. Those are
+the holder's and not the object's: a retire made outside a turn reads the
+handle out of a holder in the shared heap, a forged pair of a victim's
+context handle and an object handle of that same context agrees with
+itself, and a same-class swap is two handles of one isolate. A holder
+cannot move to host memory, because the turn reads it on every
+dereference, and moving it to a region readable but not writable at ring 3
+-- a class gk does not have -- would only move the problem one step, since
+the reference to the holder is itself in a JS-heap object the turn must be
+able to write. What closes them is the shared heap leaving the arena,
+which is the placement work the inventories above describe, and not an
+`IoOwn` change.
 
 ## What is in H memory
 
