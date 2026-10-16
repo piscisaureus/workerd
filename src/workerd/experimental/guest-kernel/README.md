@@ -370,7 +370,21 @@ hardware:
   caller identity at ring 0 that is not memory -- ring 3 can neither read it
   nor load it, and the host alone decides which root a turn enters with --
   so a turn that rewrites its handle word to another isolate's live handle
-  gets 0, the answer a stale handle gets, and not that isolate's object. The
+  gets 0, the answer a stale handle gets, and not that isolate's object. No
+  entry outlives its arena, and gk enforces that rather than assuming it: the
+  tag is a root, a destroyed arena's root goes back to the page-table
+  allocator, and the next `gk_arena_create` is handed exactly that page (the
+  root is its first allocation and the allocator's free list is LIFO), so an
+  entry left behind would carry the new isolate's `CR3` as its tag and
+  resolve at that isolate's ring 3 -- the cross-isolate read the tag exists
+  to refuse, with no race in it. Each arena carries the list of its entries
+  and a count of them in gk's control block, and `gk_arena_destroy` retires
+  whatever is still on the list in the same critical section that frees the
+  root, reports the count on stderr and adds it to
+  `gk_stats.resolve_orphans`. A nonzero count is an embedder bug rather than
+  a gk one: an object registered under an isolate has outlived that isolate.
+  The runtime's entries go with the objects that hold them, and the isolate
+  outlives every context that registers one, so the count should stay 0. The
   base root is a root like any other rather than a wildcard, so an entry
   registered with no arena active resolves at ring 3 only on the base root;
   a host thread that registers an entry for an isolate it is not locked into
@@ -414,7 +428,8 @@ hardware:
   request parked on a timer, eight per open WebSocket (memory-classes.md,
   Cost), so 2^20 holds about two hundred thousand such requests, in 32 MiB
   that cost nothing until written (an entry is 32 bytes: three words and the
-  padding that keeps the index a shift and an entry inside one cache line). The test registers an entry and resolves it
+  chain word that puts it on its arena's list, whose size also keeps the
+  index a shift and an entry inside one cache line). The test registers an entry and resolves it
   from ring 3 on both kinds of stack, from ring 0 and from the host; feeds
   the lookup a zero handle, an index at and past capacity, generations never
   issued, a slot never taken, the pointer itself, a heap address, a
@@ -439,11 +454,20 @@ hardware:
   around the SYSCALL/SYSRET pair rather than by the work added. It also
   registers an entry under each of two arenas and one on the base root and
   resolves all three from ring 3 under each root in turn: each answers in
-  its own and nothing in the others, while the host resolves all three.
+  its own and nothing in the others, while the host resolves all three. It
+  then registers one entry under an arena, destroys that arena with the entry
+  left registered, creates another, and checks that the new arena's root is
+  the destroyed one's recycled page -- so the case is the collision and not
+  two arenas that happened to differ -- before resolving the stale handle
+  from the new arena's ring 3 and from the host: both answer nothing, the
+  destroy having retired the entry and counted it in
+  `gk_stats.resolve_orphans`.
   Negative builds (`gk_test_neg`) remove the generation check
   (`GK_NEG_RESOLVE`), so the case fails on the never-issued generations and
-  the recycled slot, and the owner check (`GK_NEG_RESOLVE_OWNER`), so it
-  fails on all six off-diagonal resolves. It also reserves three entries, sees them resolve to nothing from
+  the recycled slot, the owner check (`GK_NEG_RESOLVE_OWNER`), so it
+  fails on all six off-diagonal resolves, and the retirement at destroy
+  (`GK_NEG_RESOLVE_ORPHAN`), so the stale handle resolves to the dead
+  isolate's object from the next arena's ring 3 and host-side. It also reserves three entries, sees them resolve to nothing from
   ring 3 until committed, commits one and sees it take once, and sees a
   commit refused for a committed, retired or never-issued handle and for a
   NULL, supervisor, refused or arena pointer, from commit and from register

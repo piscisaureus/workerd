@@ -2593,17 +2593,21 @@ static int resolve_check(void) {
   static char objs[GK_RESOLVE_SLOTS + 1];
   gk_get_stats(&s3);
   int n = 0;
+  double t_fill = now_ns();
   for (; n <= GK_RESOLVE_SLOTS; n++) {
     want[n] = &objs[n];
     all[n] = gk_resolve_register(want[n]);
     if (!all[n]) break;
   }
+  double ns_register = (now_ns() - t_fill) / (n ? n : 1);
   gk_resolve_handle over = n <= GK_RESOLVE_SLOTS ? all[n] : gk_resolve_register(&objs[0]);
   gk_get_stats(&s4);
   struct rs_all ra = {all, want, n};
   long mismatched = gk_run_user(rs_resolve_all, &ra);
+  double t_drain = now_ns();
   for (int i = 0; i < n; i += 2) gk_resolve_unregister(all[i]);
   for (int i = (n - 1) | 1; i >= 1; i -= 2) if (i < n) gk_resolve_unregister(all[i]);
+  double ns_unregister = (now_ns() - t_drain) / (n ? n : 1);
   gk_get_stats(&s5);
   int capacity_ok = n == GK_RESOLVE_SLOTS - s3.resolve_entries && over == 0 &&
                     s4.resolve_entries == GK_RESOLVE_SLOTS && mismatched == 0 &&
@@ -2612,6 +2616,34 @@ static int resolve_check(void) {
   gk_resolve_handle h3 = gk_resolve_register(&obj);
   int fresh = h3 != 0 && (h3 >> 20) > (all[n - 1] >> 20) && gk_resolve(h3) == &obj;
   gk_resolve_unregister(h3);
+
+  // What register and retire cost, on the base root above and inside an
+  // arena here: one fill of the table and one drain of it in an order that
+  // scrambles the free list, per operation. An arena's registrations are the
+  // ones the runtime makes from a turn, and the ones that go on the arena's
+  // chain, so the two numbers bound what the chain adds.
+  gk_stats s6;
+  gk_arena *carena = gk_arena_create(1UL << 20);
+  double ns_register_arena = 0, ns_unregister_arena = 0;
+  int cost_ok = carena != NULL;
+  if (carena) {
+    gk_arena_enter(carena);
+    int m = 0;
+    double t0 = now_ns();
+    for (; m <= GK_RESOLVE_SLOTS; m++) {
+      all[m] = gk_resolve_register(&objs[m]);
+      if (!all[m]) break;
+    }
+    ns_register_arena = (now_ns() - t0) / (m ? m : 1);
+    t0 = now_ns();
+    for (int i = 0; i < m; i += 2) gk_resolve_unregister(all[i]);
+    for (int i = (m - 1) | 1; i >= 1; i -= 2) if (i < m) gk_resolve_unregister(all[i]);
+    ns_unregister_arena = (now_ns() - t0) / (m ? m : 1);
+    gk_arena_enter(NULL);
+    gk_get_stats(&s6);
+    cost_ok = m == n && s6.resolve_entries == s3.resolve_entries;
+    gk_arena_destroy(carena);
+  }
 
   // Reservation: reserved entries resolve to nothing from ring 3 and the host until committed,
   // a commit takes once and refuses a committed, retired or never-issued handle, and the table
@@ -2694,12 +2726,63 @@ static int resolve_check(void) {
   if (OA) gk_arena_destroy(OA);
   if (OB) gk_arena_destroy(OB);
 
+  // An entry must not outlive the arena it is tagged with. A destroyed
+  // arena's root is the next arena's -- the root is gk_arena_create's first
+  // allocation and the page-table allocator's free list is LIFO -- so an
+  // entry left behind would carry a tag that is the new isolate's CR3, and
+  // its handle would resolve at that isolate's ring 3: the cross-isolate
+  // read the tag refuses, with no race in it. One entry registered under
+  // arena RA, RA destroyed with the entry deliberately left registered, RB
+  // created: RB's root is checked to be RA's recycled page, so the case is
+  // the collision and not two arenas that happened to differ, and the stale
+  // handles are resolved from RB's ring 3 on the caller's stack and from the
+  // host. The destroy reports the entries and retires them, so both answer
+  // nothing. Two entries, one from each way an entry comes to belong to an
+  // arena: registered with the arena active, as a turn's own is, and
+  // registered for the arena by name from a thread on no arena, as the
+  // runtime registers a context's entry on the event loop.
+  static int oc, oc2;
+  gk_stats sd0, sd1;
+  gk_arena *RA = gk_arena_create(1UL << 20);
+  gk_resolve_handle hstale = 0, hstale_for = 0;
+  unsigned long root_a = 0, root_b = 0;
+  long stale_in_b = -1;
+  int recycle_ok = RA != NULL;
+  if (RA) {
+    gk_arena_enter(RA);
+    hstale = gk_resolve_register(&oc);
+    gk_arena_enter(NULL);
+    hstale_for = gk_resolve_register_for(RA, &oc2);
+    root_a = gk_debug_arena_root(RA);
+    gk_get_stats(&sd0);
+    gk_arena_destroy(RA);  // the entry is left registered on purpose
+    gk_get_stats(&sd1);
+    gk_arena *RB = gk_arena_create(1UL << 20);
+    root_b = gk_debug_arena_root(RB);
+    if (RB) {
+      gk_resolve_handle both[2] = {hstale, hstale_for};
+      void *none_wanted[2] = {NULL, NULL};
+      struct rs_all rs = {both, none_wanted, 2};
+      gk_arena_enter(RB);
+      stale_in_b = gk_run_here_user(rs_resolve_all, &rs);  // 0: it answered NULL
+      gk_arena_enter(NULL);
+      gk_arena_destroy(RB);
+    }
+    recycle_ok = hstale != 0 && hstale_for != 0 && root_a != 0 && root_b == root_a &&
+                 stale_in_b == 0 && gk_resolve(hstale) == NULL &&
+                 gk_resolve(hstale_for) == NULL && gk_resolve_unregister(hstale) == -EINVAL &&
+                 gk_resolve_unregister(hstale_for) == -EINVAL &&
+                 sd1.resolve_entries == sd0.resolve_entries - 2 &&
+                 sd1.resolve_orphans == sd0.resolve_orphans + 2;
+  }
+
   if (rarena) gk_arena_destroy(rarena);
   long cpl = gk_run_user(user_cpl, NULL);  // the process survived the faults above
 
   int ok = reg_bad && resolves && user_ok && here_ok && ring0_ok && host_ok && garbage_ok &&
            walled && bench_ok && freed && recycled && capacity_ok && fresh && reserve_ok &&
-           commit_ok && committed_wrong == 0 && reserve_freed && owner_ok && cpl == 3;
+           commit_ok && committed_wrong == 0 && reserve_freed && owner_ok && recycle_ok &&
+           cost_ok && cpl == 3;
   printf("ring-0 resolve: NULL refused %s; handle %#llx -> %p (host %s); ring 3 %s, caller's "
          "stack %s, ring 0 %s, host %s; %d garbage handles and 0 -> nothing at every ring (%s, "
          "caller's memory untouched %s); ring-3 read of the table -> %s (fault %#lx == %#lx), "
@@ -2713,7 +2796,10 @@ static int resolve_check(void) {
          "pointers %s (%ld wrong from ring 3), released %s; three entries registered under "
          "arena A, arena B and the base root: %ld, %ld and %ld of the three resolved wrongly "
          "from ring 3 under A, under B and on the base root, all three resolve host-side %s; "
-         "CPL %ld [%s]\n",
+         "two entries left registered on a destroyed arena, one made under it and one "
+         "made for it by name, are retired by the destroy (root %#lx recycled into the next "
+         "arena %s, stale handles resolved %ld times from its ring 3, host-side %s) %s; %.0f ns per register and %.0f ns per retire on the base root, "
+         "%.0f and %.0f in an arena %s; CPL %ld [%s]\n",
          reg_bad ? "yes" : "NO", (unsigned long long)h, (void *)&obj, resolves ? "ok" : "BROKEN",
          user_ok ? "ok" : "BROKEN", here_ok ? "ok" : "BROKEN", ring0_ok ? "ok" : "BROKEN",
          host_ok ? "ok" : "BROKEN", RS_BAD, garbage_ok && user_ok && host_ok ? "yes" : "NO",
@@ -2726,7 +2812,11 @@ static int resolve_check(void) {
          s5.resolve_entries == s3.resolve_entries ? "yes" : "NO", fresh ? "yes" : "NO",
          reserve_ok ? "yes" : "NO", commit_ok ? "yes" : "NO", committed_wrong,
          reserve_freed ? "yes" : "NO", wrong_in_a, wrong_in_b, wrong_on_base,
-         owner_ok ? "yes" : "NO", cpl, ok ? "OK" : "FAIL");
+         owner_ok ? "yes" : "NO", root_a, root_b == root_a ? "yes" : "NO", stale_in_b,
+         gk_resolve(hstale) == NULL && gk_resolve(hstale_for) == NULL ? "nothing" : "AN OBJECT",
+         recycle_ok ? "yes" : "NO",
+         ns_register, ns_unregister, ns_register_arena,
+         ns_unregister_arena, cost_ok ? "ok" : "BROKEN", cpl, ok ? "OK" : "FAIL");
   free(p);
   free(heap);
   munmap(none, 4096);

@@ -18,7 +18,7 @@ gk_test_guard: gk.c gk_asm.S gk_test.c gk.h
 # corresponding gk_test case fails, confirming the case actually tests the protection.
 gk_test_neg: gk.c gk_asm.S gk_test.c gk.h
 	$(CC) $(CFLAGS) -DGK_NEG_THREAD_WORDS -DGK_NEG_TURN_DIR -DGK_NEG_RESOLVE \
-		-DGK_NEG_RESOLVE_OWNER -o $@ gk.c gk_asm.S gk_test.c
+		-DGK_NEG_RESOLVE_OWNER -DGK_NEG_RESOLVE_ORPHAN -o $@ gk.c gk_asm.S gk_test.c
 
 run: gk_test
 	./gk_test

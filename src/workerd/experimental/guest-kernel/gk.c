@@ -297,6 +297,16 @@ struct gk_arena {
   // from there. Written under G->lock by the thread that has the arena
   // active, read without it by that thread's signal handler.
   int field_head;
+  // The arena's ring-0 resolve entries (see the resolve section): the index + 1
+  // of the first entry of gk_resolve_table that belongs to this arena, 0 for
+  // none, with the rest linked both ways from there through the entries' chain
+  // words, and how many there are. The head and the count are here, in the
+  // control block, which is GK_PROT_SUPER, as the table they describe is: a
+  // ring-3 access to either faults. Only the links are in the table. gk_arena_destroy retires whatever is left
+  // before the arena's root returns to the page-table allocator, since the next
+  // arena is handed that same root (see gk_resolve in gk.h). Guarded by G->lock.
+  int resolve_head;
+  int resolve_live;
   gk_arena *next_free;        // free-list link while the struct is unused
 };
 
@@ -390,18 +400,31 @@ _Static_assert(GK_SIGNAL_FIELDS <= (1 << GK_HOST_SLOT_INDEX_BITS), "a field inde
 //
 // An entry is 32 bytes rather than the 24 the three words need: the trampoline
 // indexes by a shift, and a 24-byte entry would straddle a cache line two
-// times in three. The fourth word is unused. The capacity's reservation is
-// 32 MiB, untouched until an entry is written.
+// times in three. The fourth word is the chain word, which the trampoline
+// never reads: the arena an entry belongs to and the entry's neighbours in
+// that arena's list, so that gk_arena_destroy can retire an arena's entries
+// without walking the table (see gk_resolve in gk.h and the arena's
+// resolve_head). All three are 0 for an entry the base root owns, which is
+// on no list because the base root is never destroyed, and for a reserved
+// entry, which joins its owner's list when it is committed. The capacity's
+// reservation is 32 MiB, untouched until an entry is written.
 //
 // A handle is the entry's index in its low GK_RESOLVE_INDEX_BITS bits and the
 // generation above them. The capacity is exactly 2^GK_RESOLVE_INDEX_BITS, so
 // masking the index bounds it and every 64-bit value decomposes into one
 // (generation, index) pair; the trampoline relies on both.
-typedef struct { void *ptr; uint64_t gen; uint64_t owner; uint64_t unused; } gk_resolve_entry;
+typedef struct {
+  void *ptr;
+  uint64_t gen;
+  uint64_t owner;
+  uint64_t aidx : 13, prev : 21, next : 21;  // the chain word, as index + 1 each
+} gk_resolve_entry;
 _Static_assert(sizeof(gk_resolve_entry) == 32, "gk_resolve_tramp indexes 32-byte entries");
 _Static_assert(offsetof(gk_resolve_entry, owner) == 16, "gk_resolve_tramp reads the owner at 16");
 _Static_assert(GK_RESOLVE_INDEX_BITS == 20, "gk_resolve_tramp splits a handle at bit 20");
 _Static_assert(GK_RESOLVE_SLOTS == (1 << GK_RESOLVE_INDEX_BITS), "gk_resolve_tramp bounds the index by masking");
+_Static_assert(GK_MAX_ARENAS < (1 << 13), "an arena's pool index must fit the chain word");
+_Static_assert(GK_RESOLVE_SLOTS < (1 << 21), "an entry index must fit the chain word");
 #define GK_RESOLVE_GEN_BITS (64 - GK_RESOLVE_INDEX_BITS)
 __attribute__((visibility("hidden"), aligned(4096))) union {
   gk_resolve_entry e[GK_RESOLVE_SLOTS];
@@ -592,6 +615,7 @@ struct gk_ctl {
   int resolve_free;                  // free-list head, as index + 1; 0 when empty
   int resolve_live;                  // entries registered and not yet unregistered
   uint64_t resolve_gen;              // the generation of the last registration
+  long resolve_orphans;              // entries retired by gk_arena_destroy, their arena having died first
 
   // The turn-directory policy (see gk_confine_paths in gk.h): when set,
   // forward_syscall confines every thread's path syscalls to its turn
@@ -3738,14 +3762,54 @@ long gk_hostcall(unsigned idx) {
 // through the handle, no lock, no write, no allocation (it runs under the
 // allocation guard so the guard build checks the last).
 
-// The root a registration made on this thread belongs to: the thread's active
-// arena's root, or the base root when it has none. It is the value the guest's
-// CR3 holds while a turn of that arena runs (see sync_cr3), which is what the
-// trampoline compares against. Caller holds G->lock.
-static uint64_t resolve_owner_now(void) {
+// The arena a registration made on this thread belongs to, or NULL when the
+// thread has no active arena and the base root owns the entry. Caller holds
+// G->lock.
+static gk_arena *resolve_arena_now(void) {
   gk_thread *t = thread_cur();
-  gk_arena *a = t ? t->active_arena : NULL;
+  return t ? t->active_arena : NULL;
+}
+
+// The root an entry of `a` is tagged with: the arena's root, or the base root
+// for an entry no arena owns. It is the value the guest's CR3 holds while a
+// turn of that arena runs (see sync_cr3), which is what the trampoline
+// compares against. Caller holds G->lock.
+static uint64_t resolve_root_of(const gk_arena *a) {
   return (uint64_t)(uintptr_t)(a ? a->pml4 : G->pml4);
+}
+
+// The arena an entry belongs to, from its chain word, or NULL for one the base
+// root owns and for a reserved one. Caller holds G->lock.
+static gk_arena *resolve_arena_of(const gk_resolve_entry *e) {
+  return e->aidx ? &G->arena_pool[e->aidx - 1] : NULL;
+}
+
+// Puts entry `idx` on arena `a`'s list, or on no list when the base root owns
+// it. Caller holds G->lock.
+static void resolve_chain_add(int idx, gk_arena *a) {
+  if (!a) return;
+  gk_resolve_entry *e = &gk_resolve_table.e[idx];
+  e->aidx = (uint64_t)(a - G->arena_pool) + 1;
+  e->prev = 0;
+  e->next = (uint64_t)a->resolve_head;
+  if (a->resolve_head) gk_resolve_table.e[a->resolve_head - 1].prev = (uint64_t)idx + 1;
+  a->resolve_head = idx + 1;
+  a->resolve_live++;
+}
+
+// Takes entry `idx` off its arena's list, if it is on one. The list is doubly
+// linked because entries are retired in any order, not the order they were
+// taken in, so the cost must not depend on how many the arena holds. Caller
+// holds G->lock.
+static void resolve_chain_remove(int idx) {
+  gk_resolve_entry *e = &gk_resolve_table.e[idx];
+  gk_arena *a = resolve_arena_of(e);
+  if (!a) return;
+  if (e->prev) gk_resolve_table.e[e->prev - 1].next = e->next;
+  else a->resolve_head = (int)e->next;
+  if (e->next) gk_resolve_table.e[e->next - 1].prev = e->prev;
+  e->aidx = e->prev = e->next = 0;
+  a->resolve_live--;
 }
 
 // The lookup the host and guest ring 0 take. It does not compare the owner:
@@ -3781,11 +3845,12 @@ static int resolve_ptr_ok(const void *ptr) {
 }
 
 // Takes a free entry, gives it a fresh generation and publishes it with `ptr`
-// (NULL for a reservation). Returns the handle, or 0 when the table is full.
-// A registration is owned by the root it is made under; a reservation is owned
-// by no root until gk_resolve_commit places a pointer in it, and resolves to
-// nothing meanwhile. Caller holds G->lock.
-static gk_resolve_handle resolve_take(void *ptr, uint64_t owner) {
+// (NULL for a reservation), on arena `a`'s list unless the base root owns it.
+// Returns the handle, or 0 when the table is full. A registration is owned by
+// the root it is made under; a reservation is owned by no root until
+// gk_resolve_commit places a pointer in it, and resolves to nothing meanwhile.
+// Caller holds G->lock.
+static gk_resolve_handle resolve_take(void *ptr, uint64_t owner, gk_arena *a) {
   int idx;
   if (G->resolve_free) {
     idx = G->resolve_free - 1;
@@ -3804,14 +3869,15 @@ static gk_resolve_handle resolve_take(void *ptr, uint64_t owner) {
   __atomic_store_n(&e->owner, owner, __ATOMIC_RELEASE);
   __atomic_store_n(&e->ptr, ptr, __ATOMIC_RELEASE);
   __atomic_store_n(&e->gen, gen, __ATOMIC_RELEASE);
+  resolve_chain_add(idx, a);
   G->resolve_live++;
   return (gen << GK_RESOLVE_INDEX_BITS) | (uint64_t)idx;
 }
 
-// The body of both registrations: the pointer check and a taken entry owned
-// by `owner`. Caller holds G->lock.
-static gk_resolve_handle resolve_register_locked(void *ptr, uint64_t owner, const char *who) {
-  if (resolve_ptr_ok(ptr)) return resolve_take(ptr, owner);
+// The body of both registrations: the pointer check and a taken entry owned by
+// arena `a`, or by the base root when `a` is NULL. Caller holds G->lock.
+static gk_resolve_handle resolve_register_locked(void *ptr, gk_arena *a, const char *who) {
+  if (resolve_ptr_ok(ptr)) return resolve_take(ptr, resolve_root_of(a), a);
   fprintf(stderr, "[gk] %s: %p is not ordinary user memory; nothing is registered\n", who, ptr);
   return 0;
 }
@@ -3819,7 +3885,8 @@ static gk_resolve_handle resolve_register_locked(void *ptr, uint64_t owner, cons
 gk_resolve_handle gk_resolve_register(void *ptr) {
   if (!ptr || !G->initialized) return 0;
   pthread_mutex_lock(&G->lock);
-  gk_resolve_handle h = resolve_register_locked(ptr, resolve_owner_now(), "gk_resolve_register");
+  gk_resolve_handle h =
+      resolve_register_locked(ptr, resolve_arena_now(), "gk_resolve_register");
   pthread_mutex_unlock(&G->lock);
   return h;
 }
@@ -3834,8 +3901,7 @@ gk_resolve_handle gk_resolve_register_for(gk_arena *a, void *ptr) {
     fprintf(stderr, "[gk] gk_resolve_register_for: %p is not a live arena; nothing is "
             "registered\n", (void *)a);
   } else {
-    h = resolve_register_locked(ptr, (uint64_t)(uintptr_t)(a ? a->pml4 : G->pml4),
-                                "gk_resolve_register_for");
+    h = resolve_register_locked(ptr, a, "gk_resolve_register_for");
   }
   pthread_mutex_unlock(&G->lock);
   return h;
@@ -3846,7 +3912,7 @@ int gk_resolve_reserve(gk_resolve_handle *handles, int n) {
   pthread_mutex_lock(&G->lock);
   int got = 0;
   while (got < n) {
-    gk_resolve_handle h = resolve_take(NULL, 0);
+    gk_resolve_handle h = resolve_take(NULL, 0, NULL);
     if (!h) break;
     handles[got++] = h;
   }
@@ -3874,10 +3940,57 @@ int gk_resolve_commit(gk_resolve_handle h, void *ptr) {
   // becomes visible with the store after it, which is the word the trampoline
   // gates the owner comparison on, so a lookup that saw the pointer saw the
   // owner too. A lookup that read NULL before either answered nothing.
-  __atomic_store_n(&e->owner, resolve_owner_now(), __ATOMIC_RELEASE);
+  gk_arena *a = resolve_arena_now();
+  __atomic_store_n(&e->owner, resolve_root_of(a), __ATOMIC_RELEASE);
   __atomic_store_n(&e->ptr, ptr, __ATOMIC_RELEASE);
+  resolve_chain_add((int)idx, a);
   pthread_mutex_unlock(&G->lock);
   return 0;
+}
+
+// Retires entry `idx`: it leaves its arena's list, then the generation goes
+// first, so a lookup in flight fails its second read, then the pointer word,
+// which becomes the free-list link (see gk_resolve_tramp and the table). The
+// owner is left as it was; a free entry's generation is 0, which refuses every
+// handle, and the next registration to take the entry writes its own. Caller
+// holds G->lock.
+static void resolve_retire_locked(int idx) {
+  gk_resolve_entry *e = &gk_resolve_table.e[idx];
+  resolve_chain_remove(idx);
+  __atomic_store_n(&e->gen, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&e->ptr, (void *)(uintptr_t)G->resolve_free, __ATOMIC_RELEASE);
+  G->resolve_free = idx + 1;
+  G->resolve_live--;
+}
+
+// Retires every entry an arena being destroyed still owns. Nothing should be
+// left: the runtime retires an isolate's entries with the objects that hold
+// them, and the isolate outlives those. But the owner tag is a page-table root
+// and the next arena is handed this one's, so an entry left behind would
+// resolve at that isolate's ring 3 under a tag that is no longer its owner's
+// (see gk_resolve in gk.h). Caller holds G->lock.
+static void resolve_drop_locked(gk_arena *a) {
+  if (!a->resolve_head) return;
+#ifdef GK_NEG_RESOLVE_ORPHAN
+  // GK_NEG_RESOLVE_ORPHAN (a negative-test build, never shipped) forgets the
+  // arena's entries instead of retiring them, leaving them live under a root
+  // that is about to be recycled, so the corresponding gk_test case fails.
+  while (a->resolve_head) resolve_chain_remove(a->resolve_head - 1);
+#else
+  int n = 0;
+  while (a->resolve_head) {
+    int idx = a->resolve_head - 1;
+    if (resolve_arena_of(&gk_resolve_table.e[idx]) != a) break;  // cannot happen; be safe
+    resolve_retire_locked(idx);
+    n++;
+  }
+  a->resolve_head = 0;
+  a->resolve_live = 0;
+  G->resolve_orphans += n;
+  fprintf(stderr, "[gk] gk_arena_destroy: arena [%#lx,%#lx) still owned %d resolve entr%s; "
+          "retired, so that no handle of it resolves under the arena that takes its root\n",
+          (unsigned long)a->base, (unsigned long)a->end, n, n == 1 ? "y" : "ies");
+#endif
 }
 
 int gk_resolve_unregister(gk_resolve_handle h) {
@@ -3891,15 +4004,7 @@ int gk_resolve_unregister(gk_resolve_handle h) {
               "entry; nothing is unregistered\n", (unsigned long long)h);
     return -GK_EINVAL;
   }
-  // Retire: the generation first, so a lookup in flight fails its second
-  // read, then the pointer word, which becomes the free-list link (see
-  // gk_resolve_tramp and the table). The owner is left as it was; a free
-  // entry's generation is 0, which refuses every handle, and the next
-  // registration to take the entry writes its own.
-  __atomic_store_n(&e->gen, 0, __ATOMIC_RELEASE);
-  __atomic_store_n(&e->ptr, (void *)(uintptr_t)G->resolve_free, __ATOMIC_RELEASE);
-  G->resolve_free = idx + 1;
-  G->resolve_live--;
+  resolve_retire_locked((int)idx);
   pthread_mutex_unlock(&G->lock);
   return 0;
 }
@@ -5656,6 +5761,13 @@ size_t gk_arena_size(const gk_arena *a) {
   pthread_mutex_unlock(&G->lock);
   return size;
 }
+unsigned long gk_debug_arena_root(const gk_arena *a) {
+  if (!a) return 0;
+  pthread_mutex_lock(&G->lock);
+  unsigned long root = arena_live_locked(a) ? (unsigned long)(uintptr_t)a->pml4 : 0;
+  pthread_mutex_unlock(&G->lock);
+  return root;
+}
 
 int gk_arena_enter(gk_arena *a) {
   gk_thread *t = thread_get();
@@ -5761,6 +5873,7 @@ void gk_arena_destroy(gk_arena *a) {
   if (pkey_set_range(a->base, a->end, 0) < 0 && G->dbg)
     fprintf(stderr, "[gk] pkey table full; destroyed arena keeps stale keys\n");
   signal_fields_drop_locked(a);
+  resolve_drop_locked(a);
   int in_use = __atomic_load_n(&a->active_threads, __ATOMIC_SEQ_CST);
   if (in_use > 0) {
     fprintf(stderr, "[gk] gk_arena_destroy: arena [%#lx,%#lx) is still active on %d thread(s); "
@@ -5828,6 +5941,7 @@ void gk_get_stats(gk_stats *s) {
   s->hostcalls = atomic_load_explicit(&G->hostcall_calls, memory_order_relaxed);
   s->signal_fields = G->signal_field_live;
   s->resolve_entries = G->resolve_live;
+  s->resolve_orphans = G->resolve_orphans;
   s->path_refusals = atomic_load_explicit(&G->path_refusals, memory_order_relaxed);
   s->runners = G->runner_n;
   s->runner_runs = atomic_load_explicit(&G->runner_runs, memory_order_relaxed);

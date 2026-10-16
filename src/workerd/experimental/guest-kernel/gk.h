@@ -243,6 +243,8 @@ typedef struct {
   int signal_fields;  // signal fields registered and not yet unregistered (see gk_signal_field_register)
   int resolve_entries;  // ring-0 resolve entries registered or reserved and not yet unregistered (see gk_resolve_register)
   long
+      resolve_orphans;  // entries gk_arena_destroy had to retire because their arena was destroyed first (see gk_resolve)
+  long
       path_refusals;  // forwarded path syscalls the turn-directory policy refused (see gk_confine_paths)
   int runners;        // vCPU runner threads started (GK_RUNNER=1; see the runner section in gk.c)
   long runner_runs;    // KVM_RUNs a runner executed on an owning thread's behalf
@@ -541,6 +543,28 @@ long gk_hostcall(unsigned idx);
 // entry has no pointer and no owner and resolves to nothing until it is
 // committed. The comparison costs two instructions and no further memory.
 //
+// No entry outlives its arena, and gk enforces it. The tag is a page-table
+// root, and a destroyed arena's root goes back to the allocator that the next
+// gk_arena_create takes its root from -- the root is that call's first
+// allocation and the allocator's free list is LIFO, so the next arena is
+// handed exactly the dead one's root. An entry still tagged with it would
+// resolve at the new isolate's ring 3: the cross-isolate read the tag exists
+// to refuse, and no race, just the two calls in order. The runtime's entries
+// are retired with the objects that hold them, which the isolate outlives, so
+// there should be nothing left when an arena is destroyed; the tag's soundness
+// does not rest on that. Every entry an arena owns is on a list that arena
+// carries, with a count beside it, both in gk's control block, which is
+// GK_PROT_SUPER like the table itself, so a ring-3 access to either faults;
+// the links are in the table, beside the free list already threaded
+// through it.
+// gk_arena_destroy retires whatever is still on the list, in the same critical
+// section that frees the root, so there is no window in which a recycled root
+// has a live entry under it. It reports the count on stderr and adds it to
+// gk_stats.resolve_orphans. A nonzero count is an embedder bug -- an object
+// registered under an isolate has outlived that isolate -- not a gk one, and
+// is left loud rather than fatal because the entries are gone by then and the
+// process can still be read for what leaked.
+//
 // Only ring 3 is compared. gk_resolve at guest ring 0 and on the host reads
 // the table directly, with the generation check and no owner check: host
 // code is the party the tag protects, not a party it is protected from, and
@@ -560,8 +584,9 @@ long gk_hostcall(unsigned idx);
 // a timer or on a subrequest, so that one worker with a few thousand such
 // requests outgrows a 2^16-entry table (see memory-classes.md, Cost). 2^20
 // entries hold about two hundred thousand of them. An entry is 32 bytes --
-// the three words plus the padding that keeps the index a shift and an entry
-// inside one cache line -- so the table's 32 MiB are static and untouched
+// the three words plus the chain word that puts the entry on its arena's
+// list, whose size also keeps the index a shift and an entry inside one cache
+// line -- so the table's 32 MiB are static and untouched
 // until an entry is written: the capacity costs page-table entries at init
 // (8192 of them, in the base root every arena shares) and nothing per unused
 // page; the free list is threaded through the free entries themselves, so the
@@ -853,6 +878,11 @@ long gk_debug_vcpu_stat(const char *name);
 // re-installs the PTE. With gk_stats.demand_faults a test can thus tell which
 // translations survive what. Not for production use.
 void gk_debug_drop_pte(unsigned long addr);
+
+// Test/diagnostic: an arena's page-table root, which is the owner tag of a
+// resolve entry registered under it and the value its turns' CR3 holds (see
+// gk_resolve), or 0 if `a` is not a live arena. Not for production use.
+unsigned long gk_debug_arena_root(const gk_arena *a);
 
 // Test/diagnostic: register [addr, addr+len), rounded out to pages, as a
 // supervisor (GK_DEBUG_PROT_SUPER) or refused (GK_DEBUG_PROT_REFUSE) range, or

@@ -320,8 +320,8 @@ times a small constant, and the original 2^16 entries were exhausted by one
 worker with 3300 parked requests; the table holds 2^20 (`GK_RESOLVE_SLOTS`),
 about 200000 such requests, in 32 MiB of static memory that costs nothing
 until written (an entry is 32 bytes: the pointer, the generation, the owner
-and the padding that keeps the index a shift and an entry inside one cache
-line), with the reserved pools taking 256 per thread of it. The
+and the chain word that puts the entry on its arena's list, whose size also
+keeps the index a shift and an entry inside one cache line), with the reserved pools taking 256 per thread of it. The
 table stays process-wide: a per-isolate table would move the same sizing
 question to each isolate, and the ring-0 lookup needs no per-isolate table
 to tell the isolates apart -- each entry records the page-table root it was
@@ -999,10 +999,17 @@ turn has to name the isolate it belongs to
 (`hostMemory::registerResolveFor`); the context's own entry, created on the
 event loop, is the one such entry today. The delete queue's side of the
 residual is closed too: a dropped handle is queued only for the context
-whose list holds its node, whatever context handle the holder carries. What
-the owner does not tell apart is two entries of the same isolate: a handle
-rewritten to another live handle of its own isolate still names that
-entry's object.
+whose list holds its node, whatever context handle the holder carries. The
+tag names a root, and roots are recycled -- a destroyed arena's root is the
+next arena's, that being the first page the page-table allocator hands out
+-- so an entry that outlived its arena would resolve for whichever isolate
+inherits the root. The runtime does not let that happen, since an isolate
+outlives every context that registers an entry under it, but gk does not
+rest on that: each arena carries the list of its own entries, and
+`gk_arena_destroy` retires whatever is left before the root goes, on stderr
+and counted in `gk_stats.resolve_orphans`. What the owner does not tell
+apart is two entries of the same isolate: a handle rewritten to another
+live handle of its own isolate still names that entry's object.
 
 ## What is in H memory
 
