@@ -255,7 +255,8 @@ void detachNode(OwnedNode* node) {
 void queueDeletionHost(hostMemory::ResolveHandle context, hostMemory::ResolveHandle handle) {
   kj::MutexGuarded<int>* registry = registryLock();
   if (registry == nullptr) {
-    KJ_LOG(ERROR, "the delete queue registry does not resolve; nothing is queued");
+    WD_LOG_REFUSAL(hostMemory::LogSite::QUEUE_DELETION_REGISTRY,
+        "the delete queue registry does not resolve; nothing is queued");
     return;
   }
   auto guard = registry->lockShared();
@@ -265,13 +266,14 @@ void queueDeletionHost(hostMemory::ResolveHandle context, hostMemory::ResolveHan
   if (lock->tearingDown) return;  // the context's list is taking the object
   OwnedNode* node = nodeOf(handle);
   if (node == nullptr) {
-    KJ_LOG(ERROR, "IoOwn handle does not name a live owned object; nothing is released",
-        kj::hex(handle));
+    WD_LOG_REFUSAL(hostMemory::LogSite::QUEUE_DELETION_UNKNOWN,
+        "IoOwn handle does not name a live owned object; nothing is released", kj::hex(handle));
     return;
   }
   if (node->context != context) {
-    KJ_LOG(ERROR, "IoOwn handle names an object of another context; nothing is released",
-        kj::hex(handle), kj::hex(context), kj::hex(node->context));
+    WD_LOG_REFUSAL(hostMemory::LogSite::QUEUE_DELETION_FOREIGN,
+        "IoOwn handle names an object of another context; nothing is released", kj::hex(handle),
+        kj::hex(context), kj::hex(node->context));
     return;
   }
   lock->deletions.push(handle);
@@ -282,7 +284,8 @@ void queueDeletionHost(hostMemory::ResolveHandle context, hostMemory::ResolveHan
 bool queueActionHost(hostMemory::ResolveHandle context, Action* box) {
   kj::MutexGuarded<int>* registry = registryLock();
   if (registry == nullptr) {
-    KJ_LOG(ERROR, "the delete queue registry does not resolve; nothing is queued");
+    WD_LOG_REFUSAL(hostMemory::LogSite::QUEUE_ACTION_REGISTRY,
+        "the delete queue registry does not resolve; nothing is queued");
     return false;
   }
   auto guard = registry->lockShared();
@@ -359,8 +362,8 @@ bool OwnedObjectList::committed(hostMemory::ResolveHandle handle, void* ptr, con
       auto* disposer = reinterpret_cast<const kj::Disposer*>(aux[AUX_DISPOSER]);
       auto* disposal = reinterpret_cast<void*>(aux[AUX_DISPOSAL]);
       if (disposer == nullptr || disposal == nullptr) {
-        KJ_LOG(ERROR, "an owned object's registration names no disposer; it is refused",
-            kj::hex(handle));
+        WD_LOG_REFUSAL(hostMemory::LogSite::REGISTRATION_NO_DISPOSER,
+            "an owned object's registration names no disposer; it is refused", kj::hex(handle));
         registrationsRefused.fetch_add(1, std::memory_order_relaxed);
         return false;
       }
@@ -369,7 +372,7 @@ bool OwnedObjectList::committed(hostMemory::ResolveHandle handle, void* ptr, con
         // The words are the turn's own memory: a context handle in them is a value the turn
         // chose, and one belonging to another isolate would link this object into that
         // isolate's list, to be disposed of by its teardown through the disposer named here.
-        KJ_LOG(ERROR,
+        WD_LOG_REFUSAL(hostMemory::LogSite::REGISTRATION_FOREIGN_CONTEXT,
             "an owned object's registration names a context of another isolate; it is refused",
             kj::hex(handle), kj::hex(context));
         registrationsRefused.fetch_add(1, std::memory_order_relaxed);
@@ -377,8 +380,9 @@ bool OwnedObjectList::committed(hostMemory::ResolveHandle handle, void* ptr, con
       }
       ContextRecord* record = recordOf(context);
       if (record == nullptr) {
-        KJ_LOG(ERROR, "an owned object's registration names no live context; it is refused",
-            kj::hex(handle), kj::hex(context));
+        WD_LOG_REFUSAL(hostMemory::LogSite::REGISTRATION_DEAD_CONTEXT,
+            "an owned object's registration names no live context; it is refused", kj::hex(handle),
+            kj::hex(context));
         registrationsRefused.fetch_add(1, std::memory_order_relaxed);
         return false;
       }
@@ -397,7 +401,8 @@ bool OwnedObjectList::committed(hostMemory::ResolveHandle handle, void* ptr, con
       return true;
     }
   }
-  KJ_LOG(ERROR, "a resolve registration carries an unknown kind; it is refused", kj::hex(handle),
+  WD_LOG_REFUSAL(hostMemory::LogSite::REGISTRATION_UNKNOWN_KIND,
+      "a resolve registration carries an unknown kind; it is refused", kj::hex(handle),
       aux[AUX_KIND]);
   return false;
 }
@@ -420,7 +425,8 @@ void OwnedObjectList::released(hostMemory::ResolveHandle handle) {
         auto* record = static_cast<ContextRecord*>(c.ptr);
         OwnedNode** head = headOf(*record);
         if (*head != nullptr) {
-          KJ_LOG(ERROR, "a context's record was released with objects still in it; they leak",
+          WD_LOG_REFUSAL(hostMemory::LogSite::RECORD_RELEASED_OBJECTS,
+              "a context's record was released with objects still in it; they leak",
               kj::hex(handle));
         }
         while (OwnedNode* node = *head) {
@@ -433,7 +439,8 @@ void OwnedObjectList::released(hostMemory::ResolveHandle handle) {
           taken = takeQueue(*lock);
         }
         if (taken.fulfiller != nullptr || taken.actions != nullptr) {
-          KJ_LOG(ERROR, "a context's record was released with its queue still in it; it leaks",
+          WD_LOG_REFUSAL(hostMemory::LogSite::RECORD_RELEASED_QUEUE,
+              "a context's record was released with its queue still in it; it leaks",
               kj::hex(handle));
         }
         consumeChain(taken.actions, [](uint64_t) {});
@@ -456,8 +463,9 @@ bool OwnedObjectList::noted(const uint64_t* words, bool inHandler) {
   switch (words[0]) {
     case DELETION:
       if (!hostMemory::ownedByTurn(words[1]) || !hostMemory::ownedByTurn(words[2])) {
-        KJ_LOG(ERROR, "a turn's note names a handle of another isolate; nothing is queued",
-            kj::hex(words[1]), kj::hex(words[2]));
+        WD_LOG_REFUSAL(hostMemory::LogSite::NOTE_FOREIGN_HANDLE,
+            "a turn's note names a handle of another isolate; nothing is queued", kj::hex(words[1]),
+            kj::hex(words[2]));
         return true;
       }
       queueDeletionHost(words[1], words[2]);
@@ -469,7 +477,8 @@ bool OwnedObjectList::noted(const uint64_t* words, bool inHandler) {
       if (hostMemory::ownedByTurn(words[1])) {
         queued = queueActionHost(words[1], box);
       } else {
-        KJ_LOG(ERROR, "a turn's note names a context of another isolate; nothing is queued",
+        WD_LOG_REFUSAL(hostMemory::LogSite::NOTE_FOREIGN_CONTEXT,
+            "a turn's note names a context of another isolate; nothing is queued",
             kj::hex(words[1]));
         foreignActionNotes.fetch_add(1, std::memory_order_relaxed);
 #ifdef WORKERD_GK_NEG_FOREIGN_ACTION
@@ -500,7 +509,8 @@ bool OwnedObjectList::noted(const uint64_t* words, bool inHandler) {
       return true;
     }
   }
-  KJ_LOG(ERROR, "a turn's note carries an unknown kind; it is ignored", words[0]);
+  WD_LOG_REFUSAL(hostMemory::LogSite::NOTE_UNKNOWN_KIND,
+      "a turn's note carries an unknown kind; it is ignored", words[0]);
   return true;
 }
 
@@ -554,8 +564,8 @@ void DeleteQueue::releaseReference(hostMemory::ResolveHandle handle, uint64_t ta
   hostMemory::unregisterResolve(handle);
 #else
   if (wrongType(handle, tag)) {
-    KJ_LOG(ERROR, "an IoPtr handle names an object of another class; nothing is retired",
-        kj::hex(handle));
+    WD_LOG_REFUSAL(hostMemory::LogSite::IOPTR_WRONG_CLASS,
+        "an IoPtr handle names an object of another class; nothing is retired", kj::hex(handle));
     return;
   }
   hostMemory::unregisterResolve(handle);
@@ -572,7 +582,8 @@ void OwnedObjectList::drop(hostMemory::ResolveHandle handle,
     void* object = hostMemory::resolveOfType(handle, type);
     if (object == nullptr) {
       if (hostMemory::resolve(handle) != nullptr) {
-        KJ_LOG(ERROR, "an IoOwn handle names an object of another class; nothing is released",
+        WD_LOG_REFUSAL(hostMemory::LogSite::DROP_WRONG_CLASS,
+            "an IoOwn handle names an object of another class; nothing is released",
             kj::hex(handle));
         return;
       }
@@ -604,14 +615,14 @@ void OwnedObjectList::drop(hostMemory::ResolveHandle handle,
 void OwnedObjectList::release(
     hostMemory::ResolveHandle handle, uint64_t type, DestroyOwnedObject destroy) {
   if (wrongType(handle, type)) {
-    KJ_LOG(ERROR, "an IoOwn handle names an object of another class; nothing is released",
-        kj::hex(handle));
+    WD_LOG_REFUSAL(hostMemory::LogSite::RELEASE_WRONG_CLASS,
+        "an IoOwn handle names an object of another class; nothing is released", kj::hex(handle));
     return;
   }
   OwnedNode* node = nodeOf(handle);
   if (node == nullptr) {
-    KJ_LOG(ERROR, "IoOwn handle does not name a live owned object; nothing is released",
-        kj::hex(handle));
+    WD_LOG_REFUSAL(hostMemory::LogSite::RELEASE_UNKNOWN,
+        "IoOwn handle does not name a live owned object; nothing is released", kj::hex(handle));
     return;
   }
   detachNode(node);
@@ -621,14 +632,14 @@ void OwnedObjectList::release(
 
 const kj::Disposer& OwnedObjectList::take(hostMemory::ResolveHandle handle, uint64_t type) {
   if (wrongType(handle, type)) {
-    KJ_LOG(ERROR, "an IoOwn handle names an object of another class; nothing is taken",
-        kj::hex(handle));
+    WD_LOG_REFUSAL(hostMemory::LogSite::TAKE_WRONG_CLASS,
+        "an IoOwn handle names an object of another class; nothing is taken", kj::hex(handle));
     KJ_FAIL_REQUIRE("IoOwn handle names an object of another class", kj::hex(handle));
   }
   OwnedNode* node = nodeOf(handle);
   if (node == nullptr) {
-    KJ_LOG(
-        ERROR, "IoOwn handle does not name a live owned object; nothing is taken", kj::hex(handle));
+    WD_LOG_REFUSAL(hostMemory::LogSite::TAKE_UNKNOWN,
+        "IoOwn handle does not name a live owned object; nothing is taken", kj::hex(handle));
     KJ_FAIL_REQUIRE("IoOwn handle does not name a live owned object", kj::hex(handle));
   }
   detachNode(node);
@@ -686,8 +697,8 @@ OwnedObjectList::~OwnedObjectList() noexcept(false) {
   }
   ContextRecord* record = recordOf(ctx);
   if (record == nullptr) {
-    KJ_LOG(ERROR, "an owned list's context does not name a live record; nothing is released",
-        kj::hex(ctx));
+    WD_LOG_REFUSAL(hostMemory::LogSite::LIST_NO_RECORD,
+        "an owned list's context does not name a live record; nothing is released", kj::hex(ctx));
     return;
   }
   record->cross.lockExclusive()->tearingDown = true;
@@ -778,7 +789,8 @@ long OwnedObjectList::hostcallHandler(hostcall::Frame& frame) {
           consumeChain(lock->deletions.detach(), [](uint64_t) {});
           OwnedNode** head = headOf(*record);
           if (*head != nullptr) {
-            KJ_LOG(ERROR, "a context's record was torn down with objects still in it; they leak",
+            WD_LOG_REFUSAL(hostMemory::LogSite::HANDLER_TEARDOWN_OBJECTS,
+                "a context's record was torn down with objects still in it; they leak",
                 kj::hex(ctx));
           }
           while (OwnedNode* node = *head) {
@@ -849,8 +861,9 @@ void* DeleteQueue::resolveOwned(
     hostMemory::ResolveHandle handle, uint64_t tag, const std::type_info& type) {
   void* object = hostMemory::resolveOfType(handle, tag);
   if (object == nullptr) {
-    KJ_LOG(ERROR, "IoOwn handle does not name a live owned object; the use is refused",
-        kj::hex(handle), type.name());
+    WD_LOG_REFUSAL(hostMemory::LogSite::USE_UNKNOWN,
+        "IoOwn handle does not name a live owned object; the use is refused", kj::hex(handle),
+        type.name());
     KJ_FAIL_REQUIRE("IoOwn handle does not name a live owned object", kj::hex(handle), type.name());
   }
   return object;
@@ -870,7 +883,8 @@ void DeleteQueue::scheduleDeletion(
     if (hostMemory::resolve(context) == nullptr) return;
     uint64_t words[hostMemory::NOTE_WORDS] = {DELETION, context, handle, 0};
     if (!hostMemory::noteInTurn(words)) {
-      KJ_LOG(ERROR, "a dropped IoOwn could not be noted; its object is released with its context",
+      WD_LOG_REFUSAL(hostMemory::LogSite::DELETION_NOT_NOTED,
+          "a dropped IoOwn could not be noted; its object is released with its context",
           kj::hex(handle));
     }
     return;
@@ -1004,7 +1018,7 @@ void DeleteQueueOwner::adoptEntry() {
   // must hold this owner's address: a handle rewritten to another context's entry holds that
   // context's owner and is refused, leaving that context where it was.
   if (!hostMemory::adoptResolve(queue.getContext(), this, CONTEXT_TYPE)) {
-    KJ_LOG(ERROR,
+    WD_LOG_REFUSAL(hostMemory::LogSite::ADOPT_FAILED,
         "a context's entry could not be adopted by its own isolate; the context's "
         "handle resolves for no turn",
         kj::hex(queue.getContext()));
@@ -1040,7 +1054,8 @@ DeleteQueueOwner::~DeleteQueueOwner() noexcept(false) {
       frame.inLen = 0;
       long n = hostcall::call(OwnedObjectList::HOSTCALL, frame);
       if (n < 0) {
-        KJ_LOG(ERROR, "a context's record could not be torn down inside the turn", kj::hex(ctx), n);
+        WD_LOG_REFUSAL(hostMemory::LogSite::TEARDOWN_IN_TURN,
+            "a context's record could not be torn down inside the turn", kj::hex(ctx), n);
         break;
       }
       size_t count = static_cast<size_t>(n);
@@ -1068,7 +1083,8 @@ DeleteQueueOwner::~DeleteQueueOwner() noexcept(false) {
   }
   kj::MutexGuarded<int>* registry = registryLock();
   if (registry == nullptr) {
-    KJ_LOG(ERROR, "the delete queue registry does not resolve; the record leaks", kj::hex(ctx));
+    WD_LOG_REFUSAL(hostMemory::LogSite::TEARDOWN_REGISTRY,
+        "the delete queue registry does not resolve; the record leaks", kj::hex(ctx));
     hostMemory::unregisterResolve(ctx);
     return;
   }
@@ -1084,8 +1100,8 @@ DeleteQueueOwner::~DeleteQueueOwner() noexcept(false) {
       taken = takeQueue(*lock);
       OwnedNode** head = headOf(*record);
       if (*head != nullptr) {
-        KJ_LOG(ERROR, "a context's record was torn down with objects still in it; they leak",
-            kj::hex(ctx));
+        WD_LOG_REFUSAL(hostMemory::LogSite::TEARDOWN_OBJECTS,
+            "a context's record was torn down with objects still in it; they leak", kj::hex(ctx));
       }
       while (OwnedNode* node = *head) {
         detachNode(node);

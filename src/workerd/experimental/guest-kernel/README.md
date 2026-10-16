@@ -147,6 +147,17 @@ isolate's JS turn at guest ring 3.
   disposer is never called, the action is still the signal's and the entry no
   longer resolves. A registration whose handle is still held runs its action
   on abort; one whose handle was dropped does not.
+- `log-flood-test.sh` / `log-flood-test.capnp` — end-to-end check against a
+  built workerd that a worker cannot drive the process's log output by
+  forcing the refusal paths. One request journals 20000 notes of a kind the
+  host does not know, which the host reads and refuses after the turn;
+  another releases 5000 holders at ring 3 whose handle names an entry of
+  another class, refused in the turn's own code. The reports are budgeted
+  per site and per second out of gk's control block, so the 45000 refusals
+  draw two dozen lines rather than 45000; the first report of each kind is
+  still made, and one in the next window carries the number held back.
+  Negative build: `--copt=-DWORKERD_GK_NEG_LOG_CAP`, where every report is
+  made and the script fails on the volume.
 
 ## API
 
@@ -186,6 +197,7 @@ long  gk_signal_field_write(unsigned kind, uint32_t value); // from a signal han
 
 int   gk_thread_words_set(unsigned first, unsigned n, const uint64_t *v); // per-thread words in supervisor memory
 int   gk_thread_words_get(unsigned first, unsigned n, uint64_t *v);       // for state a signal handler reads
+long  gk_log_budget(unsigned site);          // whether a refusal path may report, counted in the control block
 int   gk_in_guest_hint(void);                // gk's own in-guest flag; a hint, never trusted
 
 void  gk_confine_paths(int on);              // bound a confined turn's path syscalls to its turn directory
@@ -648,6 +660,27 @@ hardware:
   the writer back to the heap list, which is what the writers walk without
   the guest kernel. `wasm-signal-test.sh` shows the signal reaching a module
   at ring 3 and not reaching a buffer the turn aimed the heap entry at.
+- **A budget on what the refusal paths say.** Every path that refuses
+  something a turn asked for reports it, and a turn chooses what it asks:
+  unbudgeted, one worker forcing refusals in a loop makes the host write
+  hundreds of megabytes a second of log -- a denial of service on the disk
+  and on every other tenant's diagnostics, costing the turn no more than the
+  call it was making anyway. `gk_log_budget` gives each report site
+  `GK_LOG_BURST` reports per second and counts the rest, out of buckets in
+  the supervisor control block: a counter in process memory would be one a
+  turn can zero. The first report at a site always passes, so the first
+  evidence of an attack is never what is dropped, and the report that passes
+  carries the number held back since the last one. At guest ring 3, where the
+  block is unreachable, the call decides nothing and answers `-EPERM`; the
+  caller's ring comes from CS, so a handler on the host side of an exit takes
+  the direct path however the guest has set its own flags. gk's own refusal
+  paths use it through `write_stderr`-style composition rather than `fprintf`,
+  which allocates and takes stdio's lock; workerd's use it through
+  `WD_LOG_REFUSAL` (`util/host-memory.h`), and at ring 3 ask the host for the
+  verdict through the hostcall their journal already uses.
+  A bucket is the process's and not an isolate's, so one tenant forcing
+  refusals delays another's report at the same site to the next second.
+  `gk_test.c`'s `log_budget_check` and `log-flood-test.sh` cover it.
 - **Thread words.** Per-thread state the host or a signal handler must read
   from memory no ring-3 code can write -- the opposite of thread-local
   storage, which a turn can rewrite -- lives in `GK_THREAD_WORDS` 64-bit words

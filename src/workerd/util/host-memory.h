@@ -370,6 +370,73 @@ struct HandleProbeForTest {
 void setHandleProbeForTest(HandleProbeForTest probe);
 kj::Maybe<HandleProbeForTest&> handleProbeForTest();
 
+// How much the refusal paths may say. A refusal report -- a handle that names nothing, a
+// registration that names another isolate's context, a journaled word of a kind the host does not
+// know -- is the only evidence an operator has that something is forging what the host acts on.
+// It is also the turn's to provoke: the words and handles a turn hands over are its own memory, so
+// it can draw a report for every one of them, as fast as it can journal them, and the host formats
+// and writes each. Unbounded, that is a denial of service on the log, on the disk under it, and on
+// every other tenant's diagnostics in it.
+//
+// So each report site has a budget, and the counters live where the turn cannot reach them: gk's
+// control block, which ring 3 can neither read nor write and which is found at a link-time address
+// rather than through a pointer (gk_log_budget in experimental/guest-kernel/gk.h). Process memory
+// would not do -- a turn that can zero a counter has no cap at all. The first report at a site is
+// always made, whatever came before it, so the first evidence of an attack is never what gets
+// dropped, and the report that is made carries the number held back since the last one, so a
+// suppressed run shows as a number rather than as nothing.
+//
+// The sites, one per message, continue gk's own ids: gk keeps everything below GK_LOG_SITES_GK for
+// its refusal paths. Adding a message means adding an id here.
+constexpr unsigned LOG_SITE_BASE = 16;  // GK_LOG_SITES_GK
+enum class LogSite : unsigned {
+  SLOT_RESOLVE = LOG_SITE_BASE,
+  SLOT_FREE,
+  RESOLVE_COMMIT,
+  RESOLVE_COMMIT_NULL,
+  RESOLVE_UNREGISTER,
+  COMPANION_DIRECTORY,
+  RETIRE_FOREIGN,
+  NOTE_UNCONSUMED,
+  COMMIT_HOOK_REFUSED,
+  COMMIT_FAILED,
+  COMPANION_SET,
+  QUEUE_DELETION_REGISTRY,
+  QUEUE_DELETION_UNKNOWN,
+  QUEUE_DELETION_FOREIGN,
+  QUEUE_ACTION_REGISTRY,
+  REGISTRATION_NO_DISPOSER,
+  REGISTRATION_FOREIGN_CONTEXT,
+  REGISTRATION_DEAD_CONTEXT,
+  REGISTRATION_UNKNOWN_KIND,
+  RECORD_RELEASED_OBJECTS,
+  RECORD_RELEASED_QUEUE,
+  NOTE_FOREIGN_HANDLE,
+  NOTE_FOREIGN_CONTEXT,
+  NOTE_UNKNOWN_KIND,
+  IOPTR_WRONG_CLASS,
+  DROP_WRONG_CLASS,
+  RELEASE_WRONG_CLASS,
+  RELEASE_UNKNOWN,
+  TAKE_WRONG_CLASS,
+  TAKE_UNKNOWN,
+  LIST_NO_RECORD,
+  HANDLER_TEARDOWN_OBJECTS,
+  USE_UNKNOWN,
+  DELETION_NOT_NOTED,
+  ADOPT_FAILED,
+  TEARDOWN_IN_TURN,
+  TEARDOWN_REGISTRY,
+  TEARDOWN_OBJECTS,
+};
+
+// Whether `site` may report now, and what the report would stand for: 0 for one to hold back, or
+// 1 plus the number held back at this site since the last one that was made. Safe at ring 3,
+// where the budget is out of reach and the answer comes from the host through the hostcall a turn
+// already makes; the exit is the one the report's own write would have cost. Only a path that is
+// refusing something calls it.
+uint32_t logBudget(LogSite site);
+
 // The words of the note the turn on this thread recorded last (noteInTurn), where it recorded
 // them: the journal, which is the turn's own memory. A test rewrites a note through this from
 // inside the turn that made it, as a write primitive would, for the check that the host
@@ -386,6 +453,18 @@ void setHostUseForTest(kj::StringPtr name, kj::Function<void()> use);
 kj::Maybe<kj::Function<void()>&> hostUseForTest(kj::StringPtr name);
 
 }  // namespace hostMemory
+
+// A refusal report, budgeted (see hostMemory::logBudget). The line carries `suppressedSinceLast`,
+// the number of reports this site held back since the last one it made, so a run that was mostly
+// held back is still visible as a number.
+#define WD_LOG_REFUSAL(site, ...)                                                                  \
+  do {                                                                                             \
+    uint32_t wdRefusalBudget = ::workerd::hostMemory::logBudget(site);                             \
+    if (wdRefusalBudget != 0) {                                                                    \
+      uint32_t suppressedSinceLast KJ_UNUSED = wdRefusalBudget - 1;                                \
+      KJ_LOG(ERROR, __VA_ARGS__, suppressedSinceLast);                                             \
+    }                                                                                              \
+  } while (false)
 
 // A T constructed in host memory, owned like a kj::Own: created by hostOwned<T>(...), destroyed
 // (and its block scrubbed and freed) when the HostOwn goes away. Move-only.

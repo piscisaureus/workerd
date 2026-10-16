@@ -483,13 +483,17 @@ stolen=$(echo "$made" | sed -n 's/.*stolen = \([0-9]*\).*/\1/p')
 echo "$made" | grep -q "control = true" || fail "the control action was not journaled: $made"
 echo "$made" | grep -qi "${ann_ctx2#0x}" || fail "the notes were not aimed at other's context: $made"
 echo "    $stolen notes rewritten to $ann_ctx2, one left alone as the control"
-wait_for_count "a turn's note names a context of another isolate" "$stolen" ||
-  fail "the host did not refuse every note naming the other isolate's context"
-refusals=$(grep -c "a turn's note names a context of another isolate" "$log")
-echo "26. the host refused $refusals of the $stolen notes and queued nothing on the other context"
-grep -q "a stolen action ran in a context" "$log" && fail "an action with a rewritten note was run"
 wait_for "the actions after the turn" || fail "the probe did not report after the turn"
 after=$(grep -o "the actions after the turn.*" "$log" | head -n1)
+refusals=$(echo "$after" | sed -n 's/.*foreignRefused = \([0-9]*\).*/\1/p')
+[ "${refusals:-0}" = "$stolen" ] ||
+  fail "the host did not refuse every note naming the other isolate's context: ${refusals:-0} of $stolen"
+echo "26. the host refused $refusals of the $stolen notes and queued nothing on the other context"
+# What the host says about them is budgeted, so the count above comes from the hook's own
+# counter; what the log must still carry is the first of them.
+grep -q "a turn's note names a context of another isolate" "$log" ||
+  fail "the host reported none of the notes it refused"
+grep -q "a stolen action ran in a context" "$log" && fail "an action with a rewritten note was run"
 destroyed=$(echo "$after" | sed -n 's/.*stolenActionsDestroyed = \([0-9]*\).*/\1/p')
 echo "    the closures of the dropped actions destroyed after the turn: ${destroyed:-none}"
 [ -n "$destroyed" ] || fail "no destroyed count in: $after"

@@ -3561,6 +3561,71 @@ static int thread_word_check(void) {
   return ok;
 }
 
+// ---- the report budget ----------------------------------------------------------
+// What a refusal path may say, per site and per second (see gk_log_budget in
+// gk.h). Checks: the first report at a site passes with nothing before it; a
+// burst is capped; the reports held back are counted and handed to the next
+// one that passes; a site gk does not know passes rather than goes silent;
+// and a call from a ring-3 turn decides nothing and answers -EPERM.
+
+// Runs in the guest (ring 3): asks for a report budget, which the caller's
+// ring refuses before the block is touched.
+static long lb_guest(void *arg) {
+  return gk_log_budget((unsigned)(uintptr_t)arg);
+}
+
+static int log_budget_check(void) {
+  // Two sites nothing else uses, so the counts are this test's alone.
+  const unsigned site = GK_LOG_SITES - 1, other = GK_LOG_SITES - 2;
+  // The first report at a site passes with no history behind it.
+  int first = gk_log_budget(site) == 1;
+  // The rest of the burst passes and the HELD after it do not. A window
+  // turning over in the middle starts the burst again and hands the held
+  // ones over early, so the run is retried; either way a whole second holds
+  // GK_LOG_BURST reports, which is the bound that matters.
+  enum { HELD = 20 };
+  int passed = 1, capped = 0;
+  long held = 0;
+  for (int attempt = 0; attempt < 4 && !capped; attempt++) {
+    held = 0;
+    for (int i = 1; i < GK_LOG_BURST; i++) if (gk_log_budget(site) <= 0) passed = 0;
+    for (int i = 0; i < HELD; i++) {
+      if (gk_log_budget(site) == 0) held++;
+      else held = 0;  // a new window: what was held went out with its first report
+    }
+    capped = held == HELD;
+  }
+  // The ones held back are counted, and the first report of the next window
+  // carries them: 1 plus the number left unsaid.
+  usleep(1100000);  // past the window, without asking again and adding to the count
+  long next = gk_log_budget(site);
+  int counted = next == held + 1;
+  // A site gk does not know is a caller's mistake, and the answer to one is
+  // the report: an id out of range must never be silence.
+  int unknown = gk_log_budget(GK_LOG_SITES) == 1 && gk_log_budget(~0u) == 1;
+  // Sites are counted apart: the one above is spent and this one is not.
+  int apart = gk_log_budget(other) >= 1;
+  // From a ring-3 turn: no decision and no fault -- a turn that faulted would
+  // have ended as GK_EFAULT rather than returning gk's refusal.
+  long r3 = gk_run_here_user(lb_guest, (void *)(uintptr_t)other);
+  int walled = r3 == -1;  // -GK_EPERM
+  // Cost of the host-side call on a path that is refusing something.
+  enum { LB_N = 200000 };
+  double t1 = now_ns();
+  long acc = 0;
+  for (int i = 0; i < LB_N; i++) acc += gk_log_budget(site);
+  double per = (now_ns() - t1) / LB_N;
+
+  int ok = first && passed && capped && counted && unknown && apart && walled && per > 0;
+  printf("report budget: first report passes %s; burst of %d capped %s; %ld held back came back "
+         "as %ld %s; unknown site passes %s; sites counted apart %s; from a ring-3 turn -> %ld "
+         "%s; host-side call %.0f ns (%ld passed of %d) [%s]\n",
+         first ? "yes" : "NO", GK_LOG_BURST, capped ? "yes" : "NO", held, next,
+         counted ? "yes" : "NO", unknown ? "yes" : "NO", apart ? "yes" : "NO", r3,
+         walled ? "refused" : "NOT REFUSED", per, acc, LB_N, ok ? "OK" : "FAIL");
+  return ok;
+}
+
 // ---- the turn directory ---------------------------------------------------------
 // With gk_confine_paths on, a ring-3 turn's path syscalls resolve beneath the
 // directory a hostcall handler set for it, or are refused (see
@@ -4524,6 +4589,13 @@ int main(void) {
   // turn, unreachable from ring 3 (see thread_word_check).
   int ok32 = thread_word_check() == 1;
 
+  // ---- the report budget ------------------------------------------------------
+  // What a refusal path may say is capped per site and per second, counted in
+  // the control block where ring 3 cannot reset it; the first report at a
+  // site always passes and the ones held back are handed to the next one that
+  // does; a call from a ring-3 turn decides nothing (see log_budget_check).
+  int ok36 = log_budget_check() == 1;
+
   // ---- the turn directory ----------------------------------------------------
   // A ring-3 turn's path syscalls resolve beneath the directory a hostcall
   // handler set for it, or are refused; a descriptor reused for another
@@ -4567,7 +4639,7 @@ int main(void) {
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 && ok20 && ok21 &&
             ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28 && ok29 && ok30 && ok31 &&
-            ok32 && ok33 && ok34;
+            ok32 && ok33 && ok34 && ok36;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

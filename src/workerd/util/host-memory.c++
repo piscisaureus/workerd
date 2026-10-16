@@ -11,6 +11,7 @@
 #endif
 
 #include <kj/mutex.h>
+#include <kj/time.h>
 
 #include <atomic>
 #include <cerrno>
@@ -143,7 +144,8 @@ void* fallbackResolveSlot(SlotHandle handle) {
   auto lock = fallbackTable().lockExclusive();
   FallbackSlot* slot = lock->lookup(handle);
   if (slot == nullptr) {
-    KJ_LOG(ERROR, "host slot handle does not name a live slot; it resolves to nothing", handle);
+    WD_LOG_REFUSAL(LogSite::SLOT_RESOLVE,
+        "host slot handle does not name a live slot; it resolves to nothing", handle);
     return nullptr;
   }
   return slot->ptr;
@@ -153,7 +155,8 @@ void fallbackFreeSlot(SlotHandle handle) {
   auto lock = fallbackTable().lockExclusive();
   FallbackSlot* slot = lock->lookup(handle);
   if (slot == nullptr) {
-    KJ_LOG(ERROR, "host slot handle does not name a live slot; nothing is freed", handle);
+    WD_LOG_REFUSAL(
+        LogSite::SLOT_FREE, "host slot handle does not name a live slot; nothing is freed", handle);
     return;
   }
   void* ptr = slot->ptr;
@@ -292,12 +295,13 @@ bool fallbackCommitResolve(ResolveHandle handle, void* ptr, uint64_t type) {
   auto& entry = fallbackResolveEntries[idx];
   if (gen == 0 || entry.gen.load(std::memory_order_relaxed) != gen ||
       entry.ptr.load(std::memory_order_relaxed) != nullptr) {
-    KJ_LOG(ERROR, "resolve handle does not name a reserved entry; nothing is committed",
-        kj::hex(handle));
+    WD_LOG_REFUSAL(LogSite::RESOLVE_COMMIT,
+        "resolve handle does not name a reserved entry; nothing is committed", kj::hex(handle));
     return false;
   }
   if (ptr == nullptr) {
-    KJ_LOG(ERROR, "a null pointer cannot be committed to a resolve entry", kj::hex(handle));
+    WD_LOG_REFUSAL(LogSite::RESOLVE_COMMIT_NULL,
+        "a null pointer cannot be committed to a resolve entry", kj::hex(handle));
     return false;
   }
   entry.type.store(type, std::memory_order_release);
@@ -330,8 +334,8 @@ void fallbackUnregisterResolve(ResolveHandle handle) {
   auto lock = fallbackResolveState().lockExclusive();
   auto& entry = fallbackResolveEntries[idx];
   if (gen == 0 || entry.gen.load(std::memory_order_relaxed) != gen) {
-    KJ_LOG(ERROR, "resolve handle does not name a live entry; nothing is unregistered",
-        kj::hex(handle));
+    WD_LOG_REFUSAL(LogSite::RESOLVE_UNREGISTER,
+        "resolve handle does not name a live entry; nothing is unregistered", kj::hex(handle));
     return;
   }
   entry.gen.store(0, std::memory_order_release);
@@ -493,7 +497,8 @@ kj::Maybe<ResolveCompanion&> companionOf(ResolveHandle handle, bool map) {
   if (tableResolve(handle) == nullptr) return kj::none;
   CompanionDirectory* dir = companionDirectory();
   if (dir == nullptr) {
-    KJ_LOG(ERROR, "the resolve companion directory does not resolve; the use is refused");
+    WD_LOG_REFUSAL(LogSite::COMPANION_DIRECTORY,
+        "the resolve companion directory does not resolve; the use is refused");
     return kj::none;
   }
   size_t idx = handle & (RESOLVE_CAPACITY - 1);
@@ -671,7 +676,8 @@ void flushRetired(TurnJournal& journal, const ResolveTurnHooks& hooks, void* are
       // Either the entry has gone -- a turn may release what it never committed -- or it is
       // another isolate's, which is a turn naming a handle it was not given.
       if (tableResolve(handle) != nullptr) {
-        KJ_LOG(ERROR, "a turn released a resolve entry of another isolate; nothing is retired",
+        WD_LOG_REFUSAL(LogSite::RETIRE_FOREIGN,
+            "a turn released a resolve entry of another isolate; nothing is retired",
             kj::hex(handle));
       }
       continue;
@@ -694,8 +700,8 @@ void replayNotes(TurnJournal& journal, const ResolveTurnHooks& hooks, bool inHan
     bool consumed = hooks.noted == nullptr || hooks.noted(words, inHandler);
     if (consumed) continue;
     if (!inHandler) {
-      KJ_LOG(
-          ERROR, "a turn's note was not consumed at the end of the turn; it is dropped", words[0]);
+      WD_LOG_REFUSAL(LogSite::NOTE_UNCONSUMED,
+          "a turn's note was not consumed at the end of the turn; it is dropped", words[0]);
       continue;
     }
     for (size_t w = 0; w < NOTE_WORDS; w++) journal.notes[kept][w] = words[w];
@@ -730,10 +736,12 @@ void settleJournal(ThreadPool& pool, bool inHandler) {
         if (hooks.committed == nullptr || hooks.committed(handle, journal.ptr[i], journal.aux[i])) {
           continue;
         }
-        KJ_LOG(ERROR, "a turn's resolve entry was refused by the commit hook; it is retired",
-            kj::hex(handle), journal.ptr[i]);
+        WD_LOG_REFUSAL(LogSite::COMMIT_HOOK_REFUSED,
+            "a turn's resolve entry was refused by the commit hook; it is retired", kj::hex(handle),
+            journal.ptr[i]);
       } else {
-        KJ_LOG(ERROR, "a turn's resolve entry could not be committed; it resolves to nothing",
+        WD_LOG_REFUSAL(LogSite::COMMIT_FAILED,
+            "a turn's resolve entry could not be committed; it resolves to nothing",
             kj::hex(handle), journal.ptr[i]);
       }
       // The entry is about to be retired with nothing of the turn's left naming it, so the
@@ -787,9 +795,21 @@ void flushRefusals(ThreadPool& pool) {
 // The RESOLVE hostcall: a turn whose journal has run out of reserved entries, or whose retire
 // list or notes are full, asks the host to refill or flush it. The handler finds the thread's
 // pool and journal through the host's own record, never through the frame.
-enum class ResolveOp : uint64_t { REFILL = 1, RETIRE = 2, NOTES = 3 };
+enum class ResolveOp : uint64_t { REFILL = 1, RETIRE = 2, NOTES = 3, LOG = 4 };
 
 long resolveHostcall(hostcall::Frame& frame) {
+  if (static_cast<ResolveOp>(frame.args[0]) == ResolveOp::LOG) {
+    // The verdict on a report the turn's own code is about to make. The budget is in gk's
+    // control block, which ring 3 cannot reach, so the turn pays an exit to be told whether to
+    // speak -- the same exit the report's own write would have cost it, and the only thing it
+    // buys with the exit when the answer is no is silence. The site id is all the frame carries
+    // and gk validates it; nothing here depends on a turn being in progress.
+#ifdef WORKERD_HAS_GUEST_KERNEL
+    return gk_log_budget(static_cast<unsigned>(frame.args[1]));
+#else
+    return 1;
+#endif
+  }
   ThreadPool* pool = poolOfThread();
   if (pool == nullptr || !pool->journal->active) return -EINVAL;
   switch (static_cast<ResolveOp>(frame.args[0])) {
@@ -808,19 +828,84 @@ long resolveHostcall(hostcall::Frame& frame) {
     case ResolveOp::NOTES:
       replayNotes(*pool->journal, pool->hooks, true);
       return static_cast<long>(pool->journal->noteCount);
+    case ResolveOp::LOG:
+      break;  // answered above, before the pool is looked for
   }
   return -EINVAL;
 }
 
 const hostcall::Entry RESOLVE_HOSTCALL = {hostcall::RESOLVE, &resolveHostcall};
 
-long callResolveHostcall(ResolveOp op) {
+long callResolveHostcall(ResolveOp op, uint64_t arg = 0) {
   hostcall::Frame frame;
   frame.args[0] = static_cast<uint64_t>(op);
-  frame.args[1] = frame.args[2] = frame.args[3] = 0;
+  frame.args[1] = arg;
+  frame.args[2] = frame.args[3] = 0;
   frame.inLen = 0;
   return hostcall::call(RESOLVE_HOSTCALL, frame);
 }
+
+// The budget when there is no guest kernel: the same policy over process memory, which is as
+// safe as it needs to be, since without a guest nothing is forging the words these paths refuse.
+struct FallbackBucket {
+  std::atomic<uint64_t> window{0};
+  std::atomic<uint32_t> allowed{0};
+  std::atomic<uint32_t> suppressed{0};
+};
+constexpr unsigned FALLBACK_SITES = 64;
+constexpr uint32_t FALLBACK_BURST = 8;
+FallbackBucket fallbackBuckets[FALLBACK_SITES];
+
+uint32_t fallbackLogBudget(unsigned site) {
+  if (site >= FALLBACK_SITES) return 1;
+  FallbackBucket& bucket = fallbackBuckets[site];
+  uint64_t now =
+      (kj::systemCoarseMonotonicClock().now() - kj::origin<kj::TimePoint>()) / kj::SECONDS;
+  uint64_t was = bucket.window.load(std::memory_order_relaxed);
+  if (now != was && bucket.window.compare_exchange_strong(was, now, std::memory_order_relaxed)) {
+    bucket.allowed.store(1, std::memory_order_relaxed);
+    return 1 + bucket.suppressed.exchange(0, std::memory_order_relaxed);
+  }
+  if (bucket.allowed.load(std::memory_order_relaxed) < FALLBACK_BURST) {
+    bucket.allowed.fetch_add(1, std::memory_order_relaxed);
+    return 1 + bucket.suppressed.exchange(0, std::memory_order_relaxed);
+  }
+  bucket.suppressed.fetch_add(1, std::memory_order_relaxed);
+  return 0;
+}
+
+}  // namespace
+
+uint32_t logBudget(LogSite site) {
+#ifdef WORKERD_GK_NEG_LOG_CAP
+  // WORKERD_GK_NEG_LOG_CAP is a negative-test build, never shipped: every report is made, which
+  // is what these paths did before they were budgeted. The guest kernel's log-flood-test.sh must
+  // then fail -- a worker that forces refusals in a loop draws as much log as it can make turns
+  // for; this is the check that the test tests the budget.
+  (void)site;
+  return 1;
+#else
+  unsigned id = static_cast<unsigned>(site);
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  static_assert(static_cast<unsigned>(LogSite::SLOT_RESOLVE) == GK_LOG_SITES_GK,
+      "the runtime's report sites continue gk's");
+  static_assert(static_cast<unsigned>(LogSite::TEARDOWN_OBJECTS) < GK_LOG_SITES,
+      "the report sites fit the budgets gk keeps for them");
+  if (guestKernelActive()) {
+    long verdict = gk_log_budget(id);
+    // -EPERM is gk saying the caller is at ring 3, where the budget is out of reach: the turn
+    // asks the host for the verdict through the hostcall its journal already uses.
+    if (verdict == -EPERM) verdict = callResolveHostcall(ResolveOp::LOG, id);
+    // A verdict that could not be had is a report made: the thing these reports exist for must
+    // not be lost to a failure of the thing that counts them.
+    return verdict < 0 ? 1 : static_cast<uint32_t>(verdict);
+  }
+#endif
+  return fallbackLogBudget(id);
+#endif
+}
+
+namespace {
 
 // The turn's journal, if a turn is running on this thread (as the turn's own bookkeeping says).
 TurnJournal* activeJournal() {
@@ -1067,8 +1152,8 @@ bool setResolveCompanion(ResolveHandle handle, ResolveCompanion companion) {
     c = companion;
     return true;
   }
-  KJ_LOG(ERROR, "resolve handle does not name a live committed entry; no companion is set",
-      kj::hex(handle));
+  WD_LOG_REFUSAL(LogSite::COMPANION_SET,
+      "resolve handle does not name a live committed entry; no companion is set", kj::hex(handle));
   return false;
 }
 

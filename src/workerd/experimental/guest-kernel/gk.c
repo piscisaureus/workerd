@@ -22,6 +22,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <sys/eventfd.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -491,6 +492,13 @@ typedef struct { uintptr_t start, end; } gk_span;
 
 #define GK_CPUID_ENTRIES 128
 
+// One report site's budget (see gk_log_budget in gk.h).
+typedef struct {
+  _Atomic uint64_t window;      // the coarse monotonic second it is counting in
+  _Atomic unsigned allowed;     // reports let through in that second
+  _Atomic unsigned suppressed;  // reports held back since the last one let through
+} gk_log_bucket;
+
 struct gk_ctl {
   // Platform state, set once by gk_init.
   int kvm, vmfd;
@@ -663,6 +671,11 @@ struct gk_ctl {
   gk_span image[GK_MAX_IMAGE_RANGES];
   int image_n;
 
+  // What each report site may still say (see gk_log_budget in gk.h). Here
+  // rather than in process memory because a counter the guest can reset is
+  // not a cap, and the block is the one place ring 3 cannot write.
+  gk_log_bucket log_budget[GK_LOG_SITES];
+
   // A word for tests to read and write through the guest (gk_debug_ctl_addr).
   unsigned long debug_scratch;
 };
@@ -768,6 +781,75 @@ static void db_flush(gk_dbuf *d) {
   ssize_t r = write(2, d->b, d->n);
   (void)r;
   d->n = 0;
+}
+
+// The window a report falls in: a coarse monotonic second, read with a raw
+// syscall so the path allocates nothing and takes no lock the guest thread
+// could be holding (see the note above write_stderr). A clock that will not
+// answer leaves every report in window 0, where the burst alone bounds them.
+static uint64_t log_window_now(void) {
+  struct timespec ts;
+  if (host_syscall(SYS_clock_gettime, CLOCK_MONOTONIC_COARSE, (long)(uintptr_t)&ts, 0, 0, 0, 0) <
+      0)
+    return 0;
+  return (uint64_t)ts.tv_sec;
+}
+
+long gk_log_budget(unsigned site) {
+  // The caller's ring, from CS, as gk_resolve reads it: at guest ring 3 the
+  // block is unreachable, so there is no decision to make here and the caller
+  // is told to ask the host for one.
+  unsigned short cs;
+  __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
+  if (cs == GK_USER_CS) return -GK_EPERM;
+  // An id gk does not know is the caller's mistake, and the safe answer to a
+  // mistake is the report, not silence.
+  if (site >= GK_LOG_SITES) return 1;
+  gk_log_bucket *b = &G->log_budget[site];
+  uint64_t now = log_window_now();
+  uint64_t was = atomic_load_explicit(&b->window, memory_order_relaxed);
+  if (now != was && atomic_compare_exchange_strong_explicit(&b->window, &was, now,
+                        memory_order_relaxed, memory_order_relaxed)) {
+    // A window of its own for this report. A bucket starts at window 0 with
+    // nothing allowed, so this is also how the first report at a site passes:
+    // it needs nothing to have happened before it.
+    atomic_store_explicit(&b->allowed, 1, memory_order_relaxed);
+    return 1 + (long)atomic_exchange_explicit(&b->suppressed, 0, memory_order_relaxed);
+  }
+  if (atomic_load_explicit(&b->allowed, memory_order_relaxed) < GK_LOG_BURST) {
+    // Racing callers can let a few more than GK_LOG_BURST through in a window,
+    // which costs a line; taking the lock to avoid that would cost the fault
+    // and handler paths a lock they are not allowed to take.
+    atomic_fetch_add_explicit(&b->allowed, 1, memory_order_relaxed);
+    return 1 + (long)atomic_exchange_explicit(&b->suppressed, 0, memory_order_relaxed);
+  }
+  atomic_fetch_add_explicit(&b->suppressed, 1, memory_order_relaxed);
+  return 0;
+}
+
+// A refusal report: composed in a stack buffer and written in one call, and
+// only while the site has budget left. Both halves matter on these paths.
+// They are reachable from a hostcall handler, where stdio's lock may be held
+// by the very guest thread that made the call; and the refusals are the
+// turn's to provoke, so an unbudgeted report is a log the turn writes.
+// log_report opens the line and answers 0 for a report to hold back;
+// log_report_end closes it, saying how many like it went unsaid.
+static int log_report(gk_dbuf *d, unsigned site, const char *who) {
+  long n = gk_log_budget(site);
+  if (n <= 0) return 0;
+  d->n = 0;
+  db_str(d, "[gk] ");
+  db_str(d, who);
+  db_str(d, ": ");
+  return (int)n;
+}
+static void log_report_end(gk_dbuf *d, int n) {
+  if (n > 1) {
+    db_str(d, " (");
+    db_dec(d, n - 1);
+    db_str(d, " more like it went unreported)");
+  }
+  db_flush(d);
 }
 
 // Page-table page allocator over a fixed arena: a bump allocator with a free
@@ -1068,9 +1150,15 @@ void *gk_host_slot_get(gk_host_handle h) {
   gk_host_slot *s = host_slot_of_locked(h);
   void *p = s ? s->ptr : NULL;
   pthread_mutex_unlock(&G->lock);
-  if (!p)
-    fprintf(stderr, "[gk] gk_host_slot_get: %#llx is not the handle of a live host slot; it "
-            "resolves to nothing\n", (unsigned long long)h);
+  if (!p) {
+    gk_dbuf d;
+    int rep = log_report(&d, GK_LOG_HOST_SLOT_GET, "gk_host_slot_get");
+    if (rep) {
+      db_hex(&d, h);
+      db_str(&d, " is not the handle of a live host slot; it resolves to nothing");
+      log_report_end(&d, rep);
+    }
+  }
   return p;
 }
 
@@ -1080,8 +1168,13 @@ void gk_host_slot_free(gk_host_handle h) {
   gk_host_slot *s = host_slot_of_locked(h);
   if (!s) {
     pthread_mutex_unlock(&G->lock);
-    fprintf(stderr, "[gk] gk_host_slot_free: %#llx is not the handle of a live host slot; "
-            "nothing is freed\n", (unsigned long long)h);
+    gk_dbuf d;
+    int rep = log_report(&d, GK_LOG_HOST_SLOT_FREE, "gk_host_slot_free");
+    if (rep) {
+      db_hex(&d, h);
+      db_str(&d, " is not the handle of a live host slot; nothing is freed");
+      log_report_end(&d, rep);
+    }
     return;
   }
   void *p = s->ptr;
@@ -3936,7 +4029,13 @@ static gk_resolve_handle resolve_take(void *ptr, uint64_t owner, gk_arena *a, ui
 static gk_resolve_handle resolve_register_locked(void *ptr, gk_arena *a, uint64_t type,
                                                 const char *who) {
   if (resolve_ptr_ok(ptr)) return resolve_take(ptr, resolve_root_of(a), a, type);
-  fprintf(stderr, "[gk] %s: %p is not ordinary user memory; nothing is registered\n", who, ptr);
+  gk_dbuf d;
+  int rep = log_report(&d, GK_LOG_RESOLVE_REGISTER, who);
+  if (rep) {
+    db_hex(&d, (uint64_t)(uintptr_t)ptr);
+    db_str(&d, " is not ordinary user memory; nothing is registered");
+    log_report_end(&d, rep);
+  }
   return 0;
 }
 
@@ -3956,8 +4055,13 @@ gk_resolve_handle gk_resolve_register_for(gk_arena *a, void *ptr, uint64_t type)
   if (a != NULL && !arena_live_locked(a)) {
     // As gk_arena_enter does: the pointer comes from an ordinary heap object,
     // so it is checked against gk's own pool before anything is read through it.
-    fprintf(stderr, "[gk] gk_resolve_register_for: %p is not a live arena; nothing is "
-            "registered\n", (void *)a);
+    gk_dbuf d;
+    int rep = log_report(&d, GK_LOG_RESOLVE_REGISTER_FOR, "gk_resolve_register_for");
+    if (rep) {
+      db_hex(&d, (uint64_t)(uintptr_t)a);
+      db_str(&d, " is not a live arena; nothing is registered");
+      log_report_end(&d, rep);
+    }
   } else {
     h = resolve_register_locked(ptr, a, type, "gk_resolve_register_for");
   }
@@ -3984,14 +4088,26 @@ int gk_resolve_commit(gk_resolve_handle h, void *ptr, uint64_t type) {
   gk_resolve_entry *e = &gk_resolve_table.e[idx];  // the mask bounds idx (see the table)
   if (gen == 0 || e->gen != gen || e->ptr != NULL) {
     pthread_mutex_unlock(&G->lock);
-    fprintf(stderr, "[gk] gk_resolve_commit: %#llx is not the handle of a reserved resolve "
-            "entry; nothing is committed\n", (unsigned long long)h);
+    gk_dbuf d;
+    int rep = log_report(&d, GK_LOG_RESOLVE_COMMIT, "gk_resolve_commit");
+    if (rep) {
+      db_hex(&d, h);
+      db_str(&d, " is not the handle of a reserved resolve entry; nothing is committed");
+      log_report_end(&d, rep);
+    }
     return -GK_EINVAL;
   }
   if (!resolve_ptr_ok(ptr)) {
     pthread_mutex_unlock(&G->lock);
-    fprintf(stderr, "[gk] gk_resolve_commit: %p is not ordinary user memory; %#llx stays "
-            "unresolvable\n", ptr, (unsigned long long)h);
+    gk_dbuf d;
+    int rep = log_report(&d, GK_LOG_RESOLVE_COMMIT_PTR, "gk_resolve_commit");
+    if (rep) {
+      db_hex(&d, (uint64_t)(uintptr_t)ptr);
+      db_str(&d, " is not ordinary user memory; ");
+      db_hex(&d, h);
+      db_str(&d, " stays unresolvable");
+      log_report_end(&d, rep);
+    }
     return -GK_EINVAL;
   }
   // The generation is already published; the owner goes first and the pointer
@@ -4058,9 +4174,15 @@ int gk_resolve_unregister(gk_resolve_handle h) {
   gk_resolve_entry *e = &gk_resolve_table.e[idx];  // the mask bounds idx (see the table)
   if (gen == 0 || e->gen != gen) {
     pthread_mutex_unlock(&G->lock);
-    if (h)
-      fprintf(stderr, "[gk] gk_resolve_unregister: %#llx is not the handle of a live resolve "
-              "entry; nothing is unregistered\n", (unsigned long long)h);
+    if (h) {
+      gk_dbuf d;
+      int rep = log_report(&d, GK_LOG_RESOLVE_UNREGISTER, "gk_resolve_unregister");
+      if (rep) {
+        db_hex(&d, h);
+        db_str(&d, " is not the handle of a live resolve entry; nothing is unregistered");
+        log_report_end(&d, rep);
+      }
+    }
     return -GK_EINVAL;
   }
   resolve_retire_locked((int)idx);
@@ -4079,8 +4201,13 @@ int gk_resolve_owned_by(gk_arena *a, gk_resolve_handle h) {
   if (a != NULL && !arena_live_locked(a)) {
     // As gk_arena_enter does: an arena pointer from an ordinary heap object is
     // checked against gk's pool before anything is read through it.
-    fprintf(stderr, "[gk] gk_resolve_owned_by: %p is not a live arena; no entry is its\n",
-            (void *)a);
+    gk_dbuf d;
+    int rep = log_report(&d, GK_LOG_RESOLVE_OWNED_BY, "gk_resolve_owned_by");
+    if (rep) {
+      db_hex(&d, (uint64_t)(uintptr_t)a);
+      db_str(&d, " is not a live arena; no entry is its");
+      log_report_end(&d, rep);
+    }
   } else if (gen != 0) {
     gk_resolve_entry *e = &gk_resolve_table.e[idx];  // the mask bounds idx (see the table)
     ok = e->gen == gen && e->ptr != NULL && e->owner == resolve_root_of(a);
@@ -4108,8 +4235,15 @@ static int resolve_reown_locked(
 #else
   if (gen == 0 || e->gen != gen || e->ptr == NULL || e->ptr != ptr || e->type != type) {
 #endif
-    fprintf(stderr, "[gk] %s: %#llx does not name a live resolve entry holding %p; nothing is "
-            "re-owned\n", who, (unsigned long long)h, ptr);
+    gk_dbuf d;
+    int rep = log_report(&d, GK_LOG_RESOLVE_REOWN, who);
+    if (rep) {
+      db_hex(&d, h);
+      db_str(&d, " does not name a live resolve entry holding ");
+      db_hex(&d, (uint64_t)(uintptr_t)ptr);
+      db_str(&d, "; nothing is re-owned");
+      log_report_end(&d, rep);
+    }
     return -GK_EINVAL;
   }
 #ifdef GK_NEG_RESOLVE_REOWN
@@ -4144,16 +4278,28 @@ int gk_resolve_unregister_for(gk_arena *a, gk_resolve_handle h) {
   pthread_mutex_lock(&G->lock);
   if (a != NULL && !arena_live_locked(a)) {
     pthread_mutex_unlock(&G->lock);
-    fprintf(stderr, "[gk] gk_resolve_unregister_for: %p is not a live arena; nothing is "
-            "unregistered\n", (void *)a);
+    gk_dbuf d;
+    int rep = log_report(&d, GK_LOG_RESOLVE_UNREG_ARENA, "gk_resolve_unregister_for");
+    if (rep) {
+      db_hex(&d, (uint64_t)(uintptr_t)a);
+      db_str(&d, " is not a live arena; nothing is unregistered");
+      log_report_end(&d, rep);
+    }
     return -GK_EINVAL;
   }
   gk_resolve_entry *e = &gk_resolve_table.e[idx];  // the mask bounds idx (see the table)
   if (gen == 0 || e->gen != gen || e->ptr == NULL || e->owner != resolve_root_of(a)) {
     pthread_mutex_unlock(&G->lock);
-    if (h)
-      fprintf(stderr, "[gk] gk_resolve_unregister_for: %#llx is not the handle of a live resolve "
-              "entry of this arena; nothing is unregistered\n", (unsigned long long)h);
+    if (h) {
+      gk_dbuf d;
+      int rep = log_report(&d, GK_LOG_RESOLVE_UNREG_FOR, "gk_resolve_unregister_for");
+      if (rep) {
+        db_hex(&d, h);
+        db_str(&d, " is not the handle of a live resolve entry of this arena; nothing is "
+                   "unregistered");
+        log_report_end(&d, rep);
+      }
+    }
     return -GK_EINVAL;
   }
   resolve_retire_locked((int)idx);
@@ -4305,8 +4451,14 @@ int gk_signal_field_unregister(gk_signal_handle handle) {
   gk_signal_field *f = signal_field_of_locked(handle);
   if (!f || f->arena != a) {
     pthread_mutex_unlock(&G->lock);
-    fprintf(stderr, "[gk] gk_signal_field_unregister: %#llx is not the handle of a signal field "
-            "of the calling thread's arena; nothing is unregistered\n", (unsigned long long)handle);
+    gk_dbuf d;
+    int rep = log_report(&d, GK_LOG_SIGNAL_FIELD_UNREG, "gk_signal_field_unregister");
+    if (rep) {
+      db_hex(&d, handle);
+      db_str(&d, " is not the handle of a signal field of the calling thread's arena; nothing "
+                 "is unregistered");
+      log_report_end(&d, rep);
+    }
     return -GK_EINVAL;
   }
   signal_field_retire_locked(a, f);

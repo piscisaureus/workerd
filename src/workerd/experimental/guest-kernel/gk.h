@@ -887,6 +887,64 @@ long gk_signal_field_write(unsigned kind, uint32_t value);
 int gk_thread_words_set(unsigned first, unsigned n, const uint64_t *values);
 int gk_thread_words_get(unsigned first, unsigned n, uint64_t *values);
 
+// Report budget: a bound on how much the refusal paths may say. A refusal
+// report is the evidence an operator has that something is forging the
+// handles and words the runtime hands gk, and every path that makes one is
+// reachable from a turn: a turn that passes a handle it was never given, or
+// journals a word that names nothing, draws a report each time and as fast as
+// it can make the call. Unbounded, that is a denial of service on the host's
+// log -- on the disk it lands on, and on every other tenant's diagnostics in
+// it -- for no more than the call the turn was going to make anyway.
+//
+// So each report site has a budget: GK_LOG_BURST reports per second, and the
+// first report at a site always passes, whatever came before it, so the first
+// evidence of an attack is never the thing that is dropped. gk_log_budget
+// answers 0 for a report to hold back, or 1 plus the number held back at this
+// site since the last one that passed -- which the report that passes carries,
+// so a suppressed run still shows as a number rather than as nothing.
+//
+// The buckets live in gk's control block, which ring 3 can neither read nor
+// write: a cap whose counter the guest can reset is no cap at all. The block
+// is reached at a link-time address and not through a pointer in memory, so
+// there is nothing to swap either. A call at guest ring 3 therefore decides
+// nothing and answers -EPERM: the caller is in the guest, and a runtime with
+// a report to make there asks the host for the verdict instead (workerd does
+// this through the hostcall its turns already use, util/host-memory.c++).
+// Which case it is comes from CS, the caller's ring, as it does for
+// gk_resolve: no value in memory decides it.
+//
+// A bucket is the process's and not an isolate's, so a tenant forcing
+// refusals spends a site's budget for the second it is in and another
+// tenant's report at that site waits for the next second. Evidence is delayed
+// by that, not lost: the first report of every window passes. A bucket per
+// arena would close it, at an array of them per arena.
+//
+// Sites are addressed by a small id, validated before anything is counted. An
+// id at or past GK_LOG_SITES answers 1 rather than 0, since an id gk does not
+// know is the caller's mistake and must not become silence. gk keeps the ids
+// below GK_LOG_SITES_GK for its own refusal paths and the embedder assigns
+// the rest, as it does thread-word keys. Host-side the call costs one coarse
+// clock read and a few relaxed atomics, and only a path that is refusing
+// something makes it.
+#define GK_LOG_SITES 64
+#define GK_LOG_SITES_GK 16
+#define GK_LOG_BURST 8
+enum {
+  GK_LOG_HOST_SLOT_GET,         // gk_host_slot_get: the handle names no live slot
+  GK_LOG_HOST_SLOT_FREE,        // gk_host_slot_free: the handle names no live slot
+  GK_LOG_RESOLVE_REGISTER,      // the pointer is not ordinary user memory
+  GK_LOG_RESOLVE_REGISTER_FOR,  // the arena is not live
+  GK_LOG_RESOLVE_COMMIT,        // the handle names no reserved entry
+  GK_LOG_RESOLVE_COMMIT_PTR,    // the pointer is not ordinary user memory
+  GK_LOG_RESOLVE_UNREGISTER,    // the handle names no live entry
+  GK_LOG_RESOLVE_OWNED_BY,      // the arena is not live
+  GK_LOG_RESOLVE_REOWN,         // the handle names no live entry holding the pointer
+  GK_LOG_RESOLVE_UNREG_ARENA,   // gk_resolve_unregister_for: the arena is not live
+  GK_LOG_RESOLVE_UNREG_FOR,     // gk_resolve_unregister_for: not a live entry of it
+  GK_LOG_SIGNAL_FIELD_UNREG,    // the handle names no field of the thread's arena
+};
+long gk_log_budget(unsigned site);
+
 // Whether the calling thread is inside the guest, as gk's own per-thread
 // flag says. The flag is thread-local storage: gk sets it from a constant
 // around every guest entry, so a rewrite by the guest does not outlast the

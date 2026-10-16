@@ -1296,6 +1296,10 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
     // the turn ends and the host reads them there.
     constexpr size_t STOLEN_ACTIONS = 400;
     auto executor = context.getCrossContextExecutor();
+    // The notes are read by the host after the turn, and what it says about the ones it refuses
+    // is budgeted (hostMemory::logBudget), so the count comes from the hook's own counter rather
+    // than from the log.
+    uint64_t foreignBefore = OwnedObjectList::statsForTest().foreignActionNotes;
     // The control is queued on this context, which runs it when the signal wakes it: the
     // request waits for that, so the context is still there to run it.
     auto paf = kj::newPromiseAndFulfiller<void>();
@@ -1320,8 +1324,9 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
         "WORKERD_GK_TEST_PROBE: rewrote the actions' notes to another isolate's context from "
         "inside the JS turn",
         control, stolen, kj::str("0x", kj::hex(announcedIoOwnContext)));
-    context.addWaitUntil(kj::evalLater([stolen]() {
-      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the actions after the turn", stolen,
+    context.addWaitUntil(kj::evalLater([stolen, foreignBefore]() {
+      uint64_t foreignRefused = OwnedObjectList::statsForTest().foreignActionNotes - foreignBefore;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the actions after the turn", stolen, foreignRefused,
           stolenActionsDestroyed, controlActionsDestroyed);
     }).then([promise = kj::mv(paf.promise)]() mutable { return kj::mv(promise); }));
   }
@@ -1382,6 +1387,37 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
     kj::StringPtr outcome =
         stopped == kj::none ? "every round ran"_kj : "the turn ran out of entries"_kj;
     KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: registrations refused across refills", rounds, outcome);
+  }
+  if (probeEnabled && url.endsWith("/__gk_log_flood_turn")) {
+    // The same flood from inside the turn. A holder released at ring 3 whose handle names an
+    // entry of another class is refused there, in the turn's own code: no entry is spent, the
+    // turn is not ended, and it can make the refusal again as often as it can make a holder.
+    constexpr size_t DROPS = 5000;
+    auto& context = IoContext::current();
+    auto other = context.addObject(kj::heap<TypeProbeB>());
+    uint64_t hb = ownHandle(other);
+    kj::Vector<IoOwn<TypeProbeA>> victims(DROPS);
+    for (size_t i = 0; i < DROPS; i++) victims.add(context.addObject(kj::heap<TypeProbeA>()));
+    for (auto& v: victims) setOwnHandle(v, hb);
+    victims.clear();
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: holders dropped naming another class", DROPS);
+  }
+  if (probeEnabled && url.endsWith("/__gk_log_flood")) {
+    // How much log a turn can draw out of the refusal paths. A note is the turn's own memory,
+    // so a turn with a write primitive chooses what one says, and a note of a kind the host
+    // does not know is the cheapest refusal there is to force: no entry is spent on it and the
+    // journal refills itself, so a turn can make them for as long as it runs. The host reports
+    // each one, and that report is the volume this measures. The count the probe logs is what
+    // the turn journaled; the cap is what the host chose to say about them.
+    constexpr size_t NOTES = 20000;
+    constexpr uint64_t UNKNOWN_KIND = 0xbadbad;
+    size_t made = 0;
+    for (size_t i = 0; i < NOTES; i++) {
+      uint64_t words[hostMemory::NOTE_WORDS] = {UNKNOWN_KIND, 0, 0, 0};
+      if (!hostMemory::noteInTurn(words)) break;
+      made++;
+    }
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: notes of an unknown kind journaled", made);
   }
   if (probeEnabled && url.endsWith("/__gk_ioown_counts")) {
     // The host-memory block and resolve-entry counts, for a leak check across a load: read on
