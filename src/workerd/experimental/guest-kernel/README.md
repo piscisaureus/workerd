@@ -1125,17 +1125,43 @@ so a crossing a turn makes on every dereference belongs on that path.
   isolate's ring 3.
 
   The list is not complete yet. V8 has further process-wide registries that
-  grow with plain `operator new` from inside a turn, and each one faults the
-  next isolate that reads it. The one that remains is
-  `ThreadIsolation`'s JIT-page map (`src/common/code-memory-access.h`): its
-  `StlAllocator` uses the embedder's thread-isolated allocator when the
-  platform offers one and `::operator new` when it does not, which is
-  workerd's case, so the map's nodes land in whichever isolate was locked
-  when a code page was registered and an optimizing compile in another
-  isolate faults walking them. Placing that map in the shared heap is a
-  wider concession than the ones above -- it holds the code ranges of every
-  isolate in the process -- so it is a decision and not a mechanical
-  follow-up.
+  grow from whichever isolate first needs an entry, and each one faults the
+  next isolate that reads it. The one that remains is `ThreadIsolation`'s
+  JIT-page map (`src/common/code-memory-access.h`), the `Address -> JitPage*`
+  index that answers "which code allocation is this PC in?" for GC-safe code
+  lookup (`Heap::GcSafeTryFindInstructionStreamForInnerPointer`) and for
+  stack iteration (`StackFrameIterator::ComputeStackFrameType`). Both read
+  it at ring 3 inside a turn, and an optimizing compile in one isolate
+  faults walking entries another isolate registered.
+
+  The map is not the write protection's bookkeeping, so it cannot be
+  switched off with the protection: V8 builds it whether or not thread
+  isolation is enabled (`ThreadIsolation::Initialize`, which says so), and
+  its readers have no other implementation. It is enabled here in any case --
+  `server/v8-platform-impl.h` forwards the platform's thread-isolated
+  allocator on purpose, `trusted_data_.allocator_` is non-null in a running
+  workerd and its page is read-only, as only the enabled path leaves it.
+  What places the entries in an isolate's heap is that
+  `DefaultThreadIsolatedAllocator::Allocate` is `return malloc(size)`, a
+  stub V8 marks as such, so both it and the `::operator new` fallback beside
+  it allocate on the calling thread.
+
+  That allocator is an embedder interface, which is the cheap way out: a
+  `ThreadIsolatedAllocator` of workerd's own, wrapping the platform's and
+  overriding `Allocate` to run under a `SharedHeapScope`, places the map,
+  its nodes, the `JitPage`s and the mutex in the shared heap with no V8
+  patch at all, since `StlAllocator` and `ThreadIsolation::ConstructNew`
+  both go through it. What that does not settle is whether the map belongs
+  in the shared heap, and the answer is not "it is a new concession": the
+  map is in the ordinary C++ heap today, which every arena maps writably, so
+  the shared heap keeps exactly the exposure the shipping build already has.
+  What a turn can learn from it is the code ranges and allocation sizes of
+  every isolate in the process -- layout, not contents, since a read of
+  another arena still faults -- and what it can do to it is what it can do
+  to any shared-heap object: rewrite an entry so that the host's
+  `StartOfJitAllocationAt` answers with an address of the turn's choosing,
+  which `GcSafeTryFindInstructionStreamForInnerPointer` hands to an
+  unchecked cast. Both of those hold in the default build already.
 
   The thread's event loop needs more than placement. Its run queue is an
   intrusive doubly linked list through the queued events, so arming an event
