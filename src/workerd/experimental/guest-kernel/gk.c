@@ -2088,6 +2088,15 @@ static void demand_map_neighbors(gk_thread *t, uintptr_t page, uint64_t *root, g
   }
 }
 
+// Why demand_map refused a fault, for the report the fault path writes (see
+// run_vcpu). `reason` is a literal; the bounds are the arena the page lies in
+// and the arena the faulting turn runs under, both zero unless the reason
+// names them.
+typedef struct {
+  const char *reason;
+  uintptr_t page_base, page_end, turn_base, turn_end;
+} gk_dm_refusal;
+
 // Handle a guest page fault: if the faulting page is host-accessible, back it
 // with a memslot and PTE so the guest can retry. Caller must not hold G->lock.
 //
@@ -2109,7 +2118,15 @@ static void demand_map_neighbors(gk_thread *t, uintptr_t page, uint64_t *root, g
 // subtrees all arena roots share, and is global unless the page is part of a
 // stack (see the global-pages section); `sp` is the interrupted code's stack
 // pointer, which names the mapping its stack lies in.
-static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
+//
+// A refusal fills in `why`, which the fault path prints: the reasons mean
+// different things to whoever reads that report, and telling them apart from
+// the faulting address alone takes the arena layout, which the report does
+// not otherwise carry. A cross-arena refusal is the arena wall holding and
+// names both arenas; an arena page the host declines is one the arena's own
+// allocator has not committed; a refused class is gk's own memory. `why` may
+// be NULL.
+static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp, gk_dm_refusal *why) {
   uintptr_t page = addr & ~0xfffUL;
   uintptr_t rs, re; int perms;
   pthread_mutex_lock(&G->lock);
@@ -2117,6 +2134,14 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
   gk_arena *in = arena_containing(page);
   if (in) {
     if (in != t->active_arena) {
+      if (why) {
+        why->reason = "another arena's memory";
+        why->page_base = in->base;
+        why->page_end = in->end;
+        gk_arena *act = t->active_arena;
+        why->turn_base = act ? act->base : 0;
+        why->turn_end = act ? act->end : 0;
+      }
       pthread_mutex_unlock(&G->lock);
       return -1;  // another arena's memory: refuse, whatever the host has there
     }
@@ -2136,6 +2161,7 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
       db_str(&d, " (gk control region)");
       db_flush(&d);
     }
+    if (why) why->reason = "gk's own refused memory";
     pthread_mutex_unlock(&G->lock);
     return -1;
   }
@@ -2153,10 +2179,18 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
     mapped = host_region(page, &rs, &re, &perms);
   }
   if (!mapped || !(perms & 1)) {
+    if (why) {
+      // An arena page the host does not let the host itself read is one the
+      // arena's own allocator has reserved and not committed.
+      why->reason = in ? "a page of this arena the host has not committed"
+                       : (mapped ? "a page the host cannot read" : "no host mapping");
+      if (in) { why->page_base = in->base; why->page_end = in->end; }
+    }
     pthread_mutex_unlock(&G->lock);
     return -1;  // not host-readable: a genuine fault
   }
   if (!region_find(page) && region_ensure(page, page + 1) < 0) {
+    if (why) why->reason = "no memslot could be made for it";
     pthread_mutex_unlock(&G->lock);
     return -1;
   }
@@ -2194,6 +2228,8 @@ static int demand_map(gk_thread *t, uintptr_t addr, uintptr_t sp) {
       int idx = (int)((page >> 39) & 0x1ff);
       if (a->pml4[idx] != G->pml4[idx]) a->pml4[idx] = G->pml4[idx];
     }
+  } else if (why) {
+    why->reason = "the page-table entry could not be installed";
   }
   pthread_mutex_unlock(&G->lock);
   if (G->dbg && (cls == GK_PROT_SUPER || pkey != 0)) {
@@ -5983,8 +6019,9 @@ static int handle_exit(gk_thread *t, long *result) {
             G->fault_addr = cr2;
             TURN_ENDS(GK_EFAULT);
           }
+          gk_dm_refusal why = {NULL, 0, 0, 0, 0};
           int guard = GK_HANDLER_ENTER();
-          int dm = demand_map(t, (uintptr_t)cr2, (uintptr_t)pf_sp);
+          int dm = demand_map(t, (uintptr_t)cr2, (uintptr_t)pf_sp, &why);
           GK_HANDLER_LEAVE(guard);
           if (dm < 0) {
             if (G->dbg) {  // still the fault path: raw output only
@@ -5999,6 +6036,19 @@ static int handle_exit(gk_thread *t, long *result) {
               db_str(&d, " err="); db_hex(&d, frame[0]);
               db_str(&d, " rsp="); db_hex(&d, frame[4]);
               db_str(&d, " rax="); db_hex(&d, rr.rax);
+              if (why.reason) {
+                db_str(&d, ": "); db_str(&d, why.reason);
+                if (why.page_end) {
+                  db_str(&d, "; the page is in ["); db_hex(&d, why.page_base);
+                  db_str(&d, ","); db_hex(&d, why.page_end); db_str(&d, ")");
+                }
+                if (why.turn_end) {
+                  db_str(&d, ", the turn runs under ["); db_hex(&d, why.turn_base);
+                  db_str(&d, ","); db_hex(&d, why.turn_end); db_str(&d, ")");
+                } else if (why.page_end) {
+                  db_str(&d, ", the turn runs on the base root");
+                }
+              }
               db_flush(&d);
               // Best-effort frame-pointer walk of the guest stack (host memory,
               // identity mapped); stops when the chain leaves the stack.
