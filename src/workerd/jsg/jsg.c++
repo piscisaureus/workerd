@@ -581,16 +581,19 @@ namespace {
 // How far the memory reported through a target may grow past the least it has been since the
 // last collection before the isolate collects garbage: V8's kExternalAllocationSoftLimit.
 //
-// V8 answers the memory an embedder reports in two ways. Past this soft limit it starts
-// incremental marking, and workerd runs V8 with incremental marking off (see setup.c++), which
-// makes that answer nothing. Past its old-generation limits it collects, but those are sized
-// from the heap limit the isolate was given, and in a workerd that gives none, from the
-// machine: gigabytes. In between, a worker that holds large C++ objects until their JS owners
-// are collected -- a Response built from a 4 MiB buffer keeps its copy of the buffer until the
-// Response is -- and allocates little else accumulates them unbounded, since a scavenge frees
-// only what is still young and nothing else makes V8 collect. With a shared heap that is bloat;
-// with a per-isolate heap arena (heap-arena.h), whose region is fixed, it exhausts the isolate's
-// memory. So the soft limit is applied here, the way V8 would apply it.
+// V8 itself never collects for the memory an embedder reports in a workerd. Past this soft
+// limit it starts incremental marking, which workerd runs without (see setup.c++), so that
+// answer is nothing; its own hard limit for external memory is applied nowhere any more; and
+// beyond that the reported total only counts against the global allocation limit, which is
+// consulted when the JS heap next needs an old-space page
+// (Heap::ShouldExpandOldGenerationOnSlowAllocation), whatever heap limit the isolate was given.
+// A worker that holds large C++ objects until their JS owners are collected -- a Response built
+// from a 4 MiB buffer keeps its copy of the buffer until the Response is -- and promotes little
+// therefore accumulates them until that page is needed, gigabytes later, with a 128 MiB heap
+// limit exactly as with none (measure/findings.md in experimental/guest-kernel). With a shared
+// heap that is bloat; with a per-isolate heap arena (heap-arena.h), whose region is fixed, it
+// exhausts the isolate's memory. So the soft limit is applied here, the way V8 applies it with
+// incremental marking on, through the collection V8 offers an embedder on the spot.
 constexpr int64_t EXTERNAL_MEMORY_SOFT_LIMIT = 64 * 1024 * 1024;
 }  // namespace
 

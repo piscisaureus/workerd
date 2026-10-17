@@ -1626,3 +1626,257 @@ this: a 2 MiB guest leaf saves nothing on a page the host has discarded.
 - **Six probes not re-run; nothing compiled is committed.** Both knobs were
   reverted before staging and the commit touches only `measure/` and this
   document.
+
+## Whether the soft-limit collection belongs in every build
+
+### The question
+
+`ExternalMemoryTarget::applyLocked` (`jsg/jsg.c++`) has the isolate collect
+garbage once the memory reported through it has grown 64 MiB past its
+low-water mark, V8's `kExternalAllocationSoftLimit`, with
+`MemoryPressureNotification(kCritical)`. It went in for the heap-arena build,
+where a worker serving 4 MiB bodies from a buffer spent its 16 GiB region in
+seconds (section 4 above), but it runs in every build. The doubt: the comment
+that shipped with it said V8's own limits are gigabytes for an isolate given
+no heap limit, and workerd's measurement gave none, while a production worker
+has one of about 128 MiB. If a limit that small makes V8 collect on its own,
+the accumulation is a no-limit artifact and the collection, a full
+memory-reducing GC that also drops V8's caches, is a cost imposed on
+everyone for nothing. The doubt is settled below, against it: the heap limit
+does not enter into when V8 collects for reported memory, and the exhaustion
+reproduces under 128 MiB to the megabyte.
+
+### What heap limit workerd gives an isolate
+
+None, by default. `NullIsolateLimitEnforcer::getCreateParams()` in
+`server/server.c++` returns an empty `v8::Isolate::CreateParams`, so V8
+configures the heap from its own defaults (`Heap::ConfigureHeap`): a maximum
+old generation of 1,400 MB on 64-bit (`700 * (kSystemPointerSize / 4) * MB`),
+not from the machine. The only way to give a `workerd serve` isolate a limit
+is the process-wide `Config.v8Flags`, `--max-old-space-size=128`, which lands
+in the same `max_old_generation_size` that
+`ResourceConstraints::set_max_old_generation_size_in_bytes()` sets; that is
+what the limited arms below use. The 128 MiB of Cloudflare's runtime is the
+figure `jsg/setup.c++` quotes beside `--noincremental-marking`; the enforcer
+that applies it is not in this tree, so what else it does is not known here.
+
+### What V8 15.4 does with reported memory, read from the source
+
+`Heap::UpdateExternalMemory` (`src/heap/heap.cc`) is the whole of V8's
+reaction to `AdjustAmountOfExternalAllocatedMemory`. It collects at once only
+if `ReachedHeapLimit()`, which is the old generation's *capacity* against its
+maximum (the global form that would count external memory is behind
+`--enforce-global-heap-limit`, off by default). Otherwise, past the soft limit
+it calls `StartIncrementalMarkingIfAllocationLimitIsReached`, which does
+nothing when `IncrementalMarking::CanBeStarted()` is false, and workerd's
+`--noincremental-marking` makes it false. `Heap::external_memory_hard_limit()`,
+the old rule of half the maximum old generation, is still defined and no
+longer called from anywhere. After that the reported total enters only
+`GlobalConsumedBytes()`, which `ShouldExpandOldGenerationOnSlowAllocation`
+checks against the global allocation limit *when the JS heap next needs an
+old-space page*. So with incremental marking off, reported memory is collected
+when the mutator next promotes a page's worth of objects, and the heap limit
+decides only how soon that check starts refusing, which both arms below reach
+within the first burst. V8 does collect for its own ArrayBuffer backing
+stores on a different path, a scavenge in `AllocateExternalBackingStore` once
+64 MB of young ones are outstanding, which is why `front`, whose bodies become
+`ArrayBuffer`s, never needed help.
+
+### Method
+
+The same build as section 4 (jemalloc, `--platform_suffix=_jemalloc`), run
+through the heap-region workload with `--trace-gc` set process-wide through
+the capnp (`measure/extgc/region-*.capnp`) and sampled through the
+`__gk_heap_region` probe after each burst of 250 responses
+(`measure/extgc/region.sh`). Two arms by binary: the collection on, as
+committed, and off, through the uncommitted knob `cost.sh` describes, which
+leaves the report in place and skips only the collection. Two arms by
+config: no heap limit, and `--max-old-space-size=128`. 3,050 responses of
+4 MiB per run, 12 GB after the warm-up.
+
+The cost ran the workers in `measure/extgc/cost-*.js` under oha at one
+connection (eight for the second hello row), six seconds after two of
+warm-up, workerd on CPUs 12-17,36-41 and oha on 0-5,24-29, arms interleaved
+round by round with a fresh launch each, six launches per arm
+(`measure/extgc/cost.sh`): `hello` answers a string; `bigheap` builds 500,000
+objects on its first request and keeps them (42.5 MB live after a
+mark-compact) and answers a string; `bigbody` answers 4 MiB from a buffer it
+keeps, the shape that fills the region; `bigheapbody` does both. The
+production-like cell is the default build (tcmalloc, guest kernel off) with
+`--max-old-space-size=128`; the arena cell is the jemalloc build with the
+guest kernel on and no limit. GC counts and pauses are from one further
+launch per cell with `--trace-gc` and one worker per launch
+(`measure/extgc/gcsum.py`), so that the isolate in the trace is known.
+
+### 1. The region under a 128 MiB heap limit
+
+`back`'s region, MiB, after the warm-up and each burst, collection off
+(`extgc-region-off-nolimit.txt`, `extgc-region-off-limit128.txt`):
+
+| limit   | warm | 1   | 2    | 3    | 4    | 5    | 6    | 7    | 8    | 9    | 10   | 11   | 12   | mark-compacts |
+| ------- | ---- | --- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ------------- |
+| none    | 272  | 968 | 1800 | 1800 | 2440 | 3208 | 3208 | 3208 | 3528 | 4616 | 4616 | 4616 | 4616 | 4             |
+| 128 MiB | 272  | 968 | 1800 | 1800 | 2440 | 3208 | 3208 | 3208 | 3528 | 4168 | 4168 | 4168 | 4168 | 4             |
+
+The two arms are the same run to the megabyte through burst 8 and differ by
+one burst's timing of the fourth collection after that. The four
+mark-compacts come at bursts 1, 2, 5 and 10 in both, each at a step of the
+old generation's committed size (0.8, 1.5, 2.5 and 3.2 MB in the trace): the
+page expansions the reading above predicts, and nothing else. Between them
+`back`'s jemalloc `allocated` climbs by 4 MB per response to 4.3 GB. With the
+collection on, both arms hold `back`'s region at 100 MiB over the whole
+12 GB, 359 and 360 mark-compacts of 0.75 ms on a 0.2 MB heap, two per
+trigger, because `CollectGarbageOnMemoryPressure` runs a second collection
+whenever it estimates 8 MB of potential garbage after the first
+(`extgc-region-on-*.txt`). So the condition is not the absence of a heap
+limit; it is the absence of incremental marking, which every workerd build
+shares.
+
+### 2. What the collection costs, per launch
+
+Requests per second, six launches of each arm in round order; the arms are
+the same binary. Default build, `--max-old-space-size=128`
+(`extgc-cost-default-limit128.txt`):
+
+| workload        | collection on                       | collection off                      |
+| --------------- | ----------------------------------- | ----------------------------------- |
+| hello, c=1      | 22914 22763 22506 22623 22819 22829 | 23012 23052 22530 22686 22974 23196 |
+| hello, c=8      | 28970 28795 29105 28708 28938 29309 | 28911 29130 29190 29630 28816 28557 |
+| bigheap, c=1    | 22077 22067 22095 22070 22355 21661 | 22177 22463 21575 21997 22486 22379 |
+| bigbody, c=1    | 1267 1251 1238 1267 1260 1259       | 979 1016 1011 991 996 1015          |
+| bigheapbody     | 345 351 355 351 347 348             | 875 921 874 890 900 972             |
+
+jemalloc build, guest kernel on, no limit (`extgc-cost-jemalloc-gk-nolimit.txt`):
+
+| workload        | collection on                 | collection off                |
+| --------------- | ----------------------------- | ----------------------------- |
+| hello, c=1      | 5863 5951 5994 5887 6065 5957 | 5944 5759 5902 5947 5882 5930 |
+| hello, c=8      | 7764 8211 8192 7673 8185 7619 | 7741 7720 7445 8263 7945 7650 |
+| bigheap, c=1    | 6052 6086 5993 5994 6068 6100 | 6046 6006 6049 5989 6056 6095 |
+| bigbody, c=1    | 1057 1052 1051 1046 1041 989  | 878 888 866 888 944 911       |
+| bigheapbody     | 408 423 422 412 419 419       | 621 636 762 778 783 674       |
+
+Three launches of the default build with no limit
+(`extgc-cost-default-nolimit.txt`) repeat the limited cell within its spread
+in every row. Resident memory at the end of each six-second window, GB:
+`bigbody` 1.1-1.3 on against 6.0-7.0 off in the default build, 1.0 against
+7.6 under the arenas; `bigheapbody` 1.1-1.4 on against 9.9-15.6 off, and
+1.1 against 17.0-19.2 under the arenas, which is the region a second or so
+from spent.
+
+What the rows say:
+
+- **Where nothing reports memory in bulk, the collection costs nothing.**
+  `hello` and `bigheap` never cross the soft limit, and their six launches
+  per arm overlap entirely; what remains of the change on that path is one
+  atomic add per adjustment.
+- **With a small heap it is a gain.** `bigbody` is 25% faster with the
+  collection on in the default build (mean 787-806 us against 983-1019) and
+  15% under the arenas, because tcmalloc and jemalloc hand the next body the
+  pages the last one freed, warm, where the off arm faults 4 MiB of fresh
+  pages per response. The collection itself is 2 mark-compacts of 0.3 ms per
+  16 responses, 5.5% of the window (1,161 in the trace; the off arm's trace
+  has none at all in 6,050 responses).
+- **With a large heap it is the cost, and it grows with the heap.** At 42.5 MB
+  live, `bigheapbody` runs at 345-355 against 874-972 requests per second in
+  the default build: the trace shows 330 mark-compacts of 16.2 ms (35.9 max)
+  in six seconds, 5.33 s of the window in collection, two per 64 MiB of
+  bodies, each marking the whole heap; p99 goes from 1.4-1.5 ms to 40 ms.
+  Under the arenas the same rows are 408-423 against 621-783 and 402
+  collections of 11.4 ms. The pause is proportional to the live heap, so a
+  worker at the 128 MiB production limit would pay about three times this
+  per 64 MiB of bodies, around 6 ms per 4 MiB response.
+
+The off arm's rows are not free either; they are the cost deferred. Its
+process holds 6 to 19 GB after six seconds of one worker, 4 MiB per response
+until the mutator next promotes a page's worth of objects, which for
+`bigbody` was never in six seconds and for `back` was every 1 GB. In the
+shared-heap build that is what the runtime did before the copies were
+reported at all, since an unreported copy is invisible to V8 and the
+expansion check alone; under the arenas it is the condemnation of section 4.
+
+### The verdict
+
+The collection stays in every build, unconditional, with the 64 MiB soft
+limit. Of the alternatives:
+
+- **Gating on `heapArenasAvailable()`** was the leading candidate and is
+  rejected on the rows above: the shared-heap build accumulates the same
+  4 MiB per response (6 to 16 GB resident after six seconds of one worker), and
+  V8 has no path of its own that would collect it sooner in that build than
+  in the arena one. The region is where the accumulation becomes fatal, not
+  where it happens.
+- **Gating on whether the isolate has a heap limit** is rejected on section 1:
+  the limit does not change when V8 collects for reported memory, by the
+  trace or by the source.
+- **A soft limit scaled to the heap limit, the way V8's old hard limit was**
+  (`max_old_generation_size / 2`) would give exactly 64 MiB at the 128 MiB
+  production limit, so it changes nothing where it matters, and 700 MB for a
+  `workerd serve` with no limit, where the region is 16 GiB and the shared
+  heap unbounded, so it buys dev a seven-fold larger transient for no gain.
+  Rejected as complexity without effect.
+
+The agreement asked for: yes, the report is accounting that is simply
+correct, and would be worth keeping on its own. A buffer-built body's copy
+goes through the very counter V8 keeps for the `ArrayBuffer` it was copied
+from (`ExternalMemoryAccounter` in `array-buffer-sweeper.cc` calls the same
+`UpdateExternalMemory`), so the copy counts as its source already does; but
+on its own, in a workerd, that count only hastens the next page expansion's
+collection, and it is the collection that carries both the benefit and the
+cost.
+
+The 64 MiB figure is V8's own policy for an embedder's memory, applied here
+because V8 cannot apply it without incremental marking; the throughput an
+isolate loses to it with a large live heap is what V8 with incremental
+marking on would spend as well, as marking work if not as pause. What is
+workerd's own, and the lever if that cost needs reducing, is the choice of
+`kCritical`: two collections where one would do, and V8's compilation cache,
+concurrent optimization jobs and pooled pages dropped with them -- the pooled
+pages of every isolate in the group, which in the shared-heap build is the
+process. A plain `Heap::CollectAllGarbage` is not reachable through the
+public API without `--expose-gc`; a V8 patch exposing one, in the manner of
+`patches/v8/0030`, would halve the cost measured here and leave the caches
+alone, and is the next step if a workload like `bigheapbody` turns out to be
+common. A soft limit that grows with the live heap is the other lever, and a
+policy change rather than a correction, so it is left to whoever has the
+production numbers to set it against.
+
+### Found on the way
+
+**`--trace-gc` faults the next isolate under heap arenas, and so would
+anything else that first writes to `stdout` from inside a turn.** The C
+library allocates a stream's buffer on the first write to it; V8's trace line
+was the first thing written to `stdout` in these runs, from inside `back`'s
+turn, so the buffer went into `back`'s arena and the first scavenge `front`
+traced faulted on it (`cr2` in `back`'s slot, from `front`'s turn, during the
+warm-up of every run). Running under `stdbuf -o0` confirmed it: no fault, and
+the collection on its own never faulted. `jsg/setup.c++` now hands `stdout` a
+static buffer with `setvbuf()` beside the ICU hooks, which is the same cure
+for the same shape of problem, and the run that found it passes with the flag
+and without `stdbuf` on the committed build.
+
+### Caveats
+
+- **The production enforcer was not measured, only its limit.** The limited
+  arms give the isolate the 128 MiB through `--max-old-space-size`, which is
+  the one field a `ResourceConstraints` limit would set; whatever else
+  Cloudflare's enforcer does (a near-heap-limit callback, its own memory
+  accounting) is not in this tree and could change the off arm's fate, though
+  not V8's timing.
+- **The large heap was 42.5 MB, not 128.** The per-response cost at the
+  production limit is extrapolated from the pause's proportionality to live
+  size (0.29 ms at 0.2 MB, 16 ms at 42.5 MB), not measured.
+- **Six seconds per window.** Long enough for the off arm to show its growth
+  and the on arm its steady state; not long enough for the off arm's
+  expansion-timed collections to appear in `bigbody` at all, so the off
+  rows carry the fresh-page cost and none of the eventual collection's.
+- **One connection.** The cost is a mutator-side pause, so concurrency would
+  change the throughput figures without changing the per-collection cost.
+- **The second collection per trigger was counted, not explained.**
+  `CollectGarbageOnMemoryPressure` estimates potential garbage from
+  committed-minus-live plus `external_memory()`; which of the two keeps the
+  estimate over 8 MB after the first collection was not traced.
+- **The arena cell's bimodality did not show.** Six launches of `bigbody` on
+  are within 7% of one another; either every launch landed in one mode or
+  the body path here, which does not cross a service binding, does not
+  exercise it.
