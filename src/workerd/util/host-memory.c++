@@ -644,16 +644,16 @@ void setPoolOfThread(ThreadPool* pool) {
 // The journal is the thread's, not any isolate's: it is created by whichever isolate first runs
 // a turn on the thread, and read and written at ring 3 by every turn after it. So it can live
 // neither in host memory, which ring 3 cannot touch, nor on the C++ heap, where the allocator
-// decides its placement rather than what reads it does -- the shared heap every arena maps
-// today, and the arena of the first isolate to run a turn once an isolate's allocations are its
-// own (experimental/guest-kernel/memory-classes.md), where every other isolate's turn would
-// fault on it. Pages of its own are in no arena either way: ordinary process memory the guest
-// kernel maps on demand under whichever page-table root asks for it.
+// decides its placement rather than what reads it does: an isolate's allocations are that
+// isolate's own here (experimental/guest-kernel/memory-classes.md), so the heap would put the
+// journal in the arena of the first isolate to run a turn on the thread, and every other
+// isolate's turn would fault on it. Pages of its own are in no arena: ordinary process memory
+// the guest kernel maps on demand under whichever page-table root asks for it.
 #ifdef WORKERD_GK_NEG_TURN_JOURNAL_PAGES
-// A negative build, never shipped: the journal comes from the C++ heap, so it lands wherever
-// the allocations of the first isolate to run a turn on the thread land. Against a shared heap
-// that is the same memory as a mapping of its own; the two are a different placement only once
-// an isolate's allocations are the isolate's.
+// A negative build, never shipped: the journal comes from the C++ heap, so it lands in the
+// arena of the first isolate to run a turn on the thread, and every later isolate's first turn
+// faults reading journal->active. (Where the heap is shared rather than per isolate, the two
+// placements are the same memory and nothing tells them apart.)
 TurnJournal* allocateJournal() {
   return new TurnJournal();
 }
