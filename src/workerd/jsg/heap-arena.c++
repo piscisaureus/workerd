@@ -14,9 +14,13 @@
 #endif
 
 #ifdef WORKERD_HAS_HEAP_ARENA
+#include <pthread.h>
+#include <signal.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <kj/string.h>
+#include <kj/thread.h>
 
 #include <cerrno>
 #endif
@@ -162,6 +166,55 @@ void armSharedHeapAtexit() {
   placeAtexitInSharedHeap.store(true, std::memory_order_release);
 }
 
+// Keeps a thread bound to the shared arena for the rest of the process, so that no thread is
+// ever the last one to leave it. HeapArena's constructor calls it; the first call starts the
+// thread and returns once it is bound, the rest do nothing.
+//
+// jemalloc purges an arena when the thread that leaves it through thread.arena was the last
+// one bound to it (arena_migrate() in jemalloc.c): every dirty page of the arena goes back to
+// the kernel at once, whatever the arena's decay settings say. For an isolate's arena that is
+// bookkeeping, since its hooks refuse to purge and the extents move to its retained pool. For
+// the shared arena, whose extents are ordinary memory, it is madvise(MADV_DONTNEED) of
+// everything the event loop has freed since it last left -- the buffers a request body was read
+// into, say -- and the event loop leaves the shared arena on every HeapArenaScope it enters and
+// every SharedHeapScope it exits, after which the next request faults every one of those pages
+// back in, on the host and, where the guest reads them, in the nested page tables too. Without
+// the keeper, whether that happened depended on whether some other thread had bound itself to
+// the shared arena by chance: jemalloc binds a thread on its first allocation to the automatic
+// arena with the fewest threads, and the shared arena has none while the event loop is inside a
+// turn.
+//
+// This holds the condition rather than removing the dependency on it, which only allocating
+// into the isolate's arena explicitly (mallocx with MALLOCX_ARENA, from every allocation site)
+// instead of migrating the thread would do. What makes the condition safe to hold: the keeper
+// never exits, so the arena's thread count cannot fall below one for the life of the process,
+// and it is bound before the constructor returns, so no scope switch precedes it. What it does
+// not cover is a thread whose home arena is another automatic arena than the shared one, since
+// that arena is what such a thread leaves on entering a HeapArenaScope; in workerd the event
+// loop is the main thread, which jemalloc binds to the shared arena before any other thread
+// exists, and the other threads enter no scopes.
+void keepSharedHeapArenaPopulated() {
+  static kj::MutexGuarded<bool> bound(false);
+  static const bool started = []() {
+    // The thread's bookkeeping is the process's, whatever isolate is being created.
+    SharedHeapScope scope;
+    kj::Thread([]() {
+      // Every signal blocked: a process-directed signal then goes to a thread that handles it,
+      // and the pause below never returns.
+      sigset_t all;
+      sigfillset(&all);
+      pthread_sigmask(SIG_BLOCK, &all, nullptr);
+      pthread_setname_np(pthread_self(), "gk-shared-heap");
+      switchThreadArena(SHARED_HEAP_ARENA_INDEX);
+      *bound.lockExclusive() = true;
+      for (;;) pause();
+    }).detach();
+    bound.lockExclusive().wait([](const bool& isBound) { return isBound; });
+    return true;
+  }();
+  KJ_ASSERT(started);
+}
+
 }  // namespace
 
 // jemalloc hands the registered extent_hooks_t pointer back to every hook; it is the first
@@ -260,8 +313,10 @@ HeapArena::HeapArena(uintptr_t begin, uintptr_t end)
   set("muzzy_decay_ms", ssize_t(-1));
   set("retain_grow_limit", RETAIN_GROW_LIMIT);
 
-  // A turn can run on an arena from here on, so glibc's exit-function chain needs placing.
+  // A turn can run on an arena from here on, so glibc's exit-function chain needs placing, and
+  // the shared arena needs a thread that never leaves it.
   armSharedHeapAtexit();
+  keepSharedHeapArenaPopulated();
 }
 
 HeapArena::~HeapArena() noexcept(false) {

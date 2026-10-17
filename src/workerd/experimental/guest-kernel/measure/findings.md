@@ -1880,3 +1880,262 @@ and without `stdbuf` on the committed build.
   are within 7% of one another; either every launch landed in one mode or
   the body path here, which does not cross a service binding, does not
   exercise it.
+
+## Keeping the shared arena populated
+
+### The question
+
+The section before last found the shipping configuration bimodal per launch,
+by up to 1.8x on every route at once, and traced the slow mode to jemalloc
+purging arena 0 on every scope switch when no other thread was bound to it.
+This section settles how to stop that: what jemalloc's own source allows,
+which of three candidate fixes to take and why, and whether the configuration
+with the fix lands in the former fast mode or somewhere else.
+
+### What jemalloc does, read from the source
+
+The build's jemalloc is the unpatched 5.3.0 module from the Bazel Central
+Registry (`build/deps/deps.jsonc`). Writing `thread.arena` goes through
+`thread_arena_ctl` (`src/ctl.c`), which first binds the thread to an
+automatic arena if it has none (`arena_choose`) and then, for any change of
+index, calls `arena_migrate` (`src/jemalloc.c`):
+
+    arena_nthreads_dec(oldarena, false);
+    arena_nthreads_inc(newarena, false);
+    tsd_arena_set(tsd, newarena);
+    if (arena_nthreads_get(oldarena, false) == 0) {
+        /* Purge if the old arena has no associated threads anymore. */
+        arena_decay(tsd_tsdn(tsd), oldarena, false, /* all */ true);
+    }
+
+Nothing conditions the purge but the thread count. `arena_decay(all)` goes to
+`arena_decay_impl`, whose `all` branch takes the decay mutex and calls
+`pac_decay_all` without reading the arena's decay time; the decay settings are
+consulted only on the other branch (`pac_maybe_decay_purge`), which is why
+`dirty_decay_ms:-1` changed nothing in the experiment above. `pac_decay_all`
+is `pac_decay_to_limit` with a limit of zero pages over every dirty extent,
+and `pac_decay_stashed` with `fully_decay` set skips the muzzy step and hands
+each extent to `extent_dalloc_wrapper` (`src/extent.c`): with the default
+hooks and `retain` on (the default on 64-bit Linux) deallocation is declared
+to fail, decommit fails on an overcommitting Linux, and so the extent is
+purged with `pages_purge_forced`, which is `madvise(MADV_DONTNEED)`, and
+recorded in the retained pool -- the stack the experiment above caught. For
+an isolate's arena the same path runs with `HeapArena`'s hooks, which refuse
+every step, so the extents move to retained with their pages untouched; that
+purge is bookkeeping and stays.
+
+There is no control that keeps the purge from a thread that leaves. The
+`percpu_arena` mode refuses `thread.arena` for the automatic range outright
+(`EPERM`), and so cannot be combined with the scopes at all. Thread death
+takes a different path, `arena_cleanup` to `arena_unbind`, which only
+decrements the count: a thread that dies bound to an arena does not purge it;
+only a thread that migrates does. And `arena_choose_hard` is as the previous
+section inferred: among the initialized automatic arenas it takes the lowest
+index with the fewest threads, and uses that only if its count is zero,
+otherwise it initializes the next uninitialized arena -- so a thread's first
+allocation lands in arena 0 exactly when arena 0 is empty at that moment,
+which it is while the event loop is inside a turn.
+
+### The choice
+
+Three ways to end the dependence on that coin were weighed.
+
+**Keep a thread bound to the shared arena, taken.** `HeapArena`'s
+constructor, where the first arena is created and so the first scope switch
+becomes possible, starts a thread once that binds itself to arena 0 with
+`thread.arena`, blocks every signal and pauses forever; the constructor waits
+for the binding before it returns, so no scope switch precedes it
+(`keepSharedHeapArenaPopulated()` in `jsg/heap-arena.c++`). Arena 0's thread
+count can then never reach zero, and `arena_migrate` never purges it. This
+holds the condition that distinguished the fast launches rather than removing
+the dependency on it. What makes that acceptable: the thread cannot exit (it
+runs nothing after binding, and with its signals blocked nothing but the
+process's death ends its `pause()`), it is bound before any scope can switch,
+and a check in `guest-arena-test` fails the moment either stops being true.
+What it does not cover, and what would bring the purge back: a thread whose
+home arena is another automatic arena entering a `HeapArenaScope`, since that
+thread leaves *its* home arena and the keeper holds only arena 0. In workerd
+the event loop is the main thread, which jemalloc binds to arena 0 before
+any other thread exists, and no other thread enters a scope; a server with
+several event-loop threads would need a keeper per home arena, or every event
+loop moved onto arena 0, and that is the first thing to revisit if the scopes
+ever run on more than one thread. A change in jemalloc's binding rule would
+move the main thread's home the same way.
+
+**Stop migrating the thread, rejected as too large for what it buys.**
+Keeping a thread-local arena index and allocating with
+`mallocx(..., MALLOCX_ARENA(i))` would remove the dependency outright: no
+thread would ever leave an arena. But nothing in this tree routes allocation
+through a shim, so it would mean interposing `malloc`, `calloc`, `realloc`,
+`posix_memalign`, `aligned_alloc`, `memalign`, `free` and
+`malloc_usable_size` (the C++ `operator new` family reaches `malloc`, so it
+comes along) and keeping jemalloc's own symbols reachable under a prefix; and
+what the shim does not see -- the C library's own allocations from inside a
+turn, which call jemalloc's `malloc` directly and use the thread's bound
+arena -- would land in the shared heap where today a scope puts it in the
+isolate's arena. Placement by site survives only for the sites the shim
+covers, so the design would have to re-audit what the C library allocates
+during a turn. That is a larger change with a correctness tail, for a cost
+(one `mallctlbymib` per scope, under a microsecond) that the keeper leaves
+as it is.
+
+**jemalloc's own controls, none found that applies.** `narenas:1` would make
+every thread's home arena 0, so that V8's worker threads keep it populated
+from their first allocation on; that also holds the condition rather than
+removing it, with the additional cost of every thread's allocations contending
+on one arena's bin locks with the thread cache off, and was not measured.
+Patching `arena_migrate` out of purging (a `single_version_override` of the
+registry module with a patch, a mechanism the tree does not use for its
+`bazel_dep`s yet) would remove the dependency for every arena and every
+thread at once, in three lines; it was not taken because it adds a patched
+third-party module for a behaviour the keeper neutralizes exactly in the one
+configuration that exists, and it stays the step to take if the keeper's
+limitation above ever bites.
+
+### Method
+
+One jemalloc binary, `-c opt --platform_suffix=_jemalloc` from the tree as
+committed with the keeper, plus two measurement-only knobs that were reverted
+before committing and are not part of the tree:
+
+- `WORKERD_GK_SUPPRESS_SHARED_HEAP_KEEPER` leaves the keeper out, so the same
+  binary serves the before arm. Its one log line is checked in every
+  launch's `config_lines`.
+- `WORKERD_GK_STATS_PERIOD` prints arena 0's `nthreads`, `dirty_npurge`,
+  `dirty_purged`, `dirty_nmadvise` and `pdirty` as a `[gkstats]` line every
+  half second from a host-only thread that binds itself to another automatic
+  arena before the first isolate exists, so that it cannot be the thread
+  that populates arena 0 by chance. `apportion.py` records the last line
+  before and after each benchmark window.
+
+The same workers, routes and CPUs as the two sections above (server
+`12-17,36-41`, client `0-5,24-29`, `GK_RUNNER=resident GK_RUNNER_PIN=other`),
+one connection, p50, six seconds per benchmark, perf off, eight rounds with
+both arms launched afresh in every round and interleaved
+(`results/keeper-ab.json`). The VMSCAPE mitigation read `Mitigation: IBPB
+before exit to userspace` and `halt_poll_ns` 200000 before and after.
+
+The absolute figures here are not those of the section before last: commit
+`c407a287c` (the soft-limit collection, the section above) sits between, and
+with it `back`'s region holds at about 100 MiB instead of filling at 6.5 MB
+per response, so the 4 MiB response is faster in both modes than it was
+measured then (1.8 ms against 2.9 in the fast mode, 4.3 against 5.1 to 5.7 in
+the slow). What is compared is the two arms of this run against each other.
+
+### 1. Every launch, both arms
+
+p50 in microseconds, rounds in order; arena 0's `dirty_npurge` at the end of
+the 4 MiB-response window (cumulative since launch) and over that window;
+pages purged since launch; `pdirty` at the end of the window; and over the
+same window, KVM `pf_taken` per request and the process's CPU per request.
+
+Keeper on (the configuration as committed):
+
+| rnd | no body | 64 KiB | 4 MiB down | 4 MiB up | pumped | npurge | in window | purged pages | pdirty | pf/req | cpu us/req |
+| --- | ------- | ------ | ---------- | -------- | ------ | ------ | --------- | ------------ | ------ | ------ | ---------- |
+| 0   | 110.5   | 154.8  | 1805       | 1780     | 1815   | 85     | 67        | 43,448       | 1690   | 641    | 2958       |
+| 1   | 110.3   | 154.5  | 1798       | 1798     | 1823   | 98     | 72        | 51,839       | 2713   | 647    | 2946       |
+| 2   | 109.7   | 155.1  | 1807       | 1808     | 1851   | 102    | 76        | 50,649       | 1690   | 642    | 2959       |
+| 3   | 109.2   | 156.8  | 1831       | 1805     | 1840   | 102    | 72        | 47,819       | 1690   | 645    | 3000       |
+| 4   | 109.2   | 156.2  | 1799       | 1815     | 1832   | 104    | 81        | 52,288       | 1690   | 645    | 2969       |
+| 5   | 110.7   | 157.0  | 1802       | 1805     | 1830   | 105    | 78        | 52,979       | 1690   | 645    | 2947       |
+| 6   | 108.8   | 155.1  | 1799       | 1822     | 1859   | 98     | 73        | 49,897       | 1690   | 646    | 2959       |
+| 7   | 108.7   | 156.8  | 1814       | 1802     | 1831   | 91     | 58        | 42,569       | 1690   | 642    | 2956       |
+
+Keeper suppressed, the same binary:
+
+| rnd | no body   | 64 KiB    | 4 MiB down | 4 MiB up | pumped   | npurge  | in window | purged pages | pdirty | pf/req | cpu us/req |
+| --- | --------- | --------- | ---------- | -------- | -------- | ------- | --------- | ------------ | ------ | ------ | ---------- |
+| 0   | 127.8     | 194.0     | 4276       | 4305     | 4373     | 259,565 | 9757      | 4,807,551    | 0      | 1996   | 6214       |
+| 1   | **107.8** | **154.9** | **1814**   | **1783** | **1835** | 17,017  | 76        | 150,258      | 1793   | 653    | 2986       |
+| 2   | 127.7     | 192.8     | 4275       | 4306     | 4355     | 260,100 | 9762      | 4,819,862    | 0      | 1997   | 6206       |
+| 3   | 126.4     | 194.0     | 4300       | 4316     | 4372     | 260,569 | 9704      | 4,790,131    | 0      | 1998   | 6257       |
+| 4   | 127.7     | 192.2     | 4268       | 4307     | 4367     | 301,571 | 9752      | 4,812,194    | 0      | 1997   | 6205       |
+| 5   | **109.3** | **154.5** | **1799**   | **1823** | **1868** | 28,039  | 73        | 164,087      | 1690   | 645    | 2965       |
+| 6   | **110.0** | **155.9** | **1791**   | **1782** | **1828** | 13,579  | 84        | 147,752      | 1690   | 653    | 2930       |
+| 7   | 127.0     | 192.1     | 4295       | 4295     | 4352     | 316,297 | 9681      | 4,809,143    | 0      | 1995   | 6238       |
+
+The `nthreads` sample at the end of the 4 MiB window was 1 in every launch
+with the keeper (the keeper alone, the owner being inside a turn when the
+sample was taken), 0 in the five slow launches without it, and 1 or 2 in the
+three fast ones.
+
+### 2. What the tables say
+
+**The mode is gone.** Eight launches of eight with the keeper are within
+108.7 to 110.7 us with no body, 154.5 to 157.0 at 64 KiB, 1798 to 1831 on the
+4 MiB response, 1780 to 1822 on the 4 MiB request and 1815 to 1859 pumped --
+spreads of 2 to 2.5% -- where the same binary with the keeper suppressed
+alternated between that and 126.4 to 127.8, 192 to 194, 4268 to 4300, 4295 to
+4316 and 4352 to 4373: 2.4 times slower on a 4 MiB body in either direction
+and 17 us slower with no body, in five launches of eight (the earlier
+section's one in four fast was three in eight here).
+
+**Arena 0's purge count no longer tracks the scope switches.** With the
+keeper, arena 0 was purged 85 to 105 times in a whole launch, 58 to 81 of them
+in the six seconds of the 4 MiB window, with 1690 pages dirty at the end of
+it: that is jemalloc's ordinary decay, the same 73 to 84 per window that the
+three fast launches without the keeper show. In the five slow launches it was
+purged about 9,700 times per window, roughly seven times per request, which
+is the number of scope switches a request makes, and 4.8 million pages in all
+with nothing left dirty. The sample's `nthreads` confirms the mechanism from
+the other side: with the keeper the count never read zero.
+
+**It is the fast mode, not a third behaviour.** Every column of the keeper
+arm lies within, or within 1% of, the three fast launches of the suppressed
+arm: 641 to 647 nested faults per 4 MiB response against 645 to 653 (the slow
+launches' 1995 to 1998), 2946 to 3000 us of process CPU per response against
+2930 to 2986 (the slow launches' 6205 to 6257), and the p50s above. Nothing
+else came to dominate once the purge stopped; what remains at 4 MiB is the
+guest kernel's own per-byte cost, apportioned above (J1 against J0), and what
+remains of placement is the fast mode's few microseconds on a bodiless
+request.
+
+### 3. The committed binary
+
+Eight launches of the shipping configuration on the jemalloc binary built from
+the tree as committed, knobs and all other differences absent
+(`results/keeper-committed.json`), after the probe sweep on the same machine;
+no `[gkstats]` line exists in this binary, so arena 0's counters are not
+sampled, and the nested faults and CPU per request over the 4 MiB window are
+what says which mode a launch is in:
+
+| rnd | no body | 64 KiB | 4 MiB down | 4 MiB up | pumped | pf/req | cpu us/req |
+| --- | ------- | ------ | ---------- | -------- | ------ | ------ | ---------- |
+| 0   | 108.7   | 154.1  | 1796       | 1792     | 1831   | 648    | 2964       |
+| 1   | 106.5   | 153.7  | 1797       | 1809     | 1824   | 643    | 2952       |
+| 2   | 106.9   | 153.0  | 1813       | 1791     | 1833   | 650    | 2978       |
+| 3   | 108.0   | 153.1  | 1812       | 1808     | 1853   | 644    | 2945       |
+| 4   | 108.8   | 153.3  | 1801       | 1790     | 1832   | 683    | 3040       |
+| 5   | 108.1   | 155.2  | 1789       | 1787     | 1833   | 643    | 2953       |
+| 6   | 108.2   | 154.4  | 1800       | 1827     | 1871   | 648    | 2953       |
+| 7   | 107.9   | 155.3  | 1790       | 1775     | 1819   | 646    | 2925       |
+
+Every launch is in the fast mode, within the keeper arm's spreads above (a
+microsecond or two faster with no body, which is within what the knob
+binary's sampling thread could account for and was not pursued).
+
+### Caveats
+
+- **The keeper covers arena 0 and the main thread.** Its reasoning depends on
+  jemalloc binding the first thread to allocate -- the main thread, which is
+  workerd's event loop -- to arena 0, and on no other thread entering a
+  scope. Both are true of `workerd serve` today and neither is enforced; the
+  unit test checks the keeper's presence and effect for the main thread
+  only.
+- **Six-second windows, one connection, one machine**, as in the sections
+  above; the mode was a per-launch property and eight launches of each arm
+  are enough to see it gone, not to put a confidence interval on the fast
+  mode's figures.
+- **The two knobs are not committed**; the before arm exists only in
+  `results/keeper-ab.json`, and the binary that served both arms differs from
+  the committed one by the knobs. Section 3 below is the committed binary.
+- **`bench/bench.capnp`'s `cdn` pair faults under heap arenas**, found on the
+  way and not chased: 200 requests to its front worker, which forwards the
+  request object over a service binding and returns the origin's response,
+  condemn the `cdn-origin` isolate ("JS turn faulted inside the guest") at an
+  address 160 KiB above a 512 GiB slot base, on the jemalloc build with the
+  guest kernel on and not on the plain build with it on. The `hello` and
+  `alloc` workers of the same config do not fault. It reproduces with the
+  keeper suppressed, so it is not the keeper's, and is left for whoever next
+  uses that config.

@@ -1262,7 +1262,14 @@ so a crossing a turn makes on every dereference belongs on that path.
   turns too; `src/workerd/jsg/guest-arena-test.c++` checks this. The arena's
   bookkeeping is shared, so a free from any context touches only shared
   memory, and jemalloc's thread cache is off process-wide, since it would
-  recycle one isolate's freed blocks into another's allocations. What stays
+  recycle one isolate's freed blocks into another's allocations. A thread of
+  its own stays bound to the shared arena from the first `HeapArena` on,
+  because jemalloc returns every dirty page of an arena to the kernel when
+  the last thread bound to it leaves, which the event loop would otherwise do
+  each time a scope switched it onto an isolate's arena -- and then fault
+  every page of the next request's buffers back in
+  (`keepSharedHeapArenaPopulated()` in `jsg/heap-arena.c++`; what it cost,
+  and the coin it was, are in `measure/findings.md`). What stays
   shared, and readable, is what is allocated with no isolate lock held -- the
   isolate object itself and the rest of what V8 allocates while creating it
   (creation also grows process-wide registries, which must not die with one

@@ -58,6 +58,13 @@ class HeapArena;
 // -- and such memory must be reported to V8 (ExternalMemoryAdjustment in jsg.h, which collects
 // past a soft limit) so that the collection comes before the region is spent rather than when
 // V8's own heuristics, which see only the JS heap, happen to run one.
+//
+// That purge is a cost only for the shared arena, whose extents are ordinary memory: every page
+// the event loop freed since it last left would go back to the kernel each time it entered a
+// HeapArenaScope or left a SharedHeapScope, for the next request to fault in again. So from the
+// first HeapArena on, a thread that does nothing else stays bound to the shared arena, and no
+// thread is ever the last to leave it (keepSharedHeapArenaPopulated() in heap-arena.c++, which
+// says what that relies on).
 class HeapArena final {
  public:
   // Creates an arena over [begin, end), page-aligned, reserved as inaccessible anonymous memory

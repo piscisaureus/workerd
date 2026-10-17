@@ -373,6 +373,10 @@ kj_test(
             "//src/workerd/experimental/guest-kernel",
         ],
         "//conditions:default": [],
+    }) + select({
+        # The test reads the shared arena's statistics through mallctl itself.
+        "//src/workerd/server:really_use_jemalloc": ["@jemalloc"],
+        "//conditions:default": [],
     }),
 )
 

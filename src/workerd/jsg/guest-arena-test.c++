@@ -21,6 +21,10 @@
 #include <workerd/jsg/guest-run.h>
 #include <workerd/jsg/heap-arena.h>
 
+#ifdef WORKERD_HAS_HEAP_ARENA
+#include <jemalloc/jemalloc.h>
+#endif
+
 #include <cppgc/allocation.h>
 #include <cppgc/garbage-collected.h>
 #include <cppgc/persistent.h>
@@ -368,6 +372,20 @@ struct HeapTurn {
 bool inHeap(GuestArena& arena, const void* p) {
   return KJ_ASSERT_NONNULL(arena.getHeapArena()).contains(p);
 }
+
+// One of the shared arena's statistics, read fresh: jemalloc serves them from a snapshot that a
+// write to `epoch` refreshes. T must be the control's own type, which mallctl checks.
+template <typename T>
+T sharedArenaStat(kj::StringPtr name) {
+  uint64_t epoch = 1;
+  size_t epochSize = sizeof(epoch);
+  KJ_REQUIRE(mallctl("epoch", &epoch, &epochSize, &epoch, sizeof(epoch)) == 0);
+  auto key = kj::str("stats.arenas.0.", name);
+  T value = 0;
+  size_t size = sizeof(value);
+  KJ_REQUIRE(mallctl(key.cStr(), &value, &size, nullptr, 0) == 0, key);
+  return value;
+}
 #endif  // WORKERD_HAS_HEAP_ARENA
 
 // A single case with a single pair of isolates that every check up to part 6 shares; part 7
@@ -377,6 +395,10 @@ KJ_TEST("each isolate's memory lives in its own guest-kernel arena") {
   if (!enableGuestKernel()) return;
 
   V8System v8System({"--allow-natives-syntax"_kj});
+#ifdef WORKERD_HAS_HEAP_ARENA
+  // Before the first HeapArena exists, this thread is the shared arena's only one; see part 0.
+  unsigned sharedThreadsBefore = sharedArenaStat<unsigned>("nthreads");
+#endif
   ArenaIsolate a(v8System, newIsolateGroup(), nullptr, kj::heap<IsolateObserver>());
   ArenaIsolate b(v8System, newIsolateGroup(), nullptr, kj::heap<IsolateObserver>());
 
@@ -394,6 +416,42 @@ KJ_TEST("each isolate's memory lives in its own guest-kernel arena") {
   KJ_EXPECT(tailB.begin() == reinterpret_cast<uintptr_t>(arenaB.base()) + arenaB.size());
   KJ_EXPECT(tailA.end() > tailA.begin());
   KJ_EXPECT(tailA.end() <= tailB.begin() || tailB.end() <= tailA.begin());
+
+#ifdef WORKERD_HAS_HEAP_ARENA
+  // Part 0: the shared arena has a thread of its own from the first HeapArena on
+  // (keepSharedHeapArenaPopulated() in heap-arena.c++), so that leaving it for an isolate's
+  // arena never purges it: jemalloc purges an arena when the thread leaving it was the last one
+  // bound to it. Checked before any lock is taken, while this thread and the keeper are the
+  // only ones the shared arena can have: jemalloc binds every other thread on its first
+  // allocation to the automatic arena with the fewest threads, which the shared arena is not
+  // while this thread is on it but is during a turn, so after the parts below the count says
+  // nothing about the keeper.
+  KJ_EXPECT(sharedThreadsBefore == 1, sharedThreadsBefore);
+  KJ_EXPECT(sharedArenaStat<unsigned>("nthreads") == 2);
+  {
+    auto& heapA = KJ_ASSERT_NONNULL(arenaA.getHeapArena());
+    KJ_EXPECT(currentHeapArenaIndex() == 0);
+    {
+      // Free some MiB on the shared arena, so that it has dirty pages a purge would return.
+      kj::Vector<kj::Array<kj::byte>> blocks;
+      for (int i = 0; i < 16; i++) {
+        auto block = kj::heapArray<kj::byte>(1024 * 1024);
+        memset(block.begin(), BUFFER_FILL, block.size());
+        blocks.add(kj::mv(block));
+      }
+    }
+    size_t dirtyBefore = sharedArenaStat<size_t>("pdirty");
+    KJ_EXPECT(dirtyBefore > 0);
+    uint64_t purgesBefore = sharedArenaStat<uint64_t>("dirty_npurge");
+    for (int i = 0; i < 100; i++) {
+      HeapArenaScope scope(heapA);
+      KJ_EXPECT(currentHeapArenaIndex() == heapA.getIndex());
+    }
+    KJ_EXPECT(currentHeapArenaIndex() == 0);
+    KJ_EXPECT(sharedArenaStat<uint64_t>("dirty_npurge") == purgesBefore);
+    KJ_EXPECT(sharedArenaStat<size_t>("pdirty") == dirtyBefore);
+  }
+#endif  // WORKERD_HAS_HEAP_ARENA
 
   // Part 1: the sandbox. ArrayBuffer memory lives in the sandbox, which lies in the arena.
 
