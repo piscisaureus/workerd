@@ -1896,6 +1896,18 @@ complete answer for RPC shapes this workload does not reach is an embedder
 allocation hook in Cap'n Proto itself, in the style of
 `patches/capnp-cpp/0003` and the two V8 patches, rather than more windows.
 
+Promise pipelining (`binding.foo().bar()`) adds no fifth window. The queued
+client the pending pipeline hands out, the branches it holds of that
+pipeline's promise and the continuation the second call waits in are built by
+`JsRpcPromise::getClientForOneCall()` and `send()`, inside window 1, and are
+forwarded and resolved only from the event loop: the pipeline settles off the
+fork of the dispatch promise `LocalClient::call` makes, after the callee's
+turn has returned, and the forwarded call goes through `evalLater()` into a
+turn of its own. `JsRpcTargetBase` never resolves a pipeline from its turn.
+Placing the queued client and its branches in the caller's arena on purpose
+faults nothing; `rpc-pipeline-test.sh` is the check, and the README's
+Limitations say why it holds.
+
 Two members of the set are also not Cap'n Proto objects at all, which the list
 of 23 understates. `IoContext::PendingEvent` is held by every capability a
 request exports, so a stub released in the calling isolate's turn runs its
