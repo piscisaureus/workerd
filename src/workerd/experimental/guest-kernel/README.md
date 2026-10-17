@@ -1237,18 +1237,34 @@ so a crossing a turn makes on every dereference belongs on that path.
   the process then hung until killed. The cause is not known; the missing
   cross-vCPU shootdown (below) is a candidate, since the slot is reused.
 
-  What does not work is request and response *bodies* across an in-process
-  service binding, and it is now the only part of such a call that does not.
-  The rest crosses in shared memory, but body bytes travel through a `kj`
-  one-way pipe by pointer, and the copy runs in the reading isolate's turn
-  from the writing isolate's memory: the caller's `r.text()` faults in
-  `kj::AsyncPipe::tryRead` on the callee's heap region, and a body the caller
-  sends faults the callee's read the same way. That needs a copy at the
-  boundary, with the host pumping bodies through shared buffers, which is a
-  protocol change rather than a placement and is future work. Also not
-  covered: BoringSSL's lazily allocated per-thread error state, which a
-  `crypto` call in a turn would place on that turn's arena -- untested, but by
-  the same reasoning as the registries above.
+  Two parts of an in-process service binding do not work. One is request and
+  response *bodies*. The rest of a call crosses in shared memory, but body
+  bytes travel through a `kj` one-way pipe by pointer, and the copy runs in the
+  reading isolate's turn from the writing isolate's memory: the caller's
+  `r.text()` faults in `kj::AsyncPipe::tryRead` on the callee's heap region,
+  and a body the caller sends faults the callee's read the same way. That
+  needs a copy at the boundary, with the host pumping bodies through shared
+  buffers, which is a protocol change rather than a placement and is future
+  work.
+
+  The other is *cancelling* a subrequest that is still in flight, which
+  `abort-signal-test.sh`'s `/fetch-abort` does with an `AbortController`. The
+  abort drops the caller's promise in the caller's turn, and dropping it
+  destroys the chain the subrequest was built on, down to the
+  `WorkerEntrypoint::requestImpl` coroutine frame of the *callee*: that frame
+  is in the callee's arena, so the caller's turn faults in
+  `kj::_::CoroutineBase::destroy` on it and is condemned, and the host side
+  then dies on `IoContext`'s `expected !isRunning`, since the caller's
+  `IoContext` is left mid-turn. The four shared-heap windows the call has
+  cover what each side *builds* for the other; which side owns the teardown of
+  a cancelled call is a question they do not answer, and the frame's own locals
+  would still be the callee's wherever the frame itself were placed. So this
+  one is not a placement either. `rpc-arena-test.sh` does not reach it: it
+  lets every call it makes finish.
+
+  Also not covered: BoringSSL's lazily allocated per-thread error state, which
+  a `crypto` call in a turn would place on that turn's arena -- untested, but
+  by the same reasoning as the registries above.
 - **The memory classification of runtime objects is applied to few of
   them.** Which side of the boundary each runtime C++ class belongs on is
   written down in `memory-classes.md`, together with the rules that decide
