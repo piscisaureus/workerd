@@ -51,6 +51,13 @@ log=$(mktemp)
 
 cleanup() {
   kill "$pid" 2>/dev/null
+  # A condemned isolate can leave the server not exiting on SIGTERM, which is a cost of the
+  # fault and not something to wait out here.
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -9 "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
   rm -f "$log"
 }
