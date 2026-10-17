@@ -1148,6 +1148,55 @@ so a crossing a turn makes on every dereference belongs on that path.
   result against a running server: two isolates formatting dates behind a
   third whose turns registered first.
 
+  One index is placed by an allocator of its own rather than in the shared
+  heap. `ThreadIsolation`'s JIT-page map
+  (`src/common/code-memory-access.h`) is the `Address -> JitPage*` index that
+  answers "which code allocation is this PC in?" for GC-safe code lookup
+  (`Heap::GcSafeFindCodeForInnerPointer`) and for stack iteration
+  (`StackFrameIterator::ComputeStackFrameType`). Both read it at ring 3 inside
+  a turn -- the second from `Runtime_CompileOptimizedOSR` -- while an
+  optimizing compile in a turn adds entries to it, so one isolate's turn
+  faults walking to an entry another's registered. The map is not the write
+  protection's bookkeeping and cannot be switched off with it: V8 builds it
+  whether or not thread isolation is enabled (`ThreadIsolation::Initialize`,
+  which says so), and its readers have no other implementation. What placed
+  the entries in an isolate's heap is that every allocation of the index goes
+  through the platform's `v8::ThreadIsolatedAllocator`, whose `Allocate` is
+  `return malloc(size)`, above a TODO in V8 saying it ought to return
+  thread-isolated memory.
+
+  That allocator is an embedder interface, so `jsg::wrapThreadIsolatedAllocator`
+  (`jsg/thread-isolated-allocator.h`) wraps the platform's and serves the index
+  from slabs it takes from the OS, with no V8 patch: `StlAllocator` and
+  `ThreadIsolation::ConstructNew` both go through it, so the map, its nodes,
+  the `JitPage`s and the two mutexes all land in process memory outside every
+  arena, which every root maps. The slabs are keyed with the protection key the
+  platform's allocator allocated, which V8 takes as `ThreadIsolation::pkey()`,
+  so the index is also read-only outside the `RwxMemoryWriteScope` /
+  `CFIMetadataWriteScope` windows V8 already enters around every read and write
+  of it -- with one exception, `ThreadIsolation::TearDown`, which deletes the
+  map and its mutex with neither scope and which `V8System`'s destructor
+  therefore brackets with `jsg::ThreadIsolatedWriteScope`; that one belongs in
+  V8. That part is not a guest-kernel property and holds in the default
+  build: before it, workerd enabled V8's key-based write protection for JIT
+  code while leaving the bookkeeping of that protection in ordinary writable
+  heap. What the key is worth is bounded, and not by workerd: `WRPKRU` is
+  unprivileged and PKRU is ring-3 writable, and V8 reaches it through glibc's
+  exported `pkey_set`, so the key stops an adversary who can write memory and
+  not one who can redirect control flow. Keeping the index out of a turn's
+  reach at all is the page table's job.
+
+  What a turn can still learn from the index is the code ranges and allocation
+  sizes of every isolate in the process -- layout, not contents, since a read
+  of another arena still faults -- and what it can do to it, between the
+  windows in which the key is open, is what it can do to any shared object:
+  rewrite an entry so that the host's `StartOfJitAllocationAt` answers with an
+  address of the turn's choosing, which `GcSafeFindCodeForInnerPointer` hands
+  to an unchecked cast. Both of those hold in the default build already.
+  `src/workerd/jsg/thread-isolated-allocator-test.c++` checks the allocator
+  itself, including that the memory it hands out carries the key, and
+  `guest-arena-test` part 7 is where the misplacement showed as a fault.
+
   One thread-wide structure is placed without the shared heap, because it is
   below `jsg`: the resolve journal a turn registers its owned objects through
   (`hostMemory`'s `TurnJournal`). It is created by whichever isolate first runs
@@ -1197,42 +1246,17 @@ so a crossing a turn makes on every dereference belongs on that path.
   grow from whichever isolate first needs an entry, and each one faults the
   next isolate that reads it.
 
-  On V8's side the one that remains is `ThreadIsolation`'s
-  JIT-page map (`src/common/code-memory-access.h`), the `Address -> JitPage*`
-  index that answers "which code allocation is this PC in?" for GC-safe code
-  lookup (`Heap::GcSafeTryFindInstructionStreamForInnerPointer`) and for
-  stack iteration (`StackFrameIterator::ComputeStackFrameType`). Both read
-  it at ring 3 inside a turn, and an optimizing compile in one isolate
-  faults walking entries another isolate registered.
-
-  The map is not the write protection's bookkeeping, so it cannot be
-  switched off with the protection: V8 builds it whether or not thread
-  isolation is enabled (`ThreadIsolation::Initialize`, which says so), and
-  its readers have no other implementation. It is enabled here in any case --
-  `server/v8-platform-impl.h` forwards the platform's thread-isolated
-  allocator on purpose, `trusted_data_.allocator_` is non-null in a running
-  workerd and its page is read-only, as only the enabled path leaves it.
-  What places the entries in an isolate's heap is that
-  `DefaultThreadIsolatedAllocator::Allocate` is `return malloc(size)`, a
-  stub V8 marks as such, so both it and the `::operator new` fallback beside
-  it allocate on the calling thread.
-
-  That allocator is an embedder interface, which is the cheap way out: a
-  `ThreadIsolatedAllocator` of workerd's own, wrapping the platform's and
-  overriding `Allocate` to run under a `SharedHeapScope`, places the map,
-  its nodes, the `JitPage`s and the mutex in the shared heap with no V8
-  patch at all, since `StlAllocator` and `ThreadIsolation::ConstructNew`
-  both go through it. What that does not settle is whether the map belongs
-  in the shared heap, and the answer is not "it is a new concession": the
-  map is in the ordinary C++ heap today, which every arena maps writably, so
-  the shared heap keeps exactly the exposure the shipping build already has.
-  What a turn can learn from it is the code ranges and allocation sizes of
-  every isolate in the process -- layout, not contents, since a read of
-  another arena still faults -- and what it can do to it is what it can do
-  to any shared-heap object: rewrite an entry so that the host's
-  `StartOfJitAllocationAt` answers with an address of the turn's choosing,
-  which `GcSafeTryFindInstructionStreamForInnerPointer` hands to an
-  unchecked cast. Both of those hold in the default build already.
+  The one that remains is V8's wasm engine. `WasmEngine`'s `NativeModuleInfo`
+  map and the per-isolate sets `UseNativeModuleInIsolate` fills, the
+  `NativeModuleCache` keyed on wire bytes, `WasmCodeManager`'s allocation pool
+  and each `NativeModule`'s own code vectors are members of the process-wide
+  `GlobalWasmState`, with no embedder allocator between them and
+  `operator new`, so they need a V8 patch of the same shape as the two that
+  exist. The type canonicalizer, which patch `0050` places, is only one part of
+  that state: two workers instantiating the same module from a turn still fault
+  in `wasm::InstanceBuilder::InstanceBuilder`, reached from
+  `WasmEngine::SyncInstantiate`, on an entry the first worker's turn wrote.
+  Only a worker that uses wasm reaches it.
 
   The thread's event loop needs more than placement. Its run queue is an
   intrusive doubly linked list through the queued events, so arming an event

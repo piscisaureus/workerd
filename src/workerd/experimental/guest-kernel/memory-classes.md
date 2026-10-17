@@ -1811,10 +1811,11 @@ read by the same isolate in every real workload would be on the list
 wrongly, and one established outside any lock -- so already in the shared
 heap, which `nolock` counts -- is on the list not at all, correctly.
 
-**Is the list long enough to change the judgement?** No. Four of the six have
-a fix already written, the fifth is an embedder allocator and the sixth is a
-V8 patch of the same shape as the two that exist, and it is only reached by a
-worker that uses wasm. The open-ended series is closed at six for this
+**Is the list long enough to change the judgement?** No. Five of the six have
+a fix written -- four of them scopes or hooks, and the JIT-page map an
+allocator of workerd's own behind the embedder interface
+(`jsg/thread-isolated-allocator.h`) -- and the sixth is a V8 patch of the same
+shape as the two that exist, only reached by a worker that uses wasm. The open-ended series is closed at six for this
 workload. What is not settled is how many more workloads add to it: this one
 does not exercise streams over RPC, hibernatable WebSockets, the shared memory
 cache, Pyodide, `WorkerLoader`, replica storage, `AbortSignal` over RPC or
