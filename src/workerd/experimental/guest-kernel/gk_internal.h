@@ -4,25 +4,25 @@
 #define GK_INTERNAL_H
 #define _GNU_SOURCE
 #include "gk.h"
+
 #include <dlfcn.h>
 #include <errno.h>
-#include <stddef.h>
-#include <string.h>
-
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
-#include <time.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 // The hypervisor: KVM on Linux, Hypervisor.framework (HVF) on macOS, which is
@@ -60,8 +60,8 @@
 #error "gk supports x86-64 and arm64 only"
 #endif
 
-#define GK_MAP_WALLED 8          // map4k_root flag: host-writable page, W withheld (PTE_WALL)
-#define GK_MAP_GLOBAL 16         // map4k_root flag: the page may be global (see the global-pages section)
+#define GK_MAP_WALLED 8   // map4k_root flag: host-writable page, W withheld (PTE_WALL)
+#define GK_MAP_GLOBAL 16  // map4k_root flag: the page may be global (see the global-pages section)
 
 // Reserved syscall number a ring-3 guest issues to leave the guest (see
 // gk_user_exit_tramp in gk_asm.S). Ring-3 code cannot execute OUT, so it cannot
@@ -124,7 +124,7 @@
 #define GK_ESRCH 3
 #define GK_E2BIG 7
 #define GK_ENOMEM 12
-#define GK_EADDR 14   // EFAULT: GK_EFAULT is gk_run's guest-fault status
+#define GK_EADDR 14  // EFAULT: GK_EFAULT is gk_run's guest-fault status
 #define GK_EBUSY 16
 #define GK_EINVAL 22
 #define GK_ENOSYS 38
@@ -139,25 +139,25 @@
 #endif
 #define GK_SYNC_REGS (KVM_SYNC_X86_REGS | KVM_SYNC_X86_SREGS)
 #if defined(__x86_64__)
-#define GK_IST_BYTES (64UL << 10)   // per-vCPU exception stack, TSS in its last page
+#define GK_IST_BYTES (64UL << 10)  // per-vCPU exception stack, TSS in its last page
 #else
-#define GK_IST_BYTES (4UL << 10)    // per-vCPU vcb (struct gk_vcb)
+#define GK_IST_BYTES (4UL << 10)  // per-vCPU vcb (struct gk_vcb)
 #endif
-#define GK_SIDE_STACK (512UL << 10) // host-side stack for gk_run_here's gk loop
+#define GK_SIDE_STACK (512UL << 10)  // host-side stack for gk_run_here's gk loop
 typedef struct {
 #if GK_HVF
-  int id;               // the vCPU itself is destroyed with its thread (see vcpu_park)
+  int id;  // the vCPU itself is destroyed with its thread (see vcpu_park)
 #else
   int fd, id;
   struct kvm_run *run;
 #endif
-  uint64_t stack_top;   // 0 if the vCPU has no private guest stack
-  uint64_t ist;         // its exception stack + TSS region (see vcpu_init)
-  void *side_stack;     // NULL if the vCPU has no gk_run_here side stack
+  uint64_t stack_top;        // 0 if the vCPU has no private guest stack
+  uint64_t ist;              // its exception stack + TSS region (see vcpu_init)
+  void *side_stack;          // NULL if the vCPU has no gk_run_here side stack
   struct gk_runner *runner;  // the thread that runs its KVM_RUN, if any (see the runner section)
-  struct gk_park *park; // its park frame, if it is resident (see the runner section)
-  int efd;              // the eventfd its park loop and runner wake the owner through, or -1
-  int stats_fd;         // KVM_GET_STATS_FD, taken at creation (see gk_debug_vcpu_stat), or -1
+  struct gk_park *park;      // its park frame, if it is resident (see the runner section)
+  int efd;                   // the eventfd its park loop and runner wake the owner through, or -1
+  int stats_fd;              // KVM_GET_STATS_FD, taken at creation (see gk_debug_vcpu_stat), or -1
 } gk_parked_vcpu;
 
 // Per-thread guest state: each host thread that enters the guest is a vCPU. A
@@ -165,20 +165,21 @@ typedef struct {
 // a vCPU until its first run. Records are allocated from G->threads and
 // recycled when the thread ends (see thread_get, thread_release).
 typedef struct gk_thread {
-  long tid;                // kernel tid of the owning thread (0: free record)
-  int inited;              // the thread has a vCPU
+  long tid;    // kernel tid of the owning thread (0: free record)
+  int inited;  // the thread has a vCPU
   int id;
 #if GK_HVF
-  hv_vcpu_t vcpu;          // this thread's HVF vCPU
-  hv_vcpu_exit_t *exit;    // its exit record, written by hv_vcpu_run
+  hv_vcpu_t vcpu;        // this thread's HVF vCPU
+  hv_vcpu_exit_t *exit;  // its exit record, written by hv_vcpu_run
 #else
   int fd;
   struct kvm_run *run;
 #endif
   uint64_t stack_top;
-  uint64_t ist;            // exception stack + TSS region of this vCPU
-  void *side_stack;        // host stack for gk_run_here's gk loop (see there)
-  struct gk_runner *runner;  // the thread that runs this vCPU's KVM_RUN, or NULL (see the runner section)
+  uint64_t ist;      // exception stack + TSS region of this vCPU
+  void *side_stack;  // host stack for gk_run_here's gk loop (see there)
+  struct gk_runner
+      *runner;  // the thread that runs this vCPU's KVM_RUN, or NULL (see the runner section)
   // A resident vCPU (see the runner section): its park frame, whether it is
   // inside KVM_RUN in the park loop right now, the sequence word of the turn
   // the owner last handed it and of the KVM_RUN it last handed the runner,
@@ -191,12 +192,12 @@ typedef struct gk_thread {
   uint64_t cr3_shadow;
   int efd;
   int stats_fd;
-  unsigned root_gen;       // G->root_gen as of this vCPU's last TLB flush (0: never)
+  unsigned root_gen;  // G->root_gen as of this vCPU's last TLB flush (0: never)
   uint64_t last_fault;
   int fault_repeat;
-  int backing_retries;     // host-backing faults recovered this invocation (see run_vcpu)
-  int pkru_ready;          // guest PKRU has been given its initial value
-  int user_mode;           // the current invocation runs fn at ring 3 (gk_run_user)
+  int backing_retries;  // host-backing faults recovered this invocation (see run_vcpu)
+  int pkru_ready;       // guest PKRU has been given its initial value
+  int user_mode;        // the current invocation runs fn at ring 3 (gk_run_user)
   // The host-frame wall of a ring-3 gk_run_here_user turn (see run_here):
   // [ro_lo, ro_hi), page-aligned, is the caller's stack above the guest's
   // entry, which this vCPU maps read-only and whose write faults are genuine.
@@ -214,7 +215,7 @@ typedef struct gk_thread {
   // stack_wall_bounds' cache: the host mapping [wall_map_lo, wall_map_hi)
   // that held the previous turn's switch point, and the wall's end within it.
   uintptr_t wall_map_lo, wall_map_hi, wall_end;
-  uint64_t *active_pml4;   // root this thread runs under
+  uint64_t *active_pml4;  // root this thread runs under
   gk_arena *active_arena;
   // The arenas that gk_arena_enter displaced on this thread, innermost last:
   // gk_arena_leave returns to the last of them. The history lives here, in
@@ -234,8 +235,8 @@ typedef struct gk_thread {
   // and consumed by the child (child_entry) before it enters the guest.
   struct {
     gk_regs regs;
-    uint32_t pkru;         // the parent's guest PKRU, inherited like a real clone
-    int user;              // the parent ran at ring 3, so the child starts there too
+    uint32_t pkru;  // the parent's guest PKRU, inherited like a real clone
+    int user;       // the parent ran at ring 3, so the child starts there too
     int parent_id;
   } start;
   // This record's host-side hostcall frame (see the hostcalls section): a
@@ -322,7 +323,7 @@ static inline void cpu_relax(void) {
 // arena's private subtree with the page's current host protection.
 #define GK_SLOT_BITS 39
 #define GK_SLOT_BYTES (1UL << GK_SLOT_BITS)
-#define GK_MAX_ARENA_SLOTS 8   // 4TiB per arena; V8's largest sandbox reservation is ~1.34TB
+#define GK_MAX_ARENA_SLOTS 8  // 4TiB per arena; V8's largest sandbox reservation is ~1.34TB
 
 // One report site's budget (see gk_log_budget in gk.h). Twelve bytes, because
 // every arena carries GK_LOG_SITES of them: the window is a coarse monotonic
@@ -336,11 +337,11 @@ typedef struct {
 #define GK_FIRST_CAGE_SLOT 64  // arenas are placed from here up
 #define GK_MAX_ARENAS 4096
 struct gk_arena {
-  uintptr_t base;             // slot-aligned reservation start
-  size_t size;                // usable size, as requested (page-rounded)
-  uintptr_t end;              // base + nslots * GK_SLOT_BYTES: the whole reservation
+  uintptr_t base;  // slot-aligned reservation start
+  size_t size;     // usable size, as requested (page-rounded)
+  uintptr_t end;   // base + nslots * GK_SLOT_BYTES: the whole reservation
   uint64_t *pml4;
-  int slot0, nslots;          // the contiguous PML4 slots this arena owns
+  int slot0, nslots;                        // the contiguous PML4 slots this arena owns
   uint64_t slot_entry[GK_MAX_ARENA_SLOTS];  // its private PDPT entry per slot
   // Threads that currently have this arena active (gk_arena_enter, and guest
   // threads that inherited it). gk_arena_destroy refuses to recycle the
@@ -376,7 +377,7 @@ struct gk_arena {
   // behalf. Zeroed with the rest of the struct when it is taken from the
   // pool, so a recycled arena starts with a budget of its own.
   gk_log_bucket log_budget[GK_LOG_SITES];
-  gk_arena *next_free;        // free-list link while the struct is unused
+  gk_arena *next_free;  // free-list link while the struct is unused
 };
 
 // Host memory (see gk_host_alloc in gk.h): regions mapped by the host,
@@ -388,7 +389,9 @@ struct gk_arena {
 #define GK_HOST_MIN_SHIFT 4   // the smallest block, 16 bytes: room for a free-list link
 #define GK_HOST_MAX_SHIFT 20  // the largest block, GK_HOST_MAX_ALLOC
 #define GK_HOST_CLASSES (GK_HOST_MAX_SHIFT + 1)
-typedef struct { uintptr_t start, end, bump; } gk_host_region;
+typedef struct {
+  uintptr_t start, end, bump;
+} gk_host_region;
 _Static_assert((1UL << GK_HOST_MAX_SHIFT) == GK_HOST_MAX_ALLOC, "gk.h and gk.c disagree");
 _Static_assert(GK_HOST_MAX_ALLOC <= GK_HOST_REGION_BYTES, "a block must fit a region");
 
@@ -401,10 +404,10 @@ _Static_assert(GK_HOST_MAX_ALLOC <= GK_HOST_REGION_BYTES, "a block must fit a re
 #define GK_HOST_SLOT_INDEX_BITS 16
 #define GK_HOST_SLOT_GEN_BITS (64 - GK_HOST_SLOT_INDEX_BITS)
 typedef struct {
-  void *ptr;        // the block, NULL while the slot is free
-  size_t size;      // the size it was allocated with (selects the class on free)
-  uint64_t gen;     // the generation in the slot's current handle; 0 never issued
-  int next_free;    // free-list link, as index + 1; 0 ends the list
+  void *ptr;      // the block, NULL while the slot is free
+  size_t size;    // the size it was allocated with (selects the class on free)
+  uint64_t gen;   // the generation in the slot's current handle; 0 never issued
+  int next_free;  // free-list link, as index + 1; 0 ends the list
   int live;
 } gk_host_slot;
 _Static_assert(GK_HOST_SLOTS <= (1 << GK_HOST_SLOT_INDEX_BITS), "a slot index must fit a handle");
@@ -414,10 +417,14 @@ _Static_assert(GK_HOST_SLOTS <= (1 << GK_HOST_SLOT_INDEX_BITS), "a slot index mu
 // GK_MAX_VCPUS regions, indexed by thread record, so a record's region is a
 // fixed address the host computes from the record and the guest can neither
 // move (the mapping policy refuses the whole reservation) nor choose.
-typedef struct { gk_hostcall_fn fn; void *ctx; } gk_hostcall_entry;
+typedef struct {
+  gk_hostcall_fn fn;
+  void *ctx;
+} gk_hostcall_entry;
 #define GK_HOSTCALL_REGION_BYTES (8UL << 10)
 #define GK_HOSTCALL_AREA_BYTES ((size_t)GK_MAX_VCPUS * GK_HOSTCALL_REGION_BYTES)
-_Static_assert(sizeof(gk_hostcall_frame) <= GK_HOSTCALL_REGION_BYTES, "a frame must fit its region");
+_Static_assert(
+    sizeof(gk_hostcall_frame) <= GK_HOSTCALL_REGION_BYTES, "a frame must fit its region");
 _Static_assert(sizeof(gk_hostcall_frame) <= GK_HOST_MAX_ALLOC, "a frame must fit a host block");
 
 // A signal field (see gk_signal_field_register in gk.h): one 4-byte word in
@@ -429,15 +436,16 @@ _Static_assert(sizeof(gk_hostcall_frame) <= GK_HOST_MAX_ALLOC, "a frame must fit
 // left in place when the entry is retired, so a walk standing on a retired
 // entry still finds the rest of the list; `next_free` links the free list.
 typedef struct {
-  uintptr_t addr;    // absolute address of the field
-  gk_arena *arena;   // the arena it lies in
-  uint64_t gen;      // the generation in the entry's current handle
+  uintptr_t addr;   // absolute address of the field
+  gk_arena *arena;  // the arena it lies in
+  uint64_t gen;     // the generation in the entry's current handle
   uint32_t kind;
   int live;
-  int next;          // per-arena list link, as index + 1; 0 ends the list
-  int next_free;     // free-list link, as index + 1; 0 ends the list
+  int next;       // per-arena list link, as index + 1; 0 ends the list
+  int next_free;  // free-list link, as index + 1; 0 ends the list
 } gk_signal_field;
-_Static_assert(GK_SIGNAL_FIELDS <= (1 << GK_HOST_SLOT_INDEX_BITS), "a field index must fit a handle");
+_Static_assert(
+    GK_SIGNAL_FIELDS <= (1 << GK_HOST_SLOT_INDEX_BITS), "a field index must fit a handle");
 
 // The ring-0 resolve table (see gk_resolve in gk.h): GK_RESOLVE_SLOTS entries
 // of {pointer, generation, owner}, read at guest ring 0 by gk_resolve_tramp
@@ -508,7 +516,8 @@ _Static_assert(sizeof(gk_resolve_entry) == 64, "gk_resolve_tramp indexes 64-byte
 _Static_assert(offsetof(gk_resolve_entry, owner) == 16, "gk_resolve_tramp reads the owner at 16");
 _Static_assert(offsetof(gk_resolve_entry, type) == 32, "gk_resolve_tramp reads the type at 32");
 _Static_assert(GK_RESOLVE_INDEX_BITS == 20, "gk_resolve_tramp splits a handle at bit 20");
-_Static_assert(GK_RESOLVE_SLOTS == (1 << GK_RESOLVE_INDEX_BITS), "gk_resolve_tramp bounds the index by masking");
+_Static_assert(GK_RESOLVE_SLOTS == (1 << GK_RESOLVE_INDEX_BITS),
+    "gk_resolve_tramp bounds the index by masking");
 _Static_assert(GK_MAX_ARENAS < (1 << 13), "an arena's pool index must fit the chain word");
 _Static_assert(GK_RESOLVE_SLOTS < (1 << 21), "an entry index must fit the chain word");
 #define GK_RESOLVE_GEN_BITS (64 - GK_RESOLVE_INDEX_BITS)
@@ -532,12 +541,15 @@ __attribute__((visibility("hidden"), aligned(4096))) union {
 #define GK_PROT_SUPER 1
 #define GK_PROT_REFUSE 2
 #define GK_MAX_PROT_RANGES (4 * GK_MAX_VCPUS + GK_MAX_HOST_REGIONS + 1024)
-typedef struct { uintptr_t start, end; int kind; } gk_prot_range;
+typedef struct {
+  uintptr_t start, end;
+  int kind;
+} gk_prot_range;
 _Static_assert(GK_MAX_PROT_RANGES >= 2 * GK_MAX_VCPUS + GK_MAX_HOST_REGIONS + 512,
-               "registry must hold every vCPU's permanent ranges with headroom");
+    "registry must hold every vCPU's permanent ranges with headroom");
 
 // A memslot-backed window (see the MMU layer in gk_region.c).
-#define GK_BACK_WIN (2UL << 20)   // memslot backing granularity (2MB, aligned)
+#define GK_BACK_WIN (2UL << 20)  // memslot backing granularity (2MB, aligned)
 // The neighborhood a demand fault maps around its page (see demand_map_neighbors).
 #define GK_NEIGHBOR_WIN (256UL << 10)  // 64 pages, aligned; within one GK_BACK_WIN
 
@@ -565,21 +577,24 @@ _Static_assert(GK_MAX_PROT_RANGES >= 2 * GK_MAX_VCPUS + GK_MAX_HOST_REGIONS + 51
 #define HOST_CEIL(a) (((a) + GK_HOST_PAGE - 1) & ~(GK_HOST_PAGE - 1))
 #define GK_MAX_REGIONS 65536
 typedef struct gk_region {
-  uintptr_t start, end;   // [start, end), GK_BACK_WIN-aligned
-  int slot;               // KVM memslot id backing this region
+  uintptr_t start, end;  // [start, end), GK_BACK_WIN-aligned
+  int slot;              // KVM memslot id backing this region
 #if defined(__aarch64__)
-  uint64_t gpa;           // guest-physical address of `start` (see the guest-physical allocator)
+  uint64_t gpa;  // guest-physical address of `start` (see the guest-physical allocator)
 #endif
 #if GK_HVF
-  long s2_n;              // how many of its host pages are in stage 2 (see the HVF section)
+  long s2_n;  // how many of its host pages are in stage 2 (see the HVF section)
 #endif
-  unsigned prio;          // treap heap priority
+  unsigned prio;  // treap heap priority
   struct gk_region *l, *r;
 } gk_region;
 
 // A range holding a nonzero protection key (see the protection-keys section).
 #define GK_MAX_PKEY_RANGES 4096
-typedef struct { uintptr_t start, end; int pkey; } gk_pkey_range;
+typedef struct {
+  uintptr_t start, end;
+  int pkey;
+} gk_pkey_range;
 
 // A page-aligned [start, end) span of the runtime image (see the
 // mapping-change policy section). The table holds the PT_LOAD segments of
@@ -603,17 +618,24 @@ typedef struct { uintptr_t start, end; int pkey; } gk_pkey_range;
 #else
 #define GK_MAX_IMAGE_RANGES 1024
 #endif
-typedef struct { uintptr_t start, end; } gk_span;
+typedef struct {
+  uintptr_t start, end;
+} gk_span;
 
 #define GK_CPUID_ENTRIES 128
 #if defined(__aarch64__)
-typedef struct { uint64_t start, size; } gk_gpa_extent;
+typedef struct {
+  uint64_t start, size;
+} gk_gpa_extent;
 #endif
 #if GK_HVF
 // A stage-2 shadow (see the HVF section): host page `hva` is backed in the
 // guest by the copy at `copy`.
-typedef struct { uintptr_t hva; void *copy; } gk_shadow;
-#define GK_MAX_SHADOWS 8192   // the shadow pool: this many host pages
+typedef struct {
+  uintptr_t hva;
+  void *copy;
+} gk_shadow;
+#define GK_MAX_SHADOWS 8192  // the shadow pool: this many host pages
 #define GK_COMMPAGE_N 2
 #endif
 
@@ -622,18 +644,18 @@ struct gk_ctl {
 #if !GK_HVF
   int kvm, vmfd;
 #endif
-  uint64_t *pml4;                    // base page-table root
-  uint8_t *pt_next, *pt_end;         // bump allocator over the page-table area
+  uint64_t *pml4;             // base page-table root
+  uint8_t *pt_next, *pt_end;  // bump allocator over the page-table area
   uintptr_t pt_base;
   size_t pt_bytes;
-  uint64_t *pt_free;                 // freed page-table pages, linked through their first word
-  long pt_used, pt_free_n;           // pages handed out and not returned; pages on the free list
+  uint64_t *pt_free;        // freed page-table pages, linked through their first word
+  long pt_used, pt_free_n;  // pages handed out and not returned; pages on the free list
 #if defined(__x86_64__)
   uint64_t gdt_va, idt_va;
 #else
-  uint64_t vbar;                     // the vector table: the supervisor text's first page
-  uint64_t pt_gpa;                   // guest-physical address of pt_base
-  int ips;                           // TCR_EL1.IPS for the VM's guest-physical size
+  uint64_t vbar;    // the vector table: the supervisor text's first page
+  uint64_t pt_gpa;  // guest-physical address of pt_base
+  int ips;          // TCR_EL1.IPS for the VM's guest-physical size
 #if !GK_HVF
   struct kvm_vcpu_init vcpu_target;  // KVM_ARM_PREFERRED_TARGET, for every vCPU
 #endif
@@ -641,39 +663,38 @@ struct gk_ctl {
   uint64_t gpa_next, gpa_limit;
   gk_gpa_extent gpa_free[GK_MAX_REGIONS];
   int gpa_free_n;
-  size_t pthread_size;               // glibc's struct pthread (see stack_wall_bounds), 0 if unknown
+  size_t pthread_size;  // glibc's struct pthread (see stack_wall_bounds), 0 if unknown
   // The vDSO and the kernel's data pages behind it (see the vDSO section).
   uintptr_t vdso_lo, vdso_hi;
-  uintptr_t vdso_fn[64];             // the vDSO's function entry points
+  uintptr_t vdso_fn[64];  // the vDSO's function entry points
   int vdso_n;
-  gk_prot_range holes[8];            // host ranges no memslot may cover ([vvar])
+  gk_prot_range holes[8];  // host ranges no memslot may cover ([vvar])
   int hole_n;
-  size_t host_page;                  // the kernel's page size (see the page-sizes section)
+  size_t host_page;  // the kernel's page size (see the page-sizes section)
 #if GK_HVF
   // The shadow pool and the commpage shadows in it (see the HVF section).
   uintptr_t shadow_pool;
   int shadow_used;
   gk_shadow commpage[GK_COMMPAGE_N];
   int commpage_n;
-  uint64_t *s2_map;                  // one bit per guest-physical host page: in stage 2
-  long s2_pages, s2_shadowed;        // host pages in stage 2: all, and those that are shadows
+  uint64_t *s2_map;            // one bit per guest-physical host page: in stage 2
+  long s2_pages, s2_shadowed;  // host pages in stage 2: all, and those that are shadows
 #endif
 #endif
-  int next_slot;                     // KVM memslot ids handed out, ever (see the region pool)
+  int next_slot;  // KVM memslot ids handed out, ever (see the region pool)
   int run_size;
 #if defined(__x86_64__)
-  int sync_regs;                     // registers go through kvm_run, not ioctls (see regs_get)
-  uint64_t xcr0;                     // the XCR0 every vCPU starts with (see xcr0_select)
+  int sync_regs;  // registers go through kvm_run, not ioctls (see regs_get)
+  uint64_t xcr0;  // the XCR0 every vCPU starts with (see xcr0_select)
   // Host CPUID, applied to every vCPU: a struct kvm_cpuid2 (a flexible-array
   // struct, hence the raw buffer) with room for GK_CPUID_ENTRIES entries.
   _Alignas(struct kvm_cpuid2) unsigned char cpuid_buf[sizeof(struct kvm_cpuid2) +
-                                                      GK_CPUID_ENTRIES *
-                                                          sizeof(struct kvm_cpuid_entry2)];
+      GK_CPUID_ENTRIES * sizeof(struct kvm_cpuid_entry2)];
 #endif
   const char *err;
   unsigned long fault_addr;
   int dbg;
-  int thp;                 // arena host backing may use transparent huge pages (see arena_thp_advise)
+  int thp;  // arena host backing may use transparent huge pages (see arena_thp_advise)
   gk_syscall_filter filter;
   // glibc's _dl_get_tls_static_info (GLIBC_PRIVATE, resolved at gk_init; NULL
   // if absent): the size of a thread's static TLS block, which on a pthread
@@ -688,15 +709,15 @@ struct gk_ctl {
   atomic_long root_switches;        // guest entries that loaded another root (enter_guest)
   atomic_long tlb_flushes;          // full flushes run on a vCPU, on any path (see flush_run)
 #if defined(__x86_64__)
-  void (*flush_stub)(void);         // the flush stub for this CPU (see flush_stub_select)
+  void (*flush_stub)(void);  // the flush stub for this CPU (see flush_stub_select)
 #endif
   // vCPU runners (see the runner section): whether new vCPUs get one, how
   // long a waiting side spins before it sleeps, where the runner is pinned,
   // the pool of runner records and the count of KVM_RUNs they have executed.
   int runner_mode;
   long runner_spin;
-  int runner_pin;                   // GK_RUNNER_PIN_NONE, _SIBLING or a CPU number + GK_RUNNER_PIN_CPU
-  struct gk_runner *runner_pool;    // GK_MAX_VCPUS records, in supervisor memory (see gk_init)
+  int runner_pin;  // GK_RUNNER_PIN_NONE, _SIBLING or a CPU number + GK_RUNNER_PIN_CPU
+  struct gk_runner *runner_pool;  // GK_MAX_VCPUS records, in supervisor memory (see gk_init)
   int runner_n;
   atomic_long runner_runs;
   // Resident vCPUs (see the runner section): whether new vCPUs are resident,
@@ -724,13 +745,13 @@ struct gk_ctl {
   // The vCPU pool. Guarded by G->lock.
   gk_parked_vcpu parked[GK_MAX_VCPUS];
   int parked_n;
-  atomic_int vcpus_created;          // vcpu ids handed out, ever
-  pthread_key_t thread_key;          // releases a host thread's record at exit
+  atomic_int vcpus_created;  // vcpu ids handed out, ever
+  pthread_key_t thread_key;  // releases a host thread's record at exit
 
   // Thread records. Guarded by G->lock.
   gk_thread threads[GK_MAX_VCPUS];
-  int thread_n;                      // records ever taken
-  gk_thread *thread_free;            // records of ended threads
+  int thread_n;            // records ever taken
+  gk_thread *thread_free;  // records of ended threads
 
   // Registry of live arenas, so demand paging can tell a fault inside the
   // active arena (backed, into that arena's root) from one inside any other
@@ -740,8 +761,8 @@ struct gk_ctl {
   gk_arena *arenas[GK_MAX_ARENAS];
   int arena_n;
   gk_arena arena_pool[GK_MAX_ARENAS];
-  int arena_pool_n;                  // pool structs ever taken
-  gk_arena *arena_free;              // structs of destroyed arenas
+  int arena_pool_n;      // pool structs ever taken
+  gk_arena *arena_free;  // structs of destroyed arenas
   // Which PML4 slots live arenas own. A destroyed arena's slots are reused by
   // later arenas, so slot churn does not run through the user address space.
   unsigned char slot_used[GK_USER_SLOTS];
@@ -764,41 +785,41 @@ struct gk_ctl {
   gk_host_region host_regions[GK_MAX_HOST_REGIONS];
   int host_region_n;
   void *host_free[GK_HOST_CLASSES];
-  long host_blocks;                  // blocks handed out and not yet freed
+  long host_blocks;  // blocks handed out and not yet freed
 
   // Host slots (see the host-slots section). The table is here, in supervisor
   // memory, so no ring-3 access reaches an entry. Guarded by G->lock.
   gk_host_slot host_slots[GK_HOST_SLOTS];
-  int host_slot_n;                   // slots ever taken from the table
-  int host_slot_free;                // free-list head, as index + 1; 0 when empty
-  int host_slot_live;                // slots allocated and not yet freed
-  uint64_t host_slot_gen;            // the generation of the last allocation
+  int host_slot_n;         // slots ever taken from the table
+  int host_slot_free;      // free-list head, as index + 1; 0 when empty
+  int host_slot_live;      // slots allocated and not yet freed
+  uint64_t host_slot_gen;  // the generation of the last allocation
 
   // Hostcalls (see the hostcalls section): the handler table, in supervisor
   // memory so no ring-3 access reaches an entry, and the exchange-region
   // reservation. Guarded by G->lock; hostcall_calls is a counter.
   gk_hostcall_entry hostcalls[GK_HOSTCALLS];
-  int hostcall_n;                    // entries with a handler
-  atomic_long hostcall_calls;        // calls that reached a handler
-  uintptr_t hostcall_area;           // GK_HOSTCALL_AREA_BYTES, PROT_NONE until a region is committed
+  int hostcall_n;              // entries with a handler
+  atomic_long hostcall_calls;  // calls that reached a handler
+  uintptr_t hostcall_area;     // GK_HOSTCALL_AREA_BYTES, PROT_NONE until a region is committed
 
   // Signal fields (see the signal-fields section). The table is here, in
   // supervisor memory, so no ring-3 access reaches an entry. Mutated under
   // G->lock; walked without it by gk_signal_field_write (see there).
   gk_signal_field signal_fields[GK_SIGNAL_FIELDS];
-  int signal_field_n;                // entries ever taken from the table
-  int signal_field_free;             // free-list head, as index + 1; 0 when empty
-  int signal_field_live;             // fields registered and not yet unregistered
-  uint64_t signal_field_gen;         // the generation of the last registration
+  int signal_field_n;         // entries ever taken from the table
+  int signal_field_free;      // free-list head, as index + 1; 0 when empty
+  int signal_field_live;      // fields registered and not yet unregistered
+  uint64_t signal_field_gen;  // the generation of the last registration
 
   // The ring-0 resolve table's bookkeeping (see the resolve section): the
   // table itself is gk_resolve_table, outside the block, and the free list is
   // threaded through its free entries. Guarded by G->lock.
-  int resolve_n;                     // entries ever taken from the table
-  int resolve_free;                  // free-list head, as index + 1; 0 when empty
-  int resolve_live;                  // entries registered and not yet unregistered
-  uint64_t resolve_gen;              // the generation of the last registration
-  long resolve_orphans;              // entries retired by gk_arena_destroy, their arena having died first
+  int resolve_n;         // entries ever taken from the table
+  int resolve_free;      // free-list head, as index + 1; 0 when empty
+  int resolve_live;      // entries registered and not yet unregistered
+  uint64_t resolve_gen;  // the generation of the last registration
+  long resolve_orphans;  // entries retired by gk_arena_destroy, their arena having died first
 
   // The turn-directory policy (see gk_confine_paths in gk.h): when set,
   // forward_syscall confines every thread's path syscalls to its turn
@@ -811,12 +832,12 @@ struct gk_ctl {
 
   // The memslot interval tree and its node pool (see the MMU layer). Guarded
   // by G->lock.
-  gk_region *regions;                // treap root
+  gk_region *regions;  // treap root
   gk_region region_pool[GK_MAX_REGIONS];
-  int region_n;                      // pool nodes ever taken
-  gk_region *region_free;            // nodes of deleted regions, linked through `l`
-  int region_live;                   // regions currently in the treap (= live memslots)
-  unsigned rand_state;               // xorshift32 state for treap priorities
+  int region_n;            // pool nodes ever taken
+  gk_region *region_free;  // nodes of deleted regions, linked through `l`
+  int region_live;         // regions currently in the treap (= live memslots)
+  unsigned rand_state;     // xorshift32 state for treap priorities
 
   // Protection-key ranges (see the protection-keys section). Guarded by G->lock.
   gk_pkey_range pkeys[GK_MAX_PKEY_RANGES];
@@ -876,8 +897,7 @@ extern void gk_exit_tramp(void);
 extern void gk_user_exit_tramp(void);
 extern void gk_park_entry(void), gk_park_exit_tramp(void), gk_park_syscall_tramp(void),
     gk_park_exit(void), gk_park_loop(void), gk_exc_nmi(void);
-extern void gk_exc_de(void), gk_exc_ud(void), gk_exc_df(void), gk_exc_gp(void),
-    gk_exc_pf(void);
+extern void gk_exc_de(void), gk_exc_ud(void), gk_exc_df(void), gk_exc_gp(void), gk_exc_pf(void);
 extern void gk_pkru_stub(void);
 extern void gk_flush_stub(void);
 extern void gk_flush_stub_invpcid(void);
@@ -889,29 +909,32 @@ extern const unsigned char gk_super_start[], gk_super_end[], gk_vectors[];
 #endif
 #if !GK_HVF
 // Host-side helpers for guest thread creation (gk_asm.S); never run in the guest.
-extern long gk_host_clone_raw(long nr, long a1, long a2, long a3, long a4,
-                              long a5);
-extern void gk_host_unmapself_exit(void *addr, size_t len, long code)
-    __attribute__((noreturn));
+extern long gk_host_clone_raw(long nr, long a1, long a2, long a3, long a4, long a5);
+extern void gk_host_unmapself_exit(void *addr, size_t len, long code) __attribute__((noreturn));
 #endif
-extern long gk_host_call_on_stack(void *stack_top,
-                                  long (*f)(void *ctx, unsigned long caller_sp),
-                                  void *ctx);
-typedef struct { char b[512]; size_t n; } gk_dbuf;
+extern long gk_host_call_on_stack(
+    void *stack_top, long (*f)(void *ctx, unsigned long caller_sp), void *ctx);
+typedef struct {
+  char b[512];
+  size_t n;
+} gk_dbuf;
 // What a page-table walk over a range does to each leaf PTE it reaches.
 enum {
   PTE_OP_UNMAP,       // clear the entry: reflect a munmap, fixed mmap or PROT_NONE mprotect
   PTE_OP_WALL_RAISE,  // present and writable: withhold W, tag PTE_WALL (see wall_raise)
   PTE_OP_WALL_LOWER,  // present and PTE_WALL: give W back, untag; counts the present and
                       // writable entries that carry no tag (see wall_lower)
-  PTE_OP_REPROTECT,   // present: rewrite W and NX from a new host protection (see reprotect_range_all)
+  PTE_OP_REPROTECT,  // present: rewrite W and NX from a new host protection (see reprotect_range_all)
 };
 
 // The arguments of PTE_OP_REPROTECT: the protection a successful mprotect
 // just established over the range (bit0=r, bit1=w, bit2=x, the mprotect's own
 // prot argument) and the calling vCPU's host-frame wall window, inside which
 // W is withheld and tagged PTE_WALL exactly as demand_map would map the page.
-typedef struct { int prot; uintptr_t wall_lo, wall_hi; } gk_reprot;
+typedef struct {
+  int prot;
+  uintptr_t wall_lo, wall_hi;
+} gk_reprot;
 
 // Allocation guard for the paths a handler runs on (off by default). Neither the
 // fault handler nor a registered hostcall handler may call malloc (see the
@@ -997,8 +1020,7 @@ static int memslot_remove(gk_region *n, int *keep_gpa);
 static void vcpu_detach(gk_thread *t);
 static void vcpu_park_hw(gk_thread *t, gk_parked_vcpu *p);
 static gk_thread *thread_ending(void *p);
-static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
-                         long a6);
+static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5, long a6);
 static int copy_in(void *dst, uintptr_t src, size_t n);
 static int s2_ensure(gk_region *rg, uintptr_t hva);
 static int s2_release(gk_region *rg);
@@ -1124,13 +1146,12 @@ static uint32_t host_pkru(void);
 static int guest_pkru_update(gk_thread *t, uint32_t keep, uint32_t set, uint32_t *out);
 static int sync_cr3(gk_thread *t, uint64_t *load);
 static int cr3_load_host(gk_thread *t, uint64_t cr3);
-static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t stack_top,
-                        int user, uint64_t cr3);
+static long enter_guest(
+    gk_thread *t, long (*fn)(void *), void *arg, uint64_t stack_top, int user, uint64_t cr3);
 static int host_backing_retry(gk_thread *t);
 static long host_backing_fail(gk_thread *t, int err);
 static long run_vcpu(gk_thread *t);
-static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
-                         long a6);
+static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5, long a6);
 static void syscall_args(const gk_regs *r, long a[7]);
 static void syscall_stub_ran(gk_regs *r);
 static void child_regs_init(gk_regs *c, uint64_t sp);
@@ -1165,8 +1186,8 @@ static uint32_t host_pkru(void);
 static int guest_pkru_update(gk_thread *t, uint32_t keep, uint32_t set, uint32_t *out);
 static int ttbr0_preload(gk_thread *t, uint64_t root);
 static int sync_cr3(gk_thread *t, uint64_t *load);
-static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t stack_top,
-                        int user, uint64_t cr3);
+static long enter_guest(
+    gk_thread *t, long (*fn)(void *), void *arg, uint64_t stack_top, int user, uint64_t cr3);
 static gk_region *region_by_gpa(gk_region *n, uint64_t gpa);
 static long vcb_bad(gk_thread *t);
 static int vcb_exception(gk_thread *t, long *ret);
@@ -1192,8 +1213,7 @@ static int cr3_load_host(gk_thread *t, uint64_t cr3);
 static int host_backing_retry(gk_thread *t);
 static long host_backing_fail(gk_thread *t, int err);
 static long run_vcpu(gk_thread *t);
-static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5,
-                         long a6);
+static long host_syscall(long nr, long a1, long a2, long a3, long a4, long a5, long a6);
 static void syscall_args(const gk_regs *r, long a[7]);
 static void syscall_stub_ran(gk_regs *r);
 static void child_regs_init(gk_regs *c, uint64_t sp);
@@ -1203,8 +1223,8 @@ static void child_launch(gk_thread *t);
 // gk_core.c
 static int arena_sync_root(gk_arena *a);
 static void arena_sync_if_stale(gk_arena *a);
-static int stack_wall_bounds(gk_thread *t, uintptr_t caller_sp, uintptr_t top,
-                             uintptr_t *lo, uintptr_t *hi);
+static int stack_wall_bounds(
+    gk_thread *t, uintptr_t caller_sp, uintptr_t top, uintptr_t *lo, uintptr_t *hi);
 static int wall_raise(gk_thread *t, uintptr_t lo, uintptr_t hi);
 static void wall_lower(gk_thread *t);
 static long run_here(void *ctx, unsigned long caller_sp);

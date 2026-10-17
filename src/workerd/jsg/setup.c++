@@ -584,8 +584,8 @@ void ArenaPageAllocator::checkRange(const void* address, size_t length) const {
   auto addr = reinterpret_cast<uintptr_t>(address);
   // The `addr <= rangeEnd` term is what keeps `rangeEnd - addr` from wrapping, which would let
   // any address above the tail through.
-  KJ_REQUIRE(addr % pageSize == 0 && length % pageSize == 0 &&
-          addr >= rangeBegin && addr <= rangeEnd && length <= rangeEnd - addr,
+  KJ_REQUIRE(addr % pageSize == 0 && length % pageSize == 0 && addr >= rangeBegin &&
+          addr <= rangeEnd && length <= rangeEnd - addr,
       "address range is not in the arena tail", addr, length, rangeBegin, rangeEnd);
 }
 

@@ -6,13 +6,14 @@
 #define PTE_P (1UL << 0)
 #define PTE_W (1UL << 1)
 #define PTE_U (1UL << 2)
-#define PTE_G (1UL << 8)         // global: the translation survives a CR3 load (see the global-pages section)
-#define PTE_WALL (1UL << 9)      // CPU-ignored software bit: W withheld by the host-frame wall
+#define PTE_G                                                                                      \
+  (1UL << 8)  // global: the translation survives a CR3 load (see the global-pages section)
+#define PTE_WALL (1UL << 9)  // CPU-ignored software bit: W withheld by the host-frame wall
 #define PTE_NX (1UL << 63)
-#define PTE_PKEY_SHIFT 59        // bits 62:59 hold the page's protection key
+#define PTE_PKEY_SHIFT 59  // bits 62:59 hold the page's protection key
 #define PTE_PKEY_MASK (0xfUL << PTE_PKEY_SHIFT)
-#define PF_ERR_WR (1UL << 1)     // #PF error code: the access was a write
-#define PF_ERR_PK (1UL << 5)     // #PF error code: protection-key violation
+#define PF_ERR_WR (1UL << 1)  // #PF error code: the access was a write
+#define PF_ERR_PK (1UL << 5)  // #PF error code: protection-key violation
 #define CR0_PE (1UL << 0)
 #define CR0_WP (1UL << 16)
 #define CR0_PG (1UL << 31)
@@ -50,8 +51,8 @@
 #define PTE_SET_W(e) ((e) | PTE_W)
 #define PTE_CLR_W(e) ((e) & ~PTE_W)
 #define PTE_SET_GLOBAL(e) ((e) | PTE_G)
-#define GK_HAS_PKEYS 1           // the guest's protection keys are virtualized (see that section)
-#define GK_USER_SLOTS 256        // PML4 slots 0..255 are the 47-bit user address space
+#define GK_HAS_PKEYS 1     // the guest's protection keys are virtualized (see that section)
+#define GK_USER_SLOTS 256  // PML4 slots 0..255 are the 47-bit user address space
 
 typedef struct kvm_regs gk_regs;
 #define GK_REGS_SP(r) ((r).rsp)

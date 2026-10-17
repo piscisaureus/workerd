@@ -256,11 +256,11 @@ typedef struct {
   long tlb_flushes;    // full TLB flushes run on a vCPU, on every path: a wall raise that could not
                        // skip, a reflected mprotect/munmap, freed page tables (wall_flushed is the
                        // wall's share)
-  int flush_invpcid;  // the flush stub in use: 1 = INVPCID (one VM exit), 0 = CR4.PGE toggle
-                      // (three); always 0 on arm64, which flushes with TLBI VMALLE1
-  int host_regions;   // host-memory regions mapped (each is one entry in the registry)
-  long host_blocks;   // host-memory blocks allocated and not yet freed
-  int host_slots;     // host slots allocated and not yet freed (see gk_host_slot_alloc)
+  int flush_invpcid;   // the flush stub in use: 1 = INVPCID (one VM exit), 0 = CR4.PGE toggle
+                       // (three); always 0 on arm64, which flushes with TLBI VMALLE1
+  int host_regions;    // host-memory regions mapped (each is one entry in the registry)
+  long host_blocks;    // host-memory blocks allocated and not yet freed
+  int host_slots;      // host slots allocated and not yet freed (see gk_host_slot_alloc)
   int hostcall_handlers;  // hostcall indices with a handler registered (see gk_hostcall_register)
   long hostcalls;         // hostcalls that reached a handler, from either side
   int signal_fields;  // signal fields registered and not yet unregistered (see gk_signal_field_register)
