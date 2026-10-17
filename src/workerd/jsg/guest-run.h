@@ -70,6 +70,10 @@ namespace workerd::jsg {
 //     the moment of the fault (a held KJ mutex would deadlock its next locker). The test hook
 //     in ServiceWorkerGlobalScope::request() faults before any such state is taken, so the test
 //     does not exercise that case;
+//   - the flag a timer callback is running under
+//     (IoContext::TimeoutManagerImpl::TimeoutState::isRunning), which a fault inside a
+//     setTimeout callback leaves set; ~TimeoutState asserts that it is clear, so the next
+//     destruction of that state takes the process down rather than only the isolate;
 //   - the guard of any function-local static the frames were initializing, which stays owned by
 //     the thread, so this one costs more than the turn: the next turn to reach that static dies
 //     on "__cxa_guard_acquire detected recursive initialization", taking the process with it, if

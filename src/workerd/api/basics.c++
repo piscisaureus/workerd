@@ -956,6 +956,16 @@ kj::Own<void> AbortSignal::registerPendingCancellation(jsg::Lock& js, ReleasingC
       [&canceler](jsg::Lock& js, const kj::Exception& exception) { canceler.cancel(exception); });
 }
 
+kj::Exception AbortSignal::abortExceptionForCancellation(jsg::Lock& js) {
+  KJ_IF_SOME(e, maybeAbortException) {
+    return e.clone();
+  }
+  KJ_IF_SOME(r, deserializePendingReason(js)) {
+    return js.exceptionToKj(r);
+  }
+  KJ_UNREACHABLE;
+}
+
 AbortSignal::Cancellation AbortSignal::newCanceler(jsg::Lock& js) {
   if (getNeverAborts()) {
     return {
@@ -966,17 +976,8 @@ AbortSignal::Cancellation AbortSignal::newCanceler(jsg::Lock& js) {
 
   if (getAborted(js)) {
     // Already aborted: hand back a pre-canceled canceler; there is no future abort to hook.
-    auto exception = [&]() -> kj::Exception {
-      KJ_IF_SOME(e, maybeAbortException) {
-        return e.clone();
-      }
-      KJ_IF_SOME(r, deserializePendingReason(js)) {
-        return js.exceptionToKj(r);
-      }
-      KJ_UNREACHABLE;
-    }();
     return {
-      .canceler = kj::heap<ReleasingCanceler>(kj::mv(exception)),
+      .canceler = kj::heap<ReleasingCanceler>(abortExceptionForCancellation(js)),
       .registration = kj::Own<void>(),
     };
   }
