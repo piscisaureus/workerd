@@ -1691,6 +1691,12 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
     // then the area is range-checked and allowed so threads run.
     case SYS_rseq: WR(a[1], a[2]); return 1;
     case SYS_sched_setaffinity: RD(a[3], a[2]); return 1;
+    case SYS_tgkill:
+      // A signal to the calling thread itself: the thread's own state, like
+      // its mask below, and the handler runs on the host side of this exit
+      // as a timer's would. Any other target is another thread's or another
+      // process's, and is refused.
+      return a[1] == getpid() && a[2] == gettid_raw();
     case SYS_rt_sigprocmask: {
       // Changes only the calling vCPU thread's own mask; abseil also uses it
       // (with an invalid `how`, so no change) to probe whether an address is
