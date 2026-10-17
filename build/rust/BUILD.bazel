@@ -1,7 +1,15 @@
-load("@rules_rust//rust:defs.bzl", "rust_lint_config")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_lint_config")
 load(":sanitizer_toolchain.bzl", "sanitizer_rust_toolchain")
 
 exports_files(["build_std.sh"])
+
+# Runs rustc on one snippet of a wd_rust_compile_test (//build:wd_rust_compile_test.bzl) and
+# compares the errors with the snippet's annotations.
+rust_binary(
+    name = "compile_test_checker",
+    srcs = ["compile_test_checker.rs"],
+    visibility = ["//visibility:public"],
+)
 
 # Lint levels for every first-party crate, applied by the wd_rust_* macros: `unsafe` is confined
 # to the modules that ask for it, and whatever can fail returns a `Result` rather than panicking.

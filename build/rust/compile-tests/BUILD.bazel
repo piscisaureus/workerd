@@ -1,0 +1,21 @@
+load("//:build/wd_rust_compile_test.bzl", "wd_rust_compile_test")
+
+# Tests of the compile test checker itself, against std alone. `pass` snippets must compile,
+# `fail` snippets exercise the annotation syntax, and every `mismatch` snippet's annotations are
+# wrong in some way the checker must catch.
+
+wd_rust_compile_test(
+    name = "pass",
+    srcs = glob(["pass/*.rs"]),
+)
+
+wd_rust_compile_test(
+    name = "fail",
+    srcs = glob(["fail/*.rs"]),
+)
+
+wd_rust_compile_test(
+    name = "mismatch",
+    srcs = glob(["mismatch/*.rs"]),
+    expect_mismatch = True,
+)
