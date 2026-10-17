@@ -1242,6 +1242,48 @@ so a crossing a turn makes on every dereference belongs on that path.
   stubs taken across, called and disposed of in the caller's turn, and a
   third worker holding the first arena.
 
+  Cancelling a call that is still in flight is an ownership question rather
+  than a placement, and the windows do not answer it. An `AbortController`
+  abort is delivered inside the aborting turn, and a subrequest's teardown
+  reaches the callee's own memory: the callee's request is served from the
+  callee's turns, so the promise plumbing those turns build for it, the
+  request's `IoContext` and the `jsg::Ref`s its frame holds are in the
+  callee's arena, which the caller's turn cannot address. The frame itself is
+  not the problem -- `kj`'s `HttpClientAdapter` calls
+  `WorkerEntrypoint::request()` from the caller's turn, so the frame is
+  allocated in the caller's arena -- and what faults is the first thing the
+  frame owns that the callee's own turn built: the promise node its
+  `co_await context.run(...)` awaits. Placing that node would move the fault
+  to the next such object and no further.
+
+  Handing the frame to the callee's context, as a cross-context `IoOwn` is
+  handed to its own context, does not work either, because the frame is not
+  independently owned. `kj` drops a promise's dependency before its
+  attachments, and the frame borrows the request body pipe, the url and the
+  headers the caller attached above it, and `this`, which the caller's
+  `kj::HttpClient` owns; a frame deferred past those reads freed memory.
+  Taking out only what `kj::Canceler` destroys is no better: destroying the
+  wrapped promise before `cancel()` returns is the guarantee the class exists
+  to give, and what it destroys is an interior node of a graph whose other
+  parts stay alive, so deferring that node alone reorders the teardown
+  against live owners.
+
+  What can be deferred, because it reorders nothing, is the *delivery* of the
+  abort. `AbortSignal::wrapDeferred()` (`api/basics.h`) joins the
+  subrequest's response promise exclusively with a cancellation promise that
+  the abort rejects: all the aborting turn does is reject a fulfiller, and
+  `kj`'s exclusive join destroys the subrequest when it fires, which is on
+  the event loop, outside the guest, where every arena is addressable. That
+  is where `workerd` destroys a cancelled request whenever the abort does not
+  come from JS. The three subrequest wraps in `api/http.c++` take it -- the
+  response promise, the WebSocket response and the actor-retry attempt -- and
+  everything else keeps `wrap()`, whose synchronous cancellation a promise
+  that borrows state from whoever holds the registration still needs. The
+  cost is that the subrequest runs on until the event loop reaches the join.
+  `abort-signal-test.sh`'s `/fetch-abort` drives it end to end, and a
+  negative build, `--copt=-DWORKERD_GK_NEG_ABORT_DEFER`, puts `wrap()` back
+  under the subrequest wraps so that the teardown runs in the turn again.
+
   The list is not complete yet. There are further process-wide registries that
   grow from whichever isolate first needs an entry, and each one faults the
   next isolate that reads it.
@@ -1282,30 +1324,15 @@ so a crossing a turn makes on every dereference belongs on that path.
   the process then hung until killed. The cause is not known; the missing
   cross-vCPU shootdown (below) is a candidate, since the slot is reused.
 
-  Two parts of an in-process service binding do not work. One is request and
-  response *bodies*. The rest of a call crosses in shared memory, but body
-  bytes travel through a `kj` one-way pipe by pointer, and the copy runs in the
-  reading isolate's turn from the writing isolate's memory: the caller's
-  `r.text()` faults in `kj::AsyncPipe::tryRead` on the callee's heap region,
-  and a body the caller sends faults the callee's read the same way. That
-  needs a copy at the boundary, with the host pumping bodies through shared
-  buffers, which is a protocol change rather than a placement and is future
-  work.
-
-  The other is *cancelling* a subrequest that is still in flight, which
-  `abort-signal-test.sh`'s `/fetch-abort` does with an `AbortController`. The
-  abort drops the caller's promise in the caller's turn, and dropping it
-  destroys the chain the subrequest was built on, down to the
-  `WorkerEntrypoint::requestImpl` coroutine frame of the *callee*: that frame
-  is in the callee's arena, so the caller's turn faults in
-  `kj::_::CoroutineBase::destroy` on it and is condemned, and the host side
-  then dies on `IoContext`'s `expected !isRunning`, since the caller's
-  `IoContext` is left mid-turn. The four shared-heap windows the call has
-  cover what each side *builds* for the other; which side owns the teardown of
-  a cancelled call is a question they do not answer, and the frame's own locals
-  would still be the callee's wherever the frame itself were placed. So this
-  one is not a placement either. `rpc-arena-test.sh` does not reach it: it
-  lets every call it makes finish.
+  What does not work is request and response *bodies* across an in-process
+  service binding, and it is now the only part of such a call that does not.
+  The rest of a call crosses in shared memory, but body bytes travel through a
+  `kj` one-way pipe by pointer, and the copy runs in the reading isolate's turn
+  from the writing isolate's memory: the caller's `r.text()` faults in
+  `kj::AsyncPipe::tryRead` on the callee's heap region, and a body the caller
+  sends faults the callee's read the same way. That needs a copy at the
+  boundary, with the host pumping bodies through shared buffers, which is a
+  protocol change rather than a placement and is future work.
 
   Also not covered: BoringSSL's lazily allocated per-thread error state, which
   a `crypto` call in a turn would place on that turn's arena -- untested, but

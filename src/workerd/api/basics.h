@@ -693,6 +693,65 @@ class AbortSignal final: public EventTarget {
     }
   }
 
+  // Like wrap(), but the abort reaches `promise` through the event loop instead of inside the
+  // turn that aborts: the abort rejects a cancellation promise exclusively joined with
+  // `promise`, and the join destroys `promise` -- and everything it owns -- when it fires,
+  // which is on the event loop. A rejection is all the aborting turn does.
+  //
+  // This is for a promise that owns objects of another isolate, which is what a subrequest
+  // through an in-process service binding owns: the callee's request is served from the callee's
+  // own turns, so the plumbing those turns build for it is in the callee's heap arena, and no
+  // other isolate's turn can address that arena -- a turn that tears the subrequest down faults
+  // on it and is condemned (see experimental/guest-kernel/README.md). Outside the guest every
+  // arena is addressable, which is where this leaves the teardown.
+  //
+  // What it gives up is wrap()'s guarantee that the wrapped operation has stopped by the time
+  // the abort returns: the operation runs on until the event loop gets to the join. So this is
+  // not what wrap() does. A promise that borrows state from whoever holds the registration --
+  // a read from a stream that the holder owns, say -- must stop before that state goes away,
+  // and must keep using wrap().
+  template <typename T>
+  kj::Promise<T> wrapDeferred(jsg::Lock& js, kj::Promise<T> promise) {
+    if (getNeverAborts()) {
+      // This signal can never abort, so there is nothing to hook up.
+      return kj::mv(promise);
+    }
+
+    if (getAborted(js)) {
+      // Already aborted: reject without ever waiting on `promise`, as wrap() does.
+      return abortExceptionForCancellation(js);
+    }
+
+    auto paf = kj::newPromiseAndFulfiller<T>();
+
+    // The registration is attached to the result, so it is dropped once the result is gone and
+    // the action can no longer run; the fulfiller it holds is then one whose promise is gone,
+    // which rejects nothing.
+    auto registration = addAbortAction(js,
+        [fulfiller = kj::mv(paf.fulfiller)](jsg::Lock&, const kj::Exception& exception) mutable {
+      fulfiller->reject(exception.clone());
+    });
+    return promise.exclusiveJoin(kj::mv(paf.promise)).attach(kj::mv(registration));
+  }
+
+  template <typename T>
+  static kj::Promise<T> maybeCancelWrapDeferred(
+      jsg::Lock& js, kj::Maybe<jsg::Ref<AbortSignal>>& signal, kj::Promise<T> promise) {
+    KJ_IF_SOME(s, signal) {
+#ifdef WORKERD_GK_NEG_ABORT_DEFER
+      // A negative build, never shipped: the subrequest wraps take wrap() again, so an abort
+      // tears the subrequest down inside the turn that aborts it. The guest kernel's
+      // abort-signal-test.sh must then fail on /fetch-abort; this is the check that the test
+      // tests where a cancelled subrequest is destroyed.
+      return s->wrap(js, kj::mv(promise));
+#else
+      return s->wrapDeferred(js, kj::mv(promise));
+#endif
+    } else {
+      return kj::mv(promise);
+    }
+  }
+
   // A canceler hooked up to this signal, plus the RAII registration keeping the hook alive.
   // Returned by newCanceler() for native consumers that need more than promise wrapping
   // (e.g. ReleasingCanceler::Listener callbacks).
@@ -950,6 +1009,11 @@ class AbortSignal final: public EventTarget {
   // Synchronously check if an abort reason was sent over RPC
   bool hasPendingReason();
   kj::Maybe<jsg::JsValue> deserializePendingReason(jsg::Lock& js);
+
+  // The exception a cancellation hands an already-aborted signal's consumer: the one the abort
+  // settled, or the one derived from a reason that arrived over RPC and has not been
+  // deserialized yet. Only valid once getAborted() is true.
+  kj::Exception abortExceptionForCancellation(jsg::Lock& js);
 
   // Wait for abort over RPC.
   // We invoke this once at least one event handler is attached to the AbortSignal

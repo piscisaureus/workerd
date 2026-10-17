@@ -607,8 +607,9 @@ at.
    `kj::MutexGuarded<kj::Maybe<kj::Function<void(jsg::Lock&, const
    kj::Exception&)>>>`, shared between the signal and one consumer. The
    consumer's RAII handle is held by (or attached to) objects the owning
-   request destroys -- `AbortSignal::wrap` attaches the `Cancellation` to the
-   wrapped `kj::Promise`, which is how `fetch(url, {signal})` registers -- so
+   request destroys -- `AbortSignal::wrap` and `wrapDeferred` attach the
+   registration to the wrapped `kj::Promise`, which is how
+   `fetch(url, {signal})` registers -- so
    it is dropped on the event loop, outside the isolate lock and outside the
    guest. That drop did two things in memory a turn can write: it took the
    cell's mutex, and it destroyed the `kj::Function`, which is a call through
