@@ -2619,11 +2619,21 @@ class ExternalMemoryTarget: public IsolateLiveness {
  private:
   void maybeDeferAdjustment(ssize_t amount) const;
   void adjustNow(Lock& js, ssize_t amount) const;
+  // Applies `amount` to `isolate`, which the calling thread holds locked, and has the isolate
+  // collect garbage when what is reported through this target has grown past a soft limit; see
+  // the implementation for why that is done here rather than left to V8.
+  void applyLocked(v8::Isolate* isolate, int64_t amount) const;
 
   // Tracks changes to external memory that were applied from a thread that did not hold the
   // isolate lock. These will be applied the next time the lock is taken.
   mutable std::atomic<int64_t> pendingExternalMemoryUpdate = {0};
   static_assert(std::atomic<int64_t>::is_always_lock_free);
+
+  // What is reported through this target at present, and the least that has been since the
+  // last collection applyLocked() requested. Both change only under the isolate lock.
+  mutable std::atomic<int64_t> reported = {0};
+  mutable std::atomic<int64_t> reportedLowWater = {0};
+  mutable std::atomic<bool> collecting = {false};
 
   friend class ExternalMemoryAdjustment;
 };

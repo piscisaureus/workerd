@@ -47,6 +47,17 @@ class HeapArena;
 // nothing. Destroying the HeapArena discards every allocation still in it, and a later free()
 // of one of them is undefined: nothing that outlives the isolate may be allocated under its
 // lock without a SharedHeapScope (below).
+//
+// The region is a fixed reservation, so what bounds the isolate is its peak C++ heap, not its
+// turnover: jemalloc recycles what the isolate frees, from its dirty extents and, after the
+// purge jemalloc makes of an arena whose last thread leaves it (arena_migrate() in jemalloc.c,
+// on every HeapArenaScope exit), from its retained ones, so the region's high-water mark
+// tracks the most the isolate has had allocated at once. An isolate that outgrows the region
+// faults on the allocation it cannot have and is condemned. What makes the peak is therefore
+// what the isolate holds until a garbage collection frees it -- C++ memory owned by JS objects
+// -- and such memory must be reported to V8 (ExternalMemoryAdjustment in jsg.h, which collects
+// past a soft limit) so that the collection comes before the region is spent rather than when
+// V8's own heuristics, which see only the JS heap, happen to run one.
 class HeapArena final {
  public:
   // Creates an arena over [begin, end), page-aligned, reserved as inaccessible anonymous memory

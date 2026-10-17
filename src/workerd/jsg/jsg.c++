@@ -558,12 +558,7 @@ void ExternalMemoryTarget::maybeDeferAdjustment(ssize_t amount) const {
     // making such a change, and that's us, and we're not.
     KJ_ASSERT(v8::Locker::IsLocked(target));
 
-    // We use AdjustAmountOfExternalAllocatedMemoryImpl() instead of ExternalMemoryAccounter
-    // because we explicitly want external memory to be allowed to live beyond the isolate
-    // in some cases. The Impl variant bypasses the destructor check that
-    // ExternalMemoryAccounter enforces (requiring adjustment to return to zero).
-    // See patches/v8/0031-Expose-AdjustAmountOfExternalAllocatedMemoryImpl.patch
-    target->AdjustAmountOfExternalAllocatedMemoryImpl(amount);
+    applyLocked(target, amount);
   } else {
     // We don't hold the isolate lock. Instead, record the adjustment to be applied the next time
     // the isolate lock is acquired.
@@ -579,7 +574,55 @@ void ExternalMemoryTarget::adjustNow(Lock& js, ssize_t amount) const {
   }
 #endif
   if (amount == 0) return;
-  js.v8Isolate->AdjustAmountOfExternalAllocatedMemoryImpl(amount);
+  applyLocked(js.v8Isolate, amount);
+}
+
+namespace {
+// How far the memory reported through a target may grow past the least it has been since the
+// last collection before the isolate collects garbage: V8's kExternalAllocationSoftLimit.
+//
+// V8 answers the memory an embedder reports in two ways. Past this soft limit it starts
+// incremental marking, and workerd runs V8 with incremental marking off (see setup.c++), which
+// makes that answer nothing. Past its old-generation limits it collects, but those are sized
+// from the heap limit the isolate was given, and in a workerd that gives none, from the
+// machine: gigabytes. In between, a worker that holds large C++ objects until their JS owners
+// are collected -- a Response built from a 4 MiB buffer keeps its copy of the buffer until the
+// Response is -- and allocates little else accumulates them unbounded, since a scavenge frees
+// only what is still young and nothing else makes V8 collect. With a shared heap that is bloat;
+// with a per-isolate heap arena (heap-arena.h), whose region is fixed, it exhausts the isolate's
+// memory. So the soft limit is applied here, the way V8 would apply it.
+constexpr int64_t EXTERNAL_MEMORY_SOFT_LIMIT = 64 * 1024 * 1024;
+}  // namespace
+
+void ExternalMemoryTarget::applyLocked(v8::Isolate* isolate, int64_t amount) const {
+  // We use AdjustAmountOfExternalAllocatedMemoryImpl() instead of ExternalMemoryAccounter
+  // because we explicitly want external memory to be allowed to live beyond the isolate
+  // in some cases. The Impl variant bypasses the destructor check that
+  // ExternalMemoryAccounter enforces (requiring adjustment to return to zero).
+  // See patches/v8/0031-Expose-AdjustAmountOfExternalAllocatedMemoryImpl.patch
+  isolate->AdjustAmountOfExternalAllocatedMemoryImpl(amount);
+
+  int64_t total = reported.fetch_add(amount, std::memory_order_relaxed) + amount;
+  int64_t low = reportedLowWater.load(std::memory_order_relaxed);
+  if (total < low) {
+    reportedLowWater.store(total, std::memory_order_relaxed);
+  } else if (total - low > EXTERNAL_MEMORY_SOFT_LIMIT &&
+      !collecting.load(std::memory_order_relaxed)) {
+    // The low-water mark is reset to where the collection was asked for rather than to what it
+    // leaves behind: what the collection frees lowers it as the frees are reported, and what it
+    // cannot free is live, and grows the mark so that the next collection waits for another
+    // soft limit's worth of growth, as V8's does.
+    reportedLowWater.store(total, std::memory_order_relaxed);
+    // A collection runs finalizers, which report the memory they free through this target; the
+    // flag keeps that from asking for another collection from inside this one.
+    collecting.store(true, std::memory_order_relaxed);
+    KJ_DEFER(collecting.store(false, std::memory_order_relaxed));
+    // Critical pressure is the one level V8 acts on without incremental marking: a full,
+    // memory-reducing collection on the spot (the thread holds the isolate locked), a second
+    // one if the first found a lot to free, and V8's caches of optimization jobs, compiled
+    // sources and pooled pages dropped first.
+    isolate->MemoryPressureNotification(v8::MemoryPressureLevel::kCritical);
+  }
 }
 
 ExternalMemoryAdjustment ExternalMemoryTarget::getAdjustment(size_t amount) const {
@@ -589,7 +632,7 @@ ExternalMemoryAdjustment ExternalMemoryTarget::getAdjustment(size_t amount) cons
 void ExternalMemoryTarget::applyDeferredMemoryUpdate() const {
   int64_t amount = pendingExternalMemoryUpdate.exchange(0, std::memory_order_relaxed);
   if (amount != 0) {
-    isolate.load(std::memory_order_relaxed)->AdjustAmountOfExternalAllocatedMemoryImpl(amount);
+    applyLocked(isolate.load(std::memory_order_relaxed), amount);
   }
 }
 
