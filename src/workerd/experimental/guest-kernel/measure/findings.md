@@ -986,3 +986,275 @@ the optimized build, 109 us against 237 us; what changes is everything it is
 measured against. **Any performance figure for the guest kernel taken on an
 unoptimized build understates its relative cost by roughly a factor of four**,
 and the figures that have been guiding this work were taken that way.
+
+## What the body relay costs
+
+### The question
+
+A request or response body crosses an in-process service binding through a `kj`
+one-way pipe whose two ends are held by different isolates, and the pipe copies
+between the writer's buffer and the reader's in whichever of the two operations
+arrives second. Under per-isolate heap arenas that copy runs in one isolate's
+turn over a buffer in the other isolate's arena, which the turn cannot address,
+so `ReadRelay` (`io/worker-interface.c++`) stands at the reading end and makes
+every operation on the pipe from the event loop: a read yields to the event
+loop, reads from the pipe into a 64 KiB staging buffer the host allocates, and
+copies into the reader's buffer from there. The cost was stated as one more copy
+and one event-loop turn per body chunk, plus the loss of the synchronous read
+fast path, and never measured. Bodies are a hot path, so this is the number.
+
+### Why the obvious A/B is the wrong experiment
+
+`bodiesRelayed()` answers `jsg::heapArenasAvailable()`, so the one configuration
+that needs the relay is the one in which the bare pipe faults: the negative
+build `--copt=-DWORKERD_GK_NEG_BODY_RELAY` condemns the reading isolate, which
+makes it a check that the correctness test tests something and not a performance
+baseline. Comparing the relay against a build with no arenas at all would price
+the relay together with jemalloc and per-isolate placement, which is three
+changes at once.
+
+So the relay is varied on its own, in configurations where heap arenas are off
+and the bare pipe is therefore safe, through a temporary knob in
+`bodiesRelayed()` that reads the environment:
+
+    static const bool forced = ::getenv("WORKERD_GK_FORCE_BODY_RELAY") != nullptr;
+    return forced || jsg::heapArenasAvailable();
+
+It is not committed, because it is a configuration nobody should ship. An
+environment variable rather than a `--copt` so that **one binary serves both
+arms** and no build difference can enter the delta. The knob logs which arm it
+is in on its first call, and since `bodiesRelayed()`'s only two callers are the
+two install sites in `asHttpClient()`, that log is the whole of the control;
+every arm below was confirmed by it (`f = false`/`true`,
+`heapArenasAvailable() = false`/`true`).
+
+### Method
+
+Three configurations, all `-c opt`, the VMSCAPE mitigation reading `Mitigation:
+IBPB before exit to userspace` and the host's `halt_poll_ns` 200000 before and
+after every run (`bodyrelay.py` records both):
+
+| arm | binary | guest kernel | heap arenas | relay |
+| --- | ------ | ------------ | ----------- | ----- |
+| **N** off / **N** on | jemalloc (`--//src/workerd/server:allocator=jemalloc`), thread cache on | off | off | off / forced on |
+| **G** off / **G** on | plain (no jemalloc, so arenas cannot exist) | on, `GK_RUNNER=resident GK_RUNNER_PIN=other`, sleeping | off | off / forced on |
+| **A** | jemalloc, thread cache off | on, resident, sleeping | **on** | on, by `heapArenasAvailable()` |
+
+N and G are each a paired comparison: the two arms are interleaved launch by
+launch, so nothing the machine does over the hour lands on one arm rather than
+the other. A has no second arm, because turning the relay off there is the
+configuration that faults; what A measures is what a deployment pays, and the
+relay's share of it is taken from N and G.
+
+A front worker fetches a back worker through a service binding and keeps all the
+size-dependent work inside that binding, answering the client with a byte count,
+so the client's traffic is the same at every body size and in both directions.
+The body is a cached `Uint8Array`, so no size-dependent encoding enters either
+arm. The routes: `/down/<n>`, the back worker answers with n bytes which the
+front reads with `arrayBuffer()`; `/up/<n>`, the front sends n bytes which the
+back reads with `arrayBuffer()`; `/upthru/<n>`, the front sends n bytes, the back
+returns them unread as its response body and the front reads that, so both
+crossings are `kj` pumps rather than reads -- this is the path whose synchronous
+fast path the relay gives up, since `pumpTo()`'s loop in
+`api/streams/internal.c++` calls `tryReadSync()` unconditionally and the pipe
+answers it whenever a writer is blocked with enough buffered;
+`/downread/<n>`, read chunk by chunk through a JS reader; and
+`/upchunk/<n>/<c>`, n bytes sent as n/c chunks from a JS stream, which is what
+tells a per-chunk cost from a per-request one. One connection for latency, eight
+for throughput; `httpbench`; the server tasksetted to one CCD (`12-17,36-41`) so
+that the owner and its runner always share a last-level cache, and the client to
+another (`0-5,24-29`). Six launches per arm in the focused run below and three in
+the full sweep (`bodyrelay.py`; `results/relay-focus-*.json`,
+`results/relay-{native,gk,arena}.json`).
+
+### 1. What the relay costs, by itself
+
+Six launches per arm, one connection, p50 per launch; the delta column is the
+paired difference taken launch by launch, with its spread over the six.
+
+| one connection, p50       | N off  | N on   | N delta, paired   | G off  | G on   | G delta, paired  |
+| ------------------------- | ------ | ------ | ----------------- | ------ | ------ | ---------------- |
+| response body, 0 B        | 75.7   | 77.2   | +1.4 (-0.2, +2.4) | 87.3   | 87.7   | +0.5 (-0.6, +1.8) |
+| response body, 64 KiB     | 119.0  | 122.3  | +3.5 (+1.3, +4.8) | 166.5  | 170.1  | +4.1 (+0.8, +6.9) |
+| response body, 4 MiB      | 1609.9 | 1642.8 | +32 (+9, +74)     | 4602.8 | 4664.1 | +138 (-21, +351)  |
+| request body, 0 B         | 84.9   | 85.9   | +0.7 (+0.2, +3.3) | 91.3   | 92.1   | +0.5 (+0.1, +2.0) |
+| request body, 64 KiB      | 126.1  | 131.2  | +4.1 (+2.6, +7.1) | 145.7  | 147.9  | +2.4 (+0.7, +2.8) |
+| request body, 4 MiB       | 1185.9 | 1220.5 | +39 (see caveat)  | 1717.2 | 1763.5 | +42 (+37, +54)    |
+| pumped both ways, 0 B     | 78.5   | 79.4   | +1.2 (-1.6, +2.9) | 87.9   | 88.8   | +0.6 (-0.4, +1.9) |
+| pumped both ways, 64 KiB  | 117.6  | 123.1  | +5.8 (+4.7, +8.2) | 134.7  | 138.5  | +3.9 (+2.5, +5.4) |
+| pumped both ways, 4 MiB   | 1133.6 | 1260.1 | +112 (+80, +170)  | 1668.0 | 1748.6 | +84 (+69, +98)    |
+
+**About a microsecond per crossing, plus eight to fourteen microseconds per
+mebibyte.** A crossing that carries no body at all costs 0.5 to 1.4 us, and the
+spread of the six launches straddles zero in four of the six bodiless cells, so
+one microsecond is the resolution rather than the figure. A 64 KiB body costs 2
+to 6 us. A 4 MiB body costs, per relayed crossing, 42 us in the cleanest cell (G
+request, 37 to 54 over six launches) and 42 us again in the second cleanest (G
+pumped, 84 us over two relayed crossings, 69 to 98), which is 10.5 us per MiB;
+the N cells put the same quantity at 8 us per MiB (response) and 14 (pumped).
+Call it 8 to 14 us per MiB per crossing and do not read the ends of that range as
+a difference between the paths.
+
+**The cost is per byte, not per chunk, and the commit message's "per body
+chunk" is wrong.** The decisive cell is a fixed 1 MiB body delivered as a
+varying number of JS stream chunks (full sweep, N, one connection, three
+launches): 1024 chunks of 1 KiB costs +33 us, 128 chunks of 8 KiB +35, 16 chunks
+of 64 KiB +19 to +61 depending on the estimator, and 4 chunks of 256 KiB +113.
+Two hundred and fifty-six times as many chunks does not cost more; it costs
+slightly less. The reason is in the code: the relay's unit is a `tryRead` call,
+not a body chunk, and workerd's readers ask for 128 KiB to 512 KiB at a time
+(`AllReader::read`'s `amountToRead` in `api/streams/internal.c++`), so the number
+of relay calls is set by the reader's buffer and the 64 KiB staging cap rather
+than by how the writer chunked the body. The caveat on that cell is that the four
+chunk sizes have wildly different baselines (6329 us at 1 KiB against 491 us at
+256 KiB, the JS stream machinery), so these are deltas against different
+quantities; the direction is what the cell establishes, and the direction is
+unambiguous.
+
+**There is no step at the 64 KiB staging buffer.** 64 KiB, one staging buffer's
+worth, costs 3.5 us; 256 KiB, four buffers' worth, costs 6.6 (full sweep, N) --
+not four times as much. Nor is there a knee anywhere between 0 and 4 MiB.
+
+**The extra event-loop turn is not where the cost is.** This is what the G arm
+is for: under the guest kernel every turn boundary is real work, and the relay's
+`co_await kj::yield()` is exactly one more of them per read. G's deltas are the
+same as N's -- 0.5 against 1.4 us bodiless, 2.4 against 4.1 at 64 KiB, 42
+against 39 at 4 MiB on the request path -- so the yield costs nothing this
+measurement can see, in the one configuration where it should have been
+expensive. What the relay costs is the second copy. That it costs only 8 to 14
+us per MiB rather than the 40 to 80 a second pass over the body would suggest is
+the staging buffer's doing: at 64 KiB it stays in cache, so the DRAM traffic is
+unchanged and only the cache-resident copy work is added.
+
+**The synchronous read fast path is not measurably lost either.** The `upthru`
+route is the pump path, where `tryReadSync()` is called unconditionally and the
+relay always declines it; per relayed crossing it costs 42 us per 4 MiB under G,
+which is the same as the request path's 42. So the fast path's loss is inside the
+noise -- plausibly because a pipe answers `tryReadSync()` only when a writer
+happens to be blocked with at least `minBytes` buffered at the instant of the
+read, which is not the common case for a body being produced.
+
+**Throughput.** At eight connections (full sweep, three launches) the rate falls
+by 0 to 9% on bodies of 64 KiB and up and is unchanged on empty bodies
+(13,859 against 13,827 requests per second). The consistent cells are the N
+request path at 64 and 256 KiB, -8.2% and -8.7%; elsewhere the sign goes both
+ways between launches and under the guest kernel one cell reads +18%. Only the
+direction and the order of magnitude are reliable.
+
+### 2. What a deployment pays, and how little of it is the relay
+
+The same three rows, one connection, p50 per launch, six launches (`relay-focus-*.json`):
+
+| one connection, p50     | N: no guest kernel, no arenas, no relay | G: guest kernel, no arenas, no relay | A: guest kernel, arenas, relay |
+| ----------------------- | --------------------------------------- | ------------------------------------ | ------------------------------ |
+| response body, 0 B      | 75.5-76.4                               | 86.7-87.7                            | 109.8-134.4                    |
+| response body, 64 KiB   | 117.4-120.8                             | 163.3-166.6                          | 161.9-238.7                    |
+| response body, 4 MiB    | 1599-1621                               | 4208-4657                            | 2868-5559                      |
+| request body, 4 MiB     | 1163-2161                               | 1712-1726                            | 1781-4304                      |
+| pumped both ways, 4 MiB | 1117-1151                               | 1658-1672                            | 1827-4349                      |
+
+**The relay is exonerated.** A bodiless crossing costs 76 us with none of this
+machinery and 110 to 134 us with all of it; a 4 MiB response body costs 1610 us
+and 2868 to 5559. Against gaps of 33 to 59 us and 1258 to 3950 us, the relay's
+own contribution is 1.4 us and 32 us: **about 1 to 4% of what the body path
+costs a deployment, and about 1% at 4 MiB.** Whatever is expensive about a body
+crossing an in-process binding under the guest kernel with heap arenas, the
+relay is not it. The relay's share is carried over from the N and G arms, which
+is sound to the extent that its cost is configuration-independent -- and N and G
+agree on it to within the measurement, which is the evidence for that.
+
+**But A moves three things at once and only the relay's share is isolated.**
+A differs from N in the guest kernel, in per-isolate placement, in jemalloc with
+its thread cache off, and in the relay; G sits between them but reaches it by a
+different route, since the plain binary is also a different allocator
+(tcmalloc). So the ladder orders the configurations and does not apportion them.
+The bodiless column is the one place an apportionment is tempting -- 76 to 87 us
+is +11 us for the guest kernel and 87 to 110-134 is the rest for arenas plus the
+allocator -- and even there the +11 carries the allocator change with it.
+
+**And A is bimodal between launches by a factor of up to 1.8, which no
+apportionment survives.** Two of the six A launches landed in a fast mode and
+four in a slow one, consistently across all nine routes at once: 110-113 against
+132-134 us bodiless, 2868-2869 against 5089-5559 us on a 4 MiB response,
+1781-1790 against 4272-4304 on a 4 MiB request. In the fast mode A's 4 MiB
+response is *faster* than G's, which is to say faster with per-isolate arenas
+than without them -- so the claim that per-isolate placement carries the large
+per-byte cost is **not** established by these numbers, and neither is its
+opposite. The earlier full sweep's three A launches all happened to land in the
+slow mode (133.0, 133.3, 133.1 us bodiless; 5321, 5391, 5497 us at 4 MiB), which
+is why they looked tight at 3.4 times N; read as a 3.4 times figure that is one
+mode of a two-mode distribution. N and G are not bimodal in the same way, so
+this is a property of the jemalloc-with-arenas arm and its cause is not known
+here. What the per-byte cost is attributable to is therefore open, with one
+observation that bears on it: the guest-kernel arm G has arenas **off**, and a
+4 MiB response body already costs 2.6 to 2.9 times N there, so whatever that
+cost is it is not specific to per-isolate placement.
+
+**What would separate the allocator from placement.** Four cells, in order of
+cost:
+
+1. The plain binary with the guest kernel **off**. It needs no knob at all, and
+   it calibrates the allocator step that currently moves with the guest kernel
+   between N and G. It was not run here, and it should have been.
+2. The jemalloc binary with the guest kernel on and arenas suppressed, which
+   holds the allocator fixed across the guest-kernel step. `heapArenasAvailable()`
+   is false exactly when jemalloc's thread cache is on, and
+   `checkHeapArenaSupport()` makes that combination fatal under the guest kernel,
+   so this cell needs a temporary knob demoting that `KJ_REQUIRE` to a warning.
+3. The jemalloc binary with the thread cache off but no per-isolate arena
+   created, which separates "jemalloc without its thread cache" -- every
+   allocation taking an arena bin lock -- from placement itself. That needs a
+   knob that leaves the per-isolate `HeapArena` uncreated while the thread
+   cache stays off.
+4. All of them over at least eight launches, reported per launch rather than as
+   a median, since two launches in six moved everything here by 1.8 times and a
+   three-launch median hid it completely.
+
+### Caveats
+
+- **The relay's cost is measured where the relay is not needed.** Both paired
+  arms have heap arenas off, which is the point -- it is the only way to run the
+  bare pipe safely -- but it means the relay was never priced in the arena
+  configuration it exists for. The N and G arms agreeing is the argument that it
+  transfers; it is an argument, not a measurement.
+- **The 4 MiB cells are the loose ones.** N's response body at 4 MiB spreads its
+  paired delta over +9 to +74 us and G's over -21 to +351; the figure quoted for
+  4 MiB rests on the two cells whose six launches agreed (G request, +37 to +54;
+  G pumped, +69 to +98). N's **request** body at 4 MiB is worse than loose: its
+  baseline is bimodal between 1163 and 2161 us within one arm, and one launch's
+  paired delta came out at -945 us, so that cell says nothing and is quoted only
+  for its median.
+- **One 64 KiB cell was unstable in the three-launch sweep**: the response body's
+  relay-off arm spread 175 to 204 us, which is why its delta read +14 us there
+  against +4.1 in the six-launch run. The six-launch figure is the one to use.
+- **The request-against-response asymmetry at zero bytes does not reproduce.**
+  The three-launch sweep had +0.6 us on the response side and +2.7 on the
+  request side, which would have been a sensible story -- the request body's
+  relay adds a `BodyRelayService` coroutine per subrequest while the response
+  body's adds a `.then()`. Over six launches the ordering reverses, +1.4 against
+  +0.7, and both spreads straddle zero. There is a fixed cost of about a
+  microsecond and this measurement does not resolve which direction pays more
+  of it.
+- **The relay caps every read at 64 KiB**, so a JS consumer that would have been
+  handed a larger chunk is handed 64 KiB and makes more loop iterations. That is
+  from reading `ReadRelay::relay()` and `AllReader::read()`, not from counting
+  iterations here, and it is the likely reason the `downread` route's delta
+  (+3.5 us at 64 KiB, +34 to +66 at 1 MiB) runs above the `arrayBuffer()` route's.
+- **The absolute latencies are not comparable with section 2's.** The front
+  worker parses a URL and reads the body into a buffer, and the client is pinned
+  to another CCD, which findings above price at about 10 us; a bodiless crossing
+  here is 76 us where section 2's is 47. Only the within-arm deltas and the
+  ordering of the three configurations are claimed.
+- **The synchronous fast path in `AllReader::read()` is behind an autogate**
+  (`stream-controller-sync-fast-paths`), which is off in these runs, so on the
+  `arrayBuffer()` routes the relay forgoes nothing that was switched on. The
+  pump loop's `tryReadSync()` is not gated and is the one that was really given
+  up; that is the `upthru` route, and it showed no cost.
+- **Three configurations, one machine, one kernel, one worker shape.** The
+  bodies are a single flat `Uint8Array` or a JS stream of them; a real body
+  arrives over a socket in whatever chunks the network gave it, and the number of
+  `tryRead` calls -- which is the relay's real unit -- would follow from that
+  rather than from this harness.
+- The six probes were not re-run, and no compiled output changed: the knob was
+  reverted before committing and the commit touches only `measure/` and this
+  document.
