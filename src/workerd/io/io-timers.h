@@ -85,6 +85,13 @@ class TimeoutManager {
   virtual size_t getTimeoutCount() const = 0;
   virtual kj::Maybe<kj::Date> getNextTimeout() const = 0;
   virtual void cancelAll() = 0;
+
+  // The turn running a timeout callback was abandoned without its frames returning (a guest fault
+  // in the experimental guest kernel, see jsg::runInGuest), so the deferred action that unmarks
+  // the state the callback was running on never ran. No callback is running any more, so the
+  // mark is cleared here instead. Only the fault path calls this; a turn that returns or unwinds
+  // clears the mark itself.
+  virtual void abandonRunningCallback() = 0;
 };
 
 }  // namespace workerd

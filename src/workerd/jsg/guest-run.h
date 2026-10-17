@@ -65,7 +65,10 @@ namespace workerd::jsg {
 //   that could release it. Known leaks per faulted turn:
 //   - for a JS turn, the IoContext::PendingEvent that IoContext::runImpl's turn registers, so
 //     that IoContext is never seen as idle by hang detection (moot once it is aborted and
-//     destroyed), and the limit enforcer's enterJs() scope, so it never sees the matching exit;
+//     destroyed), and the limit enforcer's enterJs() scope, so it never sees the matching exit.
+//     The running mark a timeout callback's TimeoutState holds is the one such leak the fault
+//     path does clear, because ~TimeoutState asserts on it when the IoContext is destroyed and
+//     that would take the process down (see runJsTurn in io/io-context.c++);
 //   - any kj::Own / jsg::Ref / IoOwn / file descriptor / KJ mutex lock the C++ frames held at
 //     the moment of the fault (a held KJ mutex would deadlock its next locker). The test hook
 //     in ServiceWorkerGlobalScope::request() faults before any such state is taken, so the test

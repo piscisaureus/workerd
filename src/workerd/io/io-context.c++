@@ -95,6 +95,8 @@ class IoContext::TimeoutManagerImpl final: public TimeoutManager {
     timeoutTimes.clear();
   }
 
+  void abandonRunningCallback() override;
+
  private:
   struct IdAndIterator {
     TimeoutId id;
@@ -856,12 +858,22 @@ IoContext::TimeoutManagerImpl::TimeoutState::~TimeoutState() {
 }
 
 void IoContext::TimeoutManagerImpl::TimeoutState::trigger(Worker::Lock& lock) {
+  // The mark is cleared when the callback returns or unwinds; when the turn running it is
+  // abandoned instead, by abandonRunningCallback().
   isRunning = true;
   auto cleanupGuard = kj::defer([&] { isRunning = false; });
 
   // Now it's safe to call the user's callback.
   KJ_IF_SOME(function, params.function) {
     (function)(lock);
+  }
+}
+
+void IoContext::TimeoutManagerImpl::abandonRunningCallback() {
+  // At most one callback runs at a time, but the mark is cleared wherever it stands rather than
+  // stopping at the first, so the state ~TimeoutState asserts on holds for every entry.
+  for (auto& [id, state]: timeouts) {
+    state.isRunning = false;
   }
 }
 
@@ -1439,12 +1451,8 @@ void IoContext::runInContextScope(Worker::LockType lockType,
   });
 }
 
-namespace {
-
-// Run one JS turn for `context` on its locked worker, inside the guest kernel when it is enabled
-// and directly otherwise (see jsg::runInGuest).
 template <typename Func>
-void runJsTurn(IoContext& context, Worker::Lock& workerLock, Func&& body) {
+void IoContext::runJsTurn(Worker::Lock& workerLock, Func&& body) {
   // The thread-locals the host reads after the turn, saved in this frame -- read-only to the
   // guest under the host-frame wall -- and put back once the guest has returned, whatever the
   // turn left in them. A nested turn runs this at ring 3 as well, where it is the turn's own
@@ -1461,11 +1469,19 @@ void runJsTurn(IoContext& context, Worker::Lock& workerLock, Func&& body) {
     // IoContext so its pending work is cancelled instead of re-entering the isolate. The
     // exception then fails the current request.
     workerLock.getWorker().getIsolate().condemn(e.clone());
-    context.abort(e.clone());
+    abort(e.clone());
+#ifndef WORKERD_GK_NEG_TIMEOUT_RUNNING
+    // The turn's frames never returned, so the marks they held through deferred actions were
+    // never cleared. The one the host later asserts on is a timeout callback's: TimeoutState::
+    // trigger() marks its state running for the callback's duration and ~TimeoutState asserts
+    // the mark is gone, which it checks when this IoContext is destroyed. No callback is running
+    // any more, so the mark is cleared here. (WORKERD_GK_NEG_TIMEOUT_RUNNING is a negative-test
+    // build, never shipped: the mark stands, and fault-timeout-test.sh must then fail -- the
+    // process dies on that assert when the faulted request's IoContext is destroyed.)
+    timeoutManager->abandonRunningCallback();
+#endif
   });
 }
-
-}  // namespace
 
 void IoContext::runImpl(Runnable& runnable,
     Worker::LockType lockType,
@@ -1637,7 +1653,7 @@ void IoContext::runImpl(Runnable& runnable,
   };
 
   runInContextScope(lockType, kj::mv(inputLock),
-      [&](Worker::Lock& workerLock) { runJsTurn(*this, workerLock, [&]() { turn(workerLock); }); });
+      [&](Worker::Lock& workerLock) { runJsTurn(workerLock, [&]() { turn(workerLock); }); });
 }
 
 static constexpr auto kAsyncIoErrorMessage =

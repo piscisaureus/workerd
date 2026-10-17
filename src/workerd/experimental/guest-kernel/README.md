@@ -32,6 +32,14 @@ isolate's JS turn at guest ring 3.
 - `fault-test.sh` / `fault-test.capnp` — end-to-end check against a built
   workerd that a fault inside the guest during a JS turn fails only that
   request and condemns only that isolate, and the process keeps serving.
+- `fault-timeout-test.sh` / `fault-timeout-test.capnp` /
+  `fault-timeout-test.js` — the same fault taken inside a `setTimeout`
+  callback, the turn whose abandoned frames hold host state the host asserts
+  on afterwards (the timeout's running mark, checked when the request's
+  IoContext is destroyed). The faulted request fails, the isolate is
+  condemned, the IoContext is torn down, and the process keeps serving.
+  Negative build: `--copt=-DWORKERD_GK_NEG_TIMEOUT_RUNNING`, where the fault
+  path leaves the mark standing and the process dies on the assert.
 - `surface-test.sh` / `surface-test.capnp` / `surface-test.js` / `add.wasm` /
   `oob.wasm` — end-to-end check against a built workerd that a broad V8 surface
   (Wasm including an out-of-bounds trap, WebCrypto, irregexp and a JIT-heavy

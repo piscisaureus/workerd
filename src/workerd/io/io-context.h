@@ -1281,6 +1281,11 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
     using Exceptional = IoContext_Runnable_Exceptional;
     virtual void run(Worker::Lock& lock) = 0;
   };
+  // Runs one JS turn for this context on its locked worker, inside the guest kernel when it is
+  // enabled and directly otherwise (see jsg::runInGuest). Defined with runImpl(), its only caller.
+  template <typename Func>
+  void runJsTurn(Worker::Lock& workerLock, Func&& body);
+
   void runImpl(Runnable& runnable,
       Worker::LockType lockType,
       kj::Maybe<InputGate::Lock> inputLock,

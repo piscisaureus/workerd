@@ -422,6 +422,12 @@ void checkWasmDescriptorsForTest(kj::StringPtr url) {
 // fail the request, condemn the isolate and keep the process serving. Both gates are required: a
 // production process (no WORKERD_GK_TEST_FAULT) never takes this branch, and neither does one
 // running without the guest kernel, where the dereference would be a host-side SIGSEGV.
+// A request whose path is /__gk_fault_timeout takes the same fault inside a timeout callback
+// instead: it sets a zero-delay timeout on this request's IoContext whose callback dereferences
+// the null pointer, so the fault lands in the turn the timer fires, the one that runs a JS
+// setTimeout callback, with that turn's own host state (the TimeoutState marked running, see
+// TimeoutManagerImpl in io/io-context.c++) abandoned by the fault; the script keeps the request
+// alive until the timer has fired (fault-timeout-test.sh).
 //
 // With WORKERD_GK_TEST_PROBE set, a request whose path is /__gk_probe_host instead reads one
 // byte of the channel token key, and one whose path is /__gk_probe_host_entropy one byte of the
@@ -494,6 +500,13 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   if (faultEnabled && url.endsWith("/__gk_fault")) {
     KJ_LOG(WARNING, "WORKERD_GK_TEST_FAULT: forcing a guest fault for this request", url);
     *static_cast<volatile int*>(nullptr) = 0;
+  }
+  if (faultEnabled && url.endsWith("/__gk_fault_timeout")) {
+    lock.getGlobalScope().setTimeoutInternal([url = kj::str(url)](jsg::Lock&) {
+      KJ_LOG(
+          WARNING, "WORKERD_GK_TEST_FAULT: forcing a guest fault inside a timeout callback", url);
+      *static_cast<volatile int*>(nullptr) = 0;
+    }, 0);
   }
   static const bool probeEnabled =
       jsg::isGuestKernelEnabled() && getenv("WORKERD_GK_TEST_PROBE") != nullptr;
