@@ -48,9 +48,20 @@ victim=http://127.0.0.1:$victim_port
 fetcher=http://127.0.0.1:$fetcher_port
 log=$(mktemp)
 
+# Stops workerd without waiting for it indefinitely: it drains in-flight requests on SIGTERM, so a
+# process that still holds a hung request -- what a failed probe can leave behind -- is killed
+# after a moment rather than waited for.
+stop_workerd() {  # $1 pid
+  kill "$1" 2>/dev/null
+  for _ in $(seq 1 50); do
+    kill -0 "$1" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -9 "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+}
 cleanup() {
-  kill "$pid" 2>/dev/null
-  wait "$pid" 2>/dev/null
+  stop_workerd "$pid"
   rm -f "$log"
 }
 fail() {

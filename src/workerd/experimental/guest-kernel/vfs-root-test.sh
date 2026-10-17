@@ -39,8 +39,20 @@ data=$(mktemp -d)
 elsewhere=$(mktemp -d)
 pid=
 
+# Stops workerd without waiting for it indefinitely: it drains in-flight requests on SIGTERM, so a
+# process that still holds a hung request -- what a failed probe can leave behind -- is killed
+# after a moment rather than waited for.
+stop_workerd() {  # $1 pid
+  kill "$1" 2>/dev/null
+  for _ in $(seq 1 50); do
+    kill -0 "$1" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -9 "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+}
 cleanup() {
-  [ -n "$pid" ] && kill "$pid" 2>/dev/null && wait "$pid" 2>/dev/null
+  [ -n "$pid" ] && stop_workerd "$pid"
   rm -rf "$log" "$data" "$elsewhere"
 }
 fail() {
@@ -71,8 +83,7 @@ start() {
   done
 }
 stop() {
-  kill "$pid"
-  wait "$pid" 2>/dev/null
+  stop_workerd "$pid"
   pid=
 }
 # Database files (relative names) in a directory.

@@ -25,16 +25,20 @@ victim=http://127.0.0.1:$victim_port
 peer=http://127.0.0.1:$peer_port
 log=$(mktemp)
 
-# Bounded: a stranded cache entry leaves a request hung, and workerd drains in-flight requests on
-# SIGTERM, so a process that still holds one is killed rather than waited for.
-cleanup() {
-  kill "$pid" 2>/dev/null
+# Stops workerd without waiting for it indefinitely: it drains in-flight requests on SIGTERM, so a
+# process that still holds a hung request -- what a failed probe can leave behind -- is killed
+# after a moment rather than waited for.
+stop_workerd() {  # $1 pid
+  kill "$1" 2>/dev/null
   for _ in $(seq 1 50); do
-    kill -0 "$pid" 2>/dev/null || break
+    kill -0 "$1" 2>/dev/null || break
     sleep 0.1
   done
-  kill -9 "$pid" 2>/dev/null
-  wait "$pid" 2>/dev/null
+  kill -9 "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+}
+cleanup() {
+  stop_workerd "$pid"
   rm -f "$log"
 }
 fail() {

@@ -15,7 +15,22 @@ workerd=${1:-$root/bazel-bin/src/workerd/server/workerd}
 port=${GK_SURFACE_TEST_PORT:-8897}
 base=http://127.0.0.1:$port
 log=$(mktemp)
-cleanup() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$log"; }
+# Stops workerd without waiting for it indefinitely: it drains in-flight requests on SIGTERM, so a
+# process that still holds a hung request -- what a failed probe can leave behind -- is killed
+# after a moment rather than waited for.
+stop_workerd() {  # $1 pid
+  kill "$1" 2>/dev/null
+  for _ in $(seq 1 50); do
+    kill -0 "$1" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -9 "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+}
+cleanup() {
+  stop_workerd "$pid"
+  rm -f "$log"
+}
 fail() { echo "FAIL: $*"; echo "--- workerd log ---"; cat "$log"; exit 1; }
 
 WORKERD_EXPERIMENTAL_GUEST_KERNEL=1 "$workerd" serve "$here/surface-test.capnp" \
