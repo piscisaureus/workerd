@@ -1078,6 +1078,18 @@ static long thp_check(void) {
     printf("arena huge pages: THP disabled on this kernel; skipped [OK]\n");
     return 1;
   }
+  // The ranges below are sized for 2MB huge pages, the PMD size of a 4KiB
+  // kernel; a 16KiB arm64 kernel's PMD is 32MB, which none of them can hold.
+  {
+    FILE *pf = fopen("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size", "r");
+    unsigned long pmd = 0;
+    if (pf) { if (fscanf(pf, "%lu", &pmd) != 1) pmd = 0; fclose(pf); }
+    if (pmd && pmd != 2UL << 20) {
+      printf("arena huge pages: this kernel's huge page is %lu MB, not 2MB; skipped [OK]\n",
+             pmd >> 20);
+      return 1;
+    }
+  }
   gk_arena *a = gk_arena_create(16UL << 20);
   if (!a) { printf("arena huge pages: no arena [FAIL]\n"); return 0; }
   unsigned char *base = gk_arena_base(a);
@@ -3405,7 +3417,9 @@ static int signal_field_check(void) {
   }
   unsigned char *base = gk_arena_base(a);
   size_t span = ((size_t)gk_arena_size(a) + (1UL << 39) - 1) & ~((1UL << 39) - 1);  // the reservation
-  unsigned char *buf = base + 3 * 4096;  // a 4 KiB buffer in the arena
+  // A 4 KiB buffer in the arena, on a host page of its own (the commit below
+  // is a host mprotect, which needs a host-page-aligned start).
+  unsigned char *buf = base + 3 * (size_t)sysconf(_SC_PAGESIZE);
   enum { BUF = 4096, FIELD = 100 };      // the field at an unaligned offset
   if (mprotect(buf, BUF, PROT_READ | PROT_WRITE) != 0) { printf("signal fields: mprotect [FAIL]\n"); return 0; }
   memset(buf, 0, BUF);
@@ -3568,7 +3582,7 @@ static int signal_field_check(void) {
   //    points of those mutations and must find a consistent list each time.
   a = gk_arena_create(1UL << 20);
   base = gk_arena_base(a);
-  buf = base + 4096;
+  buf = base + (size_t)sysconf(_SC_PAGESIZE);  // on a host page of its own, as above
   mprotect(buf, BUF, PROT_READ | PROT_WRITE);
   memset(buf, 0, BUF);
   gk_arena_enter(a);

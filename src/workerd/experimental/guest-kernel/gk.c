@@ -405,23 +405,32 @@ static __thread int tls_rec;
 static __thread int tls_in_guest;
 static __thread gk_hostcall_frame *tls_hostcall_region;
 
-// Whether the caller runs in the guest at ring 3, decided by nothing ring 3
-// can write. On x86-64 that is the CS selector: at guest ring 3 it is the one
+#if defined(__aarch64__)
+// Whether the thread is inside the hypervisor's run call, raised and lowered
+// around that call alone (run_vcpu), so that host code running on the thread
+// between two runs -- a hostcall handler, a forwarded syscall -- sees it
+// clear. The guest's own copy, in user memory, like tls_in_guest.
+static __thread int tls_in_run;
+#endif
+
+// Whether the caller runs in the guest at ring 3. On x86-64 that is the CS
+// selector, which nothing in memory decides: at guest ring 3 it is the one
 // SYSRET loads (GK_USER_CS), at guest ring 0 it is 0x08 and on the host it is
 // the kernel's user selector. arm64 has no unprivileged read of the exception
 // level (CurrentEL is undefined at EL0 and on the host), so there the guest is
-// told from the host by tls_in_guest alone and a ring-0 caller takes the
-// ring-3 path too: an svc the host answers at the hypercall exit, one VM exit
-// more than the direct read x86-64 ring 0 makes. A rewrite of tls_in_guest by
-// ring 3 costs the rewriter's own thread the direct read's fault, or a host
-// thread an svc the kernel refuses, exactly as it does for gk_hostcall.
+// told from the host by tls_in_run, and a ring-0 caller takes the ring-3 path
+// too: an svc the host answers at the hypercall exit, one VM exit more than
+// the direct read x86-64 ring 0 makes. A rewrite of tls_in_run by ring 3 costs
+// the rewriter's own thread the direct read's fault, or a host thread an svc
+// the kernel refuses with ENOSYS, which the callers treat as a refusal: the
+// same exposure gk_hostcall has through tls_in_guest on both architectures.
 static inline int at_guest_ring3(void) {
 #if defined(__x86_64__)
   unsigned short cs;
   __asm__ __volatile__("mov %%cs, %0" : "=r"(cs));
   return cs == GK_USER_CS;
 #else
-  return tls_in_guest;
+  return tls_in_run;
 #endif
 }
 
@@ -5870,6 +5879,9 @@ void *gk_resolve_typed(gk_resolve_handle h, uint64_t *type) {
     register uint64_t x0 __asm__("x0") = h;
     register uint64_t x1 __asm__("x1") = 0;
     __asm__ __volatile__("svc #0" : "+r"(x0), "+r"(x1) : "r"(x8) : "memory");
+    // An svc that reached the kernel instead (see at_guest_ring3) comes back
+    // as -ENOSYS, which no pointer is: refused, like a handle to nothing.
+    if (x0 >= (uint64_t)-4095) x0 = x1 = 0;
     p = (void *)(uintptr_t)x0;
     if (type) *type = x1;
 #endif
@@ -7108,7 +7120,10 @@ static long enter_guest(gk_thread *t, long (*fn)(void *), void *arg, uint64_t st
   }
   v->action |= GK_ACT_LAUNCH;
   t->user_mode = user;
-  return run_vcpu(t);
+  tls_in_guest = 1;
+  long r = run_vcpu(t);
+  tls_in_guest = 0;
+  return r;
 }
 #endif
 
@@ -8091,7 +8106,9 @@ static long run_vcpu(gk_thread *t) {
   struct gk_vcb *v = VCB(t);
   for (;;) {
     t->tlb_touched = 1;  // the vCPU runs: its TLB is no longer known (see wall_raise)
+    tls_in_run = 1;
     hv_return_t hr = hv_vcpu_run(t->vcpu);
+    tls_in_run = 0;
     if (hr != HV_SUCCESS) {
       if (G->dbg) {
         gk_dbuf d = {.n = 0};
@@ -8171,7 +8188,10 @@ static long run_vcpu(gk_thread *t) {
 static long run_vcpu(gk_thread *t) {
   for (;;) {
     t->tlb_touched = 1;  // the vCPU runs: its TLB is no longer known (see wall_raise)
-    if (vcpu_run_ioctl(t) < 0) {
+    tls_in_run = 1;
+    int rc = vcpu_run_ioctl(t);
+    tls_in_run = 0;
+    if (rc < 0) {
       int err = errno;
       if (err == EINTR) continue;
       if (err == EFAULT && host_backing_retry(t)) continue;
