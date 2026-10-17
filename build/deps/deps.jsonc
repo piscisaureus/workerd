@@ -37,7 +37,11 @@
       "owner": "capnproto",
       "repo": "capnproto",
       "branch": "v2",
-      "extra_strip_prefix": "/c++"
+      "extra_strip_prefix": "/c++",
+      "patches": [
+        "//:patches/capnp-cpp/0001-Start-the-symbolizer-subprocess-without-throwing.patch",
+        "//:patches/capnp-cpp/0002-Expose-the-disposer-of-an-Own.patch"
+      ]
     },
     // We want to avoid version skew with v8, so we use identical versions. Keep this
     // V8-aligned dependency marked as such in ci/v8_update.py.

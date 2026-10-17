@@ -1,0 +1,526 @@
+#!/usr/bin/env bash
+# Checks, against a built workerd, that an IoOwn (io/io-own.h) names its object by a handle the
+# host validates rather than by a pointer: a JS turn that rewrites the handle inside its own
+# object leaves the runtime refusing the later uses -- the next turn's dereference, and the
+# host's unlink when the object's holder is destroyed -- rather than reaching the address the
+# turn chose; and that a handle rewritten to another isolate's live handle is refused too, since
+# an entry resolves at ring 3 only under the page-table root it was registered under. With
+# WORKERD_GK_TEST_PROBE set three request paths drive this from inside the turn (see
+# maybeForceGuestFaultForTest in src/workerd/api/global-scope.c++):
+#
+# /__gk_ioown_corrupt creates an IoOwn in the turn, inside a heap holder that stands in for the
+# JS wrapper's C++ object. A later turn of the same request first dereferences it as it is (the
+# control: the handle resolves to the object) and then overwrites the handle with the address of
+# a buffer the turn chose, laid out as the object the handle named and carrying a magic of its
+# own. The turn after that dereferences the IoOwn and logs what it reached: it must be refused,
+# not read the chosen magic. The holder is then destroyed on the event loop, outside any turn, which hands the
+# handle to the delete queue, and a further turn makes the host drain that queue, host-side,
+# before entering the guest: the host must refuse the handle rather than unlink through the
+# chosen address.
+#
+# /__gk_ioown_node_corrupt, on the node worker, aims at the record behind the handle instead: the
+# owned-list node in host memory, whose links the host's walk follows and whose disposer the host
+# calls. The turn creates an IoOwn; the host, on the event loop, finds the node behind its handle
+# and announces its address; a later turn writes a slot and a disposer of its choosing into the
+# node's link and disposer fields, as a write primitive would. The write must fault at the node --
+# the turn is abandoned and its isolate condemned -- and the context's teardown, host-side, must
+# then dispose of the object through the disposer the node recorded, never calling the one the
+# turn chose. (Where the write lands, as in the WORKERD_GK_NEG_IOOWN_NODE build, the holder is
+# destroyed on the event loop and the next turn's host-side drain follows the rewritten node:
+# the chosen disposer logs that the host called it, and this script fails.)
+#
+# /__gk_ioown_announce, on the other worker, creates an IoOwn and publishes its handle and its
+# context's; the worker's JS keeps that request open for three seconds, so its context, which
+# owns the object and retires the entry when it ends, outlives the next steps. /__gk_ioown_steal,
+# on the victim, rewrites one of its own IoOwns to that handle and dereferences it in a later
+# turn. The entry is live and its generation is the handle's, but it was registered under the
+# other isolate's page-table root, and the ring-0 lookup compares that root against the one the
+# calling turn runs under (CR3, which ring 3 can neither read nor load): the use is refused. The
+# same handle, resolved host-side right afterwards, still names the other isolate's object --
+# the host makes no such comparison -- so the refusal is about which isolate asked and not about
+# the entry having gone. (Where the comparison is taken out of gk_resolve_tramp, the use reads
+# the other isolate's magic and this script fails.) Once the announcing request has ended,
+# /__gk_ioown_type_swap is the same-isolate case: the owner tells one isolate's handles from
+# another's and says nothing about what an entry holds, so a turn that writes one of its own
+# IoOwn handles over another of its own used to reach an object of the wrong class. The two
+# classes here are unrelated and each answers a virtual with a magic of its own, so a wrong
+# vtable shows as the wrong magic and not merely as a null. The entry carries a tag derived
+# from the class at registration, which the resolve compares against the class the holder was
+# built for, so the use is refused; the drop of the swapped holder is refused too, leaving the
+# other class's object with its own holder. (In the WORKERD_GK_NEG_RESOLVE_TYPE build the
+# comparison is not made, the use answers with the other class's magic, and this script fails.)
+#
+# /__gk_ioptr_type_swap is the same swap through an IoPtr, which owns its table entry but not
+# the object the entry names and whose destructor therefore retires the entry wherever the
+# holder is dropped -- on the event loop, outside any turn, where there is no arena to compare
+# the handle against. The turn writes an IoOwn's handle, of an unrelated class, over its own
+# IoPtr's and has the IoPtr dropped there: the class comparison refuses the retire, the IoOwn's
+# entry still resolves host-side, and the IoOwn's own holder reaches its object afterwards. (In
+# the WORKERD_GK_NEG_IOPTR_TYPE build the entry is retired whatever class it names, the IoOwn's
+# holder then resolves nothing, and this script fails.)
+#
+# /__gk_ioown_steal_drop is the retire side of the same theft. A drop is not a use: the holder's
+# destructor releases the entry whatever the resolve answered, and inside a turn that release
+# goes into the turn's journal, which is the turn's own memory, for the host to act on once the
+# turn has returned -- host-side, where the lookup compares no owner. So the victim rewrites
+# another of its IoOwns to the other isolate's handle and destroys the holder inside a turn. The
+# host checks every handle it takes out of the journal against the arena the turn ran under and
+# refuses this one: the other isolate's entry still names its object, the node behind it is
+# still linked, and the announcing request, still in flight, dereferences the object again on
+# its own context. (In the WORKERD_GK_NEG_RESOLVE_RETIRE build the check is not made, the host
+# unlinks and frees the other isolate's node and retires its entry, and this script fails.)
+#
+# /__gk_ioown_steal_again shows the same handle refused for the second reason as well: the entry
+# went with the context.
+#
+# The delete queue is the other half of an IoOwn: the context the object belongs to, which the
+# holder names by the context's handle, and whose queue -- the handles of holders dropped off
+# their context, the actions other contexts send it, the signal that wakes it and the lock over
+# them -- is in the context's record in host memory. /__gk_queue_steal, on the victim while the
+# announcing request is open, rewrites one of its own IoOwns' context handle to the other
+# isolate's and destroys the holder on the event loop: the host finds the other context live, but
+# the handle names an object of the victim's list, so it refuses to queue it there, and the
+# object stays with the victim's context, which disposes of it when the request ends.
+# /__gk_queue_rewrite rewrites the context handle to the address of a buffer the turn chose, laid
+# out as a record would be, with a fulfiller of the turn's choosing where the record keeps its
+# own -- what the delete queue pointer was -- and destroys the holder the same way: the host must
+# refuse the handle, read and write nothing at the buffer, and leave the object to the context.
+#
+# /__gk_action_steal is the action side of the same theft, and the other kind of note a turn
+# leaves for the host. An action a context is asked to run from inside a turn is boxed on the
+# heap there and the box noted for the host to queue after the turn; the note is in the turn's
+# journal, which is the turn's own memory. The victim makes real actions through its own
+# context's cross-context executor -- one it leaves alone, as the control, and four hundred
+# whose note it then rewrites to the other isolate's announced context, as a write primitive
+# would. The host must queue none of those on the other context, which goes on serving, and
+# must destroy every box no context took, so the closures the actions hold are destroyed once
+# each and the other isolate never runs one; the control, whose note says what the runtime
+# wrote, is queued and runs in its own context. (In the WORKERD_GK_NEG_FOREIGN_ACTION build the
+# host leaves a refused note's box alone, so a turn leaks one box and its closure per note:
+# none of the closures is destroyed and this script fails.)
+#
+# /__gk_queue_corrupt, on the queue worker, aims at the record itself: the turn creates an IoOwn;
+# the host, on the event loop, finds the record behind its context handle and announces its
+# address and the word holding the cross-thread signal's fulfiller, which the host calls through
+# when it queues an action; a later turn writes a fulfiller of its choosing into that word. The
+# write must fault at the record -- the turn is abandoned and its isolate condemned -- and the
+# context's teardown, host-side, must then lock the record and dispose of the object, never
+# calling the chosen fulfiller. (Where the write lands, as in the WORKERD_GK_NEG_DELETE_QUEUE
+# build, the host queues an action for the context from the event loop and calls the fulfiller
+# the turn chose: it logs that it was reached, and this script fails.) /__gk_queue_after, on the
+# victim afterwards, has the host queue an action for a live context through its record's lock
+# and fulfiller and waits for a turn to run it: a later host locker, unaffected.
+#
+# Usage: ioown-test.sh [path/to/workerd]
+#   defaults to bazel-bin/src/workerd/server/workerd in the repo root. Needs /dev/kvm and curl.
+#   GK_IOOWN_TEST_HELLO_PORT / GK_IOOWN_TEST_VICTIM_PORT / GK_IOOWN_TEST_OTHER_PORT /
+#   GK_IOOWN_TEST_NODE_PORT / GK_IOOWN_TEST_QUEUE_PORT override the ports (8885 / 8884 / 8883 /
+#   8882 / 8881).
+set -u
+
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/../../../.." && pwd)
+workerd=${1:-$root/bazel-bin/src/workerd/server/workerd}
+hello_port=${GK_IOOWN_TEST_HELLO_PORT:-8885}
+victim_port=${GK_IOOWN_TEST_VICTIM_PORT:-8884}
+other_port=${GK_IOOWN_TEST_OTHER_PORT:-8883}
+node_port=${GK_IOOWN_TEST_NODE_PORT:-8882}
+queue_port=${GK_IOOWN_TEST_QUEUE_PORT:-8881}
+hello=http://127.0.0.1:$hello_port
+victim=http://127.0.0.1:$victim_port
+other=http://127.0.0.1:$other_port
+node=http://127.0.0.1:$node_port
+queue=http://127.0.0.1:$queue_port
+log=$(mktemp)
+chosen_magic=badbadbadbadbad0
+other_magic=e7e70e7e70e7e70
+queue_magic=bab0bab0bab0bab
+rewrite_magic=cab0cab0cab0cab
+steal_magic=dab0dab0dab0dab
+type_a_magic=a11a11a11a11a10
+type_b_magic=b22b22b22b22b20
+
+# Stops workerd without waiting for it indefinitely: it drains in-flight requests on SIGTERM, so a
+# process that still holds a hung request -- what a failed probe can leave behind -- is killed
+# after a moment rather than waited for.
+stop_workerd() {  # $1 pid
+  kill "$1" 2>/dev/null
+  for _ in $(seq 1 50); do
+    kill -0 "$1" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -9 "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+}
+cleanup() {
+  stop_workerd "$pid"
+  rm -f "$log"
+}
+fail() {
+  echo "FAIL: $*"
+  echo "--- workerd log ---"
+  cat "$log"
+  exit 1
+}
+status() {
+  curl -s -o /dev/null -w '%{http_code}' "$1" || echo no-response
+}
+wait_for() {  # $1 pattern
+  for _ in $(seq 1 100); do
+    grep -q "$1" "$log" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+wait_for_count() {  # $1 pattern, $2 occurrences
+  for _ in $(seq 1 100); do
+    [ "$(grep -c "$1" "$log")" -ge "$2" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+WORKERD_EXPERIMENTAL_GUEST_KERNEL=1 WORKERD_GK_TEST_PROBE=1 \
+  "$workerd" serve "$here/ioown-test.capnp" \
+  --socket-addr "hello=127.0.0.1:$hello_port" --socket-addr "victim=127.0.0.1:$victim_port" \
+  --socket-addr "other=127.0.0.1:$other_port" --socket-addr "node=127.0.0.1:$node_port" \
+  --socket-addr "queue=127.0.0.1:$queue_port" \
+  >"$log" 2>&1 &
+pid=$!
+trap cleanup EXIT
+
+for _ in $(seq 1 100); do
+  [ "$(status "$hello/")" = 200 ] && [ "$(status "$victim/")" = 200 ] &&
+    [ "$(status "$other/")" = 200 ] && [ "$(status "$node/")" = 200 ] &&
+    [ "$(status "$queue/")" = 200 ] && break
+  kill -0 "$pid" 2>/dev/null || fail "workerd exited during startup"
+  sleep 0.1
+done
+echo "workerd pid $pid serving hello on $hello, victim on $victim, other on $other, node on $node, queue on $queue"
+
+s=$(status "$victim/__gk_ioown_corrupt")
+echo "1. GET $victim/__gk_ioown_corrupt -> $s (the in-turn overwrite of the handle must land)"
+[ "$s" = 200 ] || fail "the request that overwrote the handle did not complete"
+created=$(grep -o "created an IoOwn inside the JS turn.*" "$log" | head -n1)
+[ -n "$created" ] || fail "no IoOwn was created"
+handle=$(echo "$created" | grep -o '0x[0-9a-f]*' | sed -n 1p)
+object=$(echo "$created" | grep -o '0x[0-9a-f]*' | sed -n 2p)
+wait_for "IoOwn use after the overwrite; what = intact" || fail "the control turn did not use the IoOwn"
+use=$(grep -o "IoOwn use after the overwrite; what = intact.*" "$log" | head -n1)
+echo "   control: the next turn's use of the intact handle: ${use#*verdict = }"
+echo "$use" | grep -q "read magic 0x600d600d600d600d at $object" || fail "the intact handle did not resolve to the object in a later turn: $use"
+wait_for "overwrote the IoOwn's handle from inside the JS turn; " || fail "the handle was not overwritten"
+over=$(grep -o "overwrote the IoOwn's handle from inside the JS turn; .*" "$log" | head -n1)
+chosen=$(echo "$over" | grep -o '0x[0-9a-f]*' | sed -n 2p)
+chosen_obj=$(echo "$over" | grep -o '0x[0-9a-f]*' | sed -n 3p)
+echo "   handle $handle (object at $object) overwritten with $chosen (a buffer the turn chose, whose object at $chosen_obj carries magic 0x$chosen_magic)"
+[ -n "$handle" ] && [ -n "$chosen" ] && [ "$chosen" != "$handle" ] || fail "no handle values in: $over"
+
+wait_for "IoOwn use after the overwrite; what = rewritten" || fail "the later turn did not use the IoOwn"
+use=$(grep -o "IoOwn use after the overwrite; what = rewritten.*" "$log" | head -n1)
+echo "2. the next turn's use of the IoOwn: ${use#*verdict = }"
+echo "$use" | grep -q "verdict = refused" || fail "the use was not refused: $use"
+echo "$use" | grep -q "$chosen_magic" && fail "the use read the magic at the address the turn chose"
+echo "$use" | grep -q "does not name a live owned object" || fail "the refusal is not the handle check: $use"
+
+wait_for "the turn after the holder's destruction ran" || fail "the holder was not destroyed and drained"
+drain=$(grep -o "IoOwn handle does not name a live owned object; nothing is released.*" "$log" | head -n1)
+echo "3. host-side drain of the destroyed holder's handle: ${drain:-NOT REFUSED}"
+[ -n "$drain" ] || fail "the host did not refuse the handle when draining the delete queue"
+echo "$drain" | grep -qi "${chosen#0x}" || fail "the refused handle is not the chosen value: $drain"
+grep -q "destroying the IoOwn's holder on the event loop" "$log" || fail "the holder was not destroyed on the event loop"
+
+s=$(status "$victim/")
+echo "4. GET $victim/            -> $s (the isolate must still serve: the refusal failed nothing but the use)"
+[ "$s" = 200 ] || fail "the victim stopped serving"
+kill -0 "$pid" 2>/dev/null || fail "workerd died"
+
+curl -s -o /dev/null "$other/__gk_ioown_announce" &
+announce_pid=$!
+wait_for "announced this isolate's IoOwn for another worker's turn" || fail "the announce request did not run"
+echo "5. GET $other/__gk_ioown_announce (in flight: the worker holds the request open for 3 s)"
+ann=$(grep -o "announced this isolate's IoOwn for another worker's turn.*" "$log" | head -n1)
+ann_handle=$(echo "$ann" | grep -o '0x[0-9a-f]*' | sed -n 1p)
+ann_obj=$(echo "$ann" | grep -o '0x[0-9a-f]*' | sed -n 2p)
+ann_ctx=$(echo "$ann" | grep -o '0x[0-9a-f]*' | sed -n 3p)
+[ -n "$ann_handle" ] && [ -n "$ann_ctx" ] || fail "no announced handle and context in: $ann"
+wait_for "IoOwn use after the overwrite; what = announced-own" || fail "other's later turn did not use its own IoOwn"
+use=$(grep -o "IoOwn use after the overwrite; what = announced-own.*" "$log" | head -n1)
+echo "   control: other's own later use of it: ${use#*verdict = }"
+echo "$use" | grep -q "read magic 0x$other_magic at $ann_obj" || fail "other's own handle did not resolve in its later turn: $use"
+echo "   other's IoOwn handle $ann_handle names its object at $ann_obj (magic 0x$other_magic)"
+s=$(status "$victim/__gk_ioown_steal")
+echo "6. GET $victim/__gk_ioown_steal -> $s (victim rewrites one of its IoOwns to other's handle)"
+[ "$s" = 200 ] || fail "the steal request failed"
+wait_for "IoOwn use after the overwrite; what = cross-isolate" || fail "the later turn did not use the stolen handle"
+use=$(grep -o "IoOwn use after the overwrite; what = cross-isolate.*" "$log" | head -n1)
+echo "7. the next turn's use of the stolen handle: ${use#*verdict = }"
+echo "$use" | grep -q "verdict = refused" ||
+  fail "the cross-isolate rewrite was not refused; it named the other isolate's object: $use"
+echo "$use" | grep -q "$other_magic" && fail "the use read the other isolate's magic"
+echo "$use" | grep -q "does not name a live owned object" || fail "the refusal is not the handle check: $use"
+# The refusal is the owner check, not a dead entry: the host, which does not compare the owner,
+# reaches the other isolate's object through the very handle the turn was refused.
+wait_for "the stolen handle, resolved host-side" || fail "the host did not resolve the stolen handle"
+live=$(grep -o "the stolen handle, resolved host-side.*" "$log" | head -n1)
+echo "   the same handle resolved host-side: ${live#*host-side; }"
+echo "$live" | grep -q "$ann_obj" ||
+  fail "the entry was not live when the turn was refused, so the refusal proves nothing: $live"
+
+s=$(status "$victim/__gk_ioown_steal_drop")
+echo "7a. GET $victim/__gk_ioown_steal_drop -> $s (victim rewrites another IoOwn to other's handle $ann_handle and destroys the holder inside a turn)"
+[ "$s" = 200 ] || fail "the steal-drop request failed"
+wait_for "destroyed the thief's holder inside the JS turn, with the stolen handle in it" ||
+  fail "the thief's holder was not destroyed inside a turn"
+refused=$(grep -o "a turn released a resolve entry of another isolate; nothing is retired.*" "$log" | head -n1)
+echo "    the host's answer to the release: ${refused:-NOT REFUSED}"
+[ -n "$refused" ] || fail "the host did not refuse the cross-isolate release"
+echo "$refused" | grep -qi "${ann_handle#0x}" || fail "the refused handle is not the stolen one: $refused"
+wait_for "the stolen handle after the thief's drop" || fail "the host did not report the entry after the drop"
+after=$(grep -o "the stolen handle after the thief's drop.*" "$log" | head -n1)
+echo "    the entry afterwards: ${after#*drop; }"
+echo "$after" | grep -q "$ann_obj" ||
+  fail "the other isolate's entry no longer names its object after the thief's drop: $after"
+echo "$after" | grep -q "node intact" ||
+  fail "the other isolate's owned node was unlinked by the thief's drop: $after"
+wait_for "IoOwn use after the overwrite; what = announced-own-after-theft" ||
+  fail "the announcing isolate did not use its object again"
+use=$(grep -o "IoOwn use after the overwrite; what = announced-own-after-theft.*" "$log" | head -n1)
+echo "    the announcing isolate's own use afterwards: ${use#*verdict = }"
+echo "$use" | grep -q "read magic 0x$other_magic at $ann_obj" ||
+  fail "the thief's drop cost the other isolate its object: $use"
+
+s=$(status "$victim/__gk_queue_steal")
+echo "7b. GET $victim/__gk_queue_steal -> $s (victim rewrites an IoOwn's context handle to other's context $ann_ctx and drops the holder on the event loop)"
+[ "$s" = 200 ] || fail "the queue steal request failed"
+created=$(grep -o "created an IoOwn for the queue steal probe inside the JS turn.*" "$log" | head -n1)
+steal_ctx=$(echo "$created" | grep -o '0x[0-9a-f]*' | sed -n 1p)
+steal_handle=$(echo "$created" | grep -o '0x[0-9a-f]*' | sed -n 2p)
+[ -n "$steal_handle" ] || fail "no handle in: $created"
+[ "$steal_ctx" != "$ann_ctx" ] || fail "the two isolates' contexts share a handle"
+wait_for "the turn after the queue steal probe holder's destruction ran" || fail "the queue steal probe did not run to its end"
+refused=$(grep -o "IoOwn handle names an object of another context; nothing is released.*" "$log" | head -n1)
+echo "    the host's answer to the drop: ${refused:-NOT REFUSED}"
+[ -n "$refused" ] || fail "the host did not refuse to queue the victim's object on the other context's queue"
+echo "$refused" | grep -qi "${steal_handle#0x}" || fail "the refused handle is not the dropped one: $refused"
+echo "$refused" | grep -qi "${ann_ctx#0x}" || fail "the refusal does not name the other context: $refused"
+# The request ends with its last turn, and the context's teardown disposes of the object then:
+# the disposal must come after that turn in the log, never from the drop.
+after_line=$(grep -n "the turn after the queue steal probe holder's destruction ran" "$log" | head -n1 | cut -d: -f1)
+wait_for "disposed of through its own disposer.*0x$steal_magic" || fail "the queue steal probe's object was not disposed of with its context"
+disposed_line=$(grep -n "disposed of through its own disposer.*0x$steal_magic" "$log" | head -n1 | cut -d: -f1)
+[ "$disposed_line" -gt "$after_line" ] || fail "the queue steal probe's object was disposed of before its context ended (log lines $disposed_line vs $after_line)"
+echo "    nothing was queued; the object stayed the victim context's and its teardown disposed of it (log line $disposed_line, after the request's last turn at $after_line)"
+
+s=$(status "$victim/__gk_queue_rewrite")
+echo "7c. GET $victim/__gk_queue_rewrite -> $s (victim rewrites an IoOwn's context handle to a buffer it chose and drops the holder on the event loop)"
+[ "$s" = 200 ] || fail "the queue rewrite request failed"
+wait_for "overwrote the IoOwn's context handle from inside the JS turn; " || fail "the context handle was not overwritten"
+over=$(grep -o "overwrote the IoOwn's context handle from inside the JS turn; .*" "$log" | head -n1)
+rewrite_ctx=$(echo "$over" | grep -o '0x[0-9a-f]*' | sed -n 1p)
+chosen_record=$(echo "$over" | grep -o '0x[0-9a-f]*' | sed -n 2p)
+echo "    context handle $rewrite_ctx overwritten with $chosen_record (a buffer laid out as a record, holding a fulfiller the turn chose)"
+[ -n "$chosen_record" ] && [ "$chosen_record" != "$rewrite_ctx" ] || fail "no handle values in: $over"
+wait_for "the turn after the rewrite probe holder's destruction ran" || fail "the rewrite probe did not run to its end"
+after=$(grep -o "the turn after the rewrite probe holder's destruction ran.*" "$log" | head -n1)
+echo "$after" | grep -q "0x0; 0x[0-9a-f]*" || fail "the chosen buffer was written: $after"
+grep -q "the chosen fulfiller was called by the host" "$log" && fail "the host called the fulfiller in the chosen buffer"
+after_line=$(grep -n "the turn after the rewrite probe holder's destruction ran" "$log" | head -n1 | cut -d: -f1)
+wait_for "disposed of through its own disposer.*0x$rewrite_magic" || fail "the rewrite probe's object was not disposed of with its context"
+disposed_line=$(grep -n "disposed of through its own disposer.*0x$rewrite_magic" "$log" | head -n1 | cut -d: -f1)
+[ "$disposed_line" -gt "$after_line" ] || fail "the rewrite probe's object was disposed of before its context ended (log lines $disposed_line vs $after_line)"
+echo "    the host read and wrote nothing at $chosen_record and called no fulfiller; the object stayed the context's and its teardown disposed of it (log line $disposed_line, after the request's last turn at $after_line)"
+
+wait "$announce_pid"
+sleep 0.5
+echo "8. the announcing request has ended; its context retires the entry with its owned list"
+s=$(status "$victim/__gk_ioown_steal_again")
+echo "9. GET $victim/__gk_ioown_steal_again -> $s"
+[ "$s" = 200 ] || fail "the second steal request failed"
+wait_for "IoOwn use after the overwrite; what = cross-isolate-after-release" || fail "the later turn did not use the stolen handle again"
+use=$(grep -o "IoOwn use after the overwrite; what = cross-isolate-after-release.*" "$log" | head -n1)
+echo "   the stolen handle after other's context ended: ${use#*verdict = }"
+echo "$use" | grep -q "verdict = refused" || fail "the stolen handle still resolved after the other context ended: $use"
+
+s=$(status "$hello/")
+echo "10. GET $hello/            -> $s (other isolates must still serve)"
+[ "$s" = 200 ] || fail "hello stopped serving"
+kill -0 "$pid" 2>/dev/null || fail "workerd died"
+
+s=$(status "$node/__gk_ioown_node_corrupt")
+echo "11. GET $node/__gk_ioown_node_corrupt -> $s (creates an IoOwn whose node a later turn rewrites)"
+[ "$s" = 200 ] || fail "the node probe request did not complete"
+wait_for "the owned node behind the IoOwn, found host-side" || fail "the host did not find the node"
+found=$(grep -o "the owned node behind the IoOwn, found host-side.*" "$log" | head -n1)
+node_handle=$(echo "$found" | grep -o '0x[0-9a-f]*' | sed -n 1p)
+node_addr=$(echo "$found" | grep -o '0x[0-9a-f]*' | sed -n 2p)
+[ -n "$node_addr" ] && [ "$node_addr" != "0x0" ] || fail "no node address in: $found"
+echo "    the node behind handle $node_handle is at $node_addr, found host-side through the entry's companion"
+wait_for "rewriting the owned node from inside the JS turn" || fail "the later turn did not attempt the rewrite"
+rewrite=$(grep -o "rewriting the owned node from inside the JS turn.*" "$log" | head -n1)
+chosen_slot=$(echo "$rewrite" | grep -o '0x[0-9a-f]*' | sed -n 2p)
+chosen_disposer=$(echo "$rewrite" | grep -o '0x[0-9a-f]*' | sed -n 3p)
+echo "    the turn writes link = $chosen_slot and disposer = $chosen_disposer into the node at $node_addr"
+wait_for "isolate condemned" || fail "the in-turn write to the node did not fault"
+condemned=$(grep -o "isolate condemned.*" "$log" | head -n1)
+echo "$condemned" | grep -q "JS turn faulted inside the guest" || fail "the isolate was condemned for another reason: $condemned"
+fault_dec=$(echo "$condemned" | grep -o "gk_fault_addr() = [0-9]*" | grep -o "[0-9]*$")
+[ -n "$fault_dec" ] || fail "no fault address in: $condemned"
+fault_addr=$(printf '0x%x' "$fault_dec")
+node_dec=$((node_addr))
+# The write lands on the node's link field, inside the node.
+[ "$fault_dec" -ge "$node_dec" ] && [ "$fault_dec" -lt $((node_dec + 64)) ] ||
+  fail "the fault is not at the node ($node_addr): $condemned"
+echo "12. the write faulted at $fault_addr, inside the node at $node_addr (offset $((fault_dec - node_dec))): ${condemned%%;*}"
+grep -q "the owned node was rewritten from inside the JS turn; the write landed" "$log" && fail "the write to the node landed"
+wait_for "disposed of through its own disposer; .*0xde0de0de0de0de0" || fail "the context's teardown did not dispose of the node probe's object"
+echo "13. the context's teardown, host-side, walked the list and disposed of the object through the disposer the node recorded"
+grep -q "the chosen disposer was called by the host" "$log" && fail "the host called the disposer the turn chose: $(grep -o 'the chosen disposer was called by the host.*' "$log" | head -n1)"
+echo "    the chosen disposer was never called"
+
+s=$(status "$hello/")
+echo "14. GET $hello/            -> $s (other isolates must still serve)"
+[ "$s" = 200 ] || fail "hello stopped serving after the node fault"
+kill -0 "$pid" 2>/dev/null || fail "workerd died"
+
+s=$(status "$queue/__gk_queue_corrupt")
+echo "15. GET $queue/__gk_queue_corrupt -> $s (creates an IoOwn whose context record a later turn rewrites)"
+[ "$s" = 200 ] || fail "the queue probe request did not complete"
+wait_for "the context record behind the IoOwn, found host-side" || fail "the host did not find the record"
+found=$(grep -o "the context record behind the IoOwn, found host-side.*" "$log" | head -n1)
+record_ctx=$(echo "$found" | grep -o '0x[0-9a-f]*' | sed -n 1p)
+record_addr=$(echo "$found" | grep -o '0x[0-9a-f]*' | sed -n 2p)
+record_size=$(echo "$found" | grep -o "size = [0-9]*" | grep -o "[0-9]*$")
+fulfiller_slot=$(echo "$found" | grep -o '0x[0-9a-f]*' | sed -n 3p)
+fulfiller_val=$(echo "$found" | grep -o '0x[0-9a-f]*' | sed -n 4p)
+[ -n "$record_addr" ] && [ "$record_addr" != "0x0" ] && [ -n "$record_size" ] || fail "no record address in: $found"
+[ "$fulfiller_val" != "0x0" ] || fail "the record holds no fulfiller yet: $found"
+echo "    the record behind context $record_ctx is at $record_addr ($record_size bytes), its fulfiller $fulfiller_val at $fulfiller_slot, found host-side through the entry's companion"
+wait_for "rewriting the context record from inside the JS turn" || fail "the later turn did not attempt the rewrite"
+rewrite=$(grep -o "rewriting the context record from inside the JS turn.*" "$log" | head -n1)
+chosen_fulfiller=$(echo "$rewrite" | grep -o '0x[0-9a-f]*' | sed -n 2p)
+echo "    the turn writes fulfiller = $chosen_fulfiller into the record at $record_addr"
+wait_for_count "isolate condemned" 2 || fail "the in-turn write to the record did not fault: $(grep -o 'the context record was rewritten.*' "$log" | head -n1)"
+condemned=$(grep -o "isolate condemned.*" "$log" | sed -n 2p)
+echo "$condemned" | grep -q "JS turn faulted inside the guest" || fail "the isolate was condemned for another reason: $condemned"
+fault_dec=$(echo "$condemned" | grep -o "gk_fault_addr() = [0-9]*" | grep -o "[0-9]*$")
+[ -n "$fault_dec" ] || fail "no fault address in: $condemned"
+fault_addr=$(printf '0x%x' "$fault_dec")
+record_dec=$((record_addr))
+[ "$fault_dec" -ge "$record_dec" ] && [ "$fault_dec" -lt $((record_dec + record_size)) ] ||
+  fail "the fault is not at the record ($record_addr, $record_size bytes): $condemned"
+echo "16. the write faulted at $fault_addr, inside the record at $record_addr (offset $((fault_dec - record_dec))): ${condemned%%;*}"
+grep -q "the context record was rewritten from inside the JS turn; the write landed" "$log" && fail "the write to the record landed"
+wait_for "disposed of through its own disposer; .*0x$queue_magic" || fail "the context's teardown did not dispose of the queue probe's object"
+echo "17. the context's teardown, host-side, locked the record, walked the list and disposed of the object through the disposer the node recorded"
+grep -q "the chosen fulfiller was called by the host" "$log" && fail "the host called the fulfiller the turn chose: $(grep -o 'the chosen fulfiller was called by the host.*' "$log" | head -n1)"
+echo "    the chosen fulfiller was never called"
+
+s=$(status "$victim/__gk_queue_after")
+echo "18. GET $victim/__gk_queue_after -> $s (the host queues an action for a live context, through its record's lock and fulfiller)"
+[ "$s" = 200 ] || fail "the queue-after request failed"
+wait_for "a host-side queued action ran in its context" || fail "the action the host queued after the record fault did not run"
+queued=$(grep -o "queued an action for the context host-side.*" "$log" | tail -n1)
+echo "$queued" | grep -q "queued = true" || fail "the host did not queue the action: $queued"
+echo "    the host queued the action (${queued#*; }) and the context's next turn ran it: a later host locker is unaffected"
+
+s=$(status "$victim/__gk_ioown_type_swap")
+echo "19. GET $victim/__gk_ioown_type_swap -> $s (victim writes one of its own IoOwn handles over another of its own, of an unrelated class)"
+[ "$s" = 200 ] || fail "the type swap request failed"
+wait_for "IoOwn use after the type swap; what = control-a" || fail "the control use of the first class did not run"
+ctl_a=$(grep -o "IoOwn use after the type swap; what = control-a.*" "$log" | head -n1)
+ctl_b=$(grep -o "IoOwn use after the type swap; what = control-b.*" "$log" | head -n1)
+echo "    control: the two holders read ${ctl_a#*verdict = } and ${ctl_b#*verdict = }"
+echo "$ctl_a" | grep -q "read magic 0x$type_a_magic" || fail "the first holder did not read its own class's magic: $ctl_a"
+echo "$ctl_b" | grep -q "read magic 0x$type_b_magic" || fail "the second holder did not read its own class's magic: $ctl_b"
+wait_for "IoOwn use after the type swap; what = type-swap" || fail "the use after the swap did not run"
+use=$(grep -o "IoOwn use after the type swap; what = type-swap.*" "$log" | head -n1)
+echo "20. the use through the swapped handle: ${use#*verdict = }"
+echo "$use" | grep -q "$type_b_magic" && fail "the use called through the other class's vtable: $use"
+echo "$use" | grep -q "verdict = refused" || fail "the swapped handle was not refused: $use"
+# The drop half: releasing the swapped holder would retire the other class's entry and free the
+# node its real holder still names. The other holder must be untouched afterwards.
+wait_for "dropped the swapped IoOwn inside the JS turn" || fail "the swapped holder was not dropped"
+refused=$(grep -o "an IoOwn handle names an object of another class; nothing is released.*" "$log" | head -n1)
+echo "    the host's answer to the drop: ${refused:-NOT REFUSED}"
+[ -n "$refused" ] || fail "the drop of the swapped holder was not refused"
+wait_for "IoOwn use after the type swap; what = other-class-after-drop" || fail "the other holder was not used after the drop"
+after=$(grep -o "IoOwn use after the type swap; what = other-class-after-drop.*" "$log" | head -n1)
+echo "    the other class's holder afterwards: ${after#*verdict = }"
+echo "$after" | grep -q "read magic 0x$type_b_magic" || fail "the drop of the swapped holder cost the other class its object: $after"
+
+s=$(status "$victim/__gk_ioptr_type_swap")
+echo "21. GET $victim/__gk_ioptr_type_swap -> $s (victim writes an IoOwn's handle, of another class, over its own IoPtr's and drops the IoPtr off-turn)"
+[ "$s" = 200 ] || fail "the IoPtr type swap request failed"
+wait_for "IoOwn use after the type swap; what = ioptr-control-b" || fail "the control use of the IoOwn did not run"
+ptr_ctl=$(grep -o "IoOwn use after the type swap; what = ioptr-control-b.*" "$log" | head -n1)
+echo "    control: the IoOwn reads ${ptr_ctl#*verdict = }"
+echo "$ptr_ctl" | grep -q "read magic 0x$type_b_magic" || fail "the IoOwn did not read its own class's magic: $ptr_ctl"
+wait_for "dropped the IoPtr on the event loop" || fail "the IoPtr was not dropped on the event loop"
+ptr_refused=$(grep -o "an IoPtr handle names an object of another class; nothing is retired.*" "$log" | head -n1)
+echo "    the host's answer to the IoPtr's drop: ${ptr_refused:-NOT REFUSED}"
+[ -n "$ptr_refused" ] || fail "the retire through the swapped IoPtr was not refused"
+wait_for "the IoOwn's entry after the IoPtr's drop" || fail "the victim's entry was not reported"
+ptr_entry=$(grep -o "the IoOwn's entry after the IoPtr's drop.*" "$log" | head -n1)
+echo "    ${ptr_entry}"
+echo "$ptr_entry" | grep -q "= 0x0" && fail "the IoPtr's drop retired the other class's entry: $ptr_entry"
+wait_for "IoOwn use after the type swap; what = ioptr-other-class-after-drop" || fail "the IoOwn was not used after the IoPtr's drop"
+ptr_after=$(grep -o "IoOwn use after the type swap; what = ioptr-other-class-after-drop.*" "$log" | head -n1)
+echo "22. the IoOwn's holder after the IoPtr's drop: ${ptr_after#*verdict = }"
+echo "$ptr_after" | grep -q "read magic 0x$type_b_magic" || fail "the IoPtr's drop cost the IoOwn its object: $ptr_after"
+
+s=$(status "$hello/")
+echo "23. GET $hello/            -> $s (other isolates must still serve)"
+[ "$s" = 200 ] || fail "hello stopped serving after the record fault"
+kill -0 "$pid" 2>/dev/null || fail "workerd died"
+
+curl -s -o /dev/null "$other/__gk_ioown_announce" &
+announce_pid=$!
+wait_for_count "announced this isolate's IoOwn for another worker's turn" 2 ||
+  fail "the second announce request did not run"
+ann2=$(grep -o "announced this isolate's IoOwn for another worker's turn.*" "$log" | tail -n1)
+ann_ctx2=$(echo "$ann2" | grep -o '0x[0-9a-f]*' | sed -n 3p)
+[ -n "$ann_ctx2" ] || fail "no announced context in: $ann2"
+echo "24. GET $other/__gk_ioown_announce again (in flight: other's context $ann_ctx2 is live for 3 s)"
+
+s=$(status "$victim/__gk_action_steal")
+echo "25. GET $victim/__gk_action_steal -> $s (victim journals actions and rewrites their notes to other's context)"
+[ "$s" = 200 ] || fail "the action steal request failed"
+wait_for "rewrote the actions' notes to another isolate's context from inside the JS turn" ||
+  fail "the action steal probe did not run"
+made=$(grep -o "rewrote the actions' notes to another isolate's context from inside the JS turn.*" "$log" | head -n1)
+stolen=$(echo "$made" | sed -n 's/.*stolen = \([0-9]*\).*/\1/p')
+[ -n "$stolen" ] && [ "$stolen" -gt 0 ] || fail "no actions were journaled: $made"
+echo "$made" | grep -q "control = true" || fail "the control action was not journaled: $made"
+echo "$made" | grep -qi "${ann_ctx2#0x}" || fail "the notes were not aimed at other's context: $made"
+echo "    $stolen notes rewritten to $ann_ctx2, one left alone as the control"
+wait_for "the actions after the turn" || fail "the probe did not report after the turn"
+after=$(grep -o "the actions after the turn.*" "$log" | head -n1)
+refusals=$(echo "$after" | sed -n 's/.*foreignRefused = \([0-9]*\).*/\1/p')
+[ "${refusals:-0}" = "$stolen" ] ||
+  fail "the host did not refuse every note naming the other isolate's context: ${refusals:-0} of $stolen"
+echo "26. the host refused $refusals of the $stolen notes and queued nothing on the other context"
+# What the host says about them is budgeted, so the count above comes from the hook's own
+# counter; what the log must still carry is the first of them.
+grep -q "a turn's note names a context of another isolate" "$log" ||
+  fail "the host reported none of the notes it refused"
+grep -q "a stolen action ran in a context" "$log" && fail "an action with a rewritten note was run"
+destroyed=$(echo "$after" | sed -n 's/.*stolenActionsDestroyed = \([0-9]*\).*/\1/p')
+echo "    the closures of the dropped actions destroyed after the turn: ${destroyed:-none}"
+[ -n "$destroyed" ] || fail "no destroyed count in: $after"
+[ "$destroyed" -eq "$stolen" ] ||
+  fail "the host kept $((stolen - destroyed)) of the $stolen boxes no context took: $after"
+wait_for "a control action ran in its own context" ||
+  fail "the control action, whose note was left alone, did not run in its context"
+echo "27. control: the action whose note was left alone was queued and ran in its own context"
+
+s=$(status "$other/")
+echo "28. GET $other/            -> $s (the isolate the notes named must still serve)"
+[ "$s" = 200 ] || fail "other stopped serving"
+s=$(status "$hello/")
+echo "29. GET $hello/            -> $s (other isolates must still serve)"
+[ "$s" = 200 ] || fail "hello stopped serving"
+kill -0 "$pid" 2>/dev/null || fail "workerd died"
+wait "$announce_pid"
+
+echo "PASS: an IoOwn handle rewritten from inside a turn to an address the turn chose was refused by the next turn's dereference and by the host's drain of the delete queue, reaching neither the chosen buffer nor its magic; the isolate kept serving; a handle rewritten to another isolate's live handle was refused although the entry was live -- the host resolved the very same handle to that isolate's object -- and was refused again once that isolate's context had ended; a turn's write into the owned node behind a handle faulted at the node, and the host's teardown walk disposed of the object through the node's own disposer, never the chosen one; an IoOwn's context handle rewritten to another isolate's live context queued nothing there, since the dropped handle names an object of this context's list, and one rewritten to a buffer the turn chose queued nothing and reached nothing at the buffer, with both objects disposed of by their own context's teardown; a turn's write into the context record behind a handle faulted at the record, and the host's teardown locked the record and disposed of the object without calling the fulfiller the turn chose, after which the host queued and ran an action for another context through its record; and a handle written over another of the same isolate's, of an unrelated class, was refused at the use -- the call never reached the other class's vtable -- and at the drop, leaving that object with its own holder; and an IoOwn's handle written over an IoPtr's and dropped on the event loop, outside any turn, retired nothing, leaving the IoOwn's entry resolving and its holder reaching its object; and a turn's notes rewritten to name another isolate's live context queued no action there, left that isolate serving, and had every box no context took destroyed, while the one note left alone was queued and ran in its own context"

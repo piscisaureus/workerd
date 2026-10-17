@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Tue, 22 Sep 2026 12:00:00 +0000
+Subject: Add v8_enable_sandbox flag to the Bazel build
+
+The GN build derives v8_enable_sandbox from the pointer compression
+configuration and exports V8_ENABLE_SANDBOX to embedders, but the Bazel
+build had no equivalent. Add a v8_enable_sandbox flag (default off) that
+adds V8_ENABLE_SANDBOX to the exported defines when the shared pointer
+compression cage and external code space are enabled, so that V8 and
+its embedder agree on object layouts.
+
+diff --git a/BUILD.bazel b/BUILD.bazel
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -67,7 +67,6 @@
+ # v8_verify_torque_generation_invariance
+ # v8_enable_snapshot_compression
+ # v8_control_flow_integrity
+-# v8_enable_sandbox
+ # cppgc_enable_caged_heap
+ # cppgc_enable_api_checks
+ # cppgc_enable_check_assignments_in_prefinalizers
+@@ -429,6 +428,21 @@
+     ],
+ )
+ 
++# Enable the V8 sandbox. Mirrors the GN v8_enable_sandbox flag; the sandbox
++# requires the shared pointer compression cage and the external code space.
++v8_flag(
++    name = "v8_enable_sandbox",
++    default = False,
++)
++
++selects.config_setting_group(
++    name = "enable_sandbox",
++    match_all = [
++        ":enable_external_code_space",
++        ":is_v8_enable_sandbox",
++    ],
++)
++
+ # We use a string flag to create a 3 value-logic.
+ # If no explicit value for v8_enable_short_builtin_calls, we set it to 'none'.
+ v8_string(
+@@ -663,6 +677,11 @@
+         ],
+         "//conditions:default": [],
+     }) + select({
++        ":enable_sandbox": [
++            "V8_ENABLE_SANDBOX",
++        ],
++        "//conditions:default": [],
++    }) + select({
+         ":enable_static_roots": [
+             "V8_STATIC_ROOTS",
+         ],

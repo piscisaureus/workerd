@@ -9,6 +9,10 @@
 #include <workerd/util/autogate.h>
 #include <workerd/util/sentry.h>
 
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <workerd/experimental/guest-kernel/gk.h>
+#endif
+
 #include <kj/debug.h>
 #include <kj/refcount.h>
 #include <kj/string-tree.h>
@@ -31,6 +35,7 @@
 #include <kj/vector.h>
 
 #include <atomic>
+#include <cstdlib>
 
 namespace workerd {
 
@@ -1840,6 +1845,15 @@ void SqliteDatabase::Query::beforeSqliteReset() {
 // we want to leverage all that code. If we can just make it interpret paths differently, then we
 // can reuse the rest of the implementation.
 
+// The VFS's root directory descriptor in host memory, for the VFS root hostcall (see "The VFS
+// root under the guest kernel" below).
+struct SqliteDatabase::Vfs::RootDir {
+  static constexpr uint64_t TAG = 0x746f6f7273667620;  // " vfsroot"
+  uint64_t tag = TAG;
+  int fd;
+  explicit RootDir(int fd): fd(fd) {}
+};
+
 #if !_WIN32
 namespace {
 
@@ -1881,6 +1895,130 @@ static int replaced_lstat(const char* path, struct stat* stats) {
 
 };  // namespace
 
+// -----------------------------------------------------------------------------
+// The VFS root under the guest kernel
+//
+// `currentVfsRoot` is thread-local storage, which a JS turn at guest ring 3 can write, and it is
+// the directory descriptor of the openat, newfstatat, unlinkat and faccessat2 that the replaced
+// syscalls above issue: a turn that rewrote it would redirect where SQLite's files land. The
+// guest kernel's turn directory (gk_confine_paths in experimental/guest-kernel/gk.h) is the
+// bound. With path confinement on, a path syscall forwarded from a turn is refused unless its
+// dirfd is the directory the host set for the thread, and the lookup then runs beneath that
+// directory, in the kernel. Each wrapped native method that may name a file by path has the
+// VFS's root made the turn directory for its duration, through the VFS root hostcall
+// (util/hostcall.h): the turn passes the handle of the VFS's RootDir slot, and the handler --
+// host code, running inside the turn -- takes the descriptor from the slot the handle names, in
+// host memory the turn cannot read or write, and hands it to the guest kernel, which records
+// the directory's identity and compares it on every use. What the turn keeps in
+// `currentVfsRoot` is thus bookkeeping for its own syscalls: rewritten, those fail with EPERM,
+// and SQLite reports an I/O error for that call. The hostcall is a VM exit each way, so the
+// methods that only act on descriptors they already hold (xRead, xWrite, xLock and the rest of
+// the hot path) do not make it. Without the guest kernel the handler runs directly and does
+// nothing, so this code is exercised by the ordinary test suite.
+namespace {
+
+enum class VfsRootOp : uint64_t { SET = 1, CLEAR = 2 };
+
+// Test-only: see Vfs::rewriteRootForTest.
+int vfsRootRewriteForTest = -1;
+
+// Asks the host to make the slot's directory the turn directory (SET) or to leave the thread
+// with none (CLEAR). A refusal leaves the thread without a directory, so the call's path syscalls
+// fail closed; it is logged, since it means a handle or table problem, not something a turn can
+// bring about legitimately.
+void setTurnDir(VfsRootOp op, hostMemory::SlotHandle handle) {
+  hostcall::Frame frame{};
+  frame.args[0] = static_cast<uint64_t>(op);
+  frame.args[1] = handle;
+  long result = hostcall::call(SqliteDatabase::Vfs::HOSTCALL, frame);
+  if (result != 0) {
+    KJ_LOG(ERROR, "VFS root hostcall refused", static_cast<uint64_t>(op), result);
+  }
+}
+
+// The directory of one native VFS call: `currentVfsRoot` for its length and, when the call may
+// name a file by path, the turn directory as well.
+class NativeVfsCall {
+ public:
+  NativeVfsCall(int rootFd, hostMemory::SlotHandle rootDir, SqliteDatabase::Vfs::Paths paths)
+      : paths(paths) {
+    KJ_ASSERT(currentVfsRoot == AT_FDCWD);
+    currentVfsRoot = vfsRootRewriteForTest >= 0 ? vfsRootRewriteForTest : rootFd;
+    if (paths == SqliteDatabase::Vfs::Paths::YES) setTurnDir(VfsRootOp::SET, rootDir);
+  }
+  ~NativeVfsCall() {
+    currentVfsRoot = AT_FDCWD;
+    if (paths == SqliteDatabase::Vfs::Paths::YES) setTurnDir(VfsRootOp::CLEAR, 0);
+  }
+  KJ_DISALLOW_COPY_AND_MOVE(NativeVfsCall);
+
+ private:
+  SqliteDatabase::Vfs::Paths paths;
+};
+
+}  // namespace
+
+long SqliteDatabase::Vfs::hostcallHandler(hostcall::Frame& frame) {
+  frame.outLen = 0;
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (!gk_initialized()) return 0;
+  switch (static_cast<VfsRootOp>(frame.args[0])) {
+    case VfsRootOp::SET: {
+      // The descriptor comes from the slot the handle names; a handle naming anything else is
+      // refused here.
+      auto* root = static_cast<const RootDir*>(hostMemory::resolveSlot(frame.args[1]));
+      if (root == nullptr || root->tag != RootDir::TAG) return -EACCES;
+      return gk_turn_dir_set(root->fd);
+    }
+    case VfsRootOp::CLEAR:
+      return gk_turn_dir_set(GK_TURN_DIR_NONE);
+  }
+  return -EINVAL;
+#else
+  return 0;
+#endif
+}
+
+const hostcall::Entry SqliteDatabase::Vfs::HOSTCALL = {
+  hostcall::VFS_ROOT, &SqliteDatabase::Vfs::hostcallHandler};
+
+void SqliteDatabase::Vfs::installHostcall() {
+  hostcall::install(HOSTCALL);
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (!gk_initialized()) return;
+  // SQLite seeds its PRNG on first use by reading /dev/urandom through the default VFS, by path,
+  // and falls back to the time and pid when the read fails, which under path confinement it
+  // does from inside a turn. Seeding it here, on the host, makes the first use this one.
+  byte seed;
+  sqlite3_randomness(sizeof(seed), &seed);
+  if (getenv("WORKERD_GK_TEST_PROBE") != nullptr) {
+    // The rewrite that vfs-root-test.sh asks for from inside a turn (see /__gk_vfs_rewrite in
+    // api/global-scope.c++), run on the event loop: the directory it names, from
+    // WORKERD_GK_TEST_VFS_DIR, is opened here on the host, since a confined turn could not open
+    // it, and every native VFS call then runs with its descriptor as `currentVfsRoot`.
+    hostMemory::setHostUseForTest("vfs-root-rewrite", []() {
+      kj::StringPtr dir = getenv("WORKERD_GK_TEST_VFS_DIR");
+      int fd = open(dir.cStr(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      KJ_REQUIRE(fd >= 0, "WORKERD_GK_TEST_VFS_DIR could not be opened", dir);
+      rewriteRootForTest(fd);
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: native VFS calls now run with currentVfsRoot rewritten to a "
+          "directory of the turn's choosing",
+          dir, fd);
+    });
+    hostMemory::setHostUseForTest("vfs-root-restore", []() {
+      rewriteRootForTest(-1);
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: native VFS calls run with their own root again");
+    });
+  }
+#endif
+}
+
+void SqliteDatabase::Vfs::rewriteRootForTest(int fd) {
+  if (vfsRootRewriteForTest >= 0) close(vfsRootRewriteForTest);
+  vfsRootRewriteForTest = fd;
+}
+
 // The sqlite3_file implementation we use when wrapping the native filesystem.
 struct SqliteDatabase::Vfs::WrappedNativeFileImpl: public sqlite3_file {
   const Vfs* vfs;
@@ -1896,18 +2034,18 @@ struct SqliteDatabase::Vfs::WrappedNativeFileImpl: public sqlite3_file {
 
 // This completely nutso template generates wrapper functions for each of the function pointer
 // members of sqlite3_vfs. The wrapper function temporarily sets `currentVfsRoot` to the FD
-// of the directory from the SqliteDatabase::Vfs instance in use, then invokes the same function
-// on the underlying native VFS.
+// of the directory from the SqliteDatabase::Vfs instance in use (and, for a method that may
+// name a file by path, the guest kernel's turn directory: see "The VFS root under the guest
+// kernel" above), then invokes the same function on the underlying native VFS.
 template <typename Result,
     typename... Params,
-    Result (*sqlite3_vfs::*slot)(sqlite3_vfs* vfs, Params...)>
-struct SqliteDatabase::Vfs::MethodWrapperHack<Result (*sqlite3_vfs::*)(sqlite3_vfs* vfs, Params...),
-    slot> {
+    Result (*sqlite3_vfs::*slot)(sqlite3_vfs* vfs, Params...),
+    SqliteDatabase::Vfs::Paths paths>
+struct SqliteDatabase::Vfs::
+    MethodWrapperHack<Result (*sqlite3_vfs::*)(sqlite3_vfs* vfs, Params...), slot, paths> {
   static Result wrapper(sqlite3_vfs* vfs, Params... params) noexcept {
     auto& self = *reinterpret_cast<SqliteDatabase::Vfs*>(vfs->pAppData);
-    KJ_ASSERT(currentVfsRoot == AT_FDCWD);
-    currentVfsRoot = self.rootFd;
-    KJ_DEFER(currentVfsRoot = AT_FDCWD);
+    NativeVfsCall call(self.rootFd, self.rootDir.getHandle(), paths);
     return (self.native.*slot)(&self.native, params...);
   }
 };
@@ -1918,15 +2056,14 @@ struct SqliteDatabase::Vfs::MethodWrapperHack<Result (*sqlite3_vfs::*)(sqlite3_v
 // file.
 template <typename Result,
     typename... Params,
-    Result (*sqlite3_io_methods::*slot)(sqlite3_file* file, Params...)>
+    Result (*sqlite3_io_methods::*slot)(sqlite3_file* file, Params...),
+    SqliteDatabase::Vfs::Paths paths>
 struct SqliteDatabase::Vfs::
-    MethodWrapperHack<Result (*sqlite3_io_methods::*)(sqlite3_file* file, Params...), slot> {
+    MethodWrapperHack<Result (*sqlite3_io_methods::*)(sqlite3_file* file, Params...), slot, paths> {
   static Result wrapper(sqlite3_file* file, Params... params) noexcept {
     auto wrapper = static_cast<WrappedNativeFileImpl*>(file);
     file = wrapper->getWrapped();
-    KJ_ASSERT(currentVfsRoot == AT_FDCWD);
-    currentVfsRoot = wrapper->rootFd;
-    KJ_DEFER(currentVfsRoot = AT_FDCWD);
+    NativeVfsCall call(wrapper->rootFd, wrapper->vfs->rootDir.getHandle(), paths);
     return (file->pMethods->*slot)(file, params...);
   }
 };
@@ -1936,41 +2073,45 @@ struct SqliteDatabase::Vfs::
 // The code below has a lot of lambdas inside struct initializers, which clang-format does not
 // handle well, making it extremely hard to read if we leave the formatter on.
 
+// The second WRAP argument says whether the native method may name a file by path (Paths in
+// sqlite.h). In SQLite's unix VFS (os_unix.c): xClose stats the database by its path to report
+// a file renamed while open, xSync opens a new journal's directory by path to sync it,
+// xFileControl answers the temp-filename and has-moved operations by path, and xShmMap opens
+// and xShmUnmap unlinks the -shm file next to the database. The others act only on the
+// descriptor they hold.
 const sqlite3_io_methods SqliteDatabase::Vfs::WrappedNativeFileImpl::METHOD_TABLE = {
   .iVersion = 3,
 
-#define WRAP(name)                                                                                 \
-  .name =                                                                                          \
-      &MethodWrapperHack<decltype(&sqlite3_io_methods::name), &sqlite3_io_methods::name>::wrapper
+#define WRAP(name, paths)                                                                          \
+  .name = &MethodWrapperHack<decltype(&sqlite3_io_methods::name), &sqlite3_io_methods::name,       \
+      Paths::paths>::wrapper
 
-  WRAP(xClose),
-  WRAP(xRead),
-  WRAP(xWrite),
-  WRAP(xTruncate),
-  WRAP(xSync),
-  WRAP(xFileSize),
-  WRAP(xLock),
-  WRAP(xUnlock),
-  WRAP(xCheckReservedLock),
-  WRAP(xFileControl),
-  WRAP(xSectorSize),
+  WRAP(xClose, YES),
+  WRAP(xRead, NO),
+  WRAP(xWrite, NO),
+  WRAP(xTruncate, NO),
+  WRAP(xSync, YES),
+  WRAP(xFileSize, NO),
+  WRAP(xLock, NO),
+  WRAP(xUnlock, NO),
+  WRAP(xCheckReservedLock, NO),
+  WRAP(xFileControl, YES),
+  WRAP(xSectorSize, NO),
   .xDeviceCharacteristics = [](sqlite3_file* file) noexcept -> int {
     auto wrapper = static_cast<WrappedNativeFileImpl*>(file);
     file = wrapper->getWrapped();
-    KJ_ASSERT(currentVfsRoot == AT_FDCWD);
-    currentVfsRoot = wrapper->rootFd;
-    KJ_DEFER(currentVfsRoot = AT_FDCWD);
+    NativeVfsCall call(wrapper->rootFd, wrapper->vfs->rootDir.getHandle(), Paths::NO);
     return (file->pMethods->xDeviceCharacteristics)(file) |
         wrapper->vfs->options.deviceCharacteristics;
   },
 
-  WRAP(xShmMap),
-  WRAP(xShmLock),
-  WRAP(xShmBarrier),
-  WRAP(xShmUnmap),
+  WRAP(xShmMap, YES),
+  WRAP(xShmLock, NO),
+  WRAP(xShmBarrier, NO),
+  WRAP(xShmUnmap, YES),
 
-  WRAP(xFetch),
-  WRAP(xUnfetch),
+  WRAP(xFetch, NO),
+  WRAP(xUnfetch, NO),
 #undef WRAP
 };
 
@@ -2025,11 +2166,9 @@ sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
       file = wrapper->getWrapped();
       file->pMethods = nullptr;
 
-      // Set up currentVfsRoot.
+      // Set up currentVfsRoot (and the turn directory: xOpen names the file by path).
       auto& self = *reinterpret_cast<const SqliteDatabase::Vfs*>(vfs->pAppData);
-      KJ_ASSERT(currentVfsRoot == AT_FDCWD);
-      currentVfsRoot = self.rootFd;
-      KJ_DEFER(currentVfsRoot = AT_FDCWD);
+      NativeVfsCall call(self.rootFd, self.rootDir.getHandle(), Paths::YES);
 
       int result = self.native.xOpen(&self.native, zName, file, flags, pOutFlags);
 
@@ -2046,11 +2185,13 @@ sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
       return result;
     },
 
-#define WRAP(name)                                                                                 \
-  .name = &MethodWrapperHack<decltype(&sqlite3_vfs::name), &sqlite3_vfs::name>::wrapper
+// xDelete and xAccess name a file by path; the rest take none, and xRandomness, which opens
+// /dev/urandom, an absolute path no turn directory admits, gets its fallback either way.
+#define WRAP(name, paths)                                                                          \
+  .name = &MethodWrapperHack<decltype(&sqlite3_vfs::name), &sqlite3_vfs::name, Paths::paths>::wrapper
 
-    WRAP(xDelete),
-    WRAP(xAccess),
+    WRAP(xDelete, YES),
+    WRAP(xAccess, YES),
     .xFullPathname = [](sqlite3_vfs*, const char* zName, int nOut, char* zOut) -> int {
       // Override xFullPathname so that it doesn't rewrite the path at all.
       size_t len = kj::min(strlen(zName), nOut - 1);
@@ -2065,11 +2206,11 @@ sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
     .xDlClose = nullptr,
     // There is no dlopenat(), but we don't need to support these anyway.
 
-    WRAP(xRandomness),
-    WRAP(xSleep),
-    WRAP(xCurrentTime),
-    WRAP(xGetLastError),
-    WRAP(xCurrentTimeInt64),
+    WRAP(xRandomness, NO),
+    WRAP(xSleep, NO),
+    WRAP(xCurrentTime, NO),
+    WRAP(xGetLastError, NO),
+    WRAP(xCurrentTimeInt64, NO),
 
     .xSetSystemCall = nullptr,
     .xGetSystemCall = nullptr,
@@ -2078,6 +2219,19 @@ sqlite3_vfs SqliteDatabase::Vfs::makeWrappedNativeVfs() {
 #undef WRAP
   };
 }
+#else  // #if !_WIN32
+
+// Windows uses the KJ VFS only, so there is no native call to confine.
+long SqliteDatabase::Vfs::hostcallHandler(hostcall::Frame& frame) {
+  frame.outLen = 0;
+  return 0;
+}
+const hostcall::Entry SqliteDatabase::Vfs::HOSTCALL = {
+  hostcall::VFS_ROOT, &SqliteDatabase::Vfs::hostcallHandler};
+void SqliteDatabase::Vfs::installHostcall() {
+  hostcall::install(HOSTCALL);
+}
+void SqliteDatabase::Vfs::rewriteRootForTest(int fd) {}
 #endif  // #if !_WIN32
 
 // -----------------------------------------------------------------------------
@@ -2700,6 +2854,7 @@ SqliteDatabase::Vfs::Vfs(const kj::Directory& directory, Options options)
 #else
   KJ_IF_SOME(fd, directory.getFd()) {
     rootFd = fd;
+    rootDir = hostSlot<RootDir>(fd);
     vfs = kj::heap(makeWrappedNativeVfs());
   } else {
     vfs = kj::heap(makeKjVfs());

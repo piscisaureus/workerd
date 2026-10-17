@@ -10,7 +10,12 @@
 #include <workerd/jsg/modules-new.h>
 #include <workerd/jsg/modules.h>
 #include <workerd/jsg/util.h>
+#include <workerd/util/alloc-census.h>
 #include <workerd/util/thread-scopes.h>
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <workerd/experimental/guest-kernel/gk.h>
+#endif
 
 #ifdef V8_ENABLE_SANDBOX
 #include <sys/mman.h>
@@ -138,33 +143,95 @@ void Data::moveFromTraced(Data& other, v8::TracedReference<v8::Data>& otherTrace
   other.tracedHandle = kj::none;
 }
 
-Lock::Lock(v8::Isolate* v8Isolate)
-    : v8Isolate(v8Isolate),
-      locker(v8Isolate),
-      isolateScope(v8Isolate),
-      previousData(v8Isolate->GetData(SET_DATA_LOCK)),
-      warningsLogged(IsolateBase::from(v8Isolate).areWarningsLogged()) {
-  if (previousData != nullptr) {
-    // Hmm, there's already a current lock. It must be a recursive lock (i.e. a second lock taken
-    // on the same isolate in the same thread), otherwise `locker`'s constructor would have blocked
-    // waiting for the other thread to release the lock. We don't want to support this, but
-    // historically we have.
+GuestArenaScope::GuestArenaScope(v8::Isolate* isolate) {
+  allocCensus::enterIsolate(isolate);
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  KJ_IF_SOME(arena, IsolateBase::from(isolate).getGuestArena()) {
+    int result = gk_arena_enter(arena.get());
+    KJ_REQUIRE(result == 0, "guest-kernel: could not enter the isolate's arena", result);
+    entered = true;
+  }
+#endif
+}
+
+GuestArenaScope::~GuestArenaScope() noexcept(false) {
+  allocCensus::leaveIsolate();
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (entered) {
+    // Leaves what gk recorded this thread as having entered, whatever this object says.
+    int result = gk_arena_leave();
+    if (result != 0) {
+      KJ_LOG(ERROR, "guest-kernel: leaving the isolate's arena failed", result);
+    }
+  }
+#endif
+}
+
+namespace {
+
+// How many Locks are alive on this thread, for the recursion check below. It is a count kept
+// here rather than the lock slot, which is memory a guest turn can write and which the
+// constructor therefore must not read (see Lock::from); the host puts it back after a turn as
+// it does the slots (runTrampolineInGuest in guest-run.c++).
+thread_local uint locksHeld = 0;
+
+// A second Lock on an isolate this thread already has a Lock for is not supported: the lock
+// slot (SET_DATA_LOCK) names one Lock, and the inner one's destructor clears the slot rather
+// than restoring the outer one, which would leave the outer one unnamed and Lock::from()
+// returning null. That is what this refuses, in release as well as debug, because the slot
+// cannot represent it in any build.
+//
+// It takes both halves to say it. v8::Locker::IsLocked() -- V8's thread manager, asked before
+// `locker` is constructed -- says this thread holds this isolate's lock, but says nothing about
+// what holds it: an embedder may hold a bare v8::Locker, which V8 supports and which leaves the
+// slot alone (src/rust/jsg-test's harness holds one for the life of the harness and takes one
+// Lock at a time inside it). The count says a Lock on this thread holds one, but not of which
+// isolate, so a Lock held for another isolate makes it nonzero on its own. Together they are
+// true of a recursive Lock and, short of a Lock on one isolate taken while another isolate this
+// thread has a bare Locker on is locked, of nothing else.
+v8::Isolate* requireNotLockedByThisThread(v8::Isolate* isolate) {
+  if (v8::Locker::IsLocked(isolate) && locksHeld != 0) {
 #ifdef KJ_DEBUG
     // In debug mode, abort immediately. This makes it a little easier to debug than if we threw
     // an exception.
     ([]() noexcept { KJ_FAIL_REQUIRE("attempt to take recursive isolate lock"); })();
 #else
-    // In release mode, log the error.
-    // TODO(soon): This shouldn't happen but we know it does in at least one case. Once things
-    // are cleaned up and we know this no longer happens in production, change this to throw.
-    // Then we can stop storing `previousData`.
-    KJ_LOG(ERROR, "took recursive isolate lock", kj::getStackTrace());
+    KJ_FAIL_REQUIRE("attempt to take recursive isolate lock");
 #endif
   }
+  return isolate;
+}
+
+}  // namespace
+
+uint saveLockDepthForGuestTurn() {
+  return locksHeld;
+}
+void restoreLockDepthAfterGuestTurn(uint depth) {
+  locksHeld = depth;
+}
+uint lockDepthForTest() {
+  return locksHeld;
+}
+void setLockDepthForTest(uint depth) {
+  locksHeld = depth;
+}
+
+Lock::Lock(v8::Isolate* v8Isolate)
+    : v8Isolate(requireNotLockedByThisThread(v8Isolate)),
+      locker(v8Isolate),
+      isolateScope(v8Isolate),
+      guestArenaScope(v8Isolate),
+      warningsLogged(IsolateBase::from(v8Isolate).areWarningsLogged()) {
+  ++locksHeld;
   v8Isolate->SetData(SET_DATA_LOCK, this);
 }
 Lock::~Lock() noexcept(false) {
-  v8Isolate->SetData(SET_DATA_LOCK, previousData);
+  // The slot is cleared rather than restored: with no recursive locks there is nothing to put
+  // back, and a value kept for that in this object would be a pointer the host writes into the
+  // slot from heap memory a guest turn can write.
+  v8Isolate->SetData(SET_DATA_LOCK, nullptr);
+  --locksHeld;
 }
 
 #ifdef WORKERD_ASAN
@@ -667,20 +734,20 @@ void ContextGlobal::setSchemaLoader(const capnp::SchemaLoader& schemaLoader) {
 }
 
 #ifdef V8_ENABLE_SANDBOX
-// These are disabled by default in workerd. We do not build workerd with
-// the V8_ENABLED_SANDBOX flag. If we do decide to enable it, we will need
-// additional setup to ensure that these are handled correctly on all platforms.
-// For now, keeping it simple. This bit will only be used in the internal
-// project.
+// V8 reports -1 as the key when sandbox hardware support (memory protection keys) is not
+// compiled in or not active; in that case there is nothing to switch and the scope is a no-op.
 static constexpr int kPkeyNoRestrictions = 0;
+static constexpr int kNoPkey = -1;
 MemoryProtectionKeyScope::MemoryProtectionKeyScope(Lock& js)
     : pkey(js.v8Isolate->GetMemoryProtectionKey()) {}
 
-MemoryProtectionKeyScope::PkeyScope::PkeyScope(int pkey): key(pkey), saved(pkey_get(key)) {
-  pkey_set(pkey, kPkeyNoRestrictions);
+MemoryProtectionKeyScope::PkeyScope::PkeyScope(int pkey)
+    : key(pkey),
+      saved(key == kNoPkey ? kPkeyNoRestrictions : pkey_get(key)) {
+  if (key != kNoPkey) pkey_set(key, kPkeyNoRestrictions);
 }
 MemoryProtectionKeyScope::PkeyScope::~PkeyScope() {
-  pkey_set(key, saved);
+  if (key != kNoPkey) pkey_set(key, saved);
 }
 #endif
 

@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Wed, 23 Sep 2026 12:00:00 +0000
+Subject: Make the sandbox size a build-time flag
+
+The sandbox size is fixed per platform in include/v8-internal.h (1 TB
+on x64 desktop, 128 GB on Android, RISC-V and LoongArch). Embedders
+that reserve address space per isolate group may want a smaller sandbox
+than the platform default.
+
+Let the build choose the size: when V8_SANDBOX_SIZE_LOG2_OVERRIDE is
+defined it replaces the per-platform kSandboxSizeLog2 (restricted to
+the range 34..40 that V8 already supports). Add a v8_sandbox_size_log2
+int flag to the Bazel build (default 0, meaning the platform default)
+that exports the define through the same configuration target as the
+other layout-affecting defines, so V8 and the embedder agree on the
+sandbox layout.
+
+diff --git a/include/v8-internal.h b/include/v8-internal.h
+--- a/include/v8-internal.h
++++ b/include/v8-internal.h
+@@ -218,7 +218,15 @@
+ #ifdef V8_ENABLE_SANDBOX
+ 
+ // Size of the sandbox, excluding the guard regions surrounding it.
+-#if defined(V8_TARGET_OS_ANDROID)
++#if defined(V8_SANDBOX_SIZE_LOG2_OVERRIDE)
++// The build configuration chose the sandbox size (the v8_sandbox_size_log2
++// Bazel flag). It must be a power of two, expressed as its log2, and V8 and
++// the embedder must be compiled with the same value.
++constexpr size_t kSandboxSizeLog2 = V8_SANDBOX_SIZE_LOG2_OVERRIDE;
++static_assert(kSandboxSizeLog2 >= 34 && kSandboxSizeLog2 <= 40,
++              "V8_SANDBOX_SIZE_LOG2_OVERRIDE must be between 34 (16 GB) and "
++              "40 (1 TB)");
++#elif defined(V8_TARGET_OS_ANDROID)
+ // On Android, most 64-bit devices seem to be configured with only 39 bits of
+ // virtual address space for userspace. As such, limit the sandbox to 128GB (a
+ // quarter of the total available address space).
+diff --git a/BUILD.bazel b/BUILD.bazel
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -443,6 +443,15 @@
+     ],
+ )
+ 
++# Size of the V8 sandbox as a power of two (log2 of the size in bytes), for
++# example 37 for 128 GB or 40 for 1 TB. 0 keeps V8's per-platform default.
++# Exported to embedders as V8_SANDBOX_SIZE_LOG2_OVERRIDE so that they agree
++# with V8 on the sandbox layout.
++v8_int(
++    name = "v8_sandbox_size_log2",
++    default = 0,
++)
++
+ # We use a string flag to create a 3 value-logic.
+ # If no explicit value for v8_enable_short_builtin_calls, we set it to 'none'.
+ v8_string(
+diff --git a/bazel/defs.bzl b/bazel/defs.bzl
+--- a/bazel/defs.bzl
++++ b/bazel/defs.bzl
+@@ -56,6 +56,9 @@
+     defs = []
+     defs.append("V8_TYPED_ARRAY_MAX_SIZE_IN_HEAP=" +
+                 str(ctx.attr._v8_typed_array_max_size_in_heap[FlagInfo].value))
++    sandbox_size_log2 = ctx.attr._v8_sandbox_size_log2[FlagInfo].value
++    if sandbox_size_log2 != 0:
++        defs.append("V8_SANDBOX_SIZE_LOG2_OVERRIDE=" + str(sandbox_size_log2))
+     context = cc_common.create_compilation_context(defines = depset(defs))
+     return [CcInfo(compilation_context = context)]
+ 
+@@ -63,6 +66,7 @@
+     implementation = _custom_config_impl,
+     attrs = {
+         "_v8_typed_array_max_size_in_heap": attr.label(default = ":v8_typed_array_max_size_in_heap"),
++        "_v8_sandbox_size_log2": attr.label(default = ":v8_sandbox_size_log2"),
+     },
+ )
+ 

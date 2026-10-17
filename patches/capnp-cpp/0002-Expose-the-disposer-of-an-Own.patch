@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Thu, 15 Oct 2026 12:00:00 +0000
+Subject: Expose the disposer of an Own
+
+Own<T>::disown() surrenders the object to a caller that already knows
+the disposer, but gives no way to learn it. getDisposer() returns it, so
+that an owner which keeps the object and its disposer apart -- a table
+in memory of another protection class, say -- can take both out of an
+Own and later dispose of the object the way the Own would have.
+
+diff --git a/src/kj/memory.h b/src/kj/memory.h
+--- a/src/kj/memory.h
++++ b/src/kj/memory.h
+@@ -439,6 +439,10 @@
+     ptr = nullptr;
+     return ptrCopy;
+   }
++
++  // The disposer the object will be disposed of with. Only valid if the Own is non-null.
++  inline const Disposer& getDisposer() const { return *disposer; }
++
+ 
+ private:
+   const Disposer* disposer;  // Only valid if ptr != nullptr.

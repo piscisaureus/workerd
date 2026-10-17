@@ -588,6 +588,10 @@ class AbortSignal final: public EventTarget {
       jsg::Optional<jsg::JsRef<jsg::JsValue>> maybeReason = kj::none,
       Flag flag = Flag::NONE);
 
+  // Retires the table entries of the registrations this signal still holds before freeing
+  // them, so that a consumer handle outliving the signal resolves to nothing.
+  ~AbortSignal() noexcept(false);
+
   using PendingReason = ExternalPusherImpl::PendingAbortReasonBox;
 
   // The AbortSignal explicitly does not expose a constructor(). It is
@@ -747,7 +751,7 @@ class AbortSignal final: public EventTarget {
     EventTarget::visitForMemoryInfo(tracker);
     tracker.trackField("reason", reason);
     tracker.trackFieldWithSize(
-        "nativeRegistrations", nativeRegistrations.size() * sizeof(kj::Arc<RegistrationCell>));
+        "nativeRegistrations", nativeRegistrations.size() * sizeof(kj::Own<NativeRegistration>));
   }
 
   void serialize(jsg::Lock& js, jsg::Serializer& serializer);
@@ -789,38 +793,66 @@ class AbortSignal final: public EventTarget {
   // only if the derivation throws, which leaves the signal unmodified and still abortable.
   bool aborting = false;
 
-  // One native abort action, shared between this signal and one consumer. The action is
+  // One native abort action, held by this signal and armed for one consumer. The action is
   // invoked at most once, only ever in its owning IoContext (synchronously if the abort is
   // triggered there; otherwise on that context's next turn), always under the isolate lock,
-  // and never again after the consumer's RAII handle clears the slot. Because the handle is
-  // held by (or attached to) objects the owning request destroys, an IoContext teardown
-  // reclaims the action without ever touching the signal; the signal side retains only this
-  // trivial shell until swept.
+  // and never again once the consumer's RAII handle has disarmed it.
   //
-  // The action slot is taken under the mutex and invoked after unlocking. A cross-context
-  // abort does not take the slot; it schedules a task in the owning context that re-takes it
-  // on arrival — so a consumer that goes away in the meantime reliably turns the delivery
-  // into a no-op.
-  struct RegistrationCell final: public kj::AtomicRefcounted {
-    RegistrationCell(
+  // The record is the signal's own, so only code holding the isolate lock reads or writes it,
+  // and only such code destroys the action. Whether the consumer still wants the action is a
+  // separate fact, because the consumer's handle is held by (or attached to) objects the
+  // owning request destroys on the event loop, outside any isolate lock and outside the
+  // guest: that fact is an entry in the guest kernel's resolve table (util/host-memory.h),
+  // which the handle owns and retires when it is dropped, and which a turn resolves before it
+  // takes the action. The table is beyond a turn's reach, so dropping the handle costs the
+  // host nothing in this record: it neither takes a lock here nor runs a destructor over
+  // memory a turn can write. A cross-context abort takes the action and sends it to the
+  // owning context, which resolves the handle again on arrival — so a consumer that goes away
+  // in the meantime still turns the delivery into a no-op.
+  struct NativeRegistration {
+    NativeRegistration(
         IoCrossContextExecutor executor, kj::Function<void(jsg::Lock&, const kj::Exception&)> fn)
-        : executor(kj::mv(executor)) {
-      *action.lockExclusive() = kj::mv(fn);
-    }
+        : executor(kj::mv(executor)),
+          action(kj::mv(fn)) {}
+    KJ_DISALLOW_COPY_AND_MOVE(NativeRegistration);
 
     // Routes the action into the owning IoContext and answers "is that context current /
-    // still alive?". Immutable, so it is also usable for sweeping after the slot is cleared.
+    // still alive?". Immutable, so it is also usable for sweeping after the action is taken.
     const IoCrossContextExecutor executor;
 
-    kj::MutexGuarded<kj::Maybe<kj::Function<void(jsg::Lock&, const kj::Exception&)>>> action;
+    kj::Maybe<kj::Function<void(jsg::Lock&, const kj::Exception&)>> action;
+
+    // The table entry naming this record, owned by the consumer's RAII handle. Zero once the
+    // entry has been retired, which is also what resolving the handle then reports.
+    hostMemory::ResolveHandle armed = 0;
   };
 
-  // Cells are appended on registration and taken wholesale when the signal aborts. Cells
-  // whose action has been cleared (consumer done, or its IoContext torn down) or whose
-  // owning context is gone are swept on the next registration; this bounds growth for
-  // long-lived signals used across many requests. Holds no JS heap references (weak refs at
-  // most), so no GC visitation is needed.
-  kj::Vector<kj::Arc<RegistrationCell>> nativeRegistrations;
+  // Test-only, for the guest kernel's negative test (experimental/guest-kernel/
+  // abort-signal-test.sh): the newest native registration's record, the word holding the
+  // disposer of its action's kj::Function, and the table entry that arms it.
+ public:
+  struct NativeRegistrationForTest {
+    void* record;
+    void** actionDisposerSlot;
+    hostMemory::ResolveHandle armed;
+  };
+  NativeRegistrationForTest newestNativeRegistrationForTest();
+
+ private:
+  // Retires `reg`'s table entry if it is still live, so that no handle resolves to a record
+  // the signal is about to free. The consumer's handle retires the entry too, whichever runs
+  // first; the other finds nothing to retire.
+  static void disarmNativeRegistration(NativeRegistration& reg);
+
+  // Drops the registrations nothing can use any more: those the consumer has disarmed, those
+  // whose action has already been taken, and those whose owning IoContext is gone. Called on
+  // the registration paths so that growth on a long-lived signal is bounded by its live
+  // registrations.
+  void sweepNativeRegistrations();
+
+  // Records are appended on registration and taken wholesale when the signal aborts. Holds no
+  // JS heap references (weak refs at most), so no GC visitation is needed.
+  kj::Vector<kj::Own<NativeRegistration>> nativeRegistrations;
 
   // Registers an abort action that cancels `canceler` with the abort exception when this
   // signal aborts. The reference remains valid because the returned RAII handle guarantees

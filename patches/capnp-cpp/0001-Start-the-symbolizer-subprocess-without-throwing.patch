@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Wed, 14 Oct 2026 12:00:00 +0000
+Subject: Start the symbolizer subprocess without throwing
+
+Subprocess::exec() is noexcept, so the KJ_SYSCALL() it used for pipe()
+and fork() turned a failure of either into std::terminate(). The
+terminate handler stringifies a stack trace, which runs this function
+again, so a pipe() or fork() that fails persistently (denied by a
+seccomp filter or a sandbox, or descriptor exhaustion) recursed through
+the terminate handler until the stack overflowed. A subprocess that
+cannot be started is now reported as none and the trace goes
+unsymbolized, and the child exits with a status the parent already
+interprets rather than throwing after fork().
+
+diff --git a/src/kj/exception.c++ b/src/kj/exception.c++
+--- a/src/kj/exception.c++
++++ b/src/kj/exception.c++
+@@ -234,24 +234,28 @@
+   kj::OwnFd writeEnd;
+ };
+ 
+-PipePair raiiPipe() {
+-  int fds[2];
+-  KJ_SYSCALL(pipe(fds));
+-  return PipePair { OwnFd(fds[0]), OwnFd(fds[1]) };
+-}
+-
+ // A simple subprocess wrapper with in/out pipes.
+ struct Subprocess {
+-  // Execute command with a shell.
++  // Execute command with a shell. Returns none if the subprocess could not be started.
+   static kj::Maybe<Subprocess> exec(const char* argv[]) noexcept {
+     // Since this is used during error handling we do not to try to free resources in
+     // case of errors.
++    //
++    // Nothing here may throw. This function is noexcept, so a throw would reach std::terminate(),
++    // and the terminate handler stringifies a stack trace through this very function: a pipe()
++    // or fork() that fails persistently -- denied by a seccomp filter or a sandbox, or out of
++    // descriptors -- would then recur through the terminate handler until the stack overflowed.
++    // A subprocess that cannot be started is reported as none, and the trace goes unsymbolized.
++
++    int inFds[2];
++    if (pipe(inFds) < 0) return kj::none;
++    PipePair in { OwnFd(inFds[0]), OwnFd(inFds[1]) };
++    int outFds[2];
++    if (pipe(outFds) < 0) return kj::none;
++    PipePair out { OwnFd(outFds[0]), OwnFd(outFds[1]) };
+ 
+-    auto in = raiiPipe();
+-    auto out = raiiPipe();
+-
+-    pid_t pid;
+-    KJ_SYSCALL(pid = fork());
++    pid_t pid = fork();
++    if (pid < 0) return kj::none;
+     if (pid > 0) {
+       // parent
+       return Subprocess({ .pid = pid, .in = kj::mv(in.writeEnd), .out = kj::mv(out.readEnd) });
+@@ -261,16 +265,11 @@
+       out.readEnd = nullptr;
+ 
+       // redirect stdin & stdout
+-      KJ_SYSCALL(dup2(in.readEnd, 0));
+-      KJ_SYSCALL(dup2(out.writeEnd, 1));
++      if (dup2(in.readEnd, 0) < 0 || dup2(out.writeEnd, 1) < 0) _exit(3);
+ 
+-      KJ_SYSCALL_HANDLE_ERRORS(execvp(argv[0], const_cast<char**>(argv))) {
+-        case ENOENT:
+-          _exit(2);
+-        default:
+-          KJ_FAIL_SYSCALL("execvp", error);
+-      }
+-      KJ_UNREACHABLE;
++      execvp(argv[0], const_cast<char**>(argv));
++      // The parent reports exit code 2 as "not found" and any other failure as a bad exit code.
++      _exit(errno == ENOENT ? 2 : 3);
+     }
+   }
+ 

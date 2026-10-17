@@ -811,9 +811,19 @@ class Server::ActorNamespace final {
           return getChannelTokenImpl(usage, c.id, persistent);
         }
         KJ_CASE_ONEOF(promise, kj::ForkedPromise<void>) {
-          return promise.addBranch().then([this, usage, persistent]() {
-            return getChannelTokenImpl(
-                usage, KJ_ASSERT_NONNULL(classAndId.tryGet<ClassAndId>()).id, persistent);
+          return promise.addBranch().then(
+              [this, usage, persistent]() -> kj::Promise<kj::Array<byte>> {
+            KJ_SWITCH_ONEOF(getChannelTokenImpl(usage,
+                                KJ_ASSERT_NONNULL(classAndId.tryGet<ClassAndId>()).id,
+                                persistent)) {
+              KJ_CASE_ONEOF(token, kj::Array<byte>) {
+                return kj::mv(token);
+              }
+              KJ_CASE_ONEOF(tokenPromise, kj::Promise<kj::Array<byte>>) {
+                return kj::mv(tokenPromise);
+              }
+            }
+            KJ_UNREACHABLE;
           });
         }
       }
@@ -1391,7 +1401,8 @@ class Server::ActorNamespace final {
       co_return ClassAndId(info.actorClass.downcast<ActorClass>(), kj::mv(info.id));
     }
 
-    kj::Array<byte> getChannelTokenImpl(IoChannelFactory::ChannelTokenUsage usage,
+    kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getChannelTokenImpl(
+        IoChannelFactory::ChannelTokenUsage usage,
         const Worker::Actor::Id& id,
         Persistent persistent) {
       kj::StringPtr uniqueKey = KJ_ASSERT_NONNULL(ns.getConfig().tryGet<Durable>()).uniqueKey;
@@ -5785,7 +5796,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     }
   }
 
-  auto isolateGroup = v8::IsolateGroup::GetDefault();
+  auto isolatePlacement = jsg::newIsolateGroup();
   kj::Array<Worker::Api::InboundListener> listeners;
   KJ_IF_SOME(l, inboundListeners.find(name)) {
     listeners = KJ_MAP(listener, l) {
@@ -5797,8 +5808,8 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     };
   }
   auto api = kj::heap<WorkerdApi>(globalContext->v8System, def.featureFlags, extensions,
-      limitEnforcer->getCreateParams(), isolateGroup, kj::mv(jsgobserver), *memoryCacheProvider,
-      pythonConfig, kj::mv(listeners));
+      limitEnforcer->getCreateParams(), kj::mv(isolatePlacement), kj::mv(jsgobserver),
+      *memoryCacheProvider, pythonConfig, kj::mv(listeners));
 
   auto inspectorPolicy = Worker::Isolate::InspectorPolicy::DISALLOW;
   if (inspectorOverride != kj::none) {

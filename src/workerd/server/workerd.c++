@@ -5,10 +5,16 @@
 #include "server.h"
 
 #include <workerd/api/unsafe.h>
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <workerd/experimental/guest-kernel/gk.h>
+#endif
 #include <workerd/io/compatibility-date.capnp.h>
 #include <workerd/io/compatibility-date.h>
+#include <workerd/io/io-own.h>
 #include <workerd/io/release-version.embed.h>
+#include <workerd/io/tracked-wasm-instance.h>
 #include <workerd/jsg/setup.h>
+#include <workerd/server/actor-id-impl.h>
 #include <workerd/server/cpp-capnp-schema.embed.h>
 #include <workerd/server/json-logger.h>
 #include <workerd/server/v8-platform-impl.h>
@@ -16,6 +22,7 @@
 #include <workerd/server/workerd.capnp.h>
 #include <workerd/util/autogate.h>
 #include <workerd/util/entropy.h>
+#include <workerd/util/sqlite.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -23,6 +30,9 @@
 #ifdef __linux__
 #include <sys/mman.h>
 #include <sys/stat.h>
+#endif
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <sys/syscall.h>
 #endif
 
 #include <capnp/dynamic.h>
@@ -90,6 +100,123 @@ void initSignalHandlers() {
 
 namespace workerd::server {
 namespace {
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+// Syscall allowlist for JS turns that run inside the guest kernel. gk forwards
+// every syscall the guest makes to the host; this filter bounds that to what
+// V8 and the runtime need during a turn, and everything else fails with EPERM
+// in the guest (an escaped ring-3 isolate then cannot exec, ptrace, and so
+// on). The syscalls that change mappings are allowed only for a range the
+// guest may change (gk_mapping_syscall_ok in gk.h): the isolate's own arena
+// and the memory the process allocator hands out, but not gk's control
+// memory, another isolate's arena, the runtime's image or the main thread's
+// stack. Runs on gk's syscall-forward path, so it must not allocate.
+//
+// A disk-backed Durable Object runs SQLite's native VFS inside the turn
+// (util/sqlite.c++), which is what the file syscalls here are for: pread64,
+// pwrite64, fsync, fdatasync, ftruncate and fcntl on the descriptors it holds,
+// geteuid for its root check, and openat, newfstatat, unlinkat and faccessat2
+// by path; the turn directory (gk_confine_paths in gk.h) decides where the
+// path ones may land.
+//
+// Adapted from Deno Deploy's V8 seccomp allowlist (x86_64 set).
+// TODO: see if this can be tightened further.
+int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
+#ifndef SYS_clone3
+  constexpr long SYS_clone3 = 435;
+#endif
+#ifndef SYS_rseq
+  constexpr long SYS_rseq = 334;
+#endif
+#ifndef SYS_faccessat2
+  constexpr long SYS_faccessat2 = 439;
+#endif
+  switch (nr) {
+    case SYS_madvise:
+    case SYS_mmap:
+    case SYS_mprotect:
+    case SYS_mremap:
+    case SYS_munmap:
+    case SYS_pkey_mprotect:
+      return gk_mapping_syscall_ok(nr, a1, a2, a3, a4, a5, a6);
+    case SYS_accept4:
+    case SYS_access:
+    case SYS_bind:
+    case SYS_brk:
+    case SYS_clock_gettime:
+    case SYS_clock_nanosleep:
+    case SYS_clone:
+    case SYS_clone3:
+    case SYS_close:
+    case SYS_connect:
+    case SYS_epoll_create1:
+    case SYS_epoll_ctl:
+    case SYS_epoll_wait:
+    case SYS_eventfd:
+    case SYS_eventfd2:
+    case SYS_exit_group:
+    case SYS_exit:
+    case SYS_faccessat:
+    case SYS_faccessat2:
+    case SYS_fcntl:
+    case SYS_fdatasync:
+    case SYS_fstat:
+    case SYS_fsync:
+    case SYS_ftruncate:
+    case SYS_futex:
+    case SYS_getpeername:
+    case SYS_getpid:
+    case SYS_geteuid:
+    case SYS_getrandom:
+    case SYS_getrusage:
+    case SYS_getsockname:
+    case SYS_getsockopt:
+    case SYS_gettid:
+    case SYS_ioctl:
+    case SYS_lseek:
+    case SYS_newfstatat:
+    case SYS_openat:
+    case SYS_poll:
+    case SYS_prctl:
+    case SYS_prlimit64:
+    case SYS_pread64:
+    case SYS_pwrite64:
+    case SYS_read:
+    case SYS_recvfrom:
+    case SYS_recvmsg:
+    case SYS_rename:
+    case SYS_rseq:
+    case SYS_rt_sigaction:
+    case SYS_rt_sigprocmask:
+    case SYS_rt_sigreturn:
+    case SYS_sched_getaffinity:
+    case SYS_sched_yield:
+    case SYS_sched_getparam:
+    case SYS_sched_getscheduler:
+    case SYS_sendmmsg:
+    case SYS_sendmsg:
+    case SYS_sendto:
+    case SYS_set_robust_list:
+    case SYS_setsockopt:
+    case SYS_shutdown:
+    case SYS_sigaltstack:
+    case SYS_socket:
+    case SYS_stat:
+    case SYS_statx:
+    case SYS_restart_syscall:
+    case SYS_tgkill:
+    case SYS_uname:
+    case SYS_unlinkat:
+    case SYS_write:
+    case SYS_writev:
+    case SYS_getcwd:
+    case SYS_readlink:
+      return 1;
+    default:
+      return 0;
+  }
+}
+#endif
 
 static kj::StringPtr getVersionString() {
   static const kj::String result = kj::str("workerd ", RELEASE_VERSION);
@@ -886,6 +1013,15 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
 #endif
 
   void enableInspector(kj::StringPtr param) {
+    // The inspector executes JavaScript outside the guest: Worker::Isolate's
+    // dispatchProtocolMessage() runs it under the isolate lock with no
+    // jsg::runInGuest() around it, so an isolate's JS would run with the
+    // runtime's own privileges. Rather than quietly removing the isolation,
+    // refuse the combination.
+    if (jsg::isGuestKernelEnabled()) {
+      CLI_ERROR("The inspector cannot be used with guest-kernel isolation "
+                "(WORKERD_EXPERIMENTAL_GUEST_KERNEL): it runs JavaScript outside the guest.");
+    }
     server->enableInspector(kj::str(param));
   }
 
@@ -1541,6 +1677,39 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
 
 int main(int argc, char* argv[]) {
   workerd::server::StructuredLoggingProcessContext context(argv[0]);
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  // Experimental: make this process a KVM guest so that each isolate's JS turn
+  // can run at guest ring 3 in its own arena (see jsg::runInGuest). This comes
+  // first of all: before the Server is constructed, since it owns objects that
+  // live in guest-kernel host memory (the channel token key, see
+  // util/host-memory.h) and host memory exists only once gk_init() has run;
+  // and before the V8 platform starts its worker threads and V8::Initialize
+  // reserves the sandbox/cage. Off unless the env var is set.
+  if (getenv("WORKERD_EXPERIMENTAL_GUEST_KERNEL") != nullptr) {
+    if (gk_init() < 0) {
+      context.exitError(kj::str("guest-kernel: gk_init() failed: ",
+          gk_last_error() != nullptr ? gk_last_error() : "unknown"));
+    }
+    gk_set_syscall_filter(&workerd::server::guestKernelSyscallFilter);
+    // The hostcalls a turn makes (util/hostcall.h), registered before any turn can run.
+    workerd::server::ActorIdFactoryImpl::installHostcall();
+    workerd::TrackedWasmInstanceList::installHostcall();
+    workerd::SqliteDatabase::Vfs::installHostcall();
+    workerd::hostMemory::installResolveHostcall();
+    workerd::OwnedObjectList::installHostcall();
+    // A turn's path syscalls land beneath the turn directory its VFS root hostcall set, or
+    // nowhere (gk_confine_paths in gk.h). The test-only switch leaves them unconfined, so that
+    // vfs-root-test.sh can show what the confinement prevents.
+    if (getenv("WORKERD_GK_TEST_PROBE") != nullptr &&
+        getenv("WORKERD_GK_TEST_UNCONFINED") != nullptr) {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_UNCONFINED: a turn's path syscalls are not confined");
+    } else {
+      gk_confine_paths(1);
+    }
+    KJ_LOG(WARNING, "guest-kernel isolation enabled (experimental)");
+  }
+#endif
 
   workerd::server::CliMain mainObject(context, argv);
 

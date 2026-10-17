@@ -1,0 +1,540 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Wed, 23 Sep 2026 12:00:00 +0000
+Subject: Allow placing an IsolateGroup sandbox in an embedder reservation
+
+With the sandbox and multiple pointer compression cages enabled, every
+v8::IsolateGroup::Create() reserves its own sandbox at an address that
+V8 picks at random. Embedders that manage the address space themselves
+(for example to apply hardware memory isolation per isolate group) need
+to decide where each sandbox lives.
+
+Add v8::IsolateGroup::CreateParams with an optional embedder-owned
+reservation and v8::IsolateGroup::Create(const CreateParams&). When a
+reservation is supplied, the group's sandbox is placed at its start:
+Sandbox::InitializeAt() adopts the memory through a new
+base::VirtualAddressSpace::AdoptSubspace(), which wraps an existing
+inaccessible private mapping in a VirtualAddressSubspace that does not
+own (and therefore never unmaps) the reservation. Inside the subspace V8
+keeps remapping pages in place with MAP_FIXED as it does for its own
+reservations, so the pointer compression cage, guard regions and page
+allocator work unchanged.
+
+The reservation must be aligned to kSandboxAlignment and must be at
+least kSandboxSize + 2 * kSandboxGuardRegionSize +
+kAdditionalTrailingGuardRegionSize bytes. An adopted sandbox is always
+fully reserved with guard regions; there is no partially-reserved
+fallback. Adoption is only available on POSIX platforms other than
+Fuchsia (V8_CAN_ADOPT_ADDRESS_SPACE_RESERVATION); elsewhere supplying a
+reservation aborts. The existing Create() path is unchanged.
+
+diff --git a/include/v8-isolate.h b/include/v8-isolate.h
+--- a/include/v8-isolate.h
++++ b/include/v8-isolate.h
+@@ -244,6 +244,39 @@
+    */
+   static IsolateGroup Create();
+ 
++  /**
++   * Optional configuration for a new isolate group.
++   */
++  struct CreateParams {
++    /**
++     * When set, the group's sandbox is placed inside this embedder-owned
++     * virtual address space reservation instead of a reservation that V8
++     * picks at random. The memory must be an anonymous, private, PROT_NONE
++     * mapping that V8 may remap in place with MAP_FIXED. V8 never unmaps it;
++     * the embedder keeps ownership and must not touch it while the group is
++     * alive.
++     *
++     * Requirements:
++     *  - sandbox_reservation is aligned to internal::kSandboxAlignment.
++     *  - sandbox_reservation_size >= internal::kSandboxSize +
++     *    2 * internal::kSandboxGuardRegionSize +
++     *    internal::kAdditionalTrailingGuardRegionSize. Only that prefix of the
++     *    reservation is used.
++     *
++     * Only supported when the sandbox is enabled and V8 supports multiple
++     * pointer compression cages; otherwise Create() aborts. Only POSIX
++     * platforms (excluding Fuchsia) support placing the sandbox.
++     */
++    void* sandbox_reservation = nullptr;
++    size_t sandbox_reservation_size = 0;
++  };
++
++  /**
++   * Create a new isolate group with the given parameters. If this V8's build
++   * configuration only supports a single group, abort.
++   */
++  static IsolateGroup Create(const CreateParams& params);
++
+   IsolateGroup(IsolateGroup&& other);
+   IsolateGroup& operator=(IsolateGroup&& other);
+ 
+diff --git a/src/api/api.cc b/src/api/api.cc
+--- a/src/api/api.cc
++++ b/src/api/api.cc
+@@ -9943,6 +9943,13 @@
+   return IsolateGroup(i::IsolateGroup::New());
+ }
+ 
++// static
++IsolateGroup IsolateGroup::Create(const CreateParams& params) {
++  return IsolateGroup(i::IsolateGroup::New(
++      reinterpret_cast<i::Address>(params.sandbox_reservation),
++      params.sandbox_reservation_size));
++}
++
+ IsolateGroup::IsolateGroup(IsolateGroup&& other) {
+   isolate_group_ = other.isolate_group_;
+   other.isolate_group_ = nullptr;
+diff --git a/src/init/isolate-group.h b/src/init/isolate-group.h
+--- a/src/init/isolate-group.h
++++ b/src/init/isolate-group.h
+@@ -124,6 +124,14 @@
+   // group's refcount drops to zero.  The group's initial refcount is 1.
+   static IsolateGroup* New();
+ 
++  // Like New(), but when |sandbox_reservation_base| is non-null the group's
++  // sandbox is placed inside the embedder-owned reservation starting there
++  // (see v8::IsolateGroup::CreateParams for the requirements). Aborts if a
++  // reservation is given but the sandbox is disabled or the platform cannot
++  // adopt embedder memory.
++  static IsolateGroup* New(Address sandbox_reservation_base,
++                           size_t sandbox_reservation_size);
++
+   static void InitializeOncePerProcess();
+   static void TearDownOncePerProcess();
+ 
+diff --git a/src/init/isolate-group.cc b/src/init/isolate-group.cc
+--- a/src/init/isolate-group.cc
++++ b/src/init/isolate-group.cc
+@@ -411,7 +411,11 @@
+ }
+ 
+ // static
+-IsolateGroup* IsolateGroup::New() {
++IsolateGroup* IsolateGroup::New() { return New(kNullAddress, 0); }
++
++// static
++IsolateGroup* IsolateGroup::New(Address sandbox_reservation_base,
++                                size_t sandbox_reservation_size) {
+   if (!CanCreateNewGroups()) {
+     FATAL(
+         "Creation of new isolate groups requires enabling "
+@@ -420,10 +424,23 @@
+ 
+   IsolateGroup* group = new IsolateGroup;
+ #ifdef V8_ENABLE_SANDBOX
+-  Sandbox* sandbox =
+-      Sandbox::New(V8::GetCurrentPlatform(), GetPlatformVirtualAddressSpace());
++  Sandbox* sandbox;
++  if (sandbox_reservation_base != kNullAddress) {
++    sandbox = Sandbox::NewAt(V8::GetCurrentPlatform(),
++                             GetPlatformVirtualAddressSpace(),
++                             sandbox_reservation_base,
++                             sandbox_reservation_size);
++  } else {
++    sandbox = Sandbox::New(V8::GetCurrentPlatform(),
++                           GetPlatformVirtualAddressSpace());
++  }
+   group->Initialize(false, sandbox);
+ #else
++  if (sandbox_reservation_base != kNullAddress) {
++    FATAL(
++        "Placing an isolate group's sandbox in an embedder reservation "
++        "requires enabling the sandbox at build-time");
++  }
+   group->Initialize(false);
+ #endif
+   CHECK_NOT_NULL(group->page_allocator_);
+diff --git a/src/sandbox/sandbox.h b/src/sandbox/sandbox.h
+--- a/src/sandbox/sandbox.h
++++ b/src/sandbox/sandbox.h
+@@ -9,6 +9,7 @@
+ #include "include/v8-platform.h"
+ #include "include/v8config.h"
+ #include "src/base/bounds.h"
++#include "src/base/platform/platform.h"
+ #include "src/common/globals.h"
+ 
+ #if V8_ENABLE_WEBASSEMBLY
+@@ -101,6 +102,23 @@
+    */
+   void Initialize(v8::Platform* platform, v8::VirtualAddressSpace* vas);
+ 
++#ifdef V8_CAN_ADOPT_ADDRESS_SPACE_RESERVATION
++  /**
++   * Initializes this sandbox inside an embedder-owned reservation.
++   *
++   * The reservation must start at |reservation_base|, which must be aligned to
++   * kSandboxAlignment, and must be at least kSandboxSize +
++   * 2 * kSandboxGuardRegionSize + kAdditionalTrailingGuardRegionSize bytes;
++   * only that prefix is used. It must be an inaccessible private anonymous
++   * mapping that V8 may remap in place. Unlike Initialize(), the reservation
++   * is adopted rather than allocated: it is never a partially-reserved
++   * sandbox, always has guard regions, and TearDown() does not unmap it. |vas|
++   * must be the platform virtual address space.
++   */
++  void InitializeAt(v8::Platform* platform, v8::VirtualAddressSpace* vas,
++                    Address reservation_base, size_t reservation_size);
++#endif  // V8_CAN_ADOPT_ADDRESS_SPACE_RESERVATION
++
+   /**
+    * Tear down this sandbox.
+    *
+@@ -255,6 +273,12 @@
+   //
+   static Sandbox* New(v8::Platform* platform, v8::VirtualAddressSpace* vas);
+ 
++  // Like New(), but places the sandbox inside an embedder-owned reservation.
++  // See InitializeAt() for the requirements on the reservation. Aborts if the
++  // platform cannot adopt embedder memory.
++  static Sandbox* NewAt(v8::Platform* platform, v8::VirtualAddressSpace* vas,
++                        Address reservation_base, size_t reservation_size);
++
+ #ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
+ #ifdef USING_V8_SHARED_PRIVATE
+   static Sandbox* current() { return current_non_inlined(); }
+@@ -315,6 +339,18 @@
+   // been initialized. Called from the two Initialize variants above.
+   void FinishInitialization();
+ 
++  // Sets up the sandbox address space's fields, guard regions and the Smi
++  // address range guard once |address_space_| backs a fully-reserved sandbox
++  // of |size| bytes. Shared by Initialize() and InitializeAt().
++  void InitializeFullyReserved(v8::Platform* platform,
++                               v8::VirtualAddressSpace* vas, size_t size,
++                               bool use_guard_regions);
++
++  // Registers the initialized sandbox with the trap handler and enforces the
++  // security-mode flags. Called last by the public initialization entry
++  // points.
++  void RegisterInitializedSandbox();
++
+   // Initialize the constant objects for this sandbox.
+   void InitializeConstants();
+ 
+diff --git a/src/sandbox/sandbox.cc b/src/sandbox/sandbox.cc
+--- a/src/sandbox/sandbox.cc
++++ b/src/sandbox/sandbox.cc
+@@ -236,6 +236,29 @@
+   region_alloc_->FreeRegion(reinterpret_cast<Address>(data));
+ }
+ 
++// There should be no executable pages mapped inside the sandbox since
++// those could be corrupted by an attacker and therefore pose a security
++// risk. Furthermore, allowing executable mappings in the sandbox requires
++// MAP_JIT on macOS, which causes fork() to become excessively slow
++// (multiple seconds or even minutes for a 1TB sandbox on macOS 12.X), in
++// turn causing tests to time out. As such, the maximum page permission
++// inside the sandbox should be read + write.
++constexpr PagePermissions kSandboxMaxPermissions = PagePermissions::kReadWrite;
++
++// When sandbox hardware support is available and active, the sandbox address
++// space uses a dedicated memory protection key.
++std::optional<VirtualAddressSpace::MemoryProtectionKeyId>
++SandboxMemoryProtectionKey() {
++#ifdef V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
++  if (SandboxHardwareSupport::IsActive()) {
++    CHECK_NE(SandboxHardwareSupport::SandboxPkey(),
++             base::MemoryProtectionKey::kNoMemoryProtectionKey);
++    return SandboxHardwareSupport::SandboxPkey();
++  }
++#endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
++  return std::nullopt;
++}
++
+ }  // namespace
+ 
+ bool Sandbox::smi_address_range_reserved_ = false;
+@@ -405,6 +428,52 @@
+         "Failed to reserve the virtual address space for the V8 sandbox");
+   }
+ 
++  RegisterInitializedSandbox();
++
++  DCHECK(initialized_);
++}
++
++#ifdef V8_CAN_ADOPT_ADDRESS_SPACE_RESERVATION
++void Sandbox::InitializeAt(v8::Platform* platform, v8::VirtualAddressSpace* vas,
++                           Address reservation_base, size_t reservation_size) {
++  CHECK(!initialized_);
++  CHECK(vas->CanAllocateSubspaces());
++  CHECK_NE(reservation_base, kNullAddress);
++  CHECK(IsAligned(reservation_base, kSandboxAlignment));
++  CHECK_LT(kSandboxSize, DetermineAddressSpaceLimit());
++
++  // An adopted sandbox always has guard regions, so the reservation must be
++  // large enough to hold them.
++  constexpr bool use_guard_regions = true;
++  constexpr size_t true_reservation_size = kSandboxSize +
++                                           2 * kSandboxGuardRegionSize +
++                                           kAdditionalTrailingGuardRegionSize;
++  CHECK_GE(reservation_size, true_reservation_size);
++
++#if defined(LEAK_SANITIZER)
++  // The platform virtual address space is wrapped for LSan and cannot adopt
++  // reservations.
++  FATAL("Adopting a sandbox reservation is not supported under LSan");
++#else
++  // The platform virtual address space is always the root
++  // base::VirtualAddressSpace (see GetPlatformVirtualAddressSpace()).
++  auto* root_vas = static_cast<base::VirtualAddressSpace*>(vas);
++  address_space_ = root_vas->AdoptSubspace(
++      reservation_base, true_reservation_size, kSandboxMaxPermissions,
++      SandboxMemoryProtectionKey());
++#endif  // defined(LEAK_SANITIZER)
++  CHECK(address_space_);
++
++  InitializeFullyReserved(platform, vas, kSandboxSize, use_guard_regions);
++  RegisterInitializedSandbox();
++
++  DCHECK(initialized_);
++  DCHECK_EQ(reservation_base_, reservation_base);
++  DCHECK_EQ(base_, reservation_base + kSandboxGuardRegionSize);
++}
++#endif  // V8_CAN_ADOPT_ADDRESS_SPACE_RESERVATION
++
++void Sandbox::RegisterInitializedSandbox() {
+   if (v8_flags.sandbox_prohibit_insecure_mode) {
+     if (is_partially_reserved() || !smi_address_range_is_inaccessible()) {
+       V8::FatalProcessOutOfMemory(
+@@ -429,8 +498,6 @@
+              SandboxHardwareSupport::SandboxPkey());
+   }
+ #endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+-
+-  DCHECK(initialized_);
+ }
+ 
+ bool Sandbox::Initialize(v8::Platform* platform, v8::VirtualAddressSpace* vas,
+@@ -439,42 +506,38 @@
+   CHECK(base::bits::IsPowerOfTwo(size));
+   CHECK(vas->CanAllocateSubspaces());
+ 
+-  size_t reservation_size = size;
+   size_t true_reservation_size = size;
+ 
+   if (use_guard_regions) {
+-    reservation_size += 2 * kSandboxGuardRegionSize;
+-    true_reservation_size =
+-        reservation_size + kAdditionalTrailingGuardRegionSize;
++    true_reservation_size += 2 * kSandboxGuardRegionSize;
++    true_reservation_size += kAdditionalTrailingGuardRegionSize;
+   }
+ 
+   Address hint = RoundDown(vas->RandomPageAddress(), kSandboxAlignment);
+ 
+-  // There should be no executable pages mapped inside the sandbox since
+-  // those could be corrupted by an attacker and therefore pose a security
+-  // risk. Furthermore, allowing executable mappings in the sandbox requires
+-  // MAP_JIT on macOS, which causes fork() to become excessively slow
+-  // (multiple seconds or even minutes for a 1TB sandbox on macOS 12.X), in
+-  // turn causing tests to time out. As such, the maximum page permission
+-  // inside the sandbox should be read + write.
+-  const PagePermissions kSandboxMaxPermissions = PagePermissions::kReadWrite;
+-
+-  // When sandbox hardware support is available and active, the sandbox address
+-  // space uses a dedicated memory protection key.
+-  std::optional<VirtualAddressSpace::MemoryProtectionKeyId> sandbox_pkey =
+-      std::nullopt;
+-#ifdef V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+-  if (SandboxHardwareSupport::IsActive()) {
+-    CHECK_NE(SandboxHardwareSupport::SandboxPkey(),
+-             base::MemoryProtectionKey::kNoMemoryProtectionKey);
+-    sandbox_pkey = SandboxHardwareSupport::SandboxPkey();
+-  }
+-#endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+-
+   address_space_ =
+       vas->AllocateSubspace(hint, true_reservation_size, kSandboxAlignment,
+-                            kSandboxMaxPermissions, sandbox_pkey);
++                            kSandboxMaxPermissions,
++                            SandboxMemoryProtectionKey());
+   if (!address_space_) return false;
++
++  InitializeFullyReserved(platform, vas, size, use_guard_regions);
++  return true;
++}
++
++void Sandbox::InitializeFullyReserved(v8::Platform* platform,
++                                      v8::VirtualAddressSpace* vas, size_t size,
++                                      bool use_guard_regions) {
++  DCHECK(!initialized_);
++  DCHECK(address_space_);
++
++  size_t reservation_size = size;
++  if (use_guard_regions) {
++    reservation_size += 2 * kSandboxGuardRegionSize;
++    DCHECK_GE(address_space_->size(),
++              reservation_size + kAdditionalTrailingGuardRegionSize);
++  }
++
+   address_space_->SetName(kSandboxAddressSpaceName);
+   ExcludeReservationFromCoreDump(address_space_->base(),
+                                  address_space_->size());
+@@ -527,7 +590,6 @@
+   FinishInitialization();
+ 
+   DCHECK(!is_partially_reserved());
+-  return true;
+ }
+ 
+ bool Sandbox::InitializeAsPartiallyReservedSandbox(v8::Platform* platform,
+@@ -694,6 +756,26 @@
+   return sandbox;
+ }
+ 
++// static
++Sandbox* Sandbox::NewAt(v8::Platform* platform, v8::VirtualAddressSpace* vas,
++                        Address reservation_base, size_t reservation_size) {
++  if (!COMPRESS_POINTERS_IN_MULTIPLE_CAGES_BOOL) {
++    FATAL(
++        "Creation of new sandboxes requires enabling "
++        "multiple pointer compression cages at build-time");
++  }
++#ifdef V8_CAN_ADOPT_ADDRESS_SPACE_RESERVATION
++  Sandbox* sandbox = new Sandbox;
++  sandbox->InitializeAt(platform, vas, reservation_base, reservation_size);
++  CHECK(!v8_flags.sandbox_testing && !v8_flags.sandbox_fuzzing);
++  return sandbox;
++#else
++  FATAL(
++      "Placing a sandbox in an embedder reservation is not supported on this "
++      "platform");
++#endif  // V8_CAN_ADOPT_ADDRESS_SPACE_RESERVATION
++}
++
+ void Sandbox::set_in_sandbox_allocator(std::shared_ptr<Allocator> allocator) {
+   in_sandbox_allocator_ = std::move(allocator);
+ }
+diff --git a/src/base/virtual-address-space.h b/src/base/virtual-address-space.h
+--- a/src/base/virtual-address-space.h
++++ b/src/base/virtual-address-space.h
+@@ -81,6 +81,17 @@
+       std::optional<MemoryProtectionKeyId> key = std::nullopt,
+       std::optional<SharedMemoryHandle> handle = std::nullopt) override;
+ 
++#ifdef V8_CAN_ADOPT_ADDRESS_SPACE_RESERVATION
++  // Creates a subspace over a reservation owned by the caller instead of
++  // allocating one. [base, base + size) must be an inaccessible private
++  // anonymous mapping, aligned to the allocation granularity, that V8 may
++  // remap in place for as long as the subspace exists. The returned subspace
++  // never unmaps the reservation; the caller keeps ownership of it.
++  std::unique_ptr<v8::VirtualAddressSpace> AdoptSubspace(
++      Address base, size_t size, PagePermissions max_page_permissions,
++      std::optional<MemoryProtectionKeyId> key = std::nullopt);
++#endif  // V8_CAN_ADOPT_ADDRESS_SPACE_RESERVATION
++
+   bool RecommitPages(Address address, size_t size,
+                      PagePermissions access) override;
+ 
+@@ -152,14 +163,22 @@
+ 
+   void FreeSubspace(VirtualAddressSubspace* subspace) override;
+ 
++  // |owns_reservation| is false for a subspace adopted over caller-owned
++  // memory (see VirtualAddressSpace::AdoptSubspace); such a subspace does not
++  // free its reservation when it is destroyed.
+   VirtualAddressSubspace(AddressSpaceReservation reservation,
+                          VirtualAddressSpaceBase* parent_space,
+                          PagePermissions max_page_permissions,
+-                         std::optional<MemoryProtectionKeyId> key);
++                         std::optional<MemoryProtectionKeyId> key,
++                         bool owns_reservation = true);
+ 
+   // The address space reservation backing this subspace.
+   AddressSpaceReservation reservation_;
+ 
++  // Whether reservation_ is freed by the parent space when this subspace is
++  // destroyed.
++  bool owns_reservation_;
++
+   // Mutex guarding the non-threadsafe RegionAllocator and
+   // RandomNumberGenerator.
+   Mutex mutex_;
+diff --git a/src/base/virtual-address-space.cc b/src/base/virtual-address-space.cc
+--- a/src/base/virtual-address-space.cc
++++ b/src/base/virtual-address-space.cc
+@@ -186,6 +186,26 @@
+   return OS::DecommitPages(reinterpret_cast<void*>(address), size);
+ }
+ 
++#ifdef V8_CAN_ADOPT_ADDRESS_SPACE_RESERVATION
++std::unique_ptr<v8::VirtualAddressSpace> VirtualAddressSpace::AdoptSubspace(
++    Address base, size_t size, PagePermissions max_page_permissions,
++    std::optional<MemoryProtectionKeyId> key) {
++  CHECK_NE(base, kNullAddress);
++  CHECK(IsAligned(base, allocation_granularity()));
++  CHECK(IsAligned(size, allocation_granularity()));
++  // The sandbox and other users never need executable pages, and a
++  // caller-owned mapping was not created with MAP_JIT.
++  CHECK_NE(max_page_permissions, PagePermissions::kReadWriteExecute);
++
++  // On POSIX a reservation is simply a private inaccessible mapping that gets
++  // remapped in place, which is exactly what the caller hands us.
++  AddressSpaceReservation reservation(reinterpret_cast<void*>(base), size);
++  constexpr bool kOwnsReservation = false;
++  return std::unique_ptr<v8::VirtualAddressSpace>(new VirtualAddressSubspace(
++      reservation, this, max_page_permissions, key, kOwnsReservation));
++}
++#endif  // V8_CAN_ADOPT_ADDRESS_SPACE_RESERVATION
++
+ void VirtualAddressSpace::FreeSubspace(VirtualAddressSubspace* subspace) {
+   OS::FreeAddressSpaceReservation(subspace->reservation_);
+ }
+@@ -193,12 +213,13 @@
+ VirtualAddressSubspace::VirtualAddressSubspace(
+     AddressSpaceReservation reservation, VirtualAddressSpaceBase* parent_space,
+     PagePermissions max_page_permissions,
+-    std::optional<MemoryProtectionKeyId> key)
++    std::optional<MemoryProtectionKeyId> key, bool owns_reservation)
+     : VirtualAddressSpaceBase(parent_space->page_size(),
+                               parent_space->allocation_granularity(),
+                               reinterpret_cast<Address>(reservation.base()),
+                               reservation.size(), max_page_permissions),
+       reservation_(reservation),
++      owns_reservation_(owns_reservation),
+       region_allocator_(reinterpret_cast<Address>(reservation.base()),
+                         reservation.size(),
+                         parent_space->allocation_granularity()),
+@@ -235,7 +256,7 @@
+   // assert that all allocations have been freed. Otherwise we may end up
+   // leaking memory on Windows because VirtualFree(subspace_base, 0) will then
+   // only free the first allocation in the subspace, not the entire subspace.
+-  parent_space_->FreeSubspace(this);
++  if (owns_reservation_) parent_space_->FreeSubspace(this);
+ }
+ 
+ void VirtualAddressSubspace::SetRandomSeed(int64_t seed) {
+diff --git a/src/base/platform/platform.h b/src/base/platform/platform.h
+--- a/src/base/platform/platform.h
++++ b/src/base/platform/platform.h
+@@ -466,6 +466,15 @@
+ // Reserved address space in which no pages have been allocated is guaranteed
+ // to be inaccessible and cause a fault on access. As such, creating guard
+ // regions requires no further action.
++//
++// On POSIX platforms other than Fuchsia a reservation is nothing more than an
++// inaccessible private anonymous mapping that is remapped in place, so a
++// reservation can also be built over such a mapping owned by the embedder
++// (see VirtualAddressSpace::AdoptSubspace). V8_CAN_ADOPT_ADDRESS_SPACE_RESERVATION
++// is defined on exactly those platforms.
++#if V8_OS_POSIX && !V8_OS_FUCHSIA
++#define V8_CAN_ADOPT_ADDRESS_SPACE_RESERVATION 1
++#endif
+ class V8_BASE_EXPORT AddressSpaceReservation {
+  public:
+   using Address = uintptr_t;
+@@ -526,6 +535,9 @@
+ 
+  private:
+   friend class OS;
++  // VirtualAddressSpace::AdoptSubspace builds a reservation over embedder
++  // memory.
++  friend class VirtualAddressSpace;
+ 
+ #if V8_OS_FUCHSIA
+   AddressSpaceReservation(void* base, size_t size, zx_handle_t vmar)

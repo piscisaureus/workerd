@@ -40,6 +40,12 @@ class SqliteMemoryScope {
   ~SqliteMemoryScope() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(SqliteMemoryScope);
 
+  // The thread-local active scope, for the host side of a guest turn to save before the turn and
+  // put back after it (see GuestTurnThreadLocals in io/guest-turn-thread-locals.h). Opaque to
+  // the caller: only ever stored back.
+  static SqliteMemoryScope* saveThreadLocalForGuestTurn();
+  static void restoreThreadLocalAfterGuestTurn(SqliteMemoryScope* value);
+
  private:
   // These are accessed by the allocator functions via threadLocalScope.
   size_t& memoryBytes;

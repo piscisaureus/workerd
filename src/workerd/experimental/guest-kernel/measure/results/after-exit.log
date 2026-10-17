@@ -1,0 +1,3 @@
+none     8000 ops/run: mean   416417 TSC ticks per run, best   407616  [25bdcd6f1efc6d06]
+syscall  8000 ops/run: mean   432651 TSC ticks per run, best   423840  [25bdcd6f1efc6d06]
+kvm      8000 ops/run: mean  1239155 TSC ticks per run, best  1229408  [25bdcd6f1efc6d06]

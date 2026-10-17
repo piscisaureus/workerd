@@ -70,6 +70,7 @@ Checks: >
   workerd-angled-includes,
   workerd-consume,
   workerd-legacy-stream-alloc,
+  workerd-memory-class,
   workerd-promise-ignore-result,
   workerd-unsafe-continuation-capture,
   custom-iocontext-run-manual-capture

@@ -40,6 +40,11 @@ using kj::uint;
 using ssize_t = long long;
 #endif
 
+// A guest-kernel memory arena (experimental/guest-kernel/gk.h). Only ever non-null in builds
+// that link gk (WORKERD_HAS_GUEST_KERNEL) with guest-kernel isolation enabled at runtime; kept
+// opaque here so that gk.h stays out of the JSG headers.
+struct gk_arena;
+
 namespace workerd::jsg {
 kj::String stringifyHandle(v8::Local<v8::Value> value);
 }
@@ -2696,6 +2701,25 @@ class MemoryProtectionKeyScope final {
   friend class Lock;
 };
 
+// Makes the isolate's guest-kernel arena (IsolateBase::getGuestArena()), if it has one, the
+// calling thread's active arena for the scope's lifetime, and leaves it afterwards so that locks
+// on different isolates nest. While the scope is active, guest execution on this thread can
+// address this isolate's V8 sandbox and no other isolate's. A no-op when the isolate has no
+// arena, which is always the case unless guest-kernel isolation is enabled (see setup.h).
+//
+// The scope records nothing that selects a page-table root: the arena to return to is kept by
+// gk itself, per thread, in its supervisor memory (gk_arena_leave in gk.h). A jsg::Lock, and so
+// this scope, may live on the heap, which guest execution can write; a flag is all it holds.
+class GuestArenaScope final {
+ public:
+  explicit GuestArenaScope(v8::Isolate* isolate);
+  ~GuestArenaScope() noexcept(false);
+  KJ_DISALLOW_COPY_AND_MOVE(GuestArenaScope);
+
+ private:
+  bool entered = false;
+};
+
 // Represents an isolate lock, which allows the current thread to execute JavaScript code within
 // an isolate. A thread must lock an isolate -- obtaining an instance of `Lock` -- before it can
 // manipulate JavaScript objects or execute JavaScript code inside the isolate.
@@ -2762,6 +2786,15 @@ class Lock {
   //
   // This method is intended to be used in callbacks from V8 that pass an isolate pointer but
   // don't provide any further context. Most code should rely on the caller passing in a `Lock&`.
+  //
+  // The slot this reads (SET_DATA_LOCK) is in the C++ isolate object, which is in the shared
+  // runtime heap: with the experimental guest kernel on, that is memory every isolate's JS turn
+  // can write at guest ring 3, so during a turn the slot holds whatever a turn last put there,
+  // and a call from inside a turn runs at that turn's privilege whatever it finds. Host code
+  // calling this after a turn, with the isolate still locked, sees the value the host put back
+  // from its own stack frame when the guest returned (see runTrampolineInGuest in guest-run.c++),
+  // not what the turn left; the Lock constructor writes the slot and the destructor clears it,
+  // and neither reads it.
   static Lock& from(v8::Isolate* v8Isolate) {
     return *reinterpret_cast<Lock*>(v8Isolate->GetData(SET_DATA_LOCK));
   }
@@ -3334,8 +3367,9 @@ class Lock {
 
   v8::Locker locker;
   v8::Isolate::Scope isolateScope;
-
-  void* previousData;
+  // Declared after the V8 lock so that the isolate's guest-kernel arena is entered once the
+  // isolate is locked and left before it is unlocked.
+  GuestArenaScope guestArenaScope;
 
   bool warningsLogged;
 
@@ -3343,6 +3377,22 @@ class Lock {
   virtual kj::Maybe<Object&> getInstance(v8::Local<v8::Object> obj, const std::type_info& type) = 0;
   virtual v8::Local<v8::Object> getPrototypeFor(const std::type_info& type) = 0;
 };
+
+// How many jsg::Locks are alive on this thread. The Lock constructor consults it, together with
+// V8's own thread manager, to tell a second Lock on an isolate this thread already has one for
+// -- which the lock slot cannot represent -- from a bare v8::Locker an embedder holds, which it
+// can. The count is in thread-local storage, which a JS turn at guest ring 3 can write, so the
+// host saves it before a turn and puts it back after, as it does the isolate's data slots (see
+// runTrampolineInGuest in guest-run.c++). It is only ever compared, never dereferenced, and
+// never on its own: a decision needs V8's thread manager to agree.
+uint saveLockDepthForGuestTurn();
+void restoreLockDepthAfterGuestTurn(uint depth);
+
+// Test-only, for the guest kernel's end-to-end check of that save and restore
+// (experimental/guest-kernel/lock-slot-test.sh): a turn writes the count and the host reads it
+// back once the turn has returned.
+uint lockDepthForTest();
+void setLockDepthForTest(uint depth);
 
 template <typename T>
 inline WeakV8Ref<T> V8Ref<T>::getWeakRef(jsg::Lock& js) const {

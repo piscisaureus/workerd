@@ -1219,4 +1219,11 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
       api::AlarmInvocationInfo, api::Immediate, api::Cloudflare, api::CachePurgeError,             \
       api::CachePurgeResult, api::CachePurgeOptions, api::CacheContext, api::AccessContext
 // The list of global-scope.h types that are added to worker.c++'s JSG_DECLARE_ISOLATE_TYPE
+
+// Test-only (see maybeForceGuestFaultForTest in global-scope.c++): whether the MemoryCache
+// fallback about to run on this thread is to take a guest fault in place of the user's function.
+// Answering consumes the arming, which a request for /__gk_fault_cache_fallback makes from inside
+// its JS turn (memory-cache-fault-test.sh). Never true in a production process, where nothing
+// arms it; the arming flag is test-only state in the ordinary heap.
+bool takeForcedGuestFaultInMemoryCacheFallbackForTest();
 }  // namespace workerd::api

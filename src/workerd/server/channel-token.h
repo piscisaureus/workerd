@@ -6,6 +6,7 @@
 
 #include <workerd/io/io-channels.h>
 #include <workerd/server/channel-token.capnp.h>
+#include <workerd/util/host-memory.h>
 
 #include <capnp/message.h>
 
@@ -76,7 +77,8 @@ class ChannelTokenHandler {
       kj::Maybe<kj::StringPtr> entrypoint,
       Frankenvalue& props,
       Persistent persistent);
-  kj::Array<byte> encodeActorChannelToken(IoChannelFactory::ChannelTokenUsage usage,
+  kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> encodeActorChannelToken(
+      IoChannelFactory::ChannelTokenUsage usage,
       kj::StringPtr namespaceKey,
       kj::ArrayPtr<const byte> id,
       kj::Maybe<kj::StringPtr> name,
@@ -130,7 +132,22 @@ class ChannelTokenHandler {
   static constexpr uint KEY_ID_SIZE = 16;
 
   Resolver& resolver;
-  byte tokenKey[AES_KEY_SIZE];
+
+  // The AES-256-GCM key that encrypts and authenticates RPC tokens. It lives in host memory
+  // (util/host-memory.h), which no guest page-table root maps, so a JS turn at guest ring 3 --
+  // or an escape from one with a read primitive -- cannot read it. The handler itself is in the
+  // ordinary heap, which such an escape can write, so the key is owned through a host slot
+  // handle rather than a pointer: an access resolves the handle through the guest kernel's own
+  // table, and a rewritten handle resolves to nothing instead of pointing the host at a key of
+  // the guest's choosing. The two places that use it, serializeTokenImpl() and
+  // decodeChannelTokenImpl(), are reached from inside JS turns (a stub serialized or deserialized
+  // over JS RPC); with the guest kernel enabled they therefore run on the event loop, outside
+  // the guest, see finishToken() and decodeToken(). The key, and the nonce of every token minted
+  // with it, are drawn with getHostEntropy() (util/host-entropy.h), whose buffer is in host
+  // memory too: a nonce the guest could read or choose would let it repeat one under this key,
+  // which forfeits GCM's integrity guarantee however well the key is hidden. The key id is the
+  // public 16-byte prefix of the key's SHA-256 and goes into every token header in the clear.
+  HostSlot<kj::FixedArray<byte, AES_KEY_SIZE>> tokenKey;
   byte keyId[KEY_ID_SIZE];
 
   struct TokenHeader {
@@ -162,6 +179,24 @@ class ChannelTokenHandler {
       kj::Vector<kj::Promise<void>>& promises);
   kj::Array<byte> serializeTokenImpl(
       IoChannelFactory::ChannelTokenUsage usage, capnp::MessageBuilder& message);
+
+  // Turns a built token message into the token bytes once `promises` (the cap-table tokens
+  // it waits on, if any) resolve. An RPC token is encrypted with the token key, which a JS turn
+  // cannot read under the guest kernel, so for RPC usage with the guest kernel enabled the
+  // serialization is deferred to the event loop, outside the guest; otherwise, and for storage
+  // tokens, which carry no key, it runs synchronously when nothing is pending.
+  kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> finishToken(
+      IoChannelFactory::ChannelTokenUsage usage,
+      kj::Own<capnp::MallocMessageBuilder> message,
+      kj::Vector<kj::Promise<void>> promises);
+
+  // Decodes a token into a channel of type `T`, with the key-reading decryption of an RPC
+  // token deferred to the event loop under the guest kernel (the channel is then a promised
+  // channel that resolves once the decode has run), as finishToken() does for encoding.
+  template <typename T>
+  kj::Own<T> decodeToken(ChannelToken::Type type,
+      IoChannelFactory::ChannelTokenUsage usage,
+      kj::ArrayPtr<const byte> token);
 
   // Implementation that dynamically returns either SubrequestChannel or ActorClassChannel, which
   // both happen to inherit CapTableEntry. The caller will immediately downcast to the right type.

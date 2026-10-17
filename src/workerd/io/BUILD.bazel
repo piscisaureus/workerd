@@ -49,6 +49,7 @@ wd_cc_library(
     ] + ["//src/workerd/api:srcs"],
     hdrs = [
         "access-info.h",
+        "guest-turn-thread-locals.h",
         "hibernation-manager.h",
         "io-channels.h",
         "io-context.h",
@@ -79,7 +80,14 @@ wd_cc_library(
         "@capnp-cpp//src/kj/compat:kj-gzip",
         "@nbytes",
         "@simdutf",
-    ],
+    ] + select({
+        # Experimental guest-kernel isolation is x86-64 Linux only; the dep and
+        # its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         ":actor",
@@ -118,12 +126,16 @@ wd_cc_library(
         "//src/workerd/util:consume",
         "//src/workerd/util:exception",
         "//src/workerd/util:header-validation",
+        "//src/workerd/util:host-memory",
+        "//src/workerd/util:hostcall",
         "//src/workerd/util:immediate-crash",
         "//src/workerd/util:ring-buffer",
         "//src/workerd/util:small-weak-vector",
         "//src/workerd/util:sqlite",
+        "//src/workerd/util:sqlite-metering",
         "//src/workerd/util:state-machine",
         "//src/workerd/util:strong-bool",
+        "//src/workerd/util:thread-scopes",
         "@capnp-cpp//src/capnp:capnp-rpc",
         "@capnp-cpp//src/capnp/compat:http-over-capnp",
         "@capnp-cpp//src/kj:kj-async-io",
@@ -339,10 +351,19 @@ wd_cc_library(
         "limit-enforcer.h",
         "tracked-wasm-instance.h",
     ],
+    implementation_deps = select({
+        # Experimental guest-kernel isolation is x86-64 Linux only; the dep and
+        # its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         ":outcome_capnp",
         "//src/workerd/jsg",
+        "//src/workerd/util:hostcall",
     ],
 )
 

@@ -1,5 +1,6 @@
 #include "memory-cache.h"
 
+#include <workerd/api/global-scope.h>
 #include <workerd/api/util.h>
 #include <workerd/io/io-context.h>
 #include <workerd/io/io-util.h>
@@ -431,6 +432,20 @@ void SharedMemoryCache::Use::delete_(const kj::String& key) const {
   cache->removeIfExistsWhileLocked(*data, key);
 }
 
+namespace {
+
+// Test-only: takes the guest fault a request for /__gk_fault_cache_fallback armed (see
+// maybeForceGuestFaultForTest in global-scope.c++), in the frame that runs a fallback.
+void maybeForceGuestFaultInFallbackForTest(kj::StringPtr key) {
+  if (takeForcedGuestFaultInMemoryCacheFallbackForTest()) {
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_FAULT: forcing a guest fault inside a memory cache fallback",
+        key);
+    *static_cast<volatile int*>(nullptr) = 0;
+  }
+}
+
+}  // namespace
+
 // Attempts to serialize a JavaScript value. If that fails, this function throws
 // a tunneled exception, see jsg::createTunneledException().
 static kj::Own<CacheValue> hackySerialize(jsg::Lock& js, jsg::JsRef<jsg::JsValue>& value) {
@@ -493,7 +508,22 @@ jsg::Promise<jsg::JsRef<jsg::JsValue>> MemoryCache::read(jsg::Lock& js,
             }
             KJ_CASE_ONEOF(callback, SharedMemoryCache::Use::FallbackDoneCallback) {
               auto& context = IoContext::current();
+              // The callback's destructor reports the fallback as failed if it never settled,
+              // which releases the cache's in-progress entry for the key so that other readers
+              // of it, in any isolate sharing the cache, proceed instead of waiting on this one.
+              // It must do so also when the turn running the fallback is abandoned without its
+              // frames returning (a guest fault, see jsg::runInGuest), so the callback is owned
+              // by the context before the fallback runs: the context destroys it when the
+              // context is torn down, whatever the turn left on its stack. (The
+              // WORKERD_GK_NEG_CACHE_FALLBACK build, a negative-test build never shipped, owns
+              // it only once the fallback has returned, so a fault inside the fallback strands
+              // the entry; memory-cache-fault-test.sh must then fail on the hung reader.)
+#ifndef WORKERD_GK_NEG_CACHE_FALLBACK
+              auto ownedCallback = context.addObject(kj::heap(kj::mv(callback)));
+              auto callbackPtr = context.addObject(*ownedCallback);
+#else
               auto heapCallback = kj::heap(kj::mv(callback));
+#endif
 
               // Create a span for the fallback execution
               auto fallbackSpan = readSpan.newChild("memory_cache_fallback"_kjc);
@@ -503,10 +533,17 @@ jsg::Promise<jsg::JsRef<jsg::JsValue>> MemoryCache::read(jsg::Lock& js,
               auto fallbackSpanRc = kj::rc<SpanBuilder>(kj::mv(fallbackSpan));
               auto readSpanRc = kj::rc<SpanBuilder>(kj::mv(readSpan));
 
-              return js.evalNow([&]() { return fallback(js, kj::mv(key)); })
+              auto fallbackPromise = js.evalNow([&]() {
+                maybeForceGuestFaultInFallbackForTest(key);
+                return fallback(js, kj::mv(key));
+              });
+#ifdef WORKERD_GK_NEG_CACHE_FALLBACK
+              auto callbackPtr = context.addObject(*heapCallback);
+              auto ownedCallback = context.addObject(kj::mv(heapCallback));
+#endif
+              return fallbackPromise
                   .then(js,
-                      [callback = context.addObject(*heapCallback),
-                          fallbackSpan = fallbackSpanRc.addRef(),
+                      [callback = kj::mv(callbackPtr), fallbackSpan = fallbackSpanRc.addRef(),
                           readSpan = readSpanRc.addRef()](jsg::Lock& js,
                           CacheValueProduceResult result) mutable -> jsg::JsRef<jsg::JsValue> {
                 // NOTE: `callback` is IoPtr, not IoOwn. The catch block gets the IoOwn, which
@@ -531,7 +568,7 @@ jsg::Promise<jsg::JsRef<jsg::JsValue>> MemoryCache::read(jsg::Lock& js,
               })
                   .catch_(js,
                   JSG_VISITABLE_LAMBDA(
-                      (self = kj::mv(self), callback = context.addObject(kj::mv(heapCallback)),
+                      (self = kj::mv(self), callback = kj::mv(ownedCallback),
                           fallbackSpan = fallbackSpanRc.addRef(), readSpan = readSpanRc.addRef()),
                       (self),
                       (jsg::Lock & js, jsg::Value&& exception) mutable->jsg::JsRef<jsg::JsValue> {
