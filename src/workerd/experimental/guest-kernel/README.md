@@ -1100,6 +1100,33 @@ so a crossing a turn makes on every dereference belongs on that path.
   service-binding callee's `IoContext`, whatever `Intl` formats, and the
   canonical wasm type table, are readable from every isolate's ring 3.
 
+  One registration is placed by interposing on the call that makes it rather
+  than by a scope at its site. Every function-local static with a non-trivial
+  destructor registers that destructor through `__cxa_atexit` when it is first
+  initialized, and `glibc` keeps the registrations in a chain of 32-entry
+  blocks whose first block is static: `__new_exitfn` walks the chain from its
+  head on every registration and allocates another block once the head block
+  is full. A registration made inside a turn therefore puts a block of
+  process-wide state in that isolate's arena, and every later registration --
+  from any isolate, for any static -- faults *reading* that block on its way
+  down the chain. Scoping the code that registers is no remedy, which is why
+  the embedder scope the `Intl` builtins run under does not stop ICU's
+  registration from `SimpleDateFormat::subFormat` faulting the next isolate:
+  what faults is the read. So `__cxa_atexit` is interposed with the same
+  `--wrap` the allocation census uses for `malloc`, and every registration
+  runs in the shared heap from the moment the first arena is created
+  (`jsg/heap-arena.c++`). Before that every thread is on an automatic arena,
+  which is the shared heap, and until then the wrapper reads nothing but the
+  flag that says so: the program's first registrations are made during static
+  initialization, where evaluating `heapArenasAvailable()` could both re-enter
+  a static that is still being initialized and latch its answer before
+  `malloc_conf` has been set. Reserving blocks ahead of demand instead of
+  interposing would only postpone the fault, since nothing bounds how many
+  statics are first reached inside a turn.
+  `src/workerd/experimental/guest-kernel/atexit-arena-test.sh` checks the
+  result against a running server: two isolates formatting dates behind a
+  third whose turns registered first.
+
   One thread-wide structure is placed without the shared heap, because it is
   below `jsg`: the resolve journal a turn registers its owned objects through
   (`hostMemory`'s `TurnJournal`). It is created by whichever isolate first runs
@@ -1147,26 +1174,7 @@ so a crossing a turn makes on every dereference belongs on that path.
 
   The list is not complete yet. There are further process-wide registries that
   grow from whichever isolate first needs an entry, and each one faults the
-  next isolate that reads it. One is not V8's: `glibc`'s `atexit` chain. Any
-  function-local static with a non-trivial destructor registers through
-  `__cxa_atexit` when it is first initialized, and if that happens inside a
-  turn -- ICU does it from `SimpleDateFormat::subFormat`, reached from the
-  `Intl` builtins -- then once the chain's static first block is full,
-  `__new_exitfn` allocates a 32-entry block on the turn's arena, and the next
-  isolate's registration faults walking the chain to it. The embedder scope
-  the `Intl` builtins already run under does not help, because what faults is
-  the *read* of a block an earlier, unscoped registration placed. Placing
-  every registration would take interposing `__cxa_atexit`, which the
-  allocation census shows is possible (`--wrap`) but which nothing does yet.
-  This is what the probes that fail on a jemalloc build fail on, and it is
-  the same `__new_exitfn` each time: `abort-signal-test.sh` and
-  `ioown-test.sh` reach it from a static inside their own probe helper
-  (`maybeForceGuestFaultForTest()`), and a worker using `Intl` reaches it from
-  ICU. They pass on the default build, where there are no per-isolate heaps.
-  The next isolate to fault that way is also where a condemned turn costs
-  more than the request: the guard of the static it was initializing stays
-  owned by the thread, so a later turn on that thread aborts the process with
-  `__cxa_guard_acquire detected recursive initialization`.
+  next isolate that reads it.
 
   On V8's side the one that remains is `ThreadIsolation`'s
   JIT-page map (`src/common/code-memory-access.h`), the `Address -> JitPage*`

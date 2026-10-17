@@ -70,6 +70,13 @@ namespace workerd::jsg {
 //     the moment of the fault (a held KJ mutex would deadlock its next locker). The test hook
 //     in ServiceWorkerGlobalScope::request() faults before any such state is taken, so the test
 //     does not exercise that case;
+//   - the guard of any function-local static the frames were initializing, which stays owned by
+//     the thread, so this one costs more than the turn: the next turn to reach that static dies
+//     on "__cxa_guard_acquire detected recursive initialization", taking the process with it, if
+//     it runs on the same thread, and waits forever for an initialization that will never finish
+//     if it runs on another. Aborting the guard instead would let the next caller construct the
+//     static again over whatever a half-run constructor left in its storage, so there is nothing
+//     the fault path can do about it;
 //   - on the V8 side, the abandoned HandleScopes' handles, and the isolate itself, which is
 //     never freed because nothing evicts a condemned isolate (see Worker::Isolate::condemn).
 template <typename Func>

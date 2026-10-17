@@ -124,6 +124,13 @@ wd_cc_library(
         "@simdutf",
         "@ssl",
     ],
+    # Carried to every binary that links jsg-core, and to none that does not, which is what
+    # makes __wrap___cxa_atexit (heap-arena.c++) resolvable exactly where it is defined. Only
+    # a jemalloc build has per-isolate heap arenas for it to place registrations out of.
+    linkopts = select({
+        "//src/workerd/server:really_use_jemalloc": ["-Wl,--wrap=__cxa_atexit"],
+        "//conditions:default": [],
+    }),
     local_defines = ["JSG_IMPLEMENTATION"],
     tags = ["no-clang-tidy"],
     visibility = [
