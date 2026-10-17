@@ -1258,3 +1258,351 @@ cost:
 - The six probes were not re-run, and no compiled output changed: the knob was
   reverted before committing and the commit touches only `measure/` and this
   document.
+
+## Where a body's cost goes, and what makes the arena arm bimodal
+
+### The question
+
+The body-relay measurement above left two things open. A 4 MiB response body
+costs 2.6 to 2.9 times more under the guest kernel than natively with heap
+arenas **off** (arm G), but G differs from N in the allocator as well as in the
+guest kernel, so the ladder orders the three configurations without
+apportioning the cost. And the shipping configuration (arm A) ran 1.8 times
+slower in four of six launches than in the other two, on every route at once,
+with no counters taken. This section apportions the per-byte cost to the
+allocator, to the guest kernel, to the thread cache and to per-isolate
+placement, one variable per step, and finds what the two modes of A are.
+
+### Method
+
+One jemalloc binary and one plain binary, both `-c opt` from the same tree,
+serve every arm; the arms differ only in environment. Two temporary knobs,
+reverted before committing and not part of the tree:
+
+- `WORKERD_GK_SUPPRESS_HEAP_ARENAS` makes `heapArenasAvailable()` answer false
+  whatever the thread cache's state and demotes `checkHeapArenaSupport()`'s
+  `KJ_REQUIRE` to a warning, so the jemalloc binary runs under the guest
+  kernel with no `HeapArena` created. Its first call logs the thread cache's
+  state and its answer, and every launch's log was checked for that line.
+- `WORKERD_GK_STATS_PERIOD` prints gk's counters (`gk_get_stats`) and, in the
+  jemalloc binary, `HeapArena::take()`'s counters and jemalloc's per-arena
+  statistics to stderr every half second from a host-only thread.
+
+The same two workers and routes as the relay measurement (`bodyrelay.py`,
+imported), on the same CPUs (server `12-17,36-41`, client `0-5,24-29`), one
+connection, p50, with the VMSCAPE mitigation reading `Mitigation: IBPB before
+exit to userspace` and `halt_poll_ns` 200000 before and after every run.
+Every arm is launched afresh in every round and **every launch is reported on
+its own**; the harness (`apportion.py`) also records, per launch, where the
+owner and its runner were pinned, the CPU every thread last ran on, gk's
+counters and KVM's per-VM debugfs counters over each benchmark window, perf
+counters per thread over the bodiless and 4 MiB windows, and the process's
+huge-page backing. `results/apportion-ladder.json` is the ladder;
+`apportion-bimodal-A.json` and `-A2.json` are twelve and ten launches of A
+alone; `apportion-purge.json` is the jemalloc-option experiment in section 3.
+The fault traces and call graphs quoted in section 3 were taken by hand on
+further launches (`perf record` on `exceptions:page_fault_user`,
+`kvm:kvm_page_fault` and `syscalls:sys_enter_madvise`, and `strace`), not by
+the harness.
+
+| arm  | binary   | thread cache | guest kernel                                   | heap arenas |
+| ---- | -------- | ------------ | ---------------------------------------------- | ----------- |
+| P0   | plain    | (tcmalloc)   | off                                            | --          |
+| P1   | plain    | (tcmalloc)   | on, `GK_RUNNER=resident GK_RUNNER_PIN=other`   | --          |
+| J0   | jemalloc | on           | off                                            | off         |
+| J0t  | jemalloc | off          | off                                            | off         |
+| J1   | jemalloc | on           | on, as P1                                      | suppressed  |
+| J1t  | jemalloc | off          | on, as P1                                      | suppressed  |
+| A    | jemalloc | off          | on, as P1                                      | **on**      |
+
+P1 is the relay measurement's G, J0 its N and A its A. Eight launches per
+arm, interleaved round by round, six seconds per benchmark.
+
+### 1. The ladder, per launch
+
+Response body of 4 MiB, p50 in microseconds, the eight launches in round order:
+
+| arm | launches                                    | range     |
+| --- | ------------------------------------------- | --------- |
+| P0  | 1615 1628 1610 1623 1611 1605 1641 1606     | 1605-1641 |
+| J0  | 1618 1596 1597 1630 1624 1634 1603 1621     | 1596-1634 |
+| J0t | 1692 1680 1682 1686 1720 1697 1688 1726     | 1680-1726 |
+| P1  | 4277 4848 4294 4856 4856 4214 4838 4717     | 4214-4856 |
+| J1  | 4640 4646 4682 4670 4712 4673 4688 4745     | 4640-4745 |
+| J1t | 4740 4759 4763 4761 4758 4764 4789 4718     | 4718-4789 |
+| A   | 5673 5691 5356 5729 5366 5337 **2874** 5382 | 2874-5729 |
+
+Request body of 4 MiB (`up`), and the pumped 4 MiB body (`upthru`), the same way:
+
+| arm | up, launches                                | range     | upthru, launches                            | range     |
+| --- | ------------------------------------------- | --------- | ------------------------------------------- | --------- |
+| P0  | 1193 1120 1110 1173 1115 1126 1215 1110     | 1110-1215 | 1152 1155 1148 1157 1185 1114 1111 1138     | 1111-1185 |
+| J0  | 1163 1153 1119 1165 1191 1126 1281 1157     | 1119-1281 | 1112 1139 1118 1117 1122 1148 1243 1136     | 1112-1243 |
+| J0t | 1219 1196 1162 1163 1200 1236 1225 1193     | 1162-1236 | 1275 1253 1271 1254 1260 1248 1255 1272     | 1248-1275 |
+| P1  | 1737 1738 1725 1741 1731 1742 1732 1752     | 1725-1752 | 1668 1661 1660 1664 1664 1665 1667 1677     | 1660-1677 |
+| J1  | 1732 1724 1736 1733 1738 1731 1745 1746     | 1724-1746 | 1662 1653 1668 1662 1662 1655 1674 1669     | 1653-1674 |
+| J1t | 1775 1762 1763 1770 1760 1760 1766 1771     | 1760-1775 | 1695 1686 1687 1694 1686 1685 1687 1691     | 1685-1695 |
+| A   | 4302 4310 4317 4333 4333 4315 **1817** 4347 | 1817-4347 | 4348 4349 4355 4373 4360 4347 **1835** 4384 | 1835-4384 |
+
+No body:
+
+| arm | launches                                            | range       |
+| --- | --------------------------------------------------- | ----------- |
+| P0  | 77.7 80.3 76.6 78.7 79.9 80.2 78.7 78.8             | 76.6-80.3   |
+| J0  | 79.7 79.9 78.7 79.0 79.8 81.6 77.0 78.7             | 77.0-81.6   |
+| J0t | 92.6 90.5 92.7 88.4 94.0 91.9 91.5 95.5             | 88.4-95.5   |
+| P1  | 91.7 92.0 91.7 92.3 92.5 92.9 92.4 92.0             | 91.7-92.9   |
+| J1  | 91.5 92.6 91.9 91.5 91.8 91.8 91.4 93.4             | 91.4-93.4   |
+| J1t | 108.2 108.9 107.5 108.2 108.0 109.0 109.5 107.8     | 107.5-109.5 |
+| A   | 135.4 134.4 136.6 134.2 134.8 135.9 **110.9** 135.9 | 110.9-136.6 |
+
+### 2. The apportionment
+
+Each step changes one variable; the figures are ranges over eight launches,
+not medians, and a step is claimed only where the ranges separate.
+
+**The allocator by itself costs nothing here.** P0 and J0 -- tcmalloc against
+jemalloc with its thread cache on, no guest kernel -- overlap on every route:
+1605-1641 against 1596-1634 us at 4 MiB, 76.6-80.3 against 77.0-81.6 us with no
+body. The relay measurement's N (jemalloc) was a fair stand-in for the plain
+binary.
+
+**Turning the thread cache off costs 2 to 17%, with or without the guest
+kernel.** J0 to J0t: +60 to +130 us at 4 MiB (+5%), +11 to +14 us with no body
+(+15%), +40 to +120 us on the request path, +130 us pumped (+12%). J1 to J1t,
+the same change under the guest kernel: +40 to +150 us at 4 MiB (+2%), +16 us
+with no body (+17%), +30 us on the request path, +25 us pumped. This is the
+price of every allocation taking an arena bin lock, and it is what
+`heapArenasAvailable()` requires; it is modest at 4 MiB and the largest
+relative term on a bodiless request.
+
+**The guest kernel is the per-byte cost, 2.9 times at 4 MiB, allocator held
+fixed.** J0 to J1 -- jemalloc with its thread cache on in both, the guest
+kernel the only change -- is 1596-1634 to 4640-4745 us on a 4 MiB response
+(+3050 us, 2.9x), 1119-1281 to 1724-1746 on a 4 MiB request (+570, 1.5x),
+1112-1243 to 1653-1674 pumped (+500), and 77.0-81.6 to 91.4-93.4 with no body
+(+13 us). The plain binary agrees: P0 to P1 is 1605-1641 to 4214-4856 us. So the
+relay measurement's observation stands and is now clean: the large per-byte
+cost belongs to the guest kernel and not to the allocator and not to
+placement. (P1 is itself bimodal at 4 MiB, 4214-4294 in three launches against
+4717-4856 in five, 13% apart, a smaller effect in the same arm that the relay
+measurement's G showed as a 4208-4657 range; it was not chased here.)
+
+Where the guest kernel's per-byte cost goes is visible in the counters, and
+the same in every guest-kernel cell: **about 2000 nested page faults per 4 MiB
+response** (KVM `pf_taken` per request: P1 1992-2036, J1 2014-2060, J1t
+1976-2001; 610-634 per 4 MiB request), and 1 to 2 with no body. That is one
+fault per 4 KiB of an 8 MiB working set per request, and with it the KVM
+`pages_4k` count rises by about 1350 per request during the response benchmark
+and falls by about 600 per request during the request benchmark: the host
+pages behind a body are being unmapped and refaulted continuously, and every
+refault is a VM exit. The guest's own demand faults are not it (18 to 21 per
+request, each installing some 60 neighbouring PTEs). This bears directly on
+the huge-page question and is left for it: it says the page size the guest
+maps at is not the only thing that decides what a body costs under the guest
+kernel; what unmaps the host pages is.
+
+**Per-isolate placement costs +12 to +21% at 4 MiB in one mode and saves 39% in
+the other, which is to say it has no single figure.** J1t to A, the thread
+cache off in both and the `HeapArena` the only change: seven launches at
+5337-5729 us against J1t's 4718-4789 (+550 to +1010 us), and one at 2874 us
+(-1850 us). On the request path, 4302-4347 against 1760-1775 (+2540 us, 2.45x)
+in seven launches and 1817 (+50) in one; pumped, 4347-4384 against 1685-1695
+in seven and 1835 (+145) in one; with no body, 134.2-136.6 against 107.5-109.5
+(+26 us) in seven and 110.9 (+3) in one. Over all the launches of A taken here,
+about one in four was in the fast mode: 8 of the 30 harness launches (one of
+eight in the ladder, five of twelve and two of ten alone) and 5 of the 17
+instrumented by hand below. The honest statement is the pair: in
+its fast mode placement costs 3 us on a bodiless crossing and about 50 to 150
+us on a 4 MiB body, and in its slow mode 26 us and 550 to 2540 us, with the
+request path paying most. The next section is about what the modes are.
+
+### 3. The two modes of the arena arm
+
+**What they are not.** Not CPU placement: the owner's and the runner's CPUs are
+recorded per launch, both modes occur on the same pairs (owner 12/runner 13 was
+slow twice and fast once in the twelve-launch run, 37/38 slow once and fast
+twice), and the runner is always on another core of the owner's CCD here.
+Not the arena's own layout: `HeapArena::take()`'s sequence is identical in
+both modes to the byte (nine takes of 48 MiB in all by the first body, then
+64 MiB each, 2 MiB-aligned), as are jemalloc's statistics for the two isolate
+arenas. Not huge pages on the host: in both modes about 95% of the process's
+resident anonymous memory is `AnonHugePages`, `thp_fault_fallback` stays at
+zero system-wide, and free memory is unfragmented (29,000 free order-10
+blocks). Not the client, the mitigation, or the time of day: the modes
+alternate freely in an A-only run (slow, slow, fast, slow, slow, fast, slow,
+fast, fast, slow, slow, fast), and the probability does not depend on what
+ran before.
+
+**What differs, per request, is a storm of page faults on the host side.** In
+a slow launch the owner thread, in user mode and outside the guest, takes about
+1500 page faults per 4 MiB response (`exceptions:page_fault_user`, 940,000 in
+two seconds of load at 190 requests per second) on a set of about 2300 pages
+that it faults again and again, up to 490 times each in those two seconds --
+once per request. The same pages take the guest's nested faults: 445,000
+`kvm:kvm_page_fault` in the same two seconds, read faults, on 3500 distinct
+pages faulting up to 438 times each. In a fast launch the owner takes 8500
+host faults in two seconds on 4300 distinct pages, none more than six times;
+its nested faults per request are 654 to 686 where the slow launch's are 2035
+to 2088 (eight launches of A in the ladder, per launch: 2085 2087 2037 2088
+2041 2035 **654** 2059), and its CPU per 4 MiB response is 4150 us where the
+slow launch's is 7400 to 7950. With no body the slow mode takes 6 nested faults
+per request to the fast mode's 1, and 288-292 us of CPU to 250.
+
+The pages are jemalloc's, not the arena's. With call graphs, the slow launch's
+host faults are in the continuation of `kj::Promise<kj::Array<unsigned char>>`
+(46,000 of 88,000 in 0.3 s) and in `__memmove` called from
+`workerd::(anonymous namespace)` on the event loop (41,500): the relay's copy
+into the reader's buffers and the reader's concatenation of them. Under
+`strace`, each request of the slow mode is followed by `madvise(MADV_DONTNEED)`
+on a 4 MiB-plus-a-page extent at the same address every time, on two extents
+of 2.5 MiB and 1 MiB, on one of 136 KiB and on five single pages, all in the
+`0x7e..` range where jemalloc's automatic arenas map their extents and none in
+the isolate's region: about 8 MiB discarded per request, which is the 4 MiB
+body read in 512 KiB parts (`AllReader::read`'s `MAX_BUFFER_CHUNK`) plus the
+4 MiB it is concatenated into. The next request takes the same extents back
+from the arena's free run, cold, and faults every page of them on the host as
+it writes and in the nested tables as the guest reads. The fast launch's
+`strace` over the same second shows no `MADV_DONTNEED` at all on those ranges.
+jemalloc's own counters say the same: arena 0's `dirty_purged` is 4.9 million
+pages after a slow launch of 70,000 large allocations and 0.6 million after a
+fast launch of 100,000, with `pdirty` sitting at 0 in the slow mode and 1680
+in the fast.
+
+So the slow mode is **jemalloc's shared arena returning the body buffers to
+the kernel on every free, and the fast mode is it keeping them**. The purge
+costs the slow mode about 1500 host faults and about 1400 extra nested faults
+per 4 MiB response, roughly a microsecond each, which is the 2.3 to 2.5 ms
+between the modes; a bodiless request loses 25 us to the same thing at a
+smaller scale.
+
+**What purges it.** With `perf record -e syscalls:sys_enter_madvise
+--call-graph dwarf` on a slow launch under 4 MiB load, 1051 of the 1390
+`madvise` calls in half a second come from one stack:
+`je_pages_purge_forced <- je_extent_dalloc_wrapper <- pac_decay_to_limit <-
+je_pac_decay_all <- arena_decay_impl <- je_arena_decay <- thread_arena_ctl <-
+mallctlbymib`. That is the `thread.arena` mallctl -- `switchThreadArena()` in
+`jsg/heap-arena.c++`, which `HeapArenaScope` and `SharedHeapScope` call on
+every entry and exit -- and in jemalloc it goes through `arena_migrate()`
+(`src/jemalloc.c`), which ends with:
+
+    if (arena_nthreads_get(oldarena, false) == 0) {
+        /* Purge if the old arena has no associated threads anymore. */
+        arena_decay(tsd_tsdn(tsd), oldarena, false, /* all */ true);
+    }
+
+So every time the event-loop thread leaves arena 0 for an isolate's arena and
+no other thread is bound to arena 0 at that moment, jemalloc purges **all** of
+arena 0's dirty pages, whatever its decay settings say (`all` bypasses them),
+and the body buffers it freed a moment ago go back to the kernel. The count
+fits: jemalloc's `dirty_npurge` for arena 0 is 236,000 to 248,000 in every
+slow launch of every arm of the experiment below, which is the number of
+scope switches the workload makes, not the number of frees. In the fast
+launch of the same probe the stack appears 3 times in half a second, under
+the ordinary decay path, and the bulk of the `madvise` calls are the guest
+kernel's own (`forward_syscall`), the same 261 as in the slow launch.
+
+**What decides it at launch** is therefore whether some other thread is
+bound to arena 0 for the life of the process. jemalloc's per-arena
+`nthreads` for arena 0, sampled every half second: in the slow launches it is
+0 in 62 samples of 73 and 1 in the rest (the owner itself, between scopes);
+in the fast launches it is 1 in 64 of 73 and 2 in 7, so a second thread sits
+in arena 0 and the owner's departures never empty it. jemalloc binds a thread
+on its first allocation to the arena with the fewest threads
+(`arena_choose_hard`), and arena 0 has zero threads whenever the owner is
+inside a turn: a thread whose first allocation lands in such a moment is bound
+to arena 0 for good and the launch is fast; if every other thread's first
+allocation lands while the owner is between turns, arena 0's only thread is
+the owner and the launch is slow. Which thread it is in the fast launches was
+not identified (the candidates are V8's workers and kj's threads, whose first
+allocations are early and timing-dependent), so the coin's exact weighting is
+not explained, only its existence: about one launch in four.
+
+**The settings that do not change it, and the one that would.** Six launches
+each, interleaved, four seconds per benchmark, `apportion-purge.json`:
+
+| arm, 4 MiB response, p50 us        | launches                                | arena 0 pages purged, millions, per launch |
+| ---------------------------------- | --------------------------------------- | ------------------------------------------ |
+| A, as shipped                      | 5218 5244 5181 5207 5193 5243           | 8.3 8.3 8.4 8.3 8.3 8.3                    |
+| `MALLOC_CONF=oversize_threshold:0` | 2772 2781 **5214** 2781 **5183** **5210** | 0.2 0.3 **8.4** 0.5 **8.4** **8.4**       |
+| `MALLOC_CONF=dirty_decay_ms:-1`    | 5233 5178 5217 5221 5222 4300           | 8.3 8.3 8.3 8.4 8.3 8.6                    |
+| `MALLOC_CONF=dirty_decay_ms:0`     | 5440 5405 5422 5307 5326 5347           | 10.2 10.2 10.2 10.3 10.2 10.4              |
+
+Disabling decay does nothing, because `arena_decay(all)` ignores it;
+purging on every free (`dirty_decay_ms:0`) makes every launch slow and a
+little slower still (and 147 us bodiless against 133); and jemalloc's eager
+purge of oversize coalesced extents (`oversize_threshold`), which was the
+first suspect, is not it either -- with it disabled, three launches of six
+were still slow with the same 8.4 million pages purged (the three fast ones
+purged 0.2 to 0.5 million, as every fast launch does). The one knob that
+would end the bimodality is not a jemalloc option: keep arena 0 bound to a
+thread that never leaves it (a dedicated idle thread set to `thread.arena`
+0, say), or stop migrating the event-loop thread with `thread.arena` at all
+and allocate into the isolate arena explicitly (`MALLOCX_ARENA`) instead. Of
+the two outcomes that would fix, the fast one is the one to want: it is 39%
+faster at 4 MiB than the same configuration without placement, because the
+body buffers stay warm in arena 0 instead of being discarded by every
+allocator's decay.
+
+### 4. Two things found on the way
+
+**The isolate's heap region fills at about 6.5 MB per 4 MiB response and the
+isolate is condemned when it is full.** `HeapArena::take()` is a bump allocator
+over a 16 GiB reservation with no reuse of its own, and jemalloc never asks it
+to reuse: after a GC frees the backing stores, the arena's `retained` reaches
+6 to 10 GB while `take()` keeps being called for fresh 64 MiB extents (123
+takes and 6.2 GB retained after 36 s of one launch; 178 and 9.7 GB after a fast
+one). Resident memory grows 7 GB in six seconds in the slow mode and 12 GB in
+the fast, and in the instrumented launches, which ran the 4 MiB response for
+about fifteen seconds, every launch ended with `take_bytes` at 16 GiB
+(`last_off=0x3ff80c000`), 16.4 GB of `AnonHugePages`, and then "guest-kernel:
+JS turn faulted inside the guest; the isolate has been condemned", after which
+every request on the front worker fails, at 10,000 per second. In the fast
+mode that is about five seconds of 4 MiB responses. Whether the GC is late (V8
+not treating these backing stores as the external memory pressure its
+accounting expects) or the reuse is (jemalloc's retained extents from a
+refused `dalloc` not being recycled before `take()` is asked again) is not
+settled here; a jemalloc-level test that allocates and frees 4 MiB in a loop
+on a `HeapArena` and counts `take()` calls would settle the second in minutes.
+
+**Every guest-kernel cell refaults a body's host pages once per request**, as
+section 2 says: 2000 nested faults per 4 MiB response whether the allocator is
+tcmalloc or jemalloc and whether arenas are on or off, with the KVM 4 KiB
+mapping count rising and falling by hundreds of pages per request. The
+discards that cause it were not traced in the non-arena cells; in A's slow
+mode they are jemalloc's purges, and in the others they are presumably the
+allocator's own returns of memory (tcmalloc's and jemalloc's decay) plus V8's,
+which the strace of a fast A launch shows as one `mprotect` and one
+`MADV_HUGEPAGE` of 4 MiB per request in the V8 sandbox and batched
+`MADV_DONTNEED`s of 8 to 40 MiB there. The huge-page task should start from
+this: a 2 MiB guest leaf saves nothing on a page the host has discarded.
+
+### Caveats
+
+- **The bodiless mode and the 4 MiB mode are correlated but not the same
+  flag.** In one instrumented launch of three the bodiless request was in the
+  slow mode (132.5 us) while the 4 MiB response was fast (1690 us), and one
+  launch of the ten-launch run had a slow bodiless figure (136 us) with a 4 MiB
+  response between the modes (4360 us). The purge mechanism explains the 4 MiB
+  mode; what makes a bodiless request lose 25 us and take five more nested
+  faults is consistent with it (five single-page `MADV_DONTNEED`s per request
+  were seen) but was not traced on a bodiless-only load, and should be.
+- **The thread that keeps arena 0 populated in a fast launch was not named.**
+  The purge path was observed (the call stack above) and `arena_migrate()`'s
+  condition read; that a second thread's binding to arena 0 is what the modes
+  differ in rests on jemalloc's `nthreads` samples, 7 of 8 launches examined
+  agreeing and one borderline launch (116 us bodiless) showing 0 in half its
+  samples. Logging every thread's first `arena_choose_hard` would settle it in
+  one launch of each mode.
+- **The ladder's A column has one fast launch in eight**, so its placement
+  figures are the slow mode's with one exception, and the fast mode's are
+  from the A-only runs and the probes. Both are reported; neither is "the"
+  placement cost.
+- **The fast mode's 4 MiB figures are measured over six seconds or less**,
+  because in that mode the isolate's region fills in about five seconds of
+  4 MiB responses and the isolate dies; the relay measurement's eight-second
+  windows were long enough to reach that in principle, and it is possible its
+  two fast launches were partly measured against a dying isolate.
+- **Six probes not re-run; nothing compiled is committed.** Both knobs were
+  reverted before staging and the commit touches only `measure/` and this
+  document.
