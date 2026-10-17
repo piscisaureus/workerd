@@ -82,7 +82,9 @@ class WorkerdPlatform final: public v8::Platform {
     // (Memory Protection Keys) to enforce W^X on JIT code pages and
     // write-protect the code pointer tables.  Without this, the
     // DefaultPlatform's allocator (which calls pkey_alloc) was silently
-    // dropped and ThreadIsolation was disabled.
+    // dropped and ThreadIsolation was disabled.  What V8 ends up with is the
+    // wrapper jsg::V8PlatformWrapper puts around this one, which is the
+    // platform above this one (see jsg/thread-isolated-allocator.h).
     return inner.GetThreadIsolatedAllocator();
   }
 

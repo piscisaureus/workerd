@@ -10,6 +10,7 @@
 #include "setup.h"
 
 #include "libplatform/libplatform.h"
+#include "thread-isolated-allocator.h"
 
 #include <v8-cppgc.h>
 #include <v8-initialization.h>
@@ -240,7 +241,12 @@ void V8System::init(kj::Own<v8::Platform> platformParam,
 
 V8System::~V8System() noexcept(false) {
   v8::V8::Dispose();
-  v8::V8::DisposePlatform();
+  {
+    // DisposePlatform tears V8's thread isolation down, which deletes the metadata workerd's
+    // allocator keyed without entering a write scope of its own (see ThreadIsolatedWriteScope).
+    ThreadIsolatedWriteScope writable;
+    v8::V8::DisposePlatform();
+  }
   cppgc::ShutdownProcess();
 }
 

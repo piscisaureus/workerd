@@ -5,6 +5,7 @@
 #pragma once
 
 #include "heap-arena.h"
+#include "thread-isolated-allocator.h"
 
 #include <workerd/util/memory-class.h>
 
@@ -88,12 +89,13 @@ class WD_MEMORY_CLASS_HOST V8PlatformWrapper: public v8::Platform {
   }
 
   v8::ThreadIsolatedAllocator* GetThreadIsolatedAllocator() override {
-    // Forward to the inner platform so that V8's ThreadIsolation can use PKU
-    // (Memory Protection Keys) to enforce W^X on JIT code pages and
-    // write-protect the code pointer tables.  Without this, the
-    // DefaultPlatform's allocator (which calls pkey_alloc) was silently
-    // dropped and ThreadIsolation was disabled.
-    return inner.GetThreadIsolatedAllocator();
+    // V8's ThreadIsolation uses PKU (Memory Protection Keys) to enforce W^X on JIT code pages
+    // and to write-protect the code pointer tables, and it is enabled only where the platform
+    // supplies an allocator -- so the inner platform's, which allocates the key, has to reach
+    // V8. That allocator serves the metadata of the protection with plain malloc() though,
+    // which places it in whichever isolate's heap arena was locked and leaves it writable;
+    // workerd's wraps it to fix both (see thread-isolated-allocator.h).
+    return wrapThreadIsolatedAllocator(inner.GetThreadIsolatedAllocator());
   }
 
  private:
