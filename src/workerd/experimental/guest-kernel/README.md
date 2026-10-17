@@ -1355,16 +1355,42 @@ so a crossing a turn makes on every dereference belongs on that path.
   callee's arena as it did before, and is not covered by the test.
 
   What the relay also leaves as it was is how the response promise itself
-  crosses: the callee's turn fulfils a promise the caller's turn has attached
-  its continuation to, and fulfilling it arms that continuation. This does
-  not fault because `kj` appends a promise's dependents into the 1 KiB arena
-  block the chain's head was allocated in while they fit
-  (`PromiseDisposer::appendPromise`, `kj/async-inl.h`), and the head of this
-  chain was allocated under the call's shared-heap scope; a chain that
-  outgrows its block starts the next block in the arena of whichever turn
-  adds the node. Every cross-isolate fulfilment in an in-process call relies
-  on that co-location today, and it is a property of node sizes rather than
-  a guarantee.
+  crosses. The caller's turn attaches its continuation to a promise whose head
+  `SharedHeapHttpClient::request()` (`io/worker-interface.c++`) allocated under
+  a shared-heap scope, and `kj` co-locates a promise's dependents into the
+  1 KiB arena block its head was allocated in while they fit
+  (`PromiseDisposer::appendPromise`, `kj/async-inl.h`), so the chain the caller
+  builds on top of the head -- the relay wrap, the `.catch_()` in
+  `fetchImplNoOutputLockAttempt()`, the exception-wrapping `.then()`,
+  `awaitIo()`'s own `.then()` and the `kj::TaskSet::Task` it ends in -- starts
+  in the shared heap. A chain that outgrows its block starts the next block in
+  the arena of whichever turn adds the node, which for these nodes is the
+  caller's. That overflow does not make the crossing fault, because the
+  response is not delivered inside the callee's turn: the in-process
+  `kj::HttpService`-to-`kj::HttpClient` adapter fulfils the response promise
+  from the event loop, where every arena is addressable, so the callee's turn
+  never arms a continuation the caller placed in the caller's arena. Padding
+  the chain with a hundred co-located `.then()` nodes, so the `Task` and most
+  of the chain land in the caller's arena many times over, faults no turn and
+  condemns no isolate. Co-location is therefore not what keeps this crossing
+  safe, and the chain's length does not matter to it.
+
+  Nor can a worker lengthen the chain from JS: the nodes between the head and
+  the `Task` are a fixed, bounded set built by the C++ fetch path, and a
+  worker's `.then()` chains, `await`s and stream plumbing hang off the V8
+  promise that `awaitIo()`'s resolver settles and off the JS-side stream
+  machinery, never off these `kj` nodes. Driving 4000-deep `.then()` chains,
+  4000 sequential `await`s, 200 concurrent calls and 500-call re-fetch loops
+  through an in-process binding faults no turn.
+
+  This covers the in-process HTTP service binding. A promise whose fulfilment
+  does run inside a foreign turn still faults on a continuation placed in that
+  turn's unaddressable arena -- that is exactly the body pipe's state node,
+  which the second party fulfils from its own turn and which `ReadRelay`
+  therefore moves to the event loop (above). Cap'n Proto RPC promise
+  pipelining (`binding.foo().bar()`), where a worker's JS could extend a
+  cross-isolate `kj` chain in a way an HTTP fetch cannot, was not examined and
+  is not covered by this reasoning.
 
   Also not covered: BoringSSL's lazily allocated per-thread error state, which
   a `crypto` call in a turn would place on that turn's arena -- untested, but
