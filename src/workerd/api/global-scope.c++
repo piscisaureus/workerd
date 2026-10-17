@@ -499,7 +499,9 @@ void checkWasmDescriptorsForTest(kj::StringPtr url) {
 // things as /__gk_lock_slot without writing anything. The host must find its own lock in the
 // slot in every case and must not act on the sentinel, including by refusing the lock as
 // recursive.
-bool faultInNextMemoryCacheFallbackForTest = false;
+// Per thread: a request arms it from inside its JS turn and the fallback that consumes it runs
+// on the same event loop, so another thread's fallback must not take the fault instead.
+thread_local bool faultInNextMemoryCacheFallbackForTest = false;
 
 void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   static const bool faultEnabled =
