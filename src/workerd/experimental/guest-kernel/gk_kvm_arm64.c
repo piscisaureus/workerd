@@ -212,7 +212,7 @@ static void vcpu_hw_abort(gk_thread *t) { (void)t; }
 // Linux does not.
 static int svc_class(const gk_frame *f) {
   return f->x[8] == GK_EXIT_SYSCALL || f->x[8] == GK_HOSTCALL_SYSCALL ||
-                 f->x[8] == GK_RESOLVE_SYSCALL || f->x[8] == GK_DEBUG_RING_SYSCALL
+                 f->x[8] == GK_DEBUG_RING_SYSCALL
              ? SVC_GK
              : SVC_HOST;
 }

@@ -485,7 +485,12 @@ static gk_arena *resolve_arena_now(void) {
 // turn of that arena runs (see sync_cr3), which is what the trampoline
 // compares against. Caller holds G->lock.
 static uint64_t resolve_root_of(const gk_arena *a) {
-  return (uint64_t)(uintptr_t)(a ? a->pml4 : G->pml4);
+  uint64_t *root = a ? a->pml4 : G->pml4;
+#if defined(__aarch64__)
+  return PT_GPA(root);  // what TTBR0_EL1 holds, which gk_resolve_tramp compares
+#else
+  return (uint64_t)(uintptr_t)root;  // what CR3 holds
+#endif
 }
 
 // The arena an entry belongs to, from its chain word, or NULL for one the base
@@ -895,48 +900,6 @@ int gk_resolve_unregister_for(gk_arena *a, gk_resolve_handle h) {
   return 0;
 }
 
-#if defined(__aarch64__)
-// The lookup gk_resolve_tramp makes inside the guest on x86-64, in C, for
-// the svc gk_resolve_typed issues on arm64 (see at_guest_ring3): answered by
-// the host at the hypercall exit, with the pointer in x0 and the type in x1,
-// 0 in both for a refused lookup. The same checks in the same order as the
-// trampoline's: the generation on both sides of the pointer, the owner read
-// inside that window, and a reserved entry refused by its missing pointer
-// before the owner is looked at. The owner is compared against the root the
-// calling thread's vCPU runs under, from the thread's record: supervisor
-// memory, and the host alone decides which root a turn enters with, as CR3
-// is on x86-64 the one piece of caller identity that is not memory. Under the
-// allocation guard, as the direct lookup is.
-static void resolve_answer(gk_thread *t, gk_frame *f) {
-  gk_resolve_handle h = f->x[0];
-  uint64_t idx = h & ((1ULL << GK_RESOLVE_INDEX_BITS) - 1), gen = h >> GK_RESOLVE_INDEX_BITS;
-  void *p = NULL;
-  uint64_t ty = 0;
-  int guard = GK_HANDLER_ENTER();
-  if (gen != 0) {
-    gk_resolve_entry *e = &gk_resolve_table.e[idx];  // the mask bounds idx (see the table)
-    uint64_t g1 = __atomic_load_n(&e->gen, __ATOMIC_ACQUIRE);
-    p = __atomic_load_n(&e->ptr, __ATOMIC_ACQUIRE);
-    uint64_t owner = __atomic_load_n(&e->owner, __ATOMIC_ACQUIRE);
-    ty = __atomic_load_n(&e->type, __ATOMIC_ACQUIRE);
-    uint64_t g2 = __atomic_load_n(&e->gen, __ATOMIC_ACQUIRE);
-#ifndef GK_NEG_RESOLVE
-    if (g1 != gen || g2 != gen) p = NULL;
-#else
-    (void)g1; (void)g2;
-#endif
-#ifndef GK_NEG_RESOLVE_OWNER
-    if (p && owner != (uint64_t)(uintptr_t)t->active_pml4) p = NULL;
-#else
-    (void)owner;
-#endif
-  }
-  GK_HANDLER_LEAVE(guard);
-  f->x[0] = (uint64_t)(uintptr_t)p;
-  f->x[1] = p ? ty : 0;
-}
-#endif
-
 void *gk_resolve_typed(gk_resolve_handle h, uint64_t *type) {
   // The caller's ring (see at_guest_ring3): at guest ring 3 the lookup is
   // the trap. At guest ring 0 and on the host the table is read directly.
@@ -952,12 +915,13 @@ void *gk_resolve_typed(gk_resolve_handle h, uint64_t *type) {
                          : "rcx", "r11", "rsi", "cc");
     if (type) *type = rdx;
 #else
-    // Answered by the host at the hypercall exit (see resolve_answer): the
-    // pointer in x0 and the type in x1, 0 in both for a refused lookup.
+    // Answered inside the guest by gk_resolve_tramp (gk_asm_arm64.S): the
+    // pointer in x0 and the type in x1, 0 in both for a refused lookup, and
+    // x2..x5 cleared.
     register uint64_t x8 __asm__("x8") = GK_RESOLVE_SYSCALL;
     register uint64_t x0 __asm__("x0") = h;
     register uint64_t x1 __asm__("x1") = 0;
-    __asm__ __volatile__("svc #0" : "+r"(x0), "+r"(x1) : "r"(x8) : "memory");
+    __asm__ __volatile__("svc #0" : "+r"(x0), "+r"(x1) : "r"(x8) : "x2", "x3", "x4", "x5", "memory");
     // An svc that reached the kernel instead (see at_guest_ring3) comes back
     // as -ENOSYS, which no pointer is: refused, like a handle to nothing.
     if (x0 >= (uint64_t)-4095) x0 = x1 = 0;

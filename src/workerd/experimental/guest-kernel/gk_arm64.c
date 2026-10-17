@@ -88,6 +88,10 @@ static int pt_arena_init(void) {
 
 static int guest_tables_init(void) {
   if (map_handler_text() < 0) { G->err = "map handler text"; return -1; }
+  // The resolve table is read by gk_resolve_tramp at EL1 on SP_EL1, where a
+  // demand fault would be fatal to the turn (gk_exc_bad); mapping it now,
+  // supervisor r/w, keeps that path free of faults in every root.
+  if (mmu_map_range(GK_RESOLVE_START, GK_RESOLVE_END, 1 | 2) < 0) { G->err = "map resolve table"; return -1; }
   return 0;
 }
 
@@ -474,9 +478,10 @@ static long vcb_bad(gk_thread *t) {
 // The reserved syscalls a guest issues by svc #0 with the number in x8, for
 // either ring: the turn exit (gk_user_exit_tramp), a hostcall (see the
 // hostcalls section), answered here and never forwarded or shown to the
-// filter, a resolve (what gk_resolve_tramp answers inside the guest on
-// x86-64) and the ring probe. -1 if x8 is none of them; otherwise what
-// vcb_exception returns, with *ret set when the turn ends.
+// filter, and the ring probe. A resolve never reaches the host: the vector
+// table's entry answers it (gk_resolve_tramp in gk_asm_arm64.S). -1 if x8 is
+// none of them; otherwise what vcb_exception returns, with *ret set when the
+// turn ends.
 static int vcb_sentinel(gk_thread *t, gk_frame *f, long *ret) {
   if (f->x[8] == GK_EXIT_SYSCALL) { *ret = (long)f->x[0]; return 1; }
   if (f->x[8] == GK_HOSTCALL_SYSCALL) {
@@ -487,7 +492,6 @@ static int vcb_sentinel(gk_thread *t, gk_frame *f, long *ret) {
               (long)f->x[0]);
     return 0;
   }
-  if (f->x[8] == GK_RESOLVE_SYSCALL) { resolve_answer(t, f); return 0; }
   if (f->x[8] == GK_DEBUG_RING_SYSCALL) { f->x[0] = (f->spsr & 0xc) ? 0 : 3; return 0; }  // see gk.h
   return -1;
 }

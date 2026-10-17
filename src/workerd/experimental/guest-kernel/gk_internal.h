@@ -286,8 +286,9 @@ static __thread int tls_in_run;
 // the kernel's user selector. arm64 has no unprivileged read of the exception
 // level (CurrentEL is undefined at EL0 and on the host), so there the guest is
 // told from the host by tls_in_run, and a ring-0 caller takes the ring-3 path
-// too: an svc the host answers at the hypercall exit, one VM exit more than
-// the direct read x86-64 ring 0 makes. A rewrite of tls_in_run by ring 3 costs
+// too: an svc that gk_resolve_tramp answers at the vector table, inside the
+// guest, an exception round trip where x86-64 ring 0 reads the table
+// directly. A rewrite of tls_in_run by ring 3 costs
 // the rewriter's own thread the direct read's fault, or a host thread an svc
 // the kernel refuses with ENOSYS, which the callers treat as a refusal: the
 // same exposure gk_hostcall has through tls_in_guest on both architectures.

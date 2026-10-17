@@ -81,12 +81,33 @@ SYM(gk_vectors):
     b gk_exc_bad
     .balign 0x80
 
+// A symbol's page and page offset, for the resolve trampoline's table.
+#if defined(__APPLE__)
+#define ADRP_SYM(r, s) adrp r, SYM(s)@PAGE
+#define ADD_LO12(r, s) add r, r, SYM(s)@PAGEOFF
+#else
+#define ADRP_SYM(r, s) adrp r, s
+#define ADD_LO12(r, s) add r, r, :lo12:s
+#endif
+
 // A synchronous exception from ring 0 or ring 3 (a syscall, an abort, an
 // undefined or trapped instruction): save the interrupted state into the vcb
 // (sp) and report it. The host resumes the vCPU after the HVC, into the
-// dispatcher.
+// dispatcher. A resolve (an SVC with x8 = GK_RESOLVE_SYSCALL, see
+// gk_resolve_tramp) is answered first, without leaving the guest; the two
+// registers it reads have been saved, and the trampoline's own exit returns
+// to the interrupted code directly.
 gk_exc_sync:
     stp x0, x1, [sp, #VCB_X + 16 * 0]
+    mrs x1, esr_el1
+    lsr x1, x1, #26                     /* the exception class: 0x15 is an SVC from AArch64 */
+    cmp x1, #0x15
+    b.ne 1f
+    movz x1, #0x4242
+    movk x1, #0xF, lsl #16              /* GK_RESOLVE_SYSCALL, 0xF4242 (gk_internal.h) */
+    cmp x8, x1
+    b.eq gk_resolve_tramp
+1:
     stp x2, x3, [sp, #VCB_X + 16 * 1]
     stp x4, x5, [sp, #VCB_X + 16 * 2]
     stp x6, x7, [sp, #VCB_X + 16 * 3]
@@ -234,6 +255,84 @@ gk_exc_bad:
     movk w0, #HC_HI, lsl #16
     hvc #0
     b .
+
+// The ring-0 resolve (see gk_resolve in gk.h): the lookup gk_resolve_tramp in
+// gk_asm_x86_64.S makes, for either ring, at EL1 on the vector table's entry.
+// x0 holds the handle. Looks it up in gk_resolve_table (supervisor memory,
+// mapped in every root) and returns to the interrupted code with the entry's
+// pointer in x0 and its type in x1, or 0 in both for a handle that names
+// nothing: a zero generation (never issued), an entry whose generation is not
+// the handle's, an entry reserved and not yet committed, or an entry owned by
+// a root other than the one this caller runs under. The index is the handle's
+// low 20 bits and the table holds exactly 2^20 entries, so the mask bounds
+// it. Uses no stack; reads only the table, so no value in the handle is ever
+// used as an address; writes nothing, so the table is as the host left it and
+// the path needs no lock. The generation is read before and after the pointer
+// and both reads must match the handle: the host retires an entry by zeroing
+// the generation first and publishes one by storing the pointer first (see the
+// resolve section in gk_linux.c), and here the first read is an acquire and a
+// load barrier precedes the second, so a pointer and owner seen between two
+// matching reads were the entry's under that generation.
+//
+// The owner is the root the host registered the entry under, as TTBR0_EL1
+// holds it (resolve_root_of), and TTBR0_EL1 is the root the caller runs
+// under: the one piece of caller identity that is not memory, since ring 3
+// can neither read nor load it and the host alone decides which root a turn
+// enters with. A reserved entry is refused by its missing pointer before the
+// owner is looked at; the owner is read inside the generation window, as the
+// pointer is, since an owner read outside it could be the next registration's.
+//
+// x2..x5 are scratch, cleared on both exits so ring 3 gets the pointer and
+// nothing else; gk_resolve_typed declares them clobbered. The vcb's copies of
+// x0 and x1 are the frame save's and are not read back: this exit does not go
+// through the dispatcher. GK_NEG_RESOLVE and GK_NEG_RESOLVE_OWNER remove the
+// generation and owner checks (negative-test builds, never shipped), as in
+// the x86-64 trampoline.
+gk_resolve_tramp:
+    lsr x1, x0, #20                     /* x1 = the handle's generation */
+    cbz x1, 9f
+    and x0, x0, #0xfffff                /* the handle's index, below the table's capacity */
+    lsl x0, x0, #6                      /* * 64, the entry size */
+    ADRP_SYM(x2, gk_resolve_table)
+    ADD_LO12(x2, gk_resolve_table)
+    add x0, x2, x0                      /* x0 = &table[index] */
+    add x5, x0, #8                      /* &entry.gen */
+    ldar x2, [x5]                       /* generation, before: the loads below follow it */
+    ldr x3, [x0]                        /* pointer */
+    ldr x4, [x0, #16]                   /* owner */
+#ifndef GK_NEG_RESOLVE
+    cmp x2, x1
+    b.ne 9f
+#endif
+    cbz x3, 9f                          /* a reserved entry has no pointer */
+    mrs x2, ttbr0_el1                   /* the root this caller runs under */
+#ifndef GK_NEG_RESOLVE_OWNER
+    cmp x4, x2
+    b.ne 9f
+#endif
+#ifndef GK_NEG_RESOLVE
+    dmb ishld                           /* the pointer and owner are read before the generation again */
+    ldr x2, [x5]                        /* generation, after */
+    cmp x2, x1
+    b.ne 9f
+#endif
+    ldr x1, [x0, #32]                   /* the entry's type, for the caller to compare */
+    mov x0, x3
+    mov x2, xzr
+    mov x3, xzr
+    mov x4, xzr
+    mov x5, xzr
+    eret
+9:  mov x0, xzr
+    mov x1, xzr
+    mov x2, xzr
+    mov x3, xzr
+    mov x4, xzr
+    mov x5, xzr
+    eret
+#if !defined(__APPLE__)
+    .hidden gk_resolve_table            /* page-relative above: must resolve within this object */
+#endif
     .p2align 12
     .globl SYM(gk_super_end)
 SYM(gk_super_end):
