@@ -116,6 +116,133 @@ kj::Own<WorkerInterface> newPromisedWorkerInterface(kj::Promise<kj::Own<WorkerIn
 }
 
 namespace {
+// Relays the reads of a body that crosses an in-process service binding, so that no isolate's
+// turn reaches the other isolate's side of the pipe the body travels through.
+//
+// A request or response body crosses the binding through a kj one-way pipe whose two ends are
+// held by different isolates: the caller's turn writes the request body the callee's turn reads,
+// and the other way round for the response. The pipe copies between the writer's buffer and the
+// reader's in whichever of the two operations arrives second, so under per-isolate heap arenas
+// the copy runs in one isolate's turn over a buffer in the other isolate's arena, which that turn
+// cannot address. The bytes are not all that crosses: the state object the first operation
+// leaves on the pipe (its BlockedRead or BlockedWrite, a promise node allocated in the first
+// party's arena) is read and written by the second party, and completing it arms the first
+// party's continuation, which is a write into the first party's arena too. Placing the buffers
+// in the shared heap would therefore not be enough.
+//
+// The relay sits at the reading end, in front of the pipe, and makes every operation on the pipe
+// from the event loop, outside any turn, where every arena is addressable: a read first yields to
+// the event loop, then reads from the pipe into a staging buffer the host allocates, then copies
+// into the reader's buffer. The pipe only ever sees host-side reads, whose BlockedRead node and
+// staging buffer are in the shared heap; the writer's turn fills the staging buffer and arms the
+// relay's coroutine, whose frame is in the shared heap for exactly that; and the reader's buffer
+// is touched by the reader's own turn and by the host, never by the writer. The writer's end
+// needs nothing: what it leaves on the pipe is read only by the host, and its buffers keep their
+// isolate provenance, as do the reader's. The cost is one more copy and one event-loop turn per
+// chunk, and no synchronous fast path, on bodies that cross an in-process binding; it is paid
+// only where per-isolate heap arenas are active (see asHttpClient() below).
+//
+// Dropping the relay drops the stream where the relay is dropped. For a response body that is
+// the event loop, where the caller's IoOwn of the stream is disposed of; a drop inside the
+// caller's turn (the response delivered to a fetch whose signal has aborted in the meantime,
+// api/http.c++ handleHttpResponse()) would abort the pipe's read end against whatever the
+// callee left on it and cancel the callee's request, which is memory the caller's turn cannot
+// address, and that was so before the relay existed.
+class ReadRelay final: public kj::AsyncInputStream {
+ public:
+  // Over a stream this relay owns: a response body.
+  explicit ReadRelay(kj::Own<kj::AsyncInputStream> owned): inner(*owned), owned(kj::mv(owned)) {}
+  // Over a stream someone else owns for the relay's lifetime: a request body.
+  explicit ReadRelay(kj::AsyncInputStream& inner): inner(inner) {}
+
+  kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
+    if (minBytes == 0) return size_t(0);
+    // The coroutine is the event the writer's turn arms when it fills the staging buffer, so its
+    // frame is in the shared heap whichever isolate's turn issues the read.
+    jsg::SharedHeapScope sharedHeap;
+    return relay(inner, static_cast<byte*>(buffer), minBytes, maxBytes);
+  }
+
+  kj::Maybe<size_t> tryReadSync(kj::ArrayPtr<byte> buffer, size_t minBytes) override {
+    // A synchronous read would run in the reader's turn against what the writer left on the
+    // pipe. Nothing is available synchronously through the relay.
+    return kj::none;
+  }
+
+  kj::Maybe<uint64_t> tryGetLength() override {
+    return inner.tryGetLength();
+  }
+
+  // pumpTo() is the default: the output pumps from this stream through tryRead(), or the
+  // generic loop does, so the pipe still sees only the relay's host-side reads.
+
+ private:
+  static constexpr size_t STAGING_BYTES = 64 * 1024;
+
+  static kj::Promise<size_t> relay(
+      kj::AsyncInputStream& inner, byte* dst, size_t minBytes, size_t maxBytes) {
+    co_await kj::yield();
+    // On the event loop now, outside any turn: the staging buffer and the nodes the read leaves
+    // on the pipe are the host's, and `dst`, in the reader's arena, is addressable from here.
+    auto staging = kj::heapArray<byte>(kj::min(maxBytes, STAGING_BYTES));
+    size_t total = 0;
+    while (total < minBytes) {
+      size_t want = kj::min(maxBytes - total, staging.size());
+      size_t need = kj::min(minBytes - total, want);
+      size_t n = co_await inner.tryRead(staging.begin(), need, want);
+      memcpy(dst + total, staging.begin(), n);
+      total += n;
+      if (n < need) break;  // EOF.
+    }
+    co_return total;
+  }
+
+  kj::AsyncInputStream& inner;
+  kj::Maybe<kj::Own<kj::AsyncInputStream>> owned;
+};
+
+// Whether bodies cross an in-process call through a ReadRelay: only where per-isolate heap
+// arenas are active, which is the one configuration in which an isolate's turn cannot address
+// what another isolate's turn wrote. Everywhere else the pipe is used directly.
+bool bodiesRelayed() {
+#ifdef WORKERD_GK_NEG_BODY_RELAY
+  // A negative build, never shipped: bodies cross the binding through the bare pipe even with
+  // heap arenas on, so a body read faults the reading isolate's turn. The guest kernel's
+  // body-arena-test.sh must then fail; this is the check that the test tests the relay.
+  return false;
+#else
+  return jsg::heapArenasAvailable();
+#endif
+}
+
+// The HttpService side of an in-process call: puts a ReadRelay in front of the request body
+// before the target reads it. request() is called from the caller's turn, inside
+// SharedHeapHttpClient's scope, so the relay and this frame are in the shared heap.
+class BodyRelayService final: public kj::HttpService {
+ public:
+  explicit BodyRelayService(kj::HttpService& inner): inner(inner) {}
+
+  kj::Promise<void> request(kj::HttpMethod method,
+      kj::StringPtr url,
+      const kj::HttpHeaders& headers,
+      kj::AsyncInputStream& requestBody,
+      Response& response) override {
+    ReadRelay relay(requestBody);
+    co_await inner.request(method, url, headers, relay, response);
+  }
+
+  kj::Promise<void> connect(kj::StringPtr host,
+      const kj::HttpHeaders& headers,
+      kj::AsyncIoStream& connection,
+      ConnectResponse& response,
+      kj::HttpConnectSettings settings) override {
+    return inner.connect(host, headers, connection, response, kj::mv(settings));
+  }
+
+ private:
+  kj::HttpService& inner;
+};
+
 // The HttpClient over a WorkerInterface, with every call made inside a jsg::SharedHeapScope. A
 // call starts the target's handling of the request synchronously, on the calling thread, which
 // holds the calling isolate's lock. When the target is a Worker in this process, everything
@@ -132,7 +259,16 @@ class SharedHeapHttpClient final: public kj::HttpClient {
       const kj::HttpHeaders& headers,
       kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
     jsg::SharedHeapScope sharedHeap;
-    return inner->request(method, url, headers, expectedBodySize);
+    auto result = inner->request(method, url, headers, expectedBodySize);
+    if (bodiesRelayed()) {
+      // The response body is read by the caller's turns and written by the callee's: see
+      // ReadRelay. The relay is made where the response is delivered, on the event loop.
+      result.response = result.response.then([](Response response) {
+        response.body = kj::heap<ReadRelay>(kj::mv(response.body));
+        return kj::mv(response);
+      });
+    }
+    return result;
   }
 
   kj::Promise<WebSocketResponse> openWebSocket(
@@ -154,6 +290,11 @@ class SharedHeapHttpClient final: public kj::HttpClient {
 }  // namespace
 
 kj::Own<kj::HttpClient> asHttpClient(kj::Own<WorkerInterface> workerInterface) {
+  if (bodiesRelayed()) {
+    auto relay = kj::heap<BodyRelayService>(*workerInterface);
+    auto client = kj::newHttpClient(*relay).attach(kj::mv(relay)).attach(kj::mv(workerInterface));
+    return kj::heap<SharedHeapHttpClient>(kj::mv(client));
+  }
   return kj::heap<SharedHeapHttpClient>(
       kj::newHttpClient(*workerInterface).attach(kj::mv(workerInterface)));
 }

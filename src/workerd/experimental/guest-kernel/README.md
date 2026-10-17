@@ -180,6 +180,17 @@ isolate's JS turn at guest ring 3.
   handler-allocation guard build too, where the reports the refill hostcall
   finds would otherwise format inside a handler;
   `--copt=-DWORKERD_GK_NEG_REPORT_DEFER` puts that back and aborts it.
+- `body-arena-test.sh` / `body-arena-test.capnp` / `body-arena-front.js` /
+  `body-arena-back.js` — end-to-end check against a workerd built with
+  per-isolate heap arenas that request and response bodies cross an
+  in-process service binding intact, with neither isolate's turn reaching the
+  other's arena: a string body and a JS-implemented stream body read whole by
+  the callee, a response body read whole by the caller, and a stream body the
+  callee returns unread as its response, each at 1000 bytes and at 300000;
+  and a streaming upload aborted while the callee is blocked in a read of it,
+  which tears the body pump down inside the caller's turn. Negative build:
+  `--copt=-DWORKERD_GK_NEG_BODY_RELAY`, where the bodies cross through the
+  bare pipe and the first route faults the reading isolate's turn.
 
 ## API
 
@@ -1324,15 +1335,57 @@ so a crossing a turn makes on every dereference belongs on that path.
   the process then hung until killed. The cause is not known; the missing
   cross-vCPU shootdown (below) is a candidate, since the slot is reused.
 
-  What does not work is request and response *bodies* across an in-process
-  service binding, and it is now the only part of such a call that does not.
-  The rest of a call crosses in shared memory, but body bytes travel through a
-  `kj` one-way pipe by pointer, and the copy runs in the reading isolate's turn
-  from the writing isolate's memory: the caller's `r.text()` faults in
-  `kj::AsyncPipe::tryRead` on the callee's heap region, and a body the caller
-  sends faults the callee's read the same way. That needs a copy at the
-  boundary, with the host pumping bodies through shared buffers, which is a
-  protocol change rather than a placement and is future work.
+  Request and response *bodies* cross such a call through a relay rather
+  than in shared memory. Body bytes travel through a `kj` one-way pipe whose
+  two ends are held by different isolates, and the pipe copies between the
+  writer's buffer and the reader's in whichever of the two operations arrives
+  second, so the copy runs in one isolate's turn over a buffer in the other
+  isolate's arena. Nor are the bytes all that crosses: the state object the
+  first operation leaves on the pipe is a promise node in the first party's
+  arena, which the second party reads, writes and fulfils, and fulfilling it
+  arms the first party's continuation, a write into that arena too. Placing
+  the buffers alone would therefore not do. `ReadRelay`
+  (`io/worker-interface.c++`), installed by `asHttpClient()` at the reading
+  end of each pipe -- in front of the request body the callee reads and of
+  the response body the caller reads -- makes every operation on the pipe
+  from the event loop, outside any turn, where every arena is addressable: a
+  read yields to the event loop, reads from the pipe into a staging buffer
+  the host allocates, and copies into the reader's buffer from there. The
+  pipe then sees only host-side reads, whose node and staging buffer are in
+  the shared heap; the writer's turn fills the staging buffer and arms the
+  relay's coroutine, allocated in the shared heap for that; and each side's
+  own buffers keep their isolate provenance, so the copy sites in
+  `api/streams/internal.c++` and `api/js-readable-stream.h` are unchanged.
+  The relay is installed only where heap arenas are active, so a build
+  without them uses the pipe directly. It costs a copy and an event-loop
+  turn per chunk and forgoes the synchronous read fast path on such bodies.
+  It also settles how the request body pump is cancelled: an abort delivered
+  inside the caller's turn destroys the pump and so drops the pipe's write
+  end there, which reaches whatever the callee left on the pipe, and with the
+  relay that is a node the host allocated, so the pump keeps `wrap()` and
+  needs no deferral. `body-arena-test.sh` checks both directions, a passed-
+  through body and the abort; a negative build,
+  `--copt=-DWORKERD_GK_NEG_BODY_RELAY`, leaves the relays out and the test
+  fails on its first body. Not relayed: a `connect()` tunnel through a
+  binding, whose two-way pipe crosses the same way, and a WebSocket's
+  frames, which are a separate item. What the relay does not change is a
+  drop of the response body inside the caller's turn (`handleHttpResponse()`
+  in `api/http.c++` returns early when the signal has aborted since the
+  response was delivered), which aborts the pipe's read end against what the
+  callee left on it and cancels the callee's request; that reaches the
+  callee's arena as it did before, and is not covered by the test.
+
+  What the relay also leaves as it was is how the response promise itself
+  crosses: the callee's turn fulfils a promise the caller's turn has attached
+  its continuation to, and fulfilling it arms that continuation. This does
+  not fault because `kj` appends a promise's dependents into the 1 KiB arena
+  block the chain's head was allocated in while they fit
+  (`PromiseDisposer::appendPromise`, `kj/async-inl.h`), and the head of this
+  chain was allocated under the call's shared-heap scope; a chain that
+  outgrows its block starts the next block in the arena of whichever turn
+  adds the node. Every cross-isolate fulfilment in an in-process call relies
+  on that co-location today, and it is a property of node sizes rather than
+  a guarantee.
 
   Also not covered: BoringSSL's lazily allocated per-thread error state, which
   a `crypto` call in a turn would place on that turn's arena -- untested, but
