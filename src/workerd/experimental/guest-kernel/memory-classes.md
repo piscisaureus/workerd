@@ -802,6 +802,9 @@ placement experiment hit.
   (`api/http.c++:2900`); the body is pumped with
   `jsBody.pumpTo(js, newSystemStream(nr.body))` (`:1820`) and arrives on the
   callee side wrapped by `newSystemStream` (`api/global-scope.c++:343`).
+  Both bodies now cross through `ReadRelay` (`io/worker-interface.c++`),
+  which keeps every operation on the pipe between them on the event loop;
+  see README.md, "The in-process Cap'n Proto call".
 - **Service stubs.** `Fetcher::deserialize` does
   `IoContext::current().addObject(kj::addRef(channel))`
   (`api/http.c++:2466`), so one refcounted `SubrequestChannel` is owned by two
@@ -849,6 +852,21 @@ bounds-checks and copies from: `api/streams/internal.c++:717`,
 `api/js-readable-stream.h:496`, `api/kv.c++:463`, `api/queue.h:179`,
 `api/hibernation-event-params.h:22`, `api/worker-rpc.c++:298`,
 `api/memory-cache.c++:475`.
+
+Of these, the ones on the request and response body path of an in-process
+service binding -- `internal.c++`'s write copy (`processChunk`) and read
+buffer (the `tempBuffer` of `ReadableStreamInternalController::read` and the
+`kj::heapArray` of `AllReader`), and `js-readable-stream.h`'s `Buffer::owned`
+and `scratch` -- are closed without a descriptor and without moving the
+bytes. Each is touched only by its own isolate's turn and by the host, which
+is enough once nothing of the *other* isolate ever touches it: `ReadRelay`
+(`io/worker-interface.c++`) stands at the reading end of each body pipe and
+performs every pipe operation from the event loop, so the only memory both
+isolates reach is the relay's staging buffer and the pipe's own state, both
+the host's. The `worker-rpc.h:187` message buffer is placed by the
+shared-heap windows of the call (README.md, "The in-process Cap'n Proto
+call"); the WebSocket send path, the memory cache, KV, queues and
+hibernation are still as listed.
 
 One case resists both: `api/sql.h:251` holds raw pointers into sandbox strings
 and blobs as SQLite query bindings, so the host reads sandbox memory while
