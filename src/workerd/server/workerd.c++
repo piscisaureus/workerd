@@ -174,11 +174,6 @@ int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a
     case SYS_lseek:
     case SYS_newfstatat:
     case SYS_openat:
-    case SYS_pkey_mprotect:
-#ifdef SYS_poll
-    // arm64 has no poll(2); the libc there uses ppoll instead.
-    case SYS_poll:
-#endif
     case SYS_prctl:
     case SYS_prlimit64:
     case SYS_pread64:
@@ -221,8 +216,6 @@ int guestKernelSyscallFilter(long nr, long a1, long a2, long a3, long a4, long a
 #else
     // arm64 has none of the legacy calls above; glibc issues these instead.
     case SYS_epoll_pwait:
-    case SYS_faccessat:
-    case SYS_faccessat2:
     case SYS_ppoll:
     case SYS_readlinkat:
     case SYS_renameat:
