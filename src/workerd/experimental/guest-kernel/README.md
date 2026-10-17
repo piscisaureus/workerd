@@ -1266,7 +1266,10 @@ so a crossing a turn makes on every dereference belongs on that path.
   shared heap on purpose from under a lock, through `jsg::SharedHeapScope`,
   because a turn allocates it but it is not the isolate's. That covers
   process-wide state a turn initializes or grows: everything ICU allocates
-  (`u_setMemoryFunctions()` in `jsg/setup.c++`), everything V8's `Intl`
+  (`u_setMemoryFunctions()` in `jsg/setup.c++`), the C library's buffer for
+  `stdout`, which it would allocate on the first write to the stream -- V8's
+  `--trace-gc` line from inside a turn, say -- and is given beforehand
+  (`setvbuf()` beside the ICU hooks), everything V8's `Intl`
   builtins allocate (the hooks of `patches/v8/0049-Run-Intl-builtins-under-an-
   embedder-shared-allocation-scope.patch`, which V8 keeps process-wide caches
   of locales, calendars and date formats behind), what V8's wasm type

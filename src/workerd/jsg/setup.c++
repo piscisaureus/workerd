@@ -214,6 +214,14 @@ void V8System::init(kj::Own<v8::Platform> platformParam,
     UErrorCode err = U_ZERO_ERROR;
     u_setMemoryFunctions(nullptr, &icuAlloc, &icuRealloc, &icuFree, &err);
     KJ_ASSERT(err == U_ZERO_ERROR, "u_setMemoryFunctions() failed", static_cast<int>(err));
+
+    // The C library allocates stdout's buffer on the first write to the stream, and when that
+    // write comes from inside a turn (V8's --trace-gc lines do) the buffer is in that isolate's
+    // arena, where every later write from another isolate's turn faults. Given a buffer, stdio
+    // allocates none.
+    static char stdoutBuffer[BUFSIZ];
+    KJ_ASSERT(setvbuf(stdout, stdoutBuffer, isatty(STDOUT_FILENO) ? _IOLBF : _IOFBF,
+                  sizeof(stdoutBuffer)) == 0);
   }
 
 #ifdef WORKERD_ICU_DATA_EMBED
