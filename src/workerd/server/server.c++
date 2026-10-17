@@ -3387,6 +3387,16 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
 
 }  // namespace
 
+namespace {
+#ifdef WORKERD_GK_NEG_ENTRYPOINT_NAME_HEAP
+// A negative build, never shipped: the entrypoint names stay in the heap arena of the isolate
+// whose modules declared them. See experimental/guest-kernel/rpc-arena-test.sh.
+struct EntrypointNameScope {};
+#else
+using EntrypointNameScope = jsg::SharedHeapScope;
+#endif
+}  // namespace
+
 // Shared ErrorReporter base implemnetation. The logic to collect entrypoint information is the
 // same regardless of where the code came from.
 struct Server::ErrorReporter: public Worker::ValidationErrorReporter {
@@ -3396,10 +3406,19 @@ struct Server::ErrorReporter: public Worker::ValidationErrorReporter {
   kj::HashSet<kj::String> actorClasses;
   kj::HashSet<kj::String> workflowClasses;
 
+  // These tables are filled while the worker's modules are evaluated, under its isolate's lock,
+  // and their names outlive that: `WorkerService::getEntrypoint()` hands a `kj::StringPtr` into
+  // `namedEntrypoints` to every `EntrypointService` of this worker, and
+  // `WorkerService::createEntrypoint()` copies it for each request -- which, for a service
+  // binding or a JS-RPC call, runs in a turn of the *calling* isolate. A name left in this
+  // worker's heap arena is unaddressable there, so each is copied into the shared heap as it is
+  // added. The strings handed in are copied rather than moved for the same reason: they are the
+  // isolate's too.
   void addEntrypoint(kj::Maybe<kj::StringPtr> exportName, kj::Array<kj::String> methods) override {
+    EntrypointNameScope sharedHeap;
     kj::HashSet<kj::String> set;
     for (auto& method: methods) {
-      set.insert(kj::mv(method));
+      set.insert(kj::str(method));
     }
     KJ_IF_SOME(e, exportName) {
       namedEntrypoints.insert(kj::str(e), kj::mv(set));
@@ -3409,6 +3428,7 @@ struct Server::ErrorReporter: public Worker::ValidationErrorReporter {
   }
 
   void addActorClass(kj::StringPtr exportName) override {
+    EntrypointNameScope sharedHeap;  // see addEntrypoint()
     actorClasses.insert(kj::str(exportName));
   }
 
@@ -3416,9 +3436,10 @@ struct Server::ErrorReporter: public Worker::ValidationErrorReporter {
     // At runtime, we need to add it into the normal namedEntrypoints for Workflows to appear
     // in `WorkerService`. This is a different method compared to `addEntrypoint` because we need to
     // check for `WorkflowEntrypoint` inheritance at validation time.
+    EntrypointNameScope sharedHeap;  // see addEntrypoint()
     kj::HashSet<kj::String> set;
     for (auto& method: methods) {
-      set.insert(kj::mv(method));
+      set.insert(kj::str(method));
     }
     namedEntrypoints.insert(kj::str(exportName), kj::mv(set));
     workflowClasses.insert(kj::str(exportName));
