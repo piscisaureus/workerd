@@ -36,6 +36,7 @@ use syn::FnArg;
 use syn::ItemFn;
 use syn::ItemImpl;
 use syn::parse_macro_input;
+use utils::elide_named_lifetimes;
 use utils::error;
 use utils::extract_name_attribute;
 use utils::extract_named_fields;
@@ -89,7 +90,7 @@ pub fn jsg_struct(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .ok_or_else(|| jsg::Error::new_type_error(
                         format!("Missing property '{}'", #field_name_str)
                     ))?;
-                <#field_type as jsg::FromJS>::from_js(lock, prop)?
+                <#field_type as jsg::FromJS<'s>>::from_js(lock, prop)?
             };
         });
         field_names.push(field_name);
@@ -101,43 +102,40 @@ pub fn jsg_struct(attr: TokenStream, item: TokenStream) -> TokenStream {
         impl jsg::Type for #name {
             fn class_name() -> &'static str { #class_name }
 
-            fn is_exact(value: &jsg::v8::Local<jsg::v8::Value>) -> bool {
+            fn is_exact(value: jsg::v8::Local<'_, jsg::v8::Value>) -> bool {
                 value.is_object()
             }
         }
 
-        impl jsg::ToJS for #name {
-            fn to_js<'a, 'b>(self, lock: &'a mut jsg::Lock) -> jsg::v8::Local<'b, jsg::v8::Value>
-            where
-                'b: 'a,
-            {
+        impl<'s> jsg::ToJS<'s> for #name {
+            fn to_js(self, lock: &mut jsg::Lock<'s>) -> jsg::v8::Local<'s, jsg::v8::Value> {
                 // TODO(soon): Use a precached ObjectTemplate instance to create the object,
                 // similar to how C++ JSG optimizes object creation. This would avoid recreating
                 // the object shape on every wrap() call and improve performance.
                 {
                     let this = self;
-                    let mut obj = lock.new_object();
+                    let obj = lock.new_object();
                     #(#field_assignments)*
                     obj.into()
                 }
             }
         }
 
-        impl jsg::FromJS for #name {
+        impl<'s> jsg::FromJS<'s> for #name {
             type ResultType = Self;
 
-            fn from_js(lock: &mut jsg::Lock, value: jsg::v8::Local<jsg::v8::Value>) -> Result<Self::ResultType, jsg::Error> {
+            fn from_js(lock: &mut jsg::Lock<'s>, value: jsg::v8::Local<'s, jsg::v8::Value>) -> Result<Self::ResultType, jsg::Error> {
                 if !value.is_object() {
                     return Err(jsg::Error::new_type_error(
                         format!("Expected object but got {}", value.type_of())
                     ));
                 }
-                let obj: jsg::v8::Local<'_, jsg::v8::Object> = value.into();
+                let obj: jsg::v8::Local<'s, jsg::v8::Object> = value.into();
                 #(#field_extractions)*
                 Ok(Self { #(#field_names),* })
             }
 
-            fn try_from_js(lock: &mut jsg::Lock, value: jsg::v8::Local<jsg::v8::Value>) -> Result<Option<Self::ResultType>, jsg::Error> {
+            fn try_from_js(lock: &mut jsg::Lock<'s>, value: jsg::v8::Local<'s, jsg::v8::Value>) -> Result<Option<Self::ResultType>, jsg::Error> {
                 if !value.is_object() {
                     return Ok(None);
                 }
@@ -204,13 +202,14 @@ pub fn jsg_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
         .map(|(i, ty)| {
             // First param is &mut Lock — pass the callback's lock directly.
             if i == 0 && has_lock_param {
-                return (quote! {}, quote! { &mut lock });
+                return (quote! {}, quote! { &mut *lock });
             }
 
             let js_index = i - js_arg_offset;
             let arg = syn::Ident::new(&format!("arg{js_index}"), fn_name.span());
+            let elided_ty = elide_named_lifetimes(ty);
             let unwrap = quote! {
-                let #arg = match <#ty as jsg::FromJS>::from_js(&mut lock, args.get(#js_index)) {
+                let #arg = match <#elided_ty as jsg::FromJS<'_>>::from_js(lock, args.get(#js_index)) {
                     Ok(v) => v,
                     Err(err) => {
                         lock.throw_exception(&err);
@@ -236,13 +235,13 @@ pub fn jsg_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let result_handling = if is_result {
         quote! {
             match result {
-                Ok(value) => args.set_return_value(jsg::ToJS::to_js(value, &mut lock)),
+                Ok(value) => args.set_return_value(jsg::ToJS::to_js(value, lock)),
                 Err(err) => lock.throw_exception(&err.into()),
             }
         }
     } else {
         quote! {
-            args.set_return_value(jsg::ToJS::to_js(result, &mut lock));
+            args.set_return_value(jsg::ToJS::to_js(result, lock));
         }
     };
 
@@ -261,7 +260,7 @@ pub fn jsg_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
             // "Illegal invocation" — instead of panicking (a panic here is
             // caught by `catch_panic`, but as an *internal* error + execution
             // termination, which is the wrong shape for tenant-triggerable input).
-            let Some(wrappable) = jsg::v8::WrappableRc::from_js(lock.isolate(), this) else {
+            let Some(wrappable) = jsg::v8::WrappableRc::from_js(lock, this) else {
                 lock.throw_exception(&jsg::Error::new_type_error("Illegal invocation"));
                 return;
             };
@@ -287,11 +286,12 @@ pub fn jsg_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[automatically_derived]
         #[expect(clippy::undocumented_unsafe_blocks)]
-        extern "C" fn #callback_name(args: *mut jsg::v8::ffi::FunctionCallbackInfo) {
-            let mut lock = unsafe { jsg::Lock::from_args(args) };
-            jsg::catch_panic(&mut lock, || {
-                let mut lock = unsafe { jsg::Lock::from_args(args) };
-                let mut args = unsafe { jsg::v8::FunctionCallbackInfo::from_ffi(args) };
+        extern "C" fn #callback_name(info: *mut jsg::v8::ffi::FunctionCallbackInfo) {
+            // V8 invokes this callback with a valid `FunctionCallbackInfo`, with the
+            // isolate locked, a context entered and a `HandleScope` open.
+            jsg::callback_scope!(unsafe let lock, info);
+            let args = &mut unsafe { jsg::v8::FunctionCallbackInfo::new(lock, info) };
+            jsg::catch_panic(lock, |lock| {
                 #(#unwraps)*
                 #invocation
                 #result_handling
@@ -465,7 +465,7 @@ pub fn jsg_oneof(_attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .map(|(variant_name, inner_type)| {
             quote! {
-                if let Some(result) = <#inner_type as jsg::FromJS>::try_from_js_exact(lock, &value) {
+                if let Some(result) = <#inner_type as jsg::FromJS<'s>>::try_from_js_exact(lock, value) {
                     return result.map(|value| Some(Self::#variant_name(value)));
                 }
             }
@@ -500,23 +500,23 @@ pub fn jsg_oneof(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 stringify!(#name)
             }
 
-            fn is_exact(value: &jsg::v8::Local<jsg::v8::Value>) -> bool {
+            fn is_exact(value: jsg::v8::Local<'_, jsg::v8::Value>) -> bool {
                 #(#is_exact_checks)||*
             }
         }
 
         #[automatically_derived]
-        impl jsg::FromJS for #name {
+        impl<'s> jsg::FromJS<'s> for #name {
             type ResultType = Self;
 
-            fn from_js(lock: &mut jsg::Lock, value: jsg::v8::Local<jsg::v8::Value>) -> Result<Self::ResultType, jsg::Error> {
+            fn from_js(lock: &mut jsg::Lock<'s>, value: jsg::v8::Local<'s, jsg::v8::Value>) -> Result<Self::ResultType, jsg::Error> {
                 let type_name = value.type_of();
                 Self::try_from_js(lock, value)?.ok_or_else(|| {
                     jsg::Error::new_type_error({ #error_msg })
                 })
             }
 
-            fn try_from_js(lock: &mut jsg::Lock, value: jsg::v8::Local<jsg::v8::Value>) -> Result<Option<Self::ResultType>, jsg::Error> {
+            fn try_from_js(lock: &mut jsg::Lock<'s>, value: jsg::v8::Local<'s, jsg::v8::Value>) -> Result<Option<Self::ResultType>, jsg::Error> {
                 #(#type_checks)*
                 Ok(None)
             }

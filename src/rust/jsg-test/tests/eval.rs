@@ -2,8 +2,8 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
+use jsg::FromJS;
 use jsg::Number;
-use jsg::ToJS;
 use jsg_macros::jsg_constructor;
 use jsg_macros::jsg_method;
 use jsg_macros::jsg_resource;
@@ -118,7 +118,7 @@ fn eval_throws_on_error() {
         let result = ctx.eval::<bool>(lock, "throw new Error('test error')");
         match result.unwrap_err() {
             EvalError::Exception(value) => {
-                assert_eq!(value.to_string(), "Error: test error");
+                assert_eq!(String::from_js(lock, value).unwrap(), "Error: test error");
             }
             _ => panic!("Unexpected error type"),
         }
@@ -133,7 +133,7 @@ fn eval_throws_string_preserves_message() {
         let result = ctx.eval::<bool>(lock, "throw 'custom string error'");
         match result.unwrap_err() {
             EvalError::Exception(value) => {
-                assert_eq!(value.to_string(), "custom string error");
+                assert_eq!(String::from_js(lock, value).unwrap(), "custom string error");
             }
             _ => panic!("Unexpected error type"),
         }
@@ -323,7 +323,7 @@ fn lenient_resource_some() {
         let boxed = jsg::Rc::new(NumberBox {
             value: jsg::Number::new(42.0),
         });
-        ctx.set_global("box", boxed.to_js(lock));
+        ctx.set_global(lock, "box", boxed);
         let result: jsg::Number = ctx.eval(lock, "box.takeLenient(box)").unwrap();
         assert!((result.value() - 42.0).abs() < f64::EPSILON);
         Ok(())
@@ -337,7 +337,7 @@ fn lenient_resource_undefined() {
         let boxed = jsg::Rc::new(NumberBox {
             value: jsg::Number::new(42.0),
         });
-        ctx.set_global("box", boxed.to_js(lock));
+        ctx.set_global(lock, "box", boxed);
         let result: jsg::Number = ctx.eval(lock, "box.takeLenient()").unwrap();
         assert!((result.value() - -12.6).abs() < f64::EPSILON);
         Ok(())
@@ -351,7 +351,7 @@ fn lenient_resource_undefined_explicit() {
         let boxed = jsg::Rc::new(NumberBox {
             value: jsg::Number::new(42.0),
         });
-        ctx.set_global("box", boxed.to_js(lock));
+        ctx.set_global(lock, "box", boxed);
         let result: jsg::Number = ctx.eval(lock, "box.takeLenient(undefined)").unwrap();
         assert!((result.value() - -12.6).abs() < f64::EPSILON);
         Ok(())
@@ -365,7 +365,7 @@ fn lenient_resource_null() {
         let boxed = jsg::Rc::new(NumberBox {
             value: jsg::Number::new(42.0),
         });
-        ctx.set_global("box", boxed.to_js(lock));
+        ctx.set_global(lock, "box", boxed);
         let result: jsg::Number = ctx.eval(lock, "box.takeLenient(null)").unwrap();
         assert!((result.value() - 42.97).abs() < f64::EPSILON);
         Ok(())
@@ -379,7 +379,7 @@ fn lenient_resource_wrong_type() {
         let boxed = jsg::Rc::new(NumberBox {
             value: jsg::Number::new(42.0),
         });
-        ctx.set_global("box", boxed.to_js(lock));
+        ctx.set_global(lock, "box", boxed);
         // Passing a function instead of a NumberBox — should be silently treated as absent.
         let result: jsg::Number = ctx.eval(lock, "box.takeLenient(() => {})").unwrap();
         assert!((result.value() - 321.0).abs() < f64::EPSILON);

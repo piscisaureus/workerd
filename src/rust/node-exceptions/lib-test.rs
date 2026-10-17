@@ -7,7 +7,11 @@ use jsg_test::Harness;
 
 use super::*;
 
-fn get_string(lock: &mut Lock, obj: &v8::Local<v8::Object>, key: &str) -> Option<String> {
+fn get_string<'s>(
+    lock: &mut Lock<'s>,
+    obj: &v8::Local<'s, v8::Object>,
+    key: &str,
+) -> Option<String> {
     obj.get(lock, key)
         .and_then(|value| String::from_js(lock, value).ok())
 }
@@ -22,7 +26,7 @@ fn node_exception_uses_default_message_and_code() {
             ffi::JsErrorType::Error,
             None,
         );
-        let value: v8::Local<v8::Value> = err.clone().into();
+        let value: v8::Local<v8::Value> = err.into();
         assert!(value.is_native_error());
         assert_eq!(
             get_string(lock, &err, "message").as_deref(),
