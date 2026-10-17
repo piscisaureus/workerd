@@ -477,7 +477,9 @@ hardware:
   same class, which no tag can tell apart. The tag is also the turn's own
   word for a registration it journals, so it binds a turn that swaps handles
   and not one that lies about its own registration; that one waits on the
-  journal moving out of the shared heap, as the disposer beside it does.
+  class word being recorded where a turn cannot write it, as the disposer
+  beside it does. Giving the journal pages of its own does not do that: ring 3
+  writes the journal on every turn, which is what it is for.
   Tagging is a hash, so two classes whose spellings collide share a tag,
   which costs a catch and never a false refusal.
 

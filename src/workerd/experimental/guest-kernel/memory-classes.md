@@ -1088,7 +1088,11 @@ and not one that has reached control flow of its own, where the owner's
 ring-0 comparison still holds. What is left is a swap between two live
 entries of the same isolate *and* the same class, which no tag distinguishes,
 and a turn that lies about the class in its own journal, which waits on the
-journal leaving the shared heap along with the disposer beside it.
+class word being recorded where a turn cannot write it. The journal has pages
+of its own rather than a block of the shared heap (`util/host-memory.c++`),
+which settles where it lands but not this: a turn writes its own
+registrations there by design, so the word the host reads back is still the
+word the turn put there. The disposer beside it waits on the same thing.
 
 ### Placing an `IoOwn`'s `T` in host memory
 
