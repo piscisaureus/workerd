@@ -2048,3 +2048,46 @@ what is waiting on the same facility:
   reachable for rewriting at all, is what the splits in the inventories above
   are for: the chain from the event loop down to each H object has to be H
   all the way.
+
+## Why the neuterable stream wrappers are safe
+
+Three sites in `api/global-scope.c++` wrap a stream whose lifetime belongs to
+the HTTP or datagram layer rather than to workerd, so that workerd can
+disconnect from it before it becomes invalid: `request()`'s request body, and
+`connect()`'s connection and channel. Each neuters its wrapper from a
+`kj::defer` and a `KJ_ON_SCOPE_FAILURE` in the same frame that calls the
+worker's handler, and that frame runs in the guest. A turn that faults inside
+the handler -- where a sandbox escape faults, as against the test hook, which
+fires at the top of the function before the wrapper exists -- abandons both,
+and the wrapper is left holding a raw pointer to a stream the owning layer
+then frees.
+
+Nothing dereferences it, and the reasons are worth stating because they are
+invariants that other work can break, not properties of these three sites:
+
+- The fault condemns the isolate, so no JS runs on it again. The readers the
+  neuter exists to defend against are reachable only from the `Request` or the
+  `Socket` on that isolate's heap, so they are unreachable rather than
+  guarded. The leaked wrapper references, including those on the abandoned
+  guest stack, are never dropped either, since nothing evicts a condemned
+  isolate -- the wrapper leaks with a dangling pointer instead of being read.
+- A turn holds the isolate lock from entry to fault without yielding, so no
+  parked host-side read of the same stream resumes in between. The ones the
+  `IoContext` owns are cancelled by its teardown, which runs as
+  `WorkerEntrypoint`'s `co_await context.run()` unwinds -- before the fault's
+  exception reaches the layer that frees the stream. Cancellation destroys the
+  read rather than issuing a fresh one.
+- The continuations that would read the body past the handler's own frame, the
+  bidirectional-streaming `.then()` and the default handler's
+  `adapter->request()`, are only constructed once `request()` returns a value.
+  A faulted turn never returns one, so they never exist.
+
+So these are latent hazards, not live bugs, and they need no fix today. What
+they do need is for a change in any of the three areas above to be recognised
+as reaching them: evicting condemned isolates, letting a turn yield the lock
+before its fault, or arming a reader earlier than the handler's return would
+each turn all three sites into host-side use-after-frees. The fix at that
+point is an owner that outlives the turn -- `IoContext::addObject` on the
+wrapper before the handler runs, as the memory cache's fallback callback does
+-- and not neutering from the fault path, which sits in `io/` and has no
+handle to per-request state in `api/`.

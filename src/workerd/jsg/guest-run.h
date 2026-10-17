@@ -71,8 +71,22 @@ namespace workerd::jsg {
 //     that would take the process down (see runJsTurn in io/io-context.c++);
 //   - any kj::Own / jsg::Ref / IoOwn / file descriptor / KJ mutex lock the C++ frames held at
 //     the moment of the fault (a held KJ mutex would deadlock its next locker). The test hook
-//     in ServiceWorkerGlobalScope::request() faults before any such state is taken, so the test
-//     does not exercise that case;
+//     in ServiceWorkerGlobalScope::request() faults at the top of that function, before any
+//     such state is taken, so no test exercises this case; a turn that faults where a sandbox
+//     escape would, inside the handler it called, abandons whatever the frames below it hold.
+//     The neuterable stream wrappers are that case: request()'s request body, and connect()'s
+//     connection and channel, each wrap a stream the HTTP or datagram layer owns and neuter it
+//     from a kj::defer and a KJ_ON_SCOPE_FAILURE in the frame that faults, so a fault leaves
+//     the wrapper pointing at a stream that layer then frees. Nothing reads it, for two
+//     reasons that are invariants rather than accidents: the fault condemns the isolate, so no
+//     JS ever runs on the readers reachable from the Request or the Socket; and the turn holds
+//     the isolate lock to its fault without yielding, so the IoContext's own in-flight reads
+//     are cancelled by its teardown before the exception reaches the layer that frees the
+//     stream. A change that lets any reader outlive the fault -- evicting a condemned isolate,
+//     or resuming a parked read between the fault and the teardown -- turns all three sites
+//     into host-side use-after-frees. The fix then is to give each wrapper an owner that
+//     outlives the turn (IoContext::addObject before the handler runs) rather than to neuter
+//     from the fault path, which has no handle to per-request state in api/;
 //   - on the V8 side, the abandoned HandleScopes' handles, and the isolate itself, which is
 //     never freed because nothing evicts a condemned isolate (see Worker::Isolate::condemn).
 template <typename Func>
