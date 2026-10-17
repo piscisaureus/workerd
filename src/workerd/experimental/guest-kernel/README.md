@@ -40,6 +40,17 @@ isolate's JS turn at guest ring 3.
   condemned, the IoContext is torn down, and the process keeps serving.
   Negative build: `--copt=-DWORKERD_GK_NEG_TIMEOUT_RUNNING`, where the fault
   path leaves the mark standing and the process dies on the assert.
+- `memory-cache-fault-test.sh` / `memory-cache-fault-test.capnp` /
+  `memory-cache-fault-test.js` — the fault taken inside a `MemoryCache`
+  fallback, whose frame holds the callback that releases the cache's
+  in-progress entry for the key: a process-wide entry, since workers
+  sharing a cache id share the cache, on which every later read of that key
+  from any of them waits. The callback is the request's IoContext's before
+  the fallback runs, so the teardown of the faulted request releases the
+  entry, and a co-tenant worker's read of the same key completes with its
+  own fallback. Negative build: `--copt=-DWORKERD_GK_NEG_CACHE_FALLBACK`,
+  where the entry is stranded and the co-tenant's read hangs, which the
+  script bounds and reports.
 - `surface-test.sh` / `surface-test.capnp` / `surface-test.js` / `add.wasm` /
   `oob.wasm` — end-to-end check against a built workerd that a broad V8 surface
   (Wasm including an out-of-bounds trap, WebCrypto, irregexp and a JIT-heavy

@@ -427,7 +427,12 @@ void checkWasmDescriptorsForTest(kj::StringPtr url) {
 // the null pointer, so the fault lands in the turn the timer fires, the one that runs a JS
 // setTimeout callback, with that turn's own host state (the TimeoutState marked running, see
 // TimeoutManagerImpl in io/io-context.c++) abandoned by the fault; the script keeps the request
-// alive until the timer has fired (fault-timeout-test.sh).
+// alive until the timer has fired (fault-timeout-test.sh). A request whose path is
+// /__gk_fault_cache_fallback arms the next MemoryCache fallback on this thread to take the fault
+// in the frame that runs the fallback (see forceGuestFaultInNextMemoryCacheFallbackForTest), so
+// the fault lands in the turn a cache read's fallback runs in, with the fallback's done-callback
+// -- what releases the cache's in-progress entry for the key -- as that frame left it
+// (memory-cache-fault-test.sh).
 //
 // With WORKERD_GK_TEST_PROBE set, a request whose path is /__gk_probe_host instead reads one
 // byte of the channel token key, and one whose path is /__gk_probe_host_entropy one byte of the
@@ -494,6 +499,8 @@ void checkWasmDescriptorsForTest(kj::StringPtr url) {
 // things as /__gk_lock_slot without writing anything. The host must find its own lock in the
 // slot in every case and must not act on the sentinel, including by refusing the lock as
 // recursive.
+bool faultInNextMemoryCacheFallbackForTest = false;
+
 void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   static const bool faultEnabled =
       jsg::isGuestKernelEnabled() && getenv("WORKERD_GK_TEST_FAULT") != nullptr;
@@ -507,6 +514,9 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
           WARNING, "WORKERD_GK_TEST_FAULT: forcing a guest fault inside a timeout callback", url);
       *static_cast<volatile int*>(nullptr) = 0;
     }, 0);
+  }
+  if (faultEnabled && url.endsWith("/__gk_fault_cache_fallback")) {
+    faultInNextMemoryCacheFallbackForTest = true;
   }
   static const bool probeEnabled =
       jsg::isGuestKernelEnabled() && getenv("WORKERD_GK_TEST_PROBE") != nullptr;
@@ -1579,6 +1589,12 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
 }
 
 }  // namespace
+
+bool takeForcedGuestFaultInMemoryCacheFallbackForTest() {
+  bool armed = faultInNextMemoryCacheFallbackForTest;
+  faultInNextMemoryCacheFallbackForTest = false;
+  return armed;
+}
 
 kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(kj::HttpMethod method,
     kj::StringPtr url,
