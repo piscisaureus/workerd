@@ -23,6 +23,7 @@
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/modules-new.h>
 #include <workerd/jsg/modules.h>
+#include <workerd/util/host-memory.h>
 #include <workerd/util/strong-bool.h>
 #include <workerd/util/weak-refs.h>
 
@@ -425,6 +426,16 @@ class Worker::Isolate: public kj::AtomicRefcounted {
     return *api;
   }
 
+  // The guest-kernel arena this isolate's memory lives in, as hostMemory's opaque handle, or
+  // null when the isolate has none (every isolate, unless guest-kernel isolation is enabled).
+  // It is read while the isolate is created, where the only thing that has run in the isolate
+  // is this constructor, and kept here so that host code which must name the isolate -- a
+  // resolve entry registered for it from a thread that is not locked into it, see
+  // hostMemory::registerResolveFor -- does not have to consult the isolate itself.
+  inline hostMemory::IsolateArena getGuestArena() const {
+    return guestArena;
+  }
+
   // Returns the number of threads currently blocked trying to lock this isolate's mutex (using
   // takeAsyncLock()).
   uint getCurrentLoad() const;
@@ -481,6 +492,31 @@ class Worker::Isolate: public kj::AtomicRefcounted {
 
   // Called after each completed request. Does not require a lock.
   void completedRequest() const;
+
+  // Marks the isolate as permanently unusable: every later attempt to lock it fails with `reason`
+  // (checked under the lock in Isolate::Impl::Lock, so that a thread already waiting for the
+  // lock when the isolate is condemned fails as soon as it gets it; IoContext::runImpl() also
+  // fails fast before locking). Only the teardown paths that release the isolate's resources may
+  // still enter it. Used when a JS turn was abandoned mid-execution rather than unwound: the
+  // experimental guest kernel reports a fault inside the guest by returning from the turn without
+  // the frames below the guest boundary ever running, so the isolate's V8 heap and per-thread
+  // state (handle scopes, TryCatch chain, JS entry frames) may be inconsistent and no more JS may
+  // run on it. Does not itself require the lock, but the condemning thread must hold it (as the
+  // faulting thread does) for the under-lock check to be race-free. The first reason wins.
+  //
+  // TODO(guest-kernel): This only fences the isolate off; nothing evicts it. workerd keeps the
+  //   condemned isolate's Worker in its service table and answers every request to it with
+  //   `reason` until the process restarts. Replacing it with a fresh isolate needs the embedder's
+  //   isolate-lifecycle machinery (the edge runtime's condemnation/eviction path); in workerd that
+  //   would mean rebuilding the WorkerService, which has no support for it today.
+  void condemn(kj::Exception reason) const;
+
+  // Throws the reason passed to condemn() if the isolate has been condemned. Taking the isolate
+  // lock performs this check itself; calling it without the lock is only a fast-fail, as the
+  // isolate may be condemned by another thread between the check and the lock.
+  void requireNotCondemned() const;
+
+  bool isCondemned() const;
 
   // See Worker::takeAsyncLock().
   kj::Promise<AsyncLock> takeAsyncLockWithoutRequest(SpanParent parentSpan) const;
@@ -544,6 +580,9 @@ class Worker::Isolate: public kj::AtomicRefcounted {
   kj::Own<Api> api;
   LoggingOptions loggingOptions;
 
+  // See getGuestArena(). Set once, in the constructor.
+  hostMemory::IsolateArena guestArena = nullptr;
+
   // If non-null, a serialized JSON object with a single "flags" property, which is a list of
   // compatibility enable-flags that are relevant to FL.
   kj::Maybe<kj::String> featureFlagsForFl;
@@ -598,6 +637,12 @@ class Worker::Api {
 
   // Like `current()`, but returns `kj::none` if there is no current Api instance.
   static kj::Maybe<const Api&> tryCurrent();
+
+  // The thread-local behind current(), for the host side of a guest turn to save before the turn
+  // and put back after it (see GuestTurnThreadLocals in guest-turn-thread-locals.h). The value is
+  // opaque to the caller: it is only ever stored back.
+  static const Api* saveThreadLocalForGuestTurn();
+  static void restoreThreadLocalAfterGuestTurn(const Api* value);
 
   // Take a lock on the isolate.
   virtual kj::Own<jsg::Lock> lock(jsg::V8StackScope& stackScope) const = 0;
@@ -802,11 +847,28 @@ class Worker::Lock {
   // Get the opaque storage key to use for recording user trace information in async contexts.
   kj::Arc<jsg::AsyncContextFrame::StorageKey> getUserTraceAsyncContextKey();
 
+  // Test-only (see maybeForceGuestFaultForTest in api/global-scope.c++): the heap storage of the
+  // Api pointer that Isolate::Impl::Lock puts back into the thread-local when this lock is
+  // released, which a request overwrites from inside a turn to show that the value restored
+  // after the lock comes from this stack object and not from the heap.
+  void* savedApiStorageForTest();
+
+  // Test-only (same hook): runs `probe` once, host-side, with the next Worker::Lock to be
+  // released on this process -- after its JS turn, while the isolate is still locked -- so a
+  // request can observe what host code holding the lock sees once the guest has returned.
+  static void runAtNextReleaseForTest(kj::Function<void(Lock&)> probe);
+
  private:
   explicit Lock(const Worker& worker, LockType lockType, jsg::V8StackScope&);
   struct Impl;
 
   Worker& worker;
+  // The Api current on this thread before this lock, kept here, on the stack (a Lock must be on
+  // the stack), because `impl` is heap memory a guest turn can write: with the guest kernel on,
+  // the destructor puts this value back into the thread-local after `impl` has restored its own
+  // heap copy, so what Worker::Api::current() sees once the lock is gone was decided by a host
+  // frame.
+  const Api* apiBeforeLock;
   kj::Own<Impl> impl;
 
   friend class Worker;

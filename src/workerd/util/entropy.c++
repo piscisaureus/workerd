@@ -17,20 +17,25 @@
 
 namespace workerd {
 
-void getEntropy(kj::ArrayPtr<kj::byte> output) {
-  static constexpr size_t BUFFER_SIZE = 4096;
-  struct BufferState {
-    kj::FixedArray<kj::byte, BUFFER_SIZE> store;
-    kj::ArrayPtr<kj::byte> data;  // Starts empty to trigger initial fill
+namespace {
+
+constexpr size_t BUFFER_SIZE = 4096;
+
+struct BufferState {
+  kj::FixedArray<kj::byte, BUFFER_SIZE> store;
+  kj::ArrayPtr<kj::byte> data;  // Starts empty to trigger initial fill
 #if defined(KJ_DEBUG) && defined(__unix__)
-        // Track the PID separately to detect cross-fork usage.
-    // This should be preserved across fork so we can detect PID changes.
-    pid_t lastSeenPid = 0;
+  // Track the PID separately to detect cross-fork usage.
+  // This should be preserved across fork so we can detect PID changes.
+  pid_t lastSeenPid = 0;
 #endif
-  };
+};
 
-  thread_local BufferState state{};
+thread_local BufferState state{};
 
+}  // namespace
+
+void getEntropy(kj::ArrayPtr<kj::byte> output) {
 #if defined(KJ_DEBUG) && defined(__unix__)
   // Verify that getpid() hasn't changed. This code should be called strictly post-fork.
   // If we see crashes here in tests, it means there's some pre-fork call to getEntropy()
@@ -62,6 +67,16 @@ void getEntropy(kj::ArrayPtr<kj::byte> output) {
     OPENSSL_cleanse(state.data.first(toCopy).begin(), toCopy);
     state.data = state.data.slice(toCopy);
   }
+}
+
+void poisonEntropyBufferForTest(kj::byte pattern) {
+  state.store.asPtr().fill(pattern);
+  state.data = state.store.asPtr();
+}
+
+void discardEntropyBufferForTest() {
+  OPENSSL_cleanse(state.store.begin(), BUFFER_SIZE);
+  state.data = nullptr;
 }
 
 }  // namespace workerd

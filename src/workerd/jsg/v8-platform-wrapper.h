@@ -4,13 +4,19 @@
 
 #pragma once
 
+#include "heap-arena.h"
+#include "thread-isolated-allocator.h"
+
+#include <workerd/util/memory-class.h>
+
+#include <libplatform/libplatform.h>
 #include <v8-platform.h>
 
 #include <kj/common.h>
 
 namespace workerd::jsg {
 
-class V8PlatformWrapper: public v8::Platform {
+class WD_MEMORY_CLASS_HOST V8PlatformWrapper: public v8::Platform {
  public:
   explicit V8PlatformWrapper(v8::Platform& inner): inner(inner) {}
 
@@ -27,9 +33,14 @@ class V8PlatformWrapper: public v8::Platform {
     return inner.GetForegroundTaskRunner(isolate, priority);
   }
 
+  // The worker-thread task queues are the platform's, shared by every isolate, and an isolate
+  // posts to them from inside its turns (a concurrent compile job, say): the queue entries go
+  // in the shared heap, not in the posting isolate's heap arena, where the next isolate's post
+  // would fault on them.
   void PostTaskOnWorkerThreadImpl(v8::TaskPriority priority,
       std::unique_ptr<v8::Task> task,
       const v8::SourceLocation& location) override {
+    SharedHeapScope sharedHeap;
     inner.PostTaskOnWorkerThreadImpl(priority, kj::mv(task), location);
   }
 
@@ -37,14 +48,20 @@ class V8PlatformWrapper: public v8::Platform {
       std::unique_ptr<v8::Task> task,
       double delay_in_seconds,
       const v8::SourceLocation& location) override {
+    SharedHeapScope sharedHeap;
     inner.PostDelayedTaskOnWorkerThreadImpl(priority, kj::mv(task), delay_in_seconds, location);
   }
 
+  // The job handle is V8's default one, but created over this platform rather than the inner
+  // one, so that the tasks the job posts as its concurrency grows go through
+  // PostTaskOnWorkerThreadImpl() above. The job's own state is shared with the worker threads
+  // that run it, and is allocated in the shared heap for the same reason as the queue entries.
   std::unique_ptr<v8::JobHandle> CreateJobImpl(v8::TaskPriority priority,
       std::unique_ptr<v8::JobTask> job_task,
       const v8::SourceLocation& location) override {
-    return inner.CreateJobImpl(
-        priority, std::make_unique<JobTaskWrapper>(kj::mv(job_task)), location);
+    SharedHeapScope sharedHeap;
+    return v8::platform::NewDefaultJobHandle(this, priority,
+        std::make_unique<JobTaskWrapper>(kj::mv(job_task)), inner.NumberOfWorkerThreads());
   }
 
   bool IdleTasksEnabled(v8::Isolate* isolate) override {
@@ -72,12 +89,13 @@ class V8PlatformWrapper: public v8::Platform {
   }
 
   v8::ThreadIsolatedAllocator* GetThreadIsolatedAllocator() override {
-    // Forward to the inner platform so that V8's ThreadIsolation can use PKU
-    // (Memory Protection Keys) to enforce W^X on JIT code pages and
-    // write-protect the code pointer tables.  Without this, the
-    // DefaultPlatform's allocator (which calls pkey_alloc) was silently
-    // dropped and ThreadIsolation was disabled.
-    return inner.GetThreadIsolatedAllocator();
+    // V8's ThreadIsolation uses PKU (Memory Protection Keys) to enforce W^X on JIT code pages
+    // and to write-protect the code pointer tables, and it is enabled only where the platform
+    // supplies an allocator -- so the inner platform's, which allocates the key, has to reach
+    // V8. That allocator serves the metadata of the protection with plain malloc() though,
+    // which places it in whichever isolate's heap arena was locked and leaves it writable;
+    // workerd's wraps it to fix both (see thread-isolated-allocator.h).
+    return wrapThreadIsolatedAllocator(inner.GetThreadIsolatedAllocator());
   }
 
  private:

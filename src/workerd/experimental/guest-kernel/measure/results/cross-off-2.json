@@ -1,0 +1,11 @@
+{
+ "conns_per_tenant": 2,
+ "mode": "shared",
+ "n": 16,
+ "p50_us_median_tenant": 0.0,
+ "p50_us_worst_tenant": 187.349,
+ "rps_per_core": 19256.580433034793,
+ "rps_per_tenant": 1956.26875,
+ "server_cores_busy": 1.6254339709403507,
+ "total_rps": 31300.3
+}

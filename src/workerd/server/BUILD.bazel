@@ -1,5 +1,5 @@
 load("@bazel_skylib//lib:selects.bzl", "selects")
-load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag", "string_flag")
 load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//:build/kj_test.bzl", "kj_test")
@@ -7,6 +7,30 @@ load("//:build/wd_capnp_library.bzl", "wd_capnp_library")
 load("//:build/wd_cc_binary.bzl", "wd_cc_binary")
 load("//:build/wd_cc_embed.bzl", "wd_cc_embed")
 load("//:build/wd_cc_library.bzl", "wd_cc_library")
+
+# Selects the allocator linked into workerd binaries. "tcmalloc" is the default on Linux;
+# "jemalloc" is an opt-in alternative that exposes per-arena control (arena extent hooks,
+# per-thread arena selection); "system" uses the libc allocator. On non-Linux platforms the
+# system allocator is always used.
+string_flag(
+    name = "allocator",
+    build_setting_default = "tcmalloc",
+    values = [
+        "tcmalloc",
+        "jemalloc",
+        "system",
+    ],
+)
+
+config_setting(
+    name = "allocator_tcmalloc",
+    flag_values = {"allocator": "tcmalloc"},
+)
+
+config_setting(
+    name = "allocator_jemalloc",
+    flag_values = {"allocator": "jemalloc"},
+)
 
 # Flag that can be used to force-disable tcmalloc. Mainly used for ASAN builds.
 # TODO(cleanup): This feels ugly but I've exceeded my timebox for fighting Bazel for now.
@@ -33,7 +57,16 @@ config_setting(
 selects.config_setting_group(
     name = "really_use_tcmalloc",
     match_all = [
+        ":allocator_tcmalloc",
         ":set_use_tcmalloc",
+        "//:is_linux",
+    ],
+)
+
+selects.config_setting_group(
+    name = "really_use_jemalloc",
+    match_all = [
+        ":allocator_jemalloc",
         "//:is_linux",
     ],
 )
@@ -44,6 +77,7 @@ wd_cc_library(
     visibility = ["//visibility:public"],
     deps = select({
         ":really_use_tcmalloc": ["@tcmalloc//tcmalloc"],
+        ":really_use_jemalloc": ["@jemalloc"],
         "//conditions:default": ["@bazel_tools//tools/cpp:malloc"],
     }),
 )
@@ -79,12 +113,20 @@ wd_cc_binary(
         "//src/rust/cxx/kj-rs-io:bridge",
         "//src/rust/cxx/kj-rs-io:kj-rs-io-lib",
         "//src/workerd/util:autogate",
+        "//src/workerd/util:entropy",
         "//src/workerd/util:perfetto",
         "//src/workerd/util:setup-async-io",
         "@capnp-cpp//src/capnp:capnpc",
         "@capnp-cpp//src/kj:kj-async-core",
         "@capnp-cpp//src/kj:kj-async-io",
-    ],
+    ] + select({
+        # Experimental guest-kernel isolation is Linux (x86-64 and arm64) only;
+        # the dep and its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_supported": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 # The link-time complement of build/rust_io_graph_check.sh: that query forbids dependency EDGES to
@@ -140,7 +182,9 @@ wd_cc_library(
     deps = [
         "//src/workerd/io:actor-id",
         "//src/workerd/jsg:exception",
-        "//src/workerd/util:entropy",
+        "//src/workerd/util:host-entropy",
+        "//src/workerd/util:host-memory",
+        "//src/workerd/util:hostcall",
         "//src/workerd/util:own-util",
         "//src/workerd/util:thread-scopes",
         "@capnp-cpp//src/kj",
@@ -242,7 +286,9 @@ wd_cc_library(
     deps = [
         ":channel-token_capnp",
         "//src/workerd/io",
-        "//src/workerd/util:entropy",
+        "//src/workerd/jsg",
+        "//src/workerd/util:host-entropy",
+        "//src/workerd/util:host-memory",
     ],
 )
 

@@ -1,0 +1,3 @@
+trace1-bigheapbody-default-limit128 round=1 arm=on wl=bigheapbody c=1 n=6 p50=769 p90=1048 p99=38524 mean=2725 rps=365 non200=0 errors=1 rss_kb=213536 mc=330 sc=10
+trace1-bigheapbody-default-limit128 round=1 arm=off wl=bigheapbody c=1 n=6 p50=1283 p90=1390 p99=1518 mean=1510 rps=661 non200=0 errors=1 rss_kb=3218316 mc=0 sc=0
+DONE trace1-bigheapbody-default-limit128

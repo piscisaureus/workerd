@@ -1,0 +1,3 @@
+trace1-bigbody-default-limit128 round=1 arm=on wl=bigbody c=1 n=6 p50=754 p90=796 p99=1435 mean=794 rps=1257 non200=0 errors=1 rss_kb=136108 mc=1162 sc=0
+trace1-bigbody-default-limit128 round=1 arm=off wl=bigbody c=1 n=6 p50=757 p90=1364 p99=1514 mean=989 rps=1009 non200=0 errors=1 rss_kb=5507268 mc=0 sc=0
+DONE trace1-bigbody-default-limit128

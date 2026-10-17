@@ -1,0 +1,3 @@
+trace1-bigheapbody-jemalloc-gk-nolimit round=1 arm=on wl=bigheapbody c=1 n=6 p50=936 p90=1174 p99=27698 mean=2320 rps=430 non200=0 errors=1 rss_kb=223360 mc=400 sc=10
+trace1-bigheapbody-jemalloc-gk-nolimit round=1 arm=off wl=bigheapbody c=1 n=6 p50=893 p90=2044 p99=2374 mean=1126 rps=887 non200=0 errors=1 rss_kb=8405380 mc=3 sc=10
+DONE trace1-bigheapbody-jemalloc-gk-nolimit

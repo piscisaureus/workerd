@@ -1490,7 +1490,9 @@ kj::Promise<ActorFetchAttemptResult<T>> captureActorFetchAttempt(jsg::Lock& js,
     retryState->maybeStartRetryLatencyTimer(exception);
     return ActorFetchFailure{kj::mv(exception)};
   });
-  return AbortSignal::maybeCancelWrap(js, signal, kj::mv(result))
+  // A subrequest: its teardown reaches the callee's own memory, so the abort must not run it
+  // inside this turn. See AbortSignal::wrapDeferred().
+  return AbortSignal::maybeCancelWrapDeferred(js, signal, kj::mv(result))
       .catch_([retryState = kj::mv(retryState)](
                   kj::Exception&& exception) mutable -> kj::Promise<ActorFetchAttemptResult<T>> {
     retryState->recordCanceled();
@@ -1782,7 +1784,10 @@ jsg::Promise<jsg::Ref<Response>> fetchImplNoOutputLockAttempt(jsg::Lock& js,
           });
       }
     }
-    webSocketResponse = AbortSignal::maybeCancelWrap(js, signal, kj::mv(webSocketResponse));
+    // Deferred: aborting a subrequest must not tear it down inside this turn, since the
+    // teardown reaches the callee's own memory. See AbortSignal::wrapDeferred().
+    webSocketResponse =
+        AbortSignal::maybeCancelWrapDeferred(js, signal, kj::mv(webSocketResponse));
     return ioContext.awaitIo(js, kj::mv(webSocketResponse),
         [fetcher = kj::mv(fetcher), jsRequest = kj::mv(jsRequest), urlList = kj::mv(urlList),
             client = kj::mv(client), signal = kj::mv(signal)](
@@ -1882,7 +1887,8 @@ jsg::Promise<jsg::Ref<Response>> fetchImplNoOutputLockAttempt(jsg::Lock& js,
           });
       }
     }
-    responsePromise = AbortSignal::maybeCancelWrap(js, signal, kj::mv(responsePromise));
+    // Deferred, for the same reason as the WebSocket response above.
+    responsePromise = AbortSignal::maybeCancelWrapDeferred(js, signal, kj::mv(responsePromise));
     return ioContext.awaitIo(js, kj::mv(responsePromise),
         [fetcher = kj::mv(fetcher), jsRequest = kj::mv(jsRequest), urlList = kj::mv(urlList),
             client = kj::mv(client), traceContext = kj::mv(traceContext)](

@@ -76,6 +76,8 @@ wd_cc_library(
     srcs = [
         "async-context.c++",
         "dom-exception.c++",
+        "guest-run.c++",
+        "heap-arena.c++",
         "jsg.c++",
         "jsvalue.c++",
         "modules.c++",
@@ -84,6 +86,7 @@ wd_cc_library(
         "resource.c++",
         "ser.c++",
         "setup.c++",
+        "thread-isolated-allocator.c++",
         "util.c++",
         "v8-platform-wrapper.c++",
         "wrappable.c++",
@@ -93,6 +96,8 @@ wd_cc_library(
         "dom-exception.h",
         "fast-api.h",
         "function.h",
+        "guest-run.h",
+        "heap-arena.h",
         "jsg.h",
         "jsvalue.h",
         "jsvalue-defs.h",
@@ -102,19 +107,32 @@ wd_cc_library(
         "resource.h",
         "ser.h",
         "setup.h",
+        "thread-isolated-allocator.h",
         "unwrap-args.h",
         "util.h",
         "v8-platform-wrapper.h",
         "web-idl.h",
         "wrappable.h",
     ],
+    defines = select({
+        "//src/workerd/server:really_use_jemalloc": ["WORKERD_HAS_JEMALLOC=1"],
+        "//conditions:default": [],
+    }),
     # Some JSG headers can't be compiled on their own
     features = ["-parse_headers"],
     implementation_deps = [
+        "//src/workerd/util:alloc-census",
         "//src/workerd/util:entropy",
         "@simdutf",
         "@ssl",
     ],
+    # Carried to every binary that links jsg-core, and to none that does not, which is what
+    # makes __wrap___cxa_atexit (heap-arena.c++) resolvable exactly where it is defined. Only
+    # a jemalloc build has per-isolate heap arenas for it to place registrations out of.
+    linkopts = select({
+        "//src/workerd/server:really_use_jemalloc": ["-Wl,--wrap=__cxa_atexit"],
+        "//conditions:default": [],
+    }),
     local_defines = ["JSG_IMPLEMENTATION"],
     tags = ["no-clang-tidy"],
     visibility = [
@@ -132,11 +150,25 @@ wd_cc_library(
         ":url",
         "//src/workerd/util",  # Required for util/batch-queue.h
         "//src/workerd/util:autogate",
+        "//src/workerd/util:memory-class",
         "//src/workerd/util:sentry",
         "//src/workerd/util:thread-scopes",
         "@capnp-cpp//src/kj",
         "@workerd-v8//:v8",
-    ],
+    ] + select({
+        # Experimental guest-kernel isolation is Linux (x86-64 and arm64) only;
+        # the dep and its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_supported": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }) + select({
+        # Per-isolate heap arenas (heap-arena.h) use jemalloc's arena controls;
+        # the dep and the WORKERD_HAS_JEMALLOC define exist only when jemalloc
+        # is the build's allocator.
+        "//src/workerd/server:really_use_jemalloc": ["@jemalloc"],
+        "//conditions:default": [],
+    }),
 )
 
 wd_cc_library(
@@ -190,6 +222,7 @@ wd_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":jsvalue-defs",
+        "//src/workerd/util:memory-class",
         "@capnp-cpp//src/kj",
         "@workerd-v8//:v8",
     ],
@@ -317,8 +350,31 @@ wd_cc_library(
         "rtti-test.c++",
         "url-test.c++",
         "multiple-typewrappers-test.c++",
+        "guest-arena-test.c++",
     ],
 )]
+
+# Proves that per-isolate guest-kernel arenas make one isolate's sandbox unaddressable from
+# another's guest execution. The test body is compiled only where gk is (Linux on x86-64 or
+# arm64); there it
+# also skips itself when gk cannot initialize (no /dev/kvm). The environment configures the
+# process allocator as a workerd run with guest-kernel isolation has it (see
+# heapArenasAvailable() in heap-arena.h): the test binary links jemalloc as a shared library,
+# where only MALLOC_CONF reaches it in time. MALLOC_CONF is ignored by the other allocators.
+kj_test(
+    src = "guest-arena-test.c++",
+    env = {
+        "MALLOC_CONF": "tcache:false",
+        "WORKERD_EXPERIMENTAL_GUEST_KERNEL": "1",
+    },
+    local_defines = ["JSG_IMPLEMENTATION"],
+    deps = [":jsg"] + select({
+        "//src/workerd/experimental/guest-kernel:is_supported": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
+)
 
 # Moved out as macro-meta-test does not depend on V8 or JSG proper, this makes the test much
 # smaller.

@@ -10,6 +10,7 @@
 #include "setup.h"
 
 #include "libplatform/libplatform.h"
+#include "thread-isolated-allocator.h"
 
 #include <v8-cppgc.h>
 #include <v8-initialization.h>
@@ -17,11 +18,22 @@
 #if !_WIN32
 #include <cxxabi.h>
 #include <ucontext.h>
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <workerd/experimental/guest-kernel/gk.h>
+
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstdlib>
+#endif
 #endif
 
 #ifdef WORKERD_ICU_DATA_EMBED
 #include "icu-data-file.embed.h"
 
+#include <unicode/uclean.h>
 #include <unicode/udata.h>
 #endif
 
@@ -84,6 +96,26 @@ V8System::V8System(
     v8::platform::NotifyIsolateShutdown(defaultPlatformPtr, isolate);
   }, jitCodeEventTracking);
 }
+
+namespace {
+// ICU's allocator, installed through u_setMemoryFunctions() where per-isolate heap arenas are
+// in use. ICU fills process-wide caches (locale and time zone data, converters, collators)
+// lazily, from whichever thread first needs an item, which may be a turn of one isolate on its
+// heap arena; from there every other isolate's turn would fault on the cached item. So all of
+// ICU's memory goes to the shared heap. Every isolate's ring-3 execution can read it, which for
+// ICU's data (public, and the same for every isolate) concedes nothing.
+void* icuAlloc(const void*, size_t size) {
+  SharedHeapScope sharedHeap;
+  return malloc(size);
+}
+void* icuRealloc(const void*, void* mem, size_t size) {
+  SharedHeapScope sharedHeap;
+  return realloc(mem, size);
+}
+void icuFree(const void*, void* mem) {
+  free(mem);
+}
+}  // namespace
 
 V8System::V8System(v8::Platform& platformParam,
     kj::ArrayPtr<const kj::StringPtr> flags,
@@ -177,6 +209,21 @@ void V8System::init(kj::Own<v8::Platform> platformParam,
     v8::V8::SetFlagsFromString("--expose-gc");
   }
 
+  if (heapArenasAvailable()) {
+    // Before ICU's first allocation, which u_setMemoryFunctions() requires.
+    UErrorCode err = U_ZERO_ERROR;
+    u_setMemoryFunctions(nullptr, &icuAlloc, &icuRealloc, &icuFree, &err);
+    KJ_ASSERT(err == U_ZERO_ERROR, "u_setMemoryFunctions() failed", static_cast<int>(err));
+
+    // The C library allocates stdout's buffer on the first write to the stream, and when that
+    // write comes from inside a turn (V8's --trace-gc lines do) the buffer is in that isolate's
+    // arena, where every later write from another isolate's turn faults. Given a buffer, stdio
+    // allocates none.
+    static char stdoutBuffer[BUFSIZ];
+    KJ_ASSERT(setvbuf(stdout, stdoutBuffer, isatty(STDOUT_FILENO) ? _IOLBF : _IOFBF,
+                  sizeof(stdoutBuffer)) == 0);
+  }
+
 #ifdef WORKERD_ICU_DATA_EMBED
   // V8's bazel build files currently don't support the option to embed ICU data, so we do it
   // ourselves. `ICU_DATA_FILE`, if defined, will refer to a `kj::ArrayPtr<const byte>` containing
@@ -203,7 +250,12 @@ void V8System::init(kj::Own<v8::Platform> platformParam,
 
 V8System::~V8System() noexcept(false) {
   v8::V8::Dispose();
-  v8::V8::DisposePlatform();
+  {
+    // DisposePlatform tears V8's thread isolation down, which deletes the metadata workerd's
+    // allocator keyed without entering a write scope of its own (see ThreadIsolatedWriteScope).
+    ThreadIsolatedWriteScope writable;
+    v8::V8::DisposePlatform();
+  }
   cppgc::ShutdownProcess();
 }
 
@@ -385,14 +437,34 @@ bool HeapTracer::TryResetRoot(const v8::TracedReference<v8::Value>& handle) {
 }
 
 namespace {
-std::unique_ptr<v8::CppHeap> newCppHeap(V8PlatformWrapper* system) {
+// `pageAllocator` places the heap's pages; null uses the platform's page allocator.
+std::unique_ptr<v8::CppHeap> newCppHeap(
+    V8PlatformWrapper* system, v8::PageAllocator* pageAllocator) {
   return jsg::runInV8Stack([&](jsg::V8StackScope& stackScope) {
     v8::CppHeapCreateParams heapParams{{}};
     heapParams.marking_support = cppgc::Heap::MarkingType::kAtomic;
     heapParams.sweeping_support = cppgc::Heap::SweepingType::kAtomic;
+    heapParams.page_allocator = pageAllocator;
     return v8::CppHeap::Create(system, heapParams);
   });
 }
+
+// The page allocator for an isolate's out-of-sandbox memory: that of its guest-kernel arena
+// when it has one, otherwise null for V8's default.
+v8::PageAllocator* outOfSandboxPageAllocator(kj::Maybe<kj::Own<GuestArena>>& guestArena) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  KJ_IF_SOME(arena, guestArena) {
+    return &arena->getPageAllocator();
+  }
+#endif
+  return nullptr;
+}
+// Isolate creation is deliberately not placed on the isolate's heap arena (HeapArena), although
+// that is where the isolate object itself would then live: creating an isolate also inserts it
+// into process-wide registries (V8's perfetto logger keeps a hash map of all isolates, for one),
+// whose storage is then reallocated on the creating thread's arena and dies with that isolate
+// while the registry is still in use by every other. The isolate's objects go on its heap arena
+// from its first lock on (GuestArenaScope).
 static v8::Isolate* newIsolate(
     v8::Isolate::CreateParams&& params, v8::CppHeap* cppHeap, v8::IsolateGroup group) {
   return jsg::runInV8Stack([&](jsg::V8StackScope& stackScope) -> v8::Isolate* {
@@ -423,15 +495,351 @@ static v8::Isolate* newIsolate(
     return v8::Isolate::New(group, params);
   });
 }
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+// gk places every arena on a boundary of one of the 512 GiB top-level page-table slots and
+// reserves whole slots (GK_SLOT_BITS in gk_internal.h), so the arena's reservation runs from its
+// base to the end of the last slot the sandbox reservation reaches into. The remainder of that
+// last slot is the arena's tail, from which the isolate's out-of-sandbox memory is allocated (see
+// GuestArena).
+constexpr size_t GUEST_ARENA_SLOT_SIZE = size_t(1) << 39;
+
+// The size of the heap part of an arena's tail (see GuestArena), which backs the isolate's
+// C++ heap arena. Memory in it is only given back when the isolate goes away, so this is sized
+// for an isolate's peak C++ heap use, not its steady state. Zero where heap arenas are not
+// built in: V8 then gets the whole tail.
+#ifdef WORKERD_HAS_HEAP_ARENA
+constexpr size_t GUEST_ARENA_HEAP_SIZE = 16ull * 1024 * 1024 * 1024;
+#else
+constexpr size_t GUEST_ARENA_HEAP_SIZE = 0;
+#endif
+
+int protectionFor(v8::PageAllocator::Permission permission) {
+  switch (permission) {
+    case v8::PageAllocator::kNoAccess:
+    case v8::PageAllocator::kNoAccessWillJitLater:
+      return PROT_NONE;
+    case v8::PageAllocator::kRead:
+      return PROT_READ;
+    case v8::PageAllocator::kReadWrite:
+      return PROT_READ | PROT_WRITE;
+    case v8::PageAllocator::kReadWriteExecute:
+      return PROT_READ | PROT_WRITE | PROT_EXEC;
+    case v8::PageAllocator::kReadExecute:
+      return PROT_READ | PROT_EXEC;
+  }
+  KJ_UNREACHABLE;
+}
+#endif
+
+#if defined(WORKERD_HAS_GUEST_KERNEL) && defined(V8_ENABLE_SANDBOX)
+// The reservation an isolate group needs when its sandbox is placed in embedder memory (see
+// v8::IsolateGroup::CreateParams): the sandbox itself plus the guard regions on both sides and
+// the additional trailing guard region. With the 128 GB sandbox this build configures
+// (v8_sandbox_size_log2=37 in .bazelrc, exported to embedder code as
+// V8_SANDBOX_SIZE_LOG2_OVERRIDE) that is 128 + 2 * 64 + 224 = 480 GiB, which fits in a single
+// 512 GiB gk arena slot. The assertion pins that layout: a different sandbox size changes the
+// number of slots each arena occupies (and gk caps that), so revisit it deliberately.
+constexpr size_t GUEST_ARENA_RESERVATION_SIZE = v8::internal::kSandboxSize +
+    2 * v8::internal::kSandboxGuardRegionSize + v8::internal::kAdditionalTrailingGuardRegionSize;
+static_assert(v8::internal::kSandboxSizeLog2 == 37 &&
+        GUEST_ARENA_RESERVATION_SIZE == 480ull * 1024 * 1024 * 1024,
+    "guest-kernel arenas are laid out for a 128 GB V8 sandbox (480 GiB reservation)");
+
+// With the layout above the arena's tail (see GUEST_ARENA_SLOT_SIZE) is the top 32 GiB of a
+// single slot. It must hold the trusted range (1 GiB at 4 GiB alignment; it is the first
+// allocation, and the tail starts 4 GiB-aligned), the code range (up to 512 MiB), the isolate's
+// pointer tables (about 1.75 GiB of reservations: the external, shared external and cpp heap
+// pointer tables at 512 MiB each, the trusted and shared trusted pointer tables at 64 MiB each
+// and the JS dispatch table at 128 MiB) and the cppgc heap.
+constexpr size_t GUEST_ARENA_TAIL_SIZE =
+    GUEST_ARENA_SLOT_SIZE - GUEST_ARENA_RESERVATION_SIZE % GUEST_ARENA_SLOT_SIZE;
+static_assert(GUEST_ARENA_TAIL_SIZE - GUEST_ARENA_HEAP_SIZE >= 8ull * 1024 * 1024 * 1024 &&
+        (GUEST_ARENA_RESERVATION_SIZE % (4ull * 1024 * 1024 * 1024)) == 0,
+    "guest-kernel arena tail is too small for V8's out-of-sandbox memory");
+#endif
 }  // namespace
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+
+ArenaPageAllocator::ArenaPageAllocator(uintptr_t begin, uintptr_t end)
+    : rangeBegin(begin),
+      rangeEnd(end),
+      pageSize(sysconf(_SC_PAGESIZE)) {
+  KJ_REQUIRE(begin % pageSize == 0 && end % pageSize == 0 && begin < end,
+      "invalid page allocator range", begin, end);
+  freeList.getWithoutLock().add(Range{begin, end});
+}
+
+size_t ArenaPageAllocator::AllocatePageSize() {
+  return pageSize;
+}
+
+size_t ArenaPageAllocator::CommitPageSize() {
+  return pageSize;
+}
+
+void ArenaPageAllocator::SetRandomMmapSeed(int64_t seed) {
+  // Placement is not randomized: every allocation lands in the arena's tail, as intended.
+}
+
+void* ArenaPageAllocator::GetRandomMmapAddr() {
+  // V8 uses this only to derive placement hints, which this allocator ignores anyway.
+  return reinterpret_cast<void*>(rangeBegin);
+}
+
+void ArenaPageAllocator::checkRange(const void* address, size_t length) const {
+  auto addr = reinterpret_cast<uintptr_t>(address);
+  // The `addr <= rangeEnd` term is what keeps `rangeEnd - addr` from wrapping, which would let
+  // any address above the tail through.
+  KJ_REQUIRE(addr % pageSize == 0 && length % pageSize == 0 && addr >= rangeBegin &&
+          addr <= rangeEnd && length <= rangeEnd - addr,
+      "address range is not in the arena tail", addr, length, rangeBegin, rangeEnd);
+}
+
+uintptr_t ArenaPageAllocator::take(size_t length, size_t alignment) {
+  auto lock = freeList.lockExclusive();
+  auto& ranges = *lock;
+  for (size_t i = 0; i < ranges.size(); i++) {
+    Range& range = ranges[i];
+    // The free list is an ordinary heap object, so guest execution can write it (see the
+    // GuestArena comment in setup.h). Skipping a range that is not a sub-range of the tail keeps
+    // a rewritten entry from turning into an address outside it, which the caller hands to
+    // mprotect(); the result is checked again there.
+    if (range.begin < rangeBegin || range.end > rangeEnd || range.begin >= range.end) continue;
+    uintptr_t start = (range.begin + alignment - 1) & ~(alignment - 1);
+    if (start < range.begin || start > range.end || range.end - start < length) continue;
+    uintptr_t stop = start + length;
+    if (start == range.begin && stop == range.end) {
+      // The whole range is taken: close the gap.
+      for (size_t j = i + 1; j < ranges.size(); j++) ranges[j - 1] = ranges[j];
+      ranges.removeLast();
+    } else if (start == range.begin) {
+      range.begin = stop;
+    } else if (stop == range.end) {
+      range.end = start;
+    } else {
+      // Taken from the middle: the remainder after it becomes a new range right after this one.
+      Range after{stop, range.end};
+      range.end = start;
+      ranges.add(Range{});
+      for (size_t j = ranges.size() - 1; j > i + 1; j--) ranges[j] = ranges[j - 1];
+      ranges[i + 1] = after;
+    }
+    return start;
+  }
+  return 0;
+}
+
+void ArenaPageAllocator::give(uintptr_t begin, uintptr_t end) {
+  auto lock = freeList.lockExclusive();
+  auto& ranges = *lock;
+  // Find the first free range ending after the returned one begins: the one to merge with or
+  // insert before.
+  size_t i = 0;
+  while (i < ranges.size() && ranges[i].end <= begin) i++;
+  KJ_ASSERT(i == ranges.size() || ranges[i].begin >= end, "double free in arena tail", begin, end);
+  bool mergeBefore = i > 0 && ranges[i - 1].end == begin;
+  bool mergeAfter = i < ranges.size() && ranges[i].begin == end;
+  if (mergeBefore && mergeAfter) {
+    ranges[i - 1].end = ranges[i].end;
+    for (size_t j = i + 1; j < ranges.size(); j++) ranges[j - 1] = ranges[j];
+    ranges.removeLast();
+  } else if (mergeBefore) {
+    ranges[i - 1].end = end;
+  } else if (mergeAfter) {
+    ranges[i].begin = begin;
+  } else {
+    ranges.add(Range{});
+    for (size_t j = ranges.size() - 1; j > i; j--) ranges[j] = ranges[j - 1];
+    ranges[i] = Range{begin, end};
+  }
+}
+
+bool ArenaPageAllocator::decommit(void* address, size_t length) {
+  checkRange(address, length);
+  // A fixed mapping replaces whatever is there, so the pages read as zero when next committed
+  // and any file-backed remap V8 placed in the range is gone. MAP_NORESERVE matches the
+  // arena's reservation as gk created it.
+  void* result = mmap(
+      address, length, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (result == MAP_FAILED) {
+    // Only running out of VMAs (ENOMEM) is a legitimate failure, as in V8's own allocator.
+    KJ_ASSERT(errno == ENOMEM, "decommitting arena tail pages failed", errno);
+    return false;
+  }
+  KJ_ASSERT(result == address);
+  return true;
+}
+
+void* ArenaPageAllocator::AllocatePages(
+    void* hint, size_t length, size_t alignment, Permission permissions) {
+  KJ_REQUIRE(length % pageSize == 0, length);
+  KJ_REQUIRE(alignment != 0 && (alignment & (alignment - 1)) == 0, alignment);
+  alignment = kj::max(alignment, pageSize);
+  uintptr_t start = take(length, alignment);
+  if (start == 0) return nullptr;
+  void* address = reinterpret_cast<void*>(start);
+  checkRange(address, length);
+  // Free pages are inaccessible already, so only a request for access needs a syscall.
+  int prot = protectionFor(permissions);
+  if (prot != PROT_NONE && mprotect(address, length, prot) != 0) {
+    KJ_ASSERT(errno == ENOMEM, "committing arena tail pages failed", errno);
+    give(start, start + length);
+    return nullptr;
+  }
+  return address;
+}
+
+bool ArenaPageAllocator::FreePages(void* address, size_t length) {
+  if (!decommit(address, length)) return false;
+  auto start = reinterpret_cast<uintptr_t>(address);
+  give(start, start + length);
+  return true;
+}
+
+bool ArenaPageAllocator::ReleasePages(void* address, size_t length, size_t newLength) {
+  checkRange(address, length);
+  KJ_REQUIRE(newLength % pageSize == 0 && newLength <= length, newLength, length);
+  if (newLength == length) return true;
+  return FreePages(reinterpret_cast<kj::byte*>(address) + newLength, length - newLength);
+}
+
+bool ArenaPageAllocator::SetPermissions(void* address, size_t length, Permission permissions) {
+  checkRange(address, length);
+  int prot = protectionFor(permissions);
+  if (mprotect(address, length, prot) != 0) {
+    KJ_ASSERT(errno == ENOMEM, "changing arena tail page permissions failed", errno);
+    return false;
+  }
+  if (prot == PROT_NONE) {
+    // Like V8's allocator, drop the contents of pages made inaccessible; this is advisory.
+    madvise(address, length, MADV_DONTNEED);
+  }
+  return true;
+}
+
+bool ArenaPageAllocator::RecommitPages(void* address, size_t length, Permission permissions) {
+  // Discarded pages keep their protection, so V8's contract (recommit with the permissions the
+  // pages had) is satisfied without a syscall; setting them again is cheap and makes this hold
+  // regardless of what happened to the pages in between.
+  return SetPermissions(address, length, permissions);
+}
+
+bool ArenaPageAllocator::DiscardSystemPages(void* address, size_t length) {
+  checkRange(address, length);
+  return madvise(address, length, MADV_DONTNEED) == 0;
+}
+
+bool ArenaPageAllocator::DecommitPages(void* address, size_t length) {
+  return decommit(address, length);
+}
+
+#endif  // WORKERD_HAS_GUEST_KERNEL
+
+bool isGuestKernelEnabled() {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  static const bool enabled = getenv("WORKERD_EXPERIMENTAL_GUEST_KERNEL") != nullptr;
+  return enabled;
+#else
+  return false;
+#endif
+}
+
+GuestArena::GuestArena(gk_arena* arena): arena(arena) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  auto base = reinterpret_cast<uintptr_t>(gk_arena_base(arena));
+  size_t size = gk_arena_size(arena);
+  sandboxBase = base;
+  sandboxSize = size;
+  // gk does not report the reservation's full extent; it follows from the slot layout, which
+  // the alignment check pins.
+  KJ_REQUIRE(base % GUEST_ARENA_SLOT_SIZE == 0, "guest-kernel arena is not slot-aligned", base);
+  uintptr_t tailBegin = base + size;
+  uintptr_t tailEnd =
+      base + (size + GUEST_ARENA_SLOT_SIZE - 1) / GUEST_ARENA_SLOT_SIZE * GUEST_ARENA_SLOT_SIZE;
+  KJ_REQUIRE(tailEnd > tailBegin,
+      "guest-kernel arena leaves no tail for V8's out-of-sandbox memory", base, size);
+#ifdef V8_ENABLE_SANDBOX
+  KJ_REQUIRE(tailEnd - tailBegin == GUEST_ARENA_TAIL_SIZE,
+      "guest-kernel arena has an unexpected tail", tailBegin, tailEnd);
+#endif
+  KJ_REQUIRE(tailEnd - tailBegin > GUEST_ARENA_HEAP_SIZE,
+      "guest-kernel arena tail has no room for V8 beside the heap part", tailBegin, tailEnd);
+  uintptr_t heapBegin = tailEnd - GUEST_ARENA_HEAP_SIZE;
+  pageAllocator = kj::heap<ArenaPageAllocator>(tailBegin, heapBegin);
+#ifdef WORKERD_HAS_HEAP_ARENA
+  if (heapArenasAvailable()) {
+    heapArena = kj::heap<HeapArena>(heapBegin, tailEnd);
+  } else {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      KJ_LOG(WARNING,
+          "guest-kernel: the allocator is not set up for per-isolate heap arenas (see "
+          "heapArenasAvailable()); isolates' C++ objects share one heap");
+    }
+  }
+#endif
+#endif
+}
+
+GuestArena::~GuestArena() noexcept(false) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#ifdef WORKERD_HAS_HEAP_ARENA
+  // Discards whatever is still allocated in the heap arena. By now that is nothing anyone will
+  // touch again: the isolate is disposed, and what a turn allocates for others lives in the
+  // shared heap (see SharedHeapScope in heap-arena.h).
+  heapArena = kj::none;
+#endif
+  // The isolate group that used the tail is gone by now (the arena outlives it), so nothing
+  // references the allocator any more.
+  pageAllocator = nullptr;
+  gk_arena_destroy(arena);
+#endif
+}
+
+kj::Maybe<HeapArena&> GuestArena::getHeapArena() {
+#ifdef WORKERD_HAS_HEAP_ARENA
+  KJ_IF_SOME(a, heapArena) {
+    return *a;
+  }
+#endif
+  return kj::none;
+}
+
+IsolatePlacement newIsolateGroup() {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (isGuestKernelEnabled()) {
+#ifdef V8_ENABLE_SANDBOX
+    gk_arena* arena = gk_arena_create(GUEST_ARENA_RESERVATION_SIZE);
+    KJ_REQUIRE(arena != nullptr, "guest-kernel: failed to create an isolate arena");
+    auto guestArena = kj::heap<GuestArena>(arena);
+    // The arena base is 512 GiB-slot aligned, which satisfies V8's 4 GiB sandbox alignment.
+    v8::IsolateGroup::CreateParams params;
+    params.sandbox_reservation = guestArena->base();
+    params.sandbox_reservation_size = guestArena->size();
+    // The group's trusted range and code range go in the arena's tail.
+    params.page_allocator = &guestArena->getPageAllocator();
+    return IsolatePlacement(v8::IsolateGroup::Create(params), kj::mv(guestArena));
+#else
+    KJ_FAIL_REQUIRE("guest-kernel isolation requires a V8 build with the sandbox enabled");
+#endif
+  }
+#endif
+  return v8::IsolateGroup::GetDefault();
+}
+
 IsolateBase::IsolateBase(V8System& system,
     v8::Isolate::CreateParams&& createParams,
     kj::Own<IsolateObserver> observer,
     kj::Own<ExternalStringAllocator> externalStringAllocator,
-    v8::IsolateGroup group)
+    IsolatePlacement placement)
     : v8System(system),
-      cppHeap(newCppHeap(const_cast<V8PlatformWrapper*>(system.platformWrapper.get()))),
-      ptr(newIsolate(kj::mv(createParams), cppHeap.release(), group)),
+      guestArena(kj::mv(placement.arena)),
+      cppHeap(newCppHeap(const_cast<V8PlatformWrapper*>(system.platformWrapper.get()),
+          outOfSandboxPageAllocator(guestArena))),
+      ptr(newIsolate(kj::mv(createParams), cppHeap.release(), placement.group)),
       externalMemoryTarget(kj::arc<ExternalMemoryTarget>(ptr)),
       envAsyncContextKey(kj::arc<AsyncContextFrame::StorageKey>()),
       exportsAsyncContextKey(kj::arc<AsyncContextFrame::StorageKey>()),

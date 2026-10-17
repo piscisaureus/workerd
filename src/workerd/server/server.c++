@@ -811,9 +811,19 @@ class Server::ActorNamespace final {
           return getChannelTokenImpl(usage, c.id, persistent);
         }
         KJ_CASE_ONEOF(promise, kj::ForkedPromise<void>) {
-          return promise.addBranch().then([this, usage, persistent]() {
-            return getChannelTokenImpl(
-                usage, KJ_ASSERT_NONNULL(classAndId.tryGet<ClassAndId>()).id, persistent);
+          return promise.addBranch().then(
+              [this, usage, persistent]() -> kj::Promise<kj::Array<byte>> {
+            KJ_SWITCH_ONEOF(getChannelTokenImpl(usage,
+                                KJ_ASSERT_NONNULL(classAndId.tryGet<ClassAndId>()).id,
+                                persistent)) {
+              KJ_CASE_ONEOF(token, kj::Array<byte>) {
+                return kj::mv(token);
+              }
+              KJ_CASE_ONEOF(tokenPromise, kj::Promise<kj::Array<byte>>) {
+                return kj::mv(tokenPromise);
+              }
+            }
+            KJ_UNREACHABLE;
           });
         }
       }
@@ -1391,7 +1401,8 @@ class Server::ActorNamespace final {
       co_return ClassAndId(info.actorClass.downcast<ActorClass>(), kj::mv(info.id));
     }
 
-    kj::Array<byte> getChannelTokenImpl(IoChannelFactory::ChannelTokenUsage usage,
+    kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getChannelTokenImpl(
+        IoChannelFactory::ChannelTokenUsage usage,
         const Worker::Actor::Id& id,
         Persistent persistent) {
       kj::StringPtr uniqueKey = KJ_ASSERT_NONNULL(ns.getConfig().tryGet<Durable>()).uniqueKey;
@@ -3376,6 +3387,16 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
 
 }  // namespace
 
+namespace {
+#ifdef WORKERD_GK_NEG_ENTRYPOINT_NAME_HEAP
+// A negative build, never shipped: the entrypoint names stay in the heap arena of the isolate
+// whose modules declared them. See experimental/guest-kernel/rpc-arena-test.sh.
+struct EntrypointNameScope {};
+#else
+using EntrypointNameScope = jsg::SharedHeapScope;
+#endif
+}  // namespace
+
 // Shared ErrorReporter base implemnetation. The logic to collect entrypoint information is the
 // same regardless of where the code came from.
 struct Server::ErrorReporter: public Worker::ValidationErrorReporter {
@@ -3385,10 +3406,19 @@ struct Server::ErrorReporter: public Worker::ValidationErrorReporter {
   kj::HashSet<kj::String> actorClasses;
   kj::HashSet<kj::String> workflowClasses;
 
+  // These tables are filled while the worker's modules are evaluated, under its isolate's lock,
+  // and their names outlive that: `WorkerService::getEntrypoint()` hands a `kj::StringPtr` into
+  // `namedEntrypoints` to every `EntrypointService` of this worker, and
+  // `WorkerService::createEntrypoint()` copies it for each request -- which, for a service
+  // binding or a JS-RPC call, runs in a turn of the *calling* isolate. A name left in this
+  // worker's heap arena is unaddressable there, so each is copied into the shared heap as it is
+  // added. The strings handed in are copied rather than moved for the same reason: they are the
+  // isolate's too.
   void addEntrypoint(kj::Maybe<kj::StringPtr> exportName, kj::Array<kj::String> methods) override {
+    EntrypointNameScope sharedHeap;
     kj::HashSet<kj::String> set;
     for (auto& method: methods) {
-      set.insert(kj::mv(method));
+      set.insert(kj::str(method));
     }
     KJ_IF_SOME(e, exportName) {
       namedEntrypoints.insert(kj::str(e), kj::mv(set));
@@ -3398,6 +3428,7 @@ struct Server::ErrorReporter: public Worker::ValidationErrorReporter {
   }
 
   void addActorClass(kj::StringPtr exportName) override {
+    EntrypointNameScope sharedHeap;  // see addEntrypoint()
     actorClasses.insert(kj::str(exportName));
   }
 
@@ -3405,9 +3436,10 @@ struct Server::ErrorReporter: public Worker::ValidationErrorReporter {
     // At runtime, we need to add it into the normal namedEntrypoints for Workflows to appear
     // in `WorkerService`. This is a different method compared to `addEntrypoint` because we need to
     // check for `WorkflowEntrypoint` inheritance at validation time.
+    EntrypointNameScope sharedHeap;  // see addEntrypoint()
     kj::HashSet<kj::String> set;
     for (auto& method: methods) {
-      set.insert(kj::mv(method));
+      set.insert(kj::str(method));
     }
     namedEntrypoints.insert(kj::str(exportName), kj::mv(set));
     workflowClasses.insert(kj::str(exportName));
@@ -3876,6 +3908,10 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::Own<Worker::Actor>> actor,
       bool isTracer,
       kj::Maybe<kj::Own<AccessInfo>> accessInfo) {
+    // A request's entrypoint and IoContext are created by whoever starts the request, which for
+    // a service binding is a turn of the calling isolate, on that isolate's heap arena; they
+    // belong to this worker's request and go in the shared heap instead.
+    jsg::SharedHeapScope sharedHeap;
     auto& channels = KJ_ASSERT_NONNULL(ioChannels.tryGet<LinkedIoChannels>());
 
     kj::Vector<kj::Own<WorkerInterface>> bufferedTailWorkers(channels.tails.size());
@@ -4607,10 +4643,16 @@ class Server::WorkerService final: public Service,
     // stale and the delay will effectively be shortened by that staleness, causing the timer
     // to fire too early. Instead, we compute the target time using a fresh reading from the
     // monotonic clock so the delay is measured from the actual present.
+    //
+    // The timer is the thread's, and its queue holds every isolate's entries: an entry goes in
+    // the shared heap, not in the arena of the isolate whose turn adds it, where another
+    // isolate's turn would fault on it while ordering its own entry.
+    jsg::SharedHeapScope sharedHeap;
     return threadContext.getUnsafeTimer().atTime(monotonicClock.now() + delay);
   }
 
   kj::Promise<void> afterLimitTimeout(kj::Duration t) override {
+    jsg::SharedHeapScope sharedHeap;  // see atTime()
     return threadContext.getUnsafeTimer().afterDelay(t);
   }
 
@@ -5785,7 +5827,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     }
   }
 
-  auto isolateGroup = v8::IsolateGroup::GetDefault();
+  auto isolatePlacement = jsg::newIsolateGroup();
   kj::Array<Worker::Api::InboundListener> listeners;
   KJ_IF_SOME(l, inboundListeners.find(name)) {
     listeners = KJ_MAP(listener, l) {
@@ -5797,8 +5839,8 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     };
   }
   auto api = kj::heap<WorkerdApi>(globalContext->v8System, def.featureFlags, extensions,
-      limitEnforcer->getCreateParams(), isolateGroup, kj::mv(jsgobserver), *memoryCacheProvider,
-      pythonConfig, kj::mv(listeners));
+      limitEnforcer->getCreateParams(), kj::mv(isolatePlacement), kj::mv(jsgobserver),
+      *memoryCacheProvider, pythonConfig, kj::mv(listeners));
 
   auto inspectorPolicy = Worker::Isolate::InspectorPolicy::DISALLOW;
   if (inspectorOverride != kj::none) {

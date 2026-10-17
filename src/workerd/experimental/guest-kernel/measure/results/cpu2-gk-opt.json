@@ -1,0 +1,72 @@
+{
+ "hello": {
+  "cpu_us_max": 165.2353351743392,
+  "cpu_us_min": 134.84070183539188,
+  "cpu_us_per_req": 140.82292166282699,
+  "kvm_exits_per_req": 1.1339832277697182,
+  "p50_us": 387.926,
+  "rounds": [
+   {
+    "cpu_us_per_req": 140.82292166282699,
+    "exit_window_cpu_frac": 1.20875,
+    "kvm_exits_per_req": 1.1339832277697182,
+    "p50_us": 325.73,
+    "rps": 8478.3,
+    "total": 127181
+   },
+   {
+    "cpu_us_per_req": 134.84070183539188,
+    "exit_window_cpu_frac": 1.46375,
+    "kvm_exits_per_req": 1.0597193814053658,
+    "p50_us": 387.926,
+    "rps": 9240.3,
+    "total": 138608
+   },
+   {
+    "cpu_us_per_req": 165.2353351743392,
+    "exit_window_cpu_frac": 1.29125,
+    "kvm_exits_per_req": 1.1901679735066175,
+    "p50_us": 394.265,
+    "rps": 8787.1,
+    "total": 131812
+   }
+  ],
+  "rps": 8787.1
+ },
+ "loop1k": {
+  "cpu_us_max": 190.42534258764906,
+  "cpu_us_min": 187.9904289383863,
+  "cpu_us_per_req": 188.83818883818884,
+  "kvm_exits_per_req": 1.2760705272855941,
+  "p50_us": 473.575,
+  "rounds": [
+   {
+    "cpu_us_per_req": 190.42534258764906,
+    "exit_window_cpu_frac": 1.45375,
+    "kvm_exits_per_req": 1.2760705272855941,
+    "p50_us": 478.272,
+    "rps": 7489.3,
+    "total": 112380
+   },
+   {
+    "cpu_us_per_req": 187.9904289383863,
+    "exit_window_cpu_frac": 1.43125,
+    "kvm_exits_per_req": 1.2123576452579212,
+    "p50_us": 473.575,
+    "rps": 7577.9,
+    "total": 113676
+   },
+   {
+    "cpu_us_per_req": 188.83818883818884,
+    "exit_window_cpu_frac": 1.44125,
+    "kvm_exits_per_req": 1.462202682602572,
+    "p50_us": 473.084,
+    "rps": 7597.1,
+    "total": 113960
+   }
+  ],
+  "rps": 7577.9
+ },
+ "mode": "gk",
+ "rounds": 3
+}

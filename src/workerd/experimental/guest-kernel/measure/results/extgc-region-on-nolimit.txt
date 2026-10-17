@@ -1,0 +1,14 @@
+on-nolimit warm-up: down n=4194304 count=50 total=209715200 front_region=2MiB back_region=100MiB back_alloc=68MiB back_ext=72MiB mc=6 sc=3
+on-nolimit burst  1: served  1000 MiB; front_region     4 MiB; back_region   100 MiB; back_alloc    52 MiB; back_ext   56 MiB; mc 34 sc 19; 0.29s; ok; down n=4194304 count=250 total=1048576000
+on-nolimit burst  2: served  2000 MiB; front_region     4 MiB; back_region   100 MiB; back_alloc    36 MiB; back_ext   40 MiB; mc 64 sc 35; 0.28s; ok; down n=4194304 count=250 total=1048576000
+on-nolimit burst  3: served  3000 MiB; front_region     4 MiB; back_region   100 MiB; back_alloc    20 MiB; back_ext   24 MiB; mc 94 sc 51; 0.28s; ok; down n=4194304 count=250 total=1048576000
+on-nolimit burst  4: served  4000 MiB; front_region     7 MiB; back_region   100 MiB; back_alloc     4 MiB; back_ext    8 MiB; mc 124 sc 66; 0.28s; ok; down n=4194304 count=250 total=1048576000
+on-nolimit burst  5: served  5000 MiB; front_region     7 MiB; back_region   100 MiB; back_alloc    56 MiB; back_ext   60 MiB; mc 152 sc 82; 0.28s; ok; down n=4194304 count=250 total=1048576000
+on-nolimit burst  6: served  6000 MiB; front_region     7 MiB; back_region   100 MiB; back_alloc    40 MiB; back_ext   44 MiB; mc 182 sc 98; 0.28s; ok; down n=4194304 count=250 total=1048576000
+on-nolimit burst  7: served  7000 MiB; front_region     7 MiB; back_region   100 MiB; back_alloc    24 MiB; back_ext   28 MiB; mc 212 sc 114; 0.28s; ok; down n=4194304 count=250 total=1048576000
+on-nolimit burst  8: served  8000 MiB; front_region    11 MiB; back_region   100 MiB; back_alloc     8 MiB; back_ext   12 MiB; mc 242 sc 129; 0.29s; ok; down n=4194304 count=250 total=1048576000
+on-nolimit burst  9: served  9000 MiB; front_region    11 MiB; back_region   100 MiB; back_alloc    60 MiB; back_ext   64 MiB; mc 270 sc 145; 0.28s; ok; down n=4194304 count=250 total=1048576000
+on-nolimit burst 10: served 10000 MiB; front_region    11 MiB; back_region   100 MiB; back_alloc    44 MiB; back_ext   48 MiB; mc 300 sc 161; 0.28s; ok; down n=4194304 count=250 total=1048576000
+on-nolimit burst 11: served 11000 MiB; front_region    11 MiB; back_region   100 MiB; back_alloc    28 MiB; back_ext   32 MiB; mc 330 sc 176; 0.28s; ok; down n=4194304 count=250 total=1048576000
+on-nolimit burst 12: served 12000 MiB; front_region    15 MiB; back_region   100 MiB; back_alloc    12 MiB; back_ext   16 MiB; mc 360 sc 192; 0.28s; ok; down n=4194304 count=250 total=1048576000
+DONE on-nolimit

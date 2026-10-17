@@ -96,6 +96,18 @@ inline bool isAllocGcStressModeForTest() {
 // RAII class which allows the thread's active watchdog to observe forward progress through
 // changes in a uint64_t. Use this in places where your code cannot call Watchdog::checkIn() and
 // may block for longer than the watchdog timeout, but can still observe forward progress.
+//
+// Where the active counter's state lives depends on the guest kernel. Without it, a thread-local
+// points at the active ThreadProgressCounter and the watchdog's signal handler reads through
+// that pointer. With the guest kernel on (gk_initialized()), the state -- the identity of the
+// active counter, the address of its uint64_t and the saved value -- is kept in the guest
+// kernel's thread words (gk_thread_words_set in experimental/guest-kernel/gk.h), in supervisor
+// memory a JS turn at ring 3 cannot write, because the signal handler consumes it while the
+// turn runs: a pointer it loaded from thread-local storage, which the turn can write, would be
+// a pointer of the turn's choosing dereferenced with host privilege. hasProgress() and
+// acknowledgeProgress() are host-side: the watchdog's signal handler or thread, never a turn.
+// A counter constructed inside a turn (a nested isolate lock) is always a reentrant one -- the
+// turn's own lock holds the outer counter -- and does nothing.
 class ThreadProgressCounter {
  public:
   // When a ProgressCounter is instantiated, it saves the current value of `counter`. When
@@ -126,6 +138,17 @@ class ThreadProgressCounter {
 
   friend class Watchdog;
 };
+
+// The thread-local scope counts in this file (AllowV8BackgroundThreadsScope's and
+// WarnAboutIsolateLockScope's), for the host side of a guest turn to save before the turn and
+// put back after it (see GuestTurnThreadLocals in io/guest-turn-thread-locals.h). Opaque to the
+// caller: only ever stored back.
+struct ThreadScopeCounts {
+  kj::uint allowV8BackgroundThreads;
+  kj::uint warnAboutIsolateLock;
+};
+ThreadScopeCounts saveThreadScopeCountsForGuestTurn();
+void restoreThreadScopeCountsAfterGuestTurn(ThreadScopeCounts counts);
 
 // ======================================================================================
 

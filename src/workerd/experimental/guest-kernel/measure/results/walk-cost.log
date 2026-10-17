@@ -1,0 +1,5 @@
+TSC 3.20 GHz; 32768 pages at a 4 KiB stride, 131072 accesses timed
+host, 4 KiB host pages                23.7 ns per access  (    76 TSC ticks)
+host, 2 MiB host pages                11.8 ns per access  (    38 TSC ticks)
+guest, 4 KiB guest and host pages     30.9 ns per access  (    99 TSC ticks)
+guest, 4 KiB guest, 2 MiB host pages    20.5 ns per access  (    65 TSC ticks)

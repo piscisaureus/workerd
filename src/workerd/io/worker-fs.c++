@@ -1373,6 +1373,14 @@ TmpDirStoreScope::~TmpDirStoreScope() noexcept(false) {
   }
 }
 
+TmpDirStoreScope* TmpDirStoreScope::saveThreadLocalForGuestTurn() {
+  return tmpDirStorageScope;
+}
+
+void TmpDirStoreScope::restoreThreadLocalAfterGuestTurn(TmpDirStoreScope* value) {
+  tmpDirStorageScope = value;
+}
+
 kj::Own<TmpDirStoreScope> TmpDirStoreScope::create() {
   // Creating the instance with the badge will ensure that
   // it is not set as current in the stack.
@@ -1491,6 +1499,15 @@ SymbolicLinkRecursionGuardScope::~SymbolicLinkRecursionGuardScope() noexcept(fal
   if (symbolicLinkGuard == this) {
     symbolicLinkGuard = nullptr;
   }
+}
+
+SymbolicLinkRecursionGuardScope* SymbolicLinkRecursionGuardScope::saveThreadLocalForGuestTurn() {
+  return symbolicLinkGuard;
+}
+
+void SymbolicLinkRecursionGuardScope::restoreThreadLocalAfterGuestTurn(
+    SymbolicLinkRecursionGuardScope* value) {
+  symbolicLinkGuard = value;
 }
 
 kj::Maybe<FsError> SymbolicLinkRecursionGuardScope::checkSeen(SymbolicLink* link) {
