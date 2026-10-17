@@ -70,6 +70,11 @@ which runs each isolate's JS turn at guest ring 3.
   own fallback. Negative build: `--copt=-DWORKERD_GK_NEG_CACHE_FALLBACK`,
   where the entry is stranded and the co-tenant's read hangs, which the
   script bounds and reports.
+  On a build with per-isolate heap arenas the script fails at its second step,
+  before the fault is injected: the cache instance is in the arena of the first
+  worker whose bindings were compiled, and the peer's first read faults on it.
+  `memory-classes.md`, "The shared memory cache", says why the shared heap is
+  not where the cache goes and what placement is.
 - `surface-test.sh` / `surface-test.capnp` / `surface-test.js` / `add.wasm` /
   `oob.wasm` — end-to-end check against a built workerd that a broad V8 surface
   (Wasm including an out-of-bounds trap, WebCrypto, irregexp and a JIT-heavy

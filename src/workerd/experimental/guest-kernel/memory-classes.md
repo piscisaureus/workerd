@@ -767,7 +767,7 @@ The escapees, condensed:
 | `WebSocket` (`api/web-socket.h:855`) | Already structurally split -- I shell versus `Native` holding `kj::Own<kj::WebSocket>` and a `kj::Canceler` -- except for the raw `AutoResponse&` cached beside its own `IoOwn` at `:904-905` |
 | `DurableObjectNamespace` (`api/actor.h:322`) | I namespace plus the H `ActorIdFactory`, whose vtable is currently called in-turn; the factory's keyed operations are already a hostcall (`server/actor-id-impl.h`), so what the in-turn call reaches is the heap object that holds the key's slot handle, not the key |
 | `DeferredProxy<T>` (`api/deferred-proxy.h:37`) | The `IoContext::run` result problem in its natural habitat: a promise node graph allocated in-turn and run by the host |
-| `MemoryCache` (`api/memory-cache.h:526`) | I object plus a handle. `SharedMemoryCache` is `kj::AtomicRefcounted` with a `MutexGuarded` map and is shared across isolates by design (`:119`, `:477`) |
+| `MemoryCache` (`api/memory-cache.h:526`) | I object plus a handle. `SharedMemoryCache` is `kj::AtomicRefcounted` with a `MutexGuarded` map and is shared across isolates by design (`:119`, `:477`) -- by cache id, not by process, so its rows are tenant data the shared heap must not hold. The split is an H instance behind hostcalls, with the sharing contract checked by the host against gk's record of the calling arena; see "The shared memory cache" below |
 | `CapnpServer` (`api/capnp.h:36`) | An H capnp server holding a `jsg::V8Ref<v8::Object>` and a wrapper reference its own comment marks "only valid if isolate is locked" |
 | `AbortSignal` registration cells (`api/basics.h`) | **Native registrations: done.** The record holding the action is the signal's, written only under the isolate lock, and the consumer's RAII handle owns a resolve entry instead of a share in the record: dropping it on the event loop retires the entry and touches nothing in the signal. A turn resolves the entry before it takes the action, and a cross-context delivery resolves it again on arrival. The RPC registrations beside them keep the `kj::Arc` + `MutexGuarded` shape, which no host thread touches. See violation 10a |
 | `Rewriter` (`api/html-rewriter.c++:214`) | An H `WritableStreamSink` holding `IoContext&`, the lol_html parser, and handler registrations that call back into JS |
@@ -816,7 +816,8 @@ placement experiment hit.
   `kj::Rc<kj::WebSocket>` shared with a manager that outlives the isolate,
   `api/web-socket.h:676`), the **shared memory cache** (isolate B's
   `jsg::Deserializer` reads bytes isolate A's turn allocated,
-  `api/memory-cache.c++:440` then `:475`), **Pyodide bundles**, and
+  `api/memory-cache.c++:440` then `:475`; see "The shared memory cache"
+  below), **Pyodide bundles**, and
   **WorkerLoader** (the loading isolate's module sources kept alive for the
   new isolate by `OwnContentWrapper`, `api/worker-loader.c++:112`, with a
   `CompiledWasmModule` shared through V8's process-wide Wasm engine).
@@ -872,6 +873,201 @@ One case resists both: `api/sql.h:251` holds raw pointers into sandbox strings
 and blobs as SQLite query bindings, so the host reads sandbox memory while
 stepping the query, and `:255` reads rows back out of SQLite's result memory
 in-turn.
+
+### The shared memory cache
+
+`MemoryCache` (`api/memory-cache.h`) is shared by cache id, not by process. The
+binding's `id` (`server/workerd.capnp`, `memoryCache`) is documented as
+reachable by any number of isolates in the process, and `MemoryCacheProvider`
+keeps one `SharedMemoryCache` per id in `caches`, a
+`MutexGuarded<HashMap<String, const SharedMemoryCache*>>` that `getInstance()`
+consults when a binding is created; a binding with no id gets an instance that
+is in no map. Binding creation is host-side under the binder's isolate lock
+(`compileGlobals()` in `server/workerd-api.c++`, from the globals phase in
+`io/worker.c++`, which runs no user code). So what two workers share is decided
+by configuration: an operator who gives two workers one id has decided they may
+read each other's entries, and a worker without that id has no handle to the
+instance, no entry in any table of it and no path to it, since the provider's
+map is reached only from binding creation and from the instance's own
+destructor. What is process-wide is the provider, its map and its policy cap
+(`MemoryCachePolicy`); the limits are per instance (`suggest()`/`unsuggest()`
+and the multiset they maintain), and the metrics are trace spans the calling
+turn emits per operation. No in-tree configuration but
+`memory-cache-fault-test.capnp` gives two workers one id; the sample and the
+tests use one worker per id.
+
+Under per-isolate heap arenas the instance lies in the arena of the first worker
+whose bindings were compiled, because `getInstance()` allocates it under that
+worker's lock, and the first turn of every other sharer faults on it. On the
+heap-arena build `memory-cache-fault-test.sh` fails at its second step, before
+the fault it exists to inject, and `GK_DEBUG=1` reports where: the peer's turn
+faults in `SharedMemoryCache::Use::getWithFallback()` at the load of
+`cache->timer` -- offset `0x190` of the instance, the first member the function
+reads, the instance at a page-aligned address in the victim's arena -- with the
+report naming both arenas. That is the first crossing. The rest are read off the
+code, since the probe never gets past the first and the allocation census cannot
+see a read:
+
+- the instance: the mutex, `ThreadUnsafeData` with its limits, counters and the
+  headers of both tables, `id` and `timer`;
+- the rows: the `kj::Table` of `MemoryCacheEntry` with its hash buckets and
+  three B-tree indexes, reallocated by whichever turn inserts or rehashes and
+  rewritten on every hit, since `getWhileLocked()` releases and re-inserts the
+  row to step its liveliness;
+- the keys, `kj::str(key)` in `putWhileLocked()`, in the leader's arena;
+- the values: `CacheValue` and the bytes `hackySerialize()` produced, in the
+  leader's arena, read by every sharer's `jsg::Deserializer`
+  (`api/memory-cache.c++:475`) and written by every sharer, since a hit is a
+  `kj::atomicAddRef()` of the value;
+- the in-progress table: an `InProgress` is `kj::heap`ed in the turn that misses
+  first, its `waiting` queue grows in each waiter's turn, and each waiter's
+  `CrossThreadPromiseFulfiller` is in that waiter's arena and is fulfilled from
+  the leader's turn, a write into the waiter's arena;
+- the suggested-limits multiset, whose nodes are inserted host-side at each
+  binder's binding creation, in that binder's arena, and read by `resize()`
+  host-side only, so they do not fault.
+
+Two of these are also a host-side hazard that needs no fault. The instance, and
+the storage the provider's map takes at its first insert (`kj::str(cid)` and the
+table's rows and buckets), are in the first binder's arena, and a `HeapArena`
+discards everything in it when its isolate is destroyed; from then on
+`removeInstance()`, the provider's destructor and every other sharer's `Use`
+read discarded memory from the host. It is latent for as long as no isolate
+holding a binding is destroyed, and live the moment one is.
+
+**The shared heap is not where it goes.** Everything placed there so far is
+runtime bookkeeping -- ICU's tables, V8's locale sets and canonical wasm types,
+the JIT-page map, a call's message segments and stubs -- read by every isolate's
+ring 3, as the README records per site. The cache's rows are tenant data: keys,
+values, sizes, and which keys are in flight. The contract is "the isolates
+configured with this id and no others", and a `SharedHeapScope` around the cache
+would make it "every isolate in the process": an escape with a read primitive in
+a worker that has no cache binding at all would read every cache's every value,
+and one with a write primitive could rewrite any value any sharer will
+deserialize next. That is the project's goal failing, bought for a green probe,
+and the placement is not taken.
+
+**gk has no mapping that expresses the contract, and one would not give the
+right property.** A page is placed by one question, `arena_containing()`
+(`gk_arena.c`): it is in exactly one arena, whose private subtree only that
+arena's root reaches -- `demand_map()` in `gk_pt.c` refuses a fault on any other
+arena's page before consulting the host -- or in no arena, in which case its
+entry goes into the base root, whose top-level entries every arena root copies
+(`arena_sync_root()` in `gk_core.c`), so every root sees it. The only other
+distinction is the page class, KEEP, SUPER or REFUSE, and none of the three
+names a set of roots. A region mapped into a chosen subset of roots would need a
+top-level slot the base root never fills, a subtree of its own linked into each
+member root at that slot, a membership registry in the control block consulted
+on every demand fault in the region, an unlink with a cross-vCPU shootdown --
+which gk does not have -- when a member leaves or is condemned, and 512 GiB of
+address space per cache id, since a top-level slot is the unit a root owns.
+Built, it would still be the wrong thing: every sharer's ring 3 could read and
+write the whole table, the mutex and every other sharer's values and in-flight
+state, and the `Use`'s `kj::Own<const SharedMemoryCache>` would remain a pointer
+the host loads from guest memory, which is the provenance rule failing. What the
+contract wants is narrower than "mapped into these arenas": a sharer's turn
+should get the values it asks for and nothing of the table, and a non-sharer's
+turn nothing.
+
+**A cache per isolate** when heap arenas are active keeps the isolation and
+drops the contract: two workers configured to share would stop sharing on one
+build of the binary and not on another, a behaviour change by build rather than
+by compatibility flag, and the probe's premise -- a co-tenant's read of a
+faulted leader's key completing -- would hold vacuously. It is the fallback if
+the host-side cache below is not built, and then it is a documented limitation
+of the heap-arena build rather than a quiet one.
+
+**The placement that satisfies the goal is the one the lists above already ask
+for: the cache becomes an H object, and its operations cross the boundary as
+copies.** `api/memory-cache.c++:440` and `:475` are in both binary-buffer lists
+for that reason. The facilities exist -- `gk_host_alloc` with
+`HostOwn`/`HostSlot` for the memory, `gk_hostcall` with `util/hostcall.h` for a
+synchronous operation on state a turn cannot read, `gk_arena_current()` for a
+caller identity ring 3 cannot forge, and the actor-id hostcall
+(`server/actor-id-impl.h`) as the pattern -- and what is missing is the cache
+written over them:
+
+- *State.* The instance, its tables, keys, values and in-progress entries are H
+  memory, owned by the provider. No pointer into it sits in guest memory, and no
+  turn reads it, which is what "nothing a turn reads can be H" requires.
+- *Membership.* Binding creation is host-side under the binder's lock, so the
+  provider records there, in H memory, a binding record `{arena, instance,
+  limits}` with the arena from gk's record of the thread (`gk_arena_current()`)
+  and never from the caller, and the `MemoryCache` object holds a host slot
+  handle to that record in place of the `Use`'s pointer. The binding is rooted
+  in `env` for the isolate's life, so `~Use` runs at the isolate's teardown,
+  host-side, and retires the record before the arena is destroyed. The record is
+  the sharing contract in the form the host can check.
+- *Operations.* `read`, `delete`, and the leader's publish and abandon are
+  hostcalls. The handler resolves the binding handle through the host slot table
+  and then refuses it unless the record's arena is the calling thread's arena by
+  gk's record: that comparison is the one the host slot table cannot make (the
+  ownership residual recorded above) and the handler can, as
+  `gk_signal_field_register` makes it, and it is what keeps a handle rewritten
+  to another tenant's binding from answering. The key crosses in the frame's
+  `buf` (`MAX_KEY_SIZE` is 2 KiB, the frame 4 KiB). A hit copies the value into
+  the caller's arena, either through `buf` at one exit per 4 KiB or into a range
+  the turn names by offset and length within its own arena, which the handler
+  validates against that arena as the signal-field registration validates a
+  buffer, so the host writes only into the caller's own memory and only within
+  bounds: the one direction in which a guest-named range is admissible, since
+  the worst a lie can do is clobber the caller's own heap. A value larger than
+  the range answers with the size needed. Publish copies the leader's serialized
+  bytes from a range validated the same way into H memory, the leader's own
+  data, read once. The handler takes no process heap: the spans are emitted by
+  the turn from counters the handler returns, as the V2 shim's `ReadTrace` and
+  `WriteTrace` already have it, and the handler's own allocations are
+  `gk_host_alloc`, whose lock the handler does not hold.
+- *Waiters.* A read that finds its key in flight gets "wait" and nothing in
+  guest memory to wait on: the turn allocates its promise and cross-thread
+  fulfiller in its own arena and journals the fulfiller to the host as a note
+  (`hostMemory::noteInTurn`), which the host attaches to the in-flight entry
+  after the turn. The leader's publish or abandon marks the entry and leaves a
+  wake on the thread's host-side list, and after the leader's turn the host
+  fulfils the waiters from the event loop, outside any handler and any turn,
+  with a notification only; a woken waiter re-issues `read`, which copies the
+  value into its own arena, or finds itself the next leader. An abandon by a
+  faulted leader stays what the probe checks: the callback is the context's, and
+  the context's teardown runs host-side and calls the handler directly through
+  the same table.
+- *Limits.* `suggest()` and `unsuggest()` already run host-side and operate on
+  the H instance directly.
+- *Sizing.* `gk_host_alloc` serves blocks of at most 1 MiB (`GK_HOST_MAX_ALLOC`)
+  from at most 64 regions of 4 MiB, by power-of-two class: sized for keys,
+  descriptors and records, not for a value store. The values need a REFUSE
+  region of their own, sized from the configured limits, under an allocator that
+  reuses it -- the `HeapArena` mechanism with its region registered REFUSE,
+  which needs gk to expose the registration of a host-mapped range (`prot_add`
+  is internal) -- or `gk_host_alloc`'s bounds raised. That registration is the
+  one thing gk lacks for this, and it is not a new primitive.
+
+What an attacker gains under it. A non-sharer's ring 3 has no mapping of the
+cache and no handle that passes the owner check: it reads nothing and writes
+nothing. A sharer's ring 3 gets what the contract gives it -- the values of the
+caches it is configured with, one copy per read in its own arena -- and can
+spend those caches' limits, evicting its co-tenants' entries by publishing large
+values, which the API lets it do today. A sharer that swaps one of its own
+binding handles for another of its own gains a cache it is also configured with.
+What remains is every hostcall's residual: the handler runs with host privilege
+on arguments the turn chose, so its validation is the wall; and each operation
+costs an exit, about 6.4 us, where a hit costs a lock today. The asynchronous
+`read()` absorbs the exit; the synchronous in-turn hit path does not survive.
+
+`MEMORY_CACHE_V2` (`api/memory-cache-v2.c++` over `src/rust/memory-cache`) has
+the same shape and takes the same conclusion. The crate forbids unsafe code and
+allocates through the process allocator, so under heap arenas its `Cache` is in
+the first binder's arena (`bind()` runs host-side under that lock), its entries
+and `Bytes` values in the leader's (`succeed()` runs in the leader's turn), a
+hit's `Bytes` clone is a refcount write into the leader's arena, and the
+`tokio::sync::watch` completion the leader sends wakes every waiter's future
+from the leader's turn, a write into each waiter's arena. It has not been run
+under heap arenas. Its FFI already crosses by value -- limits, decisions and
+trace structs rather than pointers -- which is the shape the hostcall interface
+needs; its state would move to H memory the same way.
+
+While the cache is unplaced, `memory-cache-fault-test.sh` fails at its second
+step on the heap-arena build, which is the correct result for a placement that
+has not been made.
 
 ## Inventory: `util/`
 
