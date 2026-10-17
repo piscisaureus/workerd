@@ -10,6 +10,7 @@
 #include <workerd/io/tracer.h>
 #include <workerd/io/worker.h>
 #include <workerd/jsg/guest-run.h>
+#include <workerd/jsg/heap-arena.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/setup.h>
 #include <workerd/util/autogate.h>
@@ -26,6 +27,16 @@
 #include <map>
 
 namespace workerd {
+
+namespace {
+#ifdef WORKERD_GK_NEG_RPC_SHARED_HEAP
+// A negative build, never shipped: the shared-heap placements an in-process Cap'n Proto call
+// needs are not made. See experimental/guest-kernel/rpc-arena-test.sh.
+struct RpcSharedHeapScope {};
+#else
+using RpcSharedHeapScope = jsg::SharedHeapScope;
+#endif
+}  // namespace
 
 // The IoContext current on this thread. Thread-local storage is memory a JS turn at guest ring 3
 // can write, so after a guest turn the host re-establishes this from a copy saved in a host frame
@@ -837,6 +848,12 @@ kj::Own<void> IoContext::registerPendingEvent() {
     // Cancel any already-scheduled finalization.
     abortFromHangTask = kj::none;
 
+    // A pending event of this context is held by every capability this request exports -- each
+    // RPC stub holds one through makeReentryCallback(), and a stub that crosses an in-process
+    // service binding is released in the *calling* isolate's turn, which runs the event's
+    // destructor. The first registration is usually made under this isolate's lock, so left in
+    // its heap arena the event is unaddressable from the turn that drops the last reference.
+    RpcSharedHeapScope sharedHeap;
     auto result = kj::refcounted<PendingEvent>(*this);
     pendingEvent = *result;
     return result;

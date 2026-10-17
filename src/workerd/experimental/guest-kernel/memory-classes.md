@@ -1841,6 +1841,50 @@ to span the call -- `LocalClient::call` and the `JsRpcTargetBase` and
 proposed and what this measurement confirms by counting what a narrower scope
 would miss.
 
+What the census could not say, and what placing the path showed, is where the
+scope goes. "A scope spanning the call" is not expressible: the call is not one
+dynamic extent in `workerd`. `LocalClient::call` does an `evalLater()`, so the
+callee's dispatch does not run inside it; the callee's turn is entered later,
+through its own lock, and writes its results from a JS promise continuation.
+What the path is instead is **four windows**, each a run of straight-line code
+in one isolate's turn with that isolate's own work on either side:
+
+1. The caller building and sending the request -- `callImpl()` in
+   `api/worker-rpc.c++`, from resolving the destination through `send()`. This
+   is where the request message and its segments, the stubs the arguments
+   serialize to, the capability table, the call context and the promise
+   plumbing are made, and where `resolveOneCall()` opens the session.
+2. The callee writing the results -- the functor `handleResult()` hands to
+   `awaitJs()`. This is `serializeJsValueWithPipeline()`: the response
+   message, the stubs the return value serializes to, and the call pipeline.
+3. The callee importing the caller's capabilities, which is a crossing for the
+   same reason: taking a capability out of a message instantiates the hook
+   that carries it and records it in the wrapper table of each membrane
+   between the two ends.
+4. The caller importing the callee's.
+
+Windows 3 and 4 are what a free-based census cannot find, because what they
+decide is a *read*. `MembranePolicy`'s two `HashMap<ClientHook*, ClientHook*>`
+tables are the case: either side grows them while passing a capability
+through, so unless every one of the four windows places them, the side that
+did not allocate the bucket array faults reading it. In the reproducer the
+callee allocated the reverse table while importing the caller's
+`ExternalPusher` -- outside window 2, which starts later -- and the caller then
+faulted on it in `MembraneCapTableBuilder::injectCap`. The same shape will
+recur for any cross-isolate container that either side can reallocate, and the
+complete answer for RPC shapes this workload does not reach is an embedder
+allocation hook in Cap'n Proto itself, in the style of
+`patches/capnp-cpp/0003` and the two V8 patches, rather than more windows.
+
+Two members of the set are also not Cap'n Proto objects at all, which the list
+of 23 understates. `IoContext::PendingEvent` is held by every capability a
+request exports, so a stub released in the calling isolate's turn runs its
+destructor there; and a worker's entrypoint names
+(`Server::ErrorReporter::addEntrypoint()`) are built while that worker's
+modules are evaluated, under its own lock, and read by every caller that
+starts a subrequest to it. Neither has a Cap'n Proto frame in its stack, and
+the second is invisible to the census entirely, since nothing frees it.
+
 Without the guest kernel the same run has 47 cross-isolate-free sites rather
 than 37, and the six extra are the owned-list nodes
 (`hostMemory::allocate` from `OwnedObjectList::committed`, 2,240 frees, which

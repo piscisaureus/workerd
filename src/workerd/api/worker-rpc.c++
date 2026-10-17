@@ -10,6 +10,7 @@
 #include <workerd/io/stored-value.h>
 #include <workerd/io/tracer.h>
 #include <workerd/io/worker-interface.h>
+#include <workerd/jsg/heap-arena.h>
 #include <workerd/jsg/ser.h>
 #include <workerd/util/autogate.h>
 #include <workerd/util/completion-membrane.h>
@@ -18,6 +19,17 @@
 #include <capnp/membrane.h>
 
 namespace workerd::api {
+
+namespace {
+#ifdef WORKERD_GK_NEG_RPC_SHARED_HEAP
+// A negative build, never shipped: the windows below are not entered, so what an in-process
+// call hands across stays in the heap arena of whichever isolate built it. See
+// experimental/guest-kernel/rpc-arena-test.sh.
+struct RpcSharedHeapScope {};
+#else
+using RpcSharedHeapScope = jsg::SharedHeapScope;
+#endif
+}  // namespace
 
 namespace {
 
@@ -329,6 +341,13 @@ jsg::JsValue deserializeRpcReturnValue(jsg::Lock& js,
   // a disposer then we should discard callPipeline so that we don't hold open the callee's
   // context for no reason.
   if (callResults.getHasDisposer()) {
+    // Taking a capability out of an in-process RPC message is as much a crossing as putting one
+    // in: it instantiates the hook that carries the capability and records it in the wrapper
+    // table of each membrane between the two ends, and that table is grown again by whichever
+    // side next passes a capability through -- the other isolate as often as this one. Both the
+    // hook and the table therefore go in the shared heap. (See the export side in callImpl() and
+    // in the result functor.)
+    RpcSharedHeapScope sharedHeap;
     disposalGroup->setCallPipeline(
         IoContext::current().addObject(kj::heap(callResults.getCallPipeline())));
   }
@@ -667,6 +686,17 @@ JsRpcPromiseAndPipeline callImpl(jsg::Lock& js,
       auto destinationSupportsRetries =
           actorTargetRetryability.orDefault(ActorCallTargetRetryable::NO).toBool();
 
+      // Everything between here and send() below is built in this isolate's turn for the callee
+      // and freed there, or the other way around: the request message with its segments and the
+      // capability table it carries, the stubs the arguments serialize to with their membranes
+      // and pending events, the call context and the promise plumbing send() makes, and --
+      // through resolveOneCall() -- the RPC session, the callee's entrypoint and its IoContext.
+      // Left in this isolate's heap arena, each of those is unaddressable from the callee's
+      // turns, which fault on it. Held in a Maybe because the window ends at send() while the
+      // locals it covers are used after it.
+      kj::Maybe<RpcSharedHeapScope> sharedHeap;
+      sharedHeap.emplace();
+
       TraceContext jsRpcCallSpan;
       kj::Maybe<JsRpcClientProvider::ClientForOneCall> oneCall;
       kj::Maybe<ActorCallRetryState::Attempt> actorCallAttempt;
@@ -788,6 +818,11 @@ JsRpcPromiseAndPipeline callImpl(jsg::Lock& js,
       builder.getResultsStreamHandler().setExternalPusher(ioContext.getExternalPusher());
 
       auto callResult = builder.send();
+
+      // The request is on its way, so the shared heap is no longer needed: the result promise,
+      // the continuation that deserializes the response and the JsRpcPromise are this isolate's
+      // own and belong in its arena.
+      sharedHeap = kj::none;
 
       // RemotePromise lets us consume its pipeline and promise portions independently; we consume
       // the promise here and the pipeline below, both via kj::mv().
@@ -1227,6 +1262,12 @@ void JsRpcStub::serialize(jsg::Lock& js, jsg::Serializer& serializer) {
       // to getClient() will force it to be created, invoking the restore chain, just so the stub
       // can be sent over RPC. Maybe we should actually leave it null and leave it up to the
       // receiving end to invoke the restore chain if desired?
+
+      // This runs inside the serialization window of a call (see the scopes in callImpl() and in
+      // the result functor), so the membrane and the pending event it attaches are already going
+      // to the shared heap; the scope is here as well because a stub is also serialized outside a
+      // call, into stored values and Frankenvalues.
+      RpcSharedHeapScope sharedHeap;
       auto cap = capnp::membrane(
           getClient(), kj::refcounted<AttachmentMembrane>(ioctx.registerPendingEvent()));
 
@@ -1345,14 +1386,19 @@ jsg::Ref<JsRpcStub> JsRpcStub::deserialize(
             IoChannelFactory::ChannelTokenUsage::RPC, rpcTarget.getChannelToken());
       }
 
+      // The capability comes out of the message in the shared heap; see
+      // deserializeRpcReturnValue(). The stub wrapping it is this isolate's own.
+      auto cap = [&]() {
+        RpcSharedHeapScope sharedHeap;
+        return ioctx.addObject(kj::heap(rpcTarget.getCap()));
+      }();
       KJ_IF_SOME(c, channel) {
-        return js.alloc<JsRpcStub>(ioctx.addObject(kj::heap(rpcTarget.getCap())),
-            ioctx.addObject(kj::mv(c)), externalHandler.getDisposalGroup(), kj::mv(externalMemory),
-            externalHandler.getOriginatingCall());
-      } else {
-        return js.alloc<JsRpcStub>(ioctx.addObject(kj::heap(rpcTarget.getCap())),
+        return js.alloc<JsRpcStub>(kj::mv(cap), ioctx.addObject(kj::mv(c)),
             externalHandler.getDisposalGroup(), kj::mv(externalMemory),
             externalHandler.getOriginatingCall());
+      } else {
+        return js.alloc<JsRpcStub>(kj::mv(cap), externalHandler.getDisposalGroup(),
+            kj::mv(externalMemory), externalHandler.getOriginatingCall());
       }
     } else KJ_IF_SOME(storedHandler,
         kj::tryDowncast<StoredExternalHandler::Deserializer>(handler)) {
@@ -1587,6 +1633,11 @@ class JsRpcTargetBase: public rpc::JsRpcTarget::Server {
       auto externalPusher = [&]() -> rpc::JsValue::ExternalPusher::Client {
         auto resultStreamHandler = params.getResultsStreamHandler();
         if (resultStreamHandler.hasExternalPusher()) {
+          // The caller's pusher comes out of the request message; see
+          // deserializeRpcReturnValue() for why an import is placed like an export. This is the
+          // first capability either side passes through the session's membrane in most calls, so
+          // it is where the membrane's reverse wrapper table is allocated.
+          RpcSharedHeapScope sharedHeap;
           return resultStreamHandler.getExternalPusher();
         } else if (resultStreamHandler.hasObsolete4()) {
           // A StreamSink was provided -- that's the old approach, which should have been
@@ -1630,6 +1681,13 @@ class JsRpcTargetBase: public rpc::JsRpcTarget::Server {
                           externalPusher = kj::mv(externalPusher),
                           callPipelineFulfiller = kj::mv(callPipelineFulfiller)](
                           jsg::Lock& js, jsg::Value value) mutable {
+        // The results are written for the caller and read and freed in its turn: the response
+        // message with its segments, the stubs the return value serializes to with their
+        // membranes and pending events, and the capability table and call pipeline that carry
+        // them. The scope covers writing them and nothing else of this turn, which is why it is
+        // here rather than around callImpl().
+        RpcSharedHeapScope sharedHeap;
+
         jsg::JsValue resultValue(value.getHandle(js));
 
         rpc::JsRpcTarget::CallResults::Builder results = nullptr;
@@ -2692,6 +2750,15 @@ kj::Promise<WorkerInterface::CustomEvent::Result> JsRpcSessionCustomEvent::run(
     jsRpcSessionInternalSpan = ioctx.makeTraceSpan("jsRpcSession"_kjc);
   }
 
+  // The session's top-level target and everything that carries it to the client -- the local
+  // client hook the RevocableServer makes, the completion membrane below and the wrapper table
+  // that membrane records every capability crossing it in -- are reached from the client's turns
+  // as well as this worker's, and for an in-process service binding the client is another
+  // isolate. The membrane's table is the sharper case: either side grows it while exporting or
+  // importing a capability, so every part of it has to be where both can reach it.
+  kj::Maybe<RpcSharedHeapScope> sessionSharedHeap;
+  sessionSharedHeap.emplace();
+
   EntrypointJsRpcTarget target(ioctx, entrypointName, kj::mv(versionInfo), kj::mv(props),
       kj::mv(wrapperModule), mapAddRef(incomingRequest->getWorkerTracer()), isDynamicDispatch);
   capnp::RevocableServer<rpc::JsRpcTarget> revocableTarget(target);
@@ -2714,6 +2781,9 @@ kj::Promise<WorkerInterface::CustomEvent::Result> JsRpcSessionCustomEvent::run(
 
     capFulfiller->fulfill(capnp::membrane(
         revocableTarget.getClient(), kj::refcounted<CompletionMembrane>(kj::mv(doneFulfiller))));
+
+    // The session is open; what this coroutine does from here is this worker's own.
+    sessionSharedHeap = kj::none;
 
     // `donePromise` resolves once there are no longer any capabilities pointing between the client
     // and server as part of this session.
@@ -2758,6 +2828,11 @@ kj::Promise<WorkerInterface::CustomEvent::Result> JsRpcSessionCustomEvent::sendR
     }
   });
 
+  // As in run(), but for the client's half of the session: the request that opens it and the two
+  // membranes wrapped around the capability it yields are reached from both ends of the call.
+  kj::Maybe<RpcSharedHeapScope> sessionSharedHeap;
+  sessionSharedHeap.emplace();
+
   auto req = dispatcher.jsRpcSessionRequest();
   auto sent = req.send();
 
@@ -2780,6 +2855,8 @@ kj::Promise<WorkerInterface::CustomEvent::Result> JsRpcSessionCustomEvent::sendR
       kj::mv(cap), kj::refcounted<CompletionMembrane>(kj::mv(completionPaf.fulfiller)));
 
   this->capFulfiller->fulfill(kj::mv(cap));
+
+  sessionSharedHeap = kj::none;  // see above
 
   auto session = sent.getSession();
 

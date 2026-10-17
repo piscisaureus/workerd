@@ -1114,19 +1114,82 @@ so a crossing a turn makes on every dereference belongs on that path.
   canonicalizer's containers and a later one's rehash moves them), the
   thread's timer queue
   entries (`TimerChannel` in `server.c++`), and the V8 platform's worker-thread
-  task queues and job state (`jsg::V8PlatformWrapper`). It also covers what an
-  in-process service binding call hands across: the request objects the caller
-  builds for the callee and the callee's per-request entrypoint and `IoContext`
-  (`asHttpClient()`, `Server::WorkerService::createEntrypoint()`), and the
-  response the callee sends back (`WorkerEntrypoint::ResponseSentTracker`).
-  Each use is a confidentiality concession: subrequest URLs and headers,
-  response headers, a service-binding callee's `IoContext`, whatever
-  `Intl` formats, and the canonical wasm type table, are readable from every
-  isolate's ring 3.
+  task queues and job state (`jsg::V8PlatformWrapper`). It also covers the
+  whole of an in-process Cap'n Proto call, which is every service binding and
+  every JS RPC call; that one is described on its own below. Each use is a
+  confidentiality concession: subrequest URLs and headers, response headers, a
+  service-binding callee's `IoContext`, whatever `Intl` formats, and the
+  canonical wasm type table, are readable from every isolate's ring 3.
 
-  The list is not complete yet. V8 has further process-wide registries that
+  One thread-wide structure is placed without the shared heap, because it is
+  below `jsg`: the resolve journal a turn registers its owned objects through
+  (`hostMemory`'s `TurnJournal`). It is created by whichever isolate first runs
+  a turn on the thread and read and written at ring 3 by every turn after
+  that, so it gets pages of its own, outside every arena, rather than a block
+  of the creating isolate's heap.
+
+  **The in-process Cap'n Proto call.** The call's host-side plumbing is shared
+  by construction. The caller's turn builds the request message with its
+  segments and capability table, the stubs its arguments serialize to with
+  their membranes and pending events, and the call context and promise
+  plumbing `send()` makes; the callee's turn reads those, writes the response
+  message the same way, and builds the stubs its return value serializes to;
+  and each side then frees what the other built, which faults as surely as a
+  read does, since `operator delete` is reached through the object's
+  destructor.
+
+  The scope that places it is not one scope around the call, because the call
+  is not one dynamic extent in `workerd`: it is four windows, each a run of
+  straight-line code in one isolate's turn, with that isolate's own work on
+  either side of it. They are, in `api/worker-rpc.c++`, building and sending
+  the request (`callImpl()`, from resolving the destination through
+  `send()`); writing the results (the functor `handleResult()` hands to
+  `awaitJs()`, around `serializeJsValueWithPipeline()` and the call pipeline);
+  and the two capability *imports* -- taking a capability out of a message is
+  as much a crossing as putting one in, because it instantiates the hook that
+  carries it and records it in the wrapper table of each membrane between the
+  two ends (`deserializeRpcReturnValue()`, `JsRpcStub::deserialize()`, and the
+  caller's `ExternalPusher` as `handleResult()` imports it). The session's own
+  capabilities and membranes (`JsRpcSessionCustomEvent::run()` and
+  `sendRpc()`) are placed where they are made.
+
+  Two things outside the call need the same placement, and neither is a
+  Cap'n Proto object. A request's `IoContext::PendingEvent`
+  (`io-context.c++`) is held by every capability the request exports, so a
+  stub released in the calling isolate's turn runs its destructor there. And a
+  worker's entrypoint names (`Server::ErrorReporter`) are built while its own
+  modules are evaluated but read by every caller that starts a subrequest to
+  it, which for a service binding is a turn of the calling isolate.
+
+  `src/workerd/experimental/guest-kernel/rpc-arena-test.sh` checks the result
+  against a running server: a caller and a callee in separate arenas, with
+  stubs taken across, called and disposed of in the caller's turn, and a
+  third worker holding the first arena.
+
+  The list is not complete yet. There are further process-wide registries that
   grow from whichever isolate first needs an entry, and each one faults the
-  next isolate that reads it. The one that remains is `ThreadIsolation`'s
+  next isolate that reads it. One is not V8's: `glibc`'s `atexit` chain. Any
+  function-local static with a non-trivial destructor registers through
+  `__cxa_atexit` when it is first initialized, and if that happens inside a
+  turn -- ICU does it from `SimpleDateFormat::subFormat`, reached from the
+  `Intl` builtins -- then once the chain's static first block is full,
+  `__new_exitfn` allocates a 32-entry block on the turn's arena, and the next
+  isolate's registration faults walking the chain to it. The embedder scope
+  the `Intl` builtins already run under does not help, because what faults is
+  the *read* of a block an earlier, unscoped registration placed. Placing
+  every registration would take interposing `__cxa_atexit`, which the
+  allocation census shows is possible (`--wrap`) but which nothing does yet.
+  This is what the probes that fail on a jemalloc build fail on, and it is
+  the same `__new_exitfn` each time: `abort-signal-test.sh` and
+  `ioown-test.sh` reach it from a static inside their own probe helper
+  (`maybeForceGuestFaultForTest()`), and a worker using `Intl` reaches it from
+  ICU. They pass on the default build, where there are no per-isolate heaps.
+  The next isolate to fault that way is also where a condemned turn costs
+  more than the request: the guard of the static it was initializing stays
+  owned by the thread, so a later turn on that thread aborts the process with
+  `__cxa_guard_acquire detected recursive initialization`.
+
+  On V8's side the one that remains is `ThreadIsolation`'s
   JIT-page map (`src/common/code-memory-access.h`), the `Address -> JitPage*`
   index that answers "which code allocation is this PC in?" for GC-safe code
   lookup (`Heap::GcSafeTryFindInstructionStreamForInnerPointer`) and for
@@ -1188,19 +1251,17 @@ so a crossing a turn makes on every dereference belongs on that path.
   cross-vCPU shootdown (below) is a candidate, since the slot is reused.
 
   What does not work is request and response *bodies* across an in-process
-  service binding. The rest of such a call crosses in shared memory, but body
-  bytes travel through a `kj` one-way pipe by pointer, and the copy runs in
-  the reading isolate's turn from the writing isolate's memory: the caller's
-  `r.text()` faults in `kj::AsyncPipe::tryRead` on the callee's heap region,
-  and a body the caller sends faults the callee's read the same way. That
-  needs a copy at the boundary, with the host pumping bodies through shared
-  buffers, which is a protocol change rather than a placement and is future
-  work. Also not covered: process-wide containers that V8 grows from inside a
-  turn without an embedder hook, such as the wasm type canonicalizer, which
-  lands in the arena of the first isolate that compiles a module (and keeps
-  pointing into it once that arena is released); and, untested but by the
-  same reasoning, BoringSSL's lazily allocated per-thread error state, which
-  a `crypto` call in a turn would place on that turn's arena.
+  service binding, and it is now the only part of such a call that does not.
+  The rest crosses in shared memory, but body bytes travel through a `kj`
+  one-way pipe by pointer, and the copy runs in the reading isolate's turn
+  from the writing isolate's memory: the caller's `r.text()` faults in
+  `kj::AsyncPipe::tryRead` on the callee's heap region, and a body the caller
+  sends faults the callee's read the same way. That needs a copy at the
+  boundary, with the host pumping bodies through shared buffers, which is a
+  protocol change rather than a placement and is future work. Also not
+  covered: BoringSSL's lazily allocated per-thread error state, which a
+  `crypto` call in a turn would place on that turn's arena -- untested, but by
+  the same reasoning as the registries above.
 - **The memory classification of runtime objects is applied to few of
   them.** Which side of the boundary each runtime C++ class belongs on is
   written down in `memory-classes.md`, together with the rules that decide
