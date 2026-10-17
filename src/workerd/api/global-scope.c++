@@ -539,6 +539,29 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   if (probeEnabled && url.endsWith("/__gk_probe_actor_key")) {
     probeHost("actor-id-key");
   }
+#ifdef WORKERD_HAS_HEAP_ARENA
+  if (probeEnabled && url.endsWith("/__gk_heap_region")) {
+    // Reports this isolate's heap arena footprint (see HeapArena::Stats), so that a probe can
+    // watch the region it is allocated from over a workload.
+    KJ_IF_SOME(arena, jsg::IsolateBase::from(lock.getIsolate()).getGuestArena()) {
+      KJ_IF_SOME(heap, arena.getHeapArena()) {
+        auto stats = heap.getStats();
+        // The memory reported to V8 as external (ExternalMemoryAdjustment); a zero adjustment
+        // reads the total.
+        int64_t externalMemory = lock.getIsolate()->AdjustAmountOfExternalAllocatedMemoryImpl(0);
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: heap arena region", url, stats.regionBytes,
+            stats.allocated, stats.active, stats.mapped, stats.retained, stats.dirty,
+            externalMemory);
+      }
+    }
+  }
+  if (probeEnabled && url.endsWith("/__gk_gc")) {
+    // A full GC of this isolate, so that a probe can tell memory the isolate holds until its
+    // next GC from memory it has lost.
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: forcing a full GC", url);
+    lock.getIsolate()->LowMemoryNotification();
+  }
+#endif
   if (probeEnabled && url.endsWith("/__gk_poison_entropy")) {
     constexpr byte PATTERN = 0x5a;
     poisonEntropyBufferForTest(PATTERN);

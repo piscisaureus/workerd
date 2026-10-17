@@ -84,6 +84,19 @@ class HeapArena final {
   // How much of the region the arena has taken so far, which only grows.
   size_t getRegionBytes() const;
 
+  // The arena's footprint, for diagnostics: the region bytes above beside what jemalloc reports
+  // for the arena. Reading jemalloc's statistics refreshes them process-wide, so this is not for
+  // hot paths.
+  struct Stats {
+    size_t regionBytes;  // taken from the region
+    size_t allocated;    // bytes in live allocations, small and large
+    size_t active;       // bytes in extents that hold live allocations
+    size_t mapped;       // bytes in extents jemalloc holds, active and cached
+    size_t retained;     // bytes in extents freed back to jemalloc's retained pool
+    size_t dirty;        // bytes in freed extents not yet purged
+  };
+  Stats getStats() const;
+
  private:
   struct Hooks;
   Hooks* hooks;  // jemalloc keeps a pointer to it for the arena's lifetime

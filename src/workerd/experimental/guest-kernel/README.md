@@ -210,6 +210,22 @@ which runs each isolate's JS turn at guest ring 3.
   which tears the body pump down inside the caller's turn. Negative build:
   `--copt=-DWORKERD_GK_NEG_BODY_RELAY`, where the bodies cross through the
   bare pipe and the first route faults the reading isolate's turn.
+- `heap-region-test.sh` / `heap-region-test.capnp` / `heap-region-front.js` /
+  `heap-region-back.js` — check against a workerd built with per-isolate heap
+  arenas that an isolate serving large response bodies does not spend its heap
+  arena region, which is a fixed 16 GiB reservation an isolate is condemned
+  for outgrowing. One worker serves 4 MiB bodies from a buffer it keeps and
+  another reads them whole across a service binding, three thousand times,
+  and the script asserts that both isolates' regions plateau (the offsets come
+  from the `__gk_heap_region` probe route in `api/global-scope.c++`) besides
+  that nothing faults. What it guards is the report of a buffer-built body's
+  copy to V8 as external memory and the collection jsg runs at a soft limit's
+  worth of such growth (`ExternalMemoryTarget` in `jsg/jsg.c++`): without
+  them the copies, held until their Response is collected, take about 4 MB of
+  region per response until a collection V8 finds some other reason for.
+  Negative build: `--copt=-DWORKERD_GK_NEG_BODY_BUFFER_UNACCOUNTED`, where
+  the copies go unreported and the serving isolate's region grows by
+  gigabytes over the run.
 
 ## API
 

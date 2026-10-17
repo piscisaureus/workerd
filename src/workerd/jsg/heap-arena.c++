@@ -301,6 +301,27 @@ size_t HeapArena::getRegionBytes() const {
   return *next.lockShared() - begin;
 }
 
+HeapArena::Stats HeapArena::getStats() const {
+  uint64_t epoch = 1;
+  size_t epochSize = sizeof(epoch);
+  mallctl("epoch", &epoch, &epochSize, &epoch, sizeof(epoch));
+  auto read = [&](kj::StringPtr name) -> size_t {
+    auto key = kj::str("stats.arenas.", index, ".", name);
+    size_t value = 0;
+    size_t size = sizeof(value);
+    if (mallctl(key.cStr(), &value, &size, nullptr, 0) != 0) return 0;
+    return value;
+  };
+  return Stats{
+    .regionBytes = getRegionBytes(),
+    .allocated = read("small.allocated") + read("large.allocated"),
+    .active = read("pactive") * PAGE_SIZE,
+    .mapped = read("mapped"),
+    .retained = read("retained"),
+    .dirty = read("pdirty") * PAGE_SIZE,
+  };
+}
+
 HeapArenaScope::HeapArenaScope(kj::Maybe<HeapArena&> arena) {
   KJ_IF_SOME(a, arena) {
     previousIndex = switchThreadArena(a.getIndex());

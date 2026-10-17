@@ -1558,12 +1558,32 @@ about fifteen seconds, every launch ended with `take_bytes` at 16 GiB
 (`last_off=0x3ff80c000`), 16.4 GB of `AnonHugePages`, and then "guest-kernel:
 JS turn faulted inside the guest; the isolate has been condemned", after which
 every request on the front worker fails, at 10,000 per second. In the fast
-mode that is about five seconds of 4 MiB responses. Whether the GC is late (V8
-not treating these backing stores as the external memory pressure its
-accounting expects) or the reuse is (jemalloc's retained extents from a
-refused `dalloc` not being recycled before `take()` is asked again) is not
-settled here; a jemalloc-level test that allocates and frees 4 MiB in a loop
-on a `HeapArena` and counts `take()` calls would settle the second in minutes.
+mode that is about five seconds of 4 MiB responses.
+
+Settled afterwards, with `heap-region-test.sh` and an allocation census: it is
+the GC that is late, and the reuse is fine. The jemalloc-level loop (the hooks
+and arena settings of `HeapArena` over a 4 GiB reservation, a turn's worth of
+allocations per iteration, freed inside or outside the turn, with the
+`thread.arena` switch that purges the arena on every exit) takes four extents
+and 13 MB of region over 3000 iterations whatever the variant: jemalloc
+recycles what the purge moves to `retained`, so the region's high-water mark
+is the isolate's peak live heap. What makes the peak is `back`'s, not
+`front`'s: a `Response` built from the `Uint8Array` keeps a 4 MiB kj copy of
+it (`JsReadableStream::Buffer`, allocated inside `back`'s turn) until the
+`Response` is collected, and `back` allocates almost nothing else on its JS
+heap, so V8 has no reason to collect -- `--trace-gc` over 2000 responses showed
+scavenges in `front` only (its `ArrayBuffer`s, which V8 does account) and no
+mark-compact at all, while `back`'s jemalloc `allocated` climbed to 3.4 GB; a
+forced full GC dropped it to 288 KB. Reporting the copy to V8 as external
+memory is necessary but not sufficient: V8's reaction to reported growth is to
+start incremental marking, which workerd disables, and the fallback is its
+old-generation limit, gigabytes for an isolate with no heap limit (the region
+still stepped up by about 1 GB at a time). The fix is that report plus a
+collection jsg runs itself at V8's soft limit, 64 MiB of growth past the
+low-water mark (`ExternalMemoryTarget::applyLocked` in `jsg/jsg.c++`). With
+it, `back`'s region holds at 100 MiB over 3050 responses and 12 GB served,
+where without it the same run grew it to 3.8 GB with a scavenge-timed plateau
+on the way.
 
 **Every guest-kernel cell refaults a body's host pages once per request**, as
 section 2 says: 2000 nested faults per 4 MiB response whether the allocator is
