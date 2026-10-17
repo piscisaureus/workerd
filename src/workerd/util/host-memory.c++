@@ -10,6 +10,8 @@
 #include <workerd/experimental/guest-kernel/gk.h>
 #endif
 
+#include <sys/mman.h>
+
 #include <kj/mutex.h>
 #include <kj/time.h>
 
@@ -591,7 +593,7 @@ struct DeferredReport {
 struct ThreadPool {
   ResolveHandle handles[POOL_CAPACITY];
   uint32_t count = 0;
-  kj::Own<TurnJournal> journal;
+  TurnJournal* journal = nullptr;
   DeferredRefusal refusals[REFUSAL_CAPACITY];
   uint32_t refusalCount = 0;
   DeferredReport reports[REPORT_CAPACITY];
@@ -639,13 +641,56 @@ void setPoolOfThread(ThreadPool* pool) {
   fallbackPool = pool;
 }
 
-// Releases the thread's pool when the thread exits: its reserved entries and the block.
+// The journal is the thread's, not any isolate's: it is created by whichever isolate first runs
+// a turn on the thread, and read and written at ring 3 by every turn after it. So it can live
+// neither in host memory, which ring 3 cannot touch, nor on the C++ heap, where the allocator
+// decides its placement rather than what reads it does -- the shared heap every arena maps
+// today, and the arena of the first isolate to run a turn once an isolate's allocations are its
+// own (experimental/guest-kernel/memory-classes.md), where every other isolate's turn would
+// fault on it. Pages of its own are in no arena either way: ordinary process memory the guest
+// kernel maps on demand under whichever page-table root asks for it.
+#ifdef WORKERD_GK_NEG_TURN_JOURNAL_PAGES
+// A negative build, never shipped: the journal comes from the C++ heap, so it lands wherever
+// the allocations of the first isolate to run a turn on the thread land. Against a shared heap
+// that is the same memory as a mapping of its own; the two are a different placement only once
+// an isolate's allocations are the isolate's.
+TurnJournal* allocateJournal() {
+  return new TurnJournal();
+}
+
+void releaseJournal(TurnJournal* journal) {
+  delete journal;
+}
+#else
+TurnJournal* allocateJournal() {
+  void* ptr = mmap(
+      nullptr, sizeof(TurnJournal), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  KJ_REQUIRE(ptr != MAP_FAILED, "allocating a turn journal failed", errno);
+  return new (ptr) TurnJournal();
+}
+
+// The pages are scrubbed and kept rather than unmapped: a turn has read and written them at
+// ring 3, so the guest kernel has backed them with a memslot and a page-table entry in every
+// arena root that faulted on them, and those roots outlive the thread. Unmapping them would
+// leave those entries naming memory the process no longer has; handing a block back to the
+// allocator, the other way to release one, leaves it mapped too. What is kept is one mapping
+// of sizeof(TurnJournal) per thread that has ever run a turn, and workerd's threads are not
+// short-lived.
+void releaseJournal(TurnJournal* journal) {
+  if (journal == nullptr) return;
+  scrub(journal, sizeof(TurnJournal));
+}
+#endif
+
+// Releases the thread's pool when the thread exits: its reserved entries, its journal and the
+// block itself.
 struct PoolReleaser {
   ~PoolReleaser() noexcept(false) {
     ThreadPool* pool = poolOfThread();
     if (pool == nullptr) return;
     setPoolOfThread(nullptr);
     for (uint32_t i = 0; i < pool->count; i++) tableUnregister(pool->handles[i]);
+    releaseJournal(pool->journal);
     pool->~ThreadPool();
     deallocate(pool, sizeof(ThreadPool), alignof(ThreadPool));
   }
@@ -676,7 +721,7 @@ ThreadPool& ensurePoolOfThread() {
   ThreadPool* pool = poolOfThread();
   if (pool == nullptr) {
     pool = new (allocate(sizeof(ThreadPool), alignof(ThreadPool))) ThreadPool();
-    pool->journal = kj::heap<TurnJournal>();
+    pool->journal = allocateJournal();
     setPoolOfThread(pool);
     static thread_local PoolReleaser releaser;
     (void)releaser;
