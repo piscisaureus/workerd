@@ -1387,10 +1387,37 @@ so a crossing a turn makes on every dereference belongs on that path.
   does run inside a foreign turn still faults on a continuation placed in that
   turn's unaddressable arena -- that is exactly the body pipe's state node,
   which the second party fulfils from its own turn and which `ReadRelay`
-  therefore moves to the event loop (above). Cap'n Proto RPC promise
-  pipelining (`binding.foo().bar()`), where a worker's JS could extend a
-  cross-isolate `kj` chain in a way an HTTP fetch cannot, was not examined and
-  is not covered by this reasoning.
+  therefore moves to the event loop (above).
+
+  Cap'n Proto promise pipelining over a JS RPC binding
+  (`binding.foo().bar()`, a call made on the promise of an earlier call's
+  result) is the one way a worker's JS extends a cross-isolate `kj` chain,
+  and it is safe for the same reason. Each call on a pending promise asks the
+  pending call's `QueuedPipeline` for a pipelined capability, which is a
+  `QueuedClient` holding branches of the pipeline's promise, and sends the
+  call into it, where it waits as a continuation on the client's
+  call-forwarding fork (`capnp/capability.c++`); the chain grows by that much
+  per hop, as deep as JS makes it. All of it is built by
+  `JsRpcPromise::getClientForOneCall()` and `send()`, inside the caller's
+  `callImpl()` window, so it is in the shared heap; and none of it fires in
+  any turn. The pipeline settles from the fork of the dispatch promise that
+  `LocalClient::call` makes, which resolves after the callee's turn has
+  returned to the event loop -- the `awaitJs()` fulfiller the callee's turn
+  arms is the callee's own, and `JsRpcTargetBase` never sets a call's
+  pipeline early: its `callPipelineFulfiller` is declared and never armed,
+  and `CallContext::setPipeline()` is used only by `connect()` tunnels -- and
+  the queued call is forwarded from that continuation into
+  `LocalClient::call`'s `evalLater()`, so the callee's turn for it is entered
+  later through its own lock, like any call's. Placing the queued client and
+  its branches in the caller's arena on purpose faults no turn, which it
+  would have to if any foreign turn read or armed them. `rpc-pipeline-test.sh`
+  drives the shapes JS can give it -- a call on a stub's promise, eight hops,
+  a plain-object result and a property path through it, a third isolate's
+  stub, fifty calls queued on one pending promise, a settled promise, a
+  rejected call, abandoned calls and an echoed stub -- and under
+  `--copt=-DWORKERD_GK_NEG_RPC_SHARED_HEAP` fails on its first route, on the
+  callee reading the caller's request, which is the four windows' own
+  crossing and not one of pipelining's.
 
   Also not covered: BoringSSL's lazily allocated per-thread error state, which
   a `crypto` call in a turn would place on that turn's arena -- untested, but
