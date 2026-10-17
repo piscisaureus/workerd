@@ -525,7 +525,7 @@ __attribute__((visibility("hidden"), aligned(4096))) union {
   gk_resolve_entry e[GK_RESOLVE_SLOTS];
   char pad[(sizeof(gk_resolve_entry) * GK_RESOLVE_SLOTS + 0xfff) & ~(size_t)0xfff];
 } gk_resolve_table;
-#define GK_RESOLVE_START ((uintptr_t)&gk_resolve_table)
+#define GK_RESOLVE_START ((uintptr_t) & gk_resolve_table)
 #define GK_RESOLVE_END (GK_RESOLVE_START + sizeof gk_resolve_table)
 
 // The supervisor/refuse registry (see prot_class in gk_pt.c). An unregistered page
@@ -870,7 +870,7 @@ static union {
   char pad[(sizeof(struct gk_ctl) + 0xfff) & ~(size_t)0xfff];
 } g_ctl __attribute__((aligned(4096)));
 #define G (&g_ctl.c)
-#define GK_CTL_START ((uintptr_t)&g_ctl)
+#define GK_CTL_START ((uintptr_t) & g_ctl)
 #define GK_CTL_END (GK_CTL_START + sizeof g_ctl)
 #if defined(__x86_64__)
 #define GK_CPUID ((struct kvm_cpuid2 *)G->cpuid_buf)
