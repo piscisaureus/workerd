@@ -34,7 +34,7 @@ fn objects_can_be_wrapped_and_unwrapped() {
             str: "test".to_owned(),
         };
         let wrapped = instance.to_js(lock);
-        let mut obj: v8::Local<'_, v8::Object> = wrapped.into();
+        let obj: v8::Local<'_, v8::Object> = wrapped.into();
         assert!(obj.has(lock, "str"));
         let str_value = obj.get(lock, "str");
         assert!(str_value.unwrap().is_string());
@@ -96,7 +96,7 @@ fn number_type_conversions() {
 fn empty_object_and_property_setting() {
     let harness = crate::Harness::new();
     harness.run_in_context(|lock, _ctx| {
-        let mut obj = lock.new_object();
+        let obj = lock.new_object();
 
         assert!(!obj.has(lock, "nonexistent"));
         assert!(obj.get(lock, "nonexistent").is_none());
@@ -137,7 +137,7 @@ fn global_handle_conversion() {
 fn nested_object_properties() {
     let harness = crate::Harness::new();
     harness.run_in_context(|lock, _ctx| {
-        let mut outer = lock.new_object();
+        let outer = lock.new_object();
 
         let inner_instance = NestedStruct {
             inner: "nested value".to_owned(),

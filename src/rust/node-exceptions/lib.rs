@@ -109,11 +109,11 @@ mod ffi {
 /// `message` is raw UTF-8 bytes: exception messages may embed arbitrary,
 /// potentially non-UTF-8 byte strings (e.g. filesystem paths), which V8
 /// renders lossily (U+FFFD) rather than rejecting.
-fn create_js_error<'a>(
-    lock: &mut Lock,
+fn create_js_error<'s>(
+    lock: &mut Lock<'s>,
     error_type: ffi::JsErrorType,
     message: &[u8],
-) -> v8::Local<'a, v8::Object> {
+) -> v8::Local<'s, v8::Object> {
     match error_type {
         ffi::JsErrorType::TypeError => lock.type_error_from_bytes(message),
         ffi::JsErrorType::RangeError => lock.range_error_from_bytes(message),
@@ -125,7 +125,7 @@ fn create_js_error<'a>(
 /// Creates a V8 string value from raw UTF-8 bytes, used for exception
 /// properties (`path`, `dest`) that may hold arbitrary, potentially non-UTF-8
 /// byte strings. Invalid sequences are replaced with U+FFFD by V8.
-fn bytes_to_value<'a>(lock: &mut Lock, data: &[u8]) -> v8::Local<'a, v8::Value> {
+fn bytes_to_value<'s>(lock: &mut Lock<'s>, data: &[u8]) -> v8::Local<'s, v8::Value> {
     v8::String::new_from_utf8(lock, data).unwrap(lock).into()
 }
 
@@ -155,14 +155,14 @@ fn node_code_name(code: ffi::NodeExceptionCode) -> &'static str {
 }
 
 /// Implements C++ `createNodeException`.
-fn create_node_exception_impl<'a>(
-    lock: &mut Lock,
+fn create_node_exception_impl<'s>(
+    lock: &mut Lock<'s>,
     code: ffi::NodeExceptionCode,
     error_type: ffi::JsErrorType,
     message: Option<&[u8]>,
-) -> v8::Local<'a, v8::Object> {
+) -> v8::Local<'s, v8::Object> {
     let message = message.unwrap_or_else(|| node_default_message(code).as_bytes());
-    let mut err = create_js_error(lock, error_type, message);
+    let err = create_js_error(lock, error_type, message);
     // The "code" value is always a fixed ASCII enumerator name.
     let code_value = node_code_name(code).to_local(lock);
     err.set(lock, "code", code_value);
@@ -232,14 +232,14 @@ fn uv_default_message(errorno: i32) -> String {
 }
 
 /// Implements C++ `createUVException`.
-fn create_uv_exception_impl<'a>(
-    lock: &mut Lock,
+fn create_uv_exception_impl<'s>(
+    lock: &mut Lock<'s>,
     errorno: i32,
     syscall: &str,
     message: Option<&[u8]>,
     path: Option<&[u8]>,
     dest: Option<&[u8]>,
-) -> v8::Local<'a, v8::Object> {
+) -> v8::Local<'s, v8::Object> {
     debug_assert!(!syscall.is_empty(), "syscall must not be null");
 
     // Format the message to match Node.js format:
@@ -262,7 +262,7 @@ fn create_uv_exception_impl<'a>(
         msg
     };
 
-    let mut obj = lock.error_from_bytes(&formatted_message);
+    let obj = lock.error_from_bytes(&formatted_message);
 
     // `syscall` and the `code` name are always fixed ASCII strings.
     let syscall_value = syscall.to_local(lock);
@@ -285,15 +285,16 @@ fn create_uv_exception_impl<'a>(
 // ======================================================================================
 // FFI wrappers
 //
-// These are thin adapters over the `*_impl` functions: they build a `Lock` from
-// the raw isolate pointer, convert the nullable `KjMaybe` arguments to
-// `Option`, and return the `v8::Local` handle for the C++ caller.
+// These are thin adapters over the `*_impl` functions: they enter the caller's
+// current scope, convert the nullable `KjMaybe` arguments to `Option`, and
+// return the `v8::Local` handle for the C++ caller.
 
 /// # Safety
-/// `isolate` must be a valid pointer to a locked `v8::Isolate`.
+/// `isolate` must be a valid pointer to a locked `v8::Isolate` with an entered context,
+/// and the caller must have a `v8::HandleScope` open.
 #[expect(
     unsafe_code,
-    reason = "builds a `Lock` from the isolate pointer C++ passes in"
+    reason = "enters the current scope of the isolate pointer C++ passes in"
 )]
 unsafe fn create_node_exception(
     isolate: *mut ffi::Isolate,
@@ -301,19 +302,21 @@ unsafe fn create_node_exception(
     error_type: ffi::JsErrorType,
     message: KjMaybe<&[u8]>,
 ) -> ffi::Local {
-    // SAFETY: isolate is valid and locked — called from C++ exception helpers.
-    let mut lock = unsafe { Lock::from_isolate_ptr(isolate) };
-    let err = create_node_exception_impl(&mut lock, code, error_type, message.into());
-    // SAFETY: the handle is returned synchronously and stays within the caller's
-    // HandleScope; C++ immediately reconstitutes it via local_from_ffi.
-    unsafe { err.into_ffi() }
+    // SAFETY: forwarded from the caller (C++ exception helpers).
+    jsg::callback_scope!(unsafe let lock, isolate);
+    let exception: v8::Local<v8::Value> =
+        create_node_exception_impl(lock, code, error_type, message.into()).into();
+    // SAFETY: the handle lives in the caller's HandleScope; C++ immediately reconstitutes it
+    // via local_from_ffi.
+    unsafe { exception.into_ffi() }
 }
 
 /// # Safety
-/// `isolate` must be a valid pointer to a locked `v8::Isolate`.
+/// `isolate` must be a valid pointer to a locked `v8::Isolate` with an entered context,
+/// and the caller must have a `v8::HandleScope` open.
 #[expect(
     unsafe_code,
-    reason = "builds a `Lock` from the isolate pointer C++ passes in"
+    reason = "enters the current scope of the isolate pointer C++ passes in"
 )]
 unsafe fn create_uv_exception(
     isolate: *mut ffi::Isolate,
@@ -323,19 +326,20 @@ unsafe fn create_uv_exception(
     path: KjMaybe<&[u8]>,
     dest: KjMaybe<&[u8]>,
 ) -> ffi::Local {
-    // SAFETY: isolate is valid and locked — called from C++ exception helpers.
-    let mut lock = unsafe { Lock::from_isolate_ptr(isolate) };
-    let obj = create_uv_exception_impl(
-        &mut lock,
+    // SAFETY: forwarded from the caller (C++ exception helpers).
+    jsg::callback_scope!(unsafe let lock, isolate);
+    let exception: v8::Local<v8::Value> = create_uv_exception_impl(
+        lock,
         errorno,
         syscall,
         message.into(),
         path.into(),
         dest.into(),
-    );
-    // SAFETY: the handle is returned synchronously and stays within the caller's
-    // HandleScope; C++ immediately reconstitutes it via local_from_ffi.
-    unsafe { obj.into_ffi() }
+    )
+    .into();
+    // SAFETY: the handle lives in the caller's HandleScope; C++ immediately reconstitutes it
+    // via local_from_ffi.
+    unsafe { exception.into_ffi() }
 }
 
 #[cfg(test)]

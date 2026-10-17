@@ -11,7 +11,7 @@ use jsg::v8::Local;
 // Helpers
 // =============================================================================
 
-fn str_to_name<'a>(lock: &mut jsg::Lock, s: &str) -> Local<'a, v8::Name> {
+fn str_to_name<'a>(lock: &mut jsg::Lock<'a>, s: &str) -> Local<'a, v8::Name> {
     let js_str = v8::String::new_from_str(lock, s).unwrap(lock);
     js_str.into()
 }
@@ -56,7 +56,7 @@ fn name_get_identity_hash_symbol_is_stable() {
     let harness = crate::Harness::new();
     harness.run_in_context(|lock, _ctx| {
         let sym = v8::Symbol::new(lock, None);
-        let name: Local<v8::Name> = sym.clone().into();
+        let name: Local<v8::Name> = sym.into();
         let name2: Local<v8::Name> = sym.into();
         assert_eq!(name.get_identity_hash(), name2.get_identity_hash());
         Ok(())

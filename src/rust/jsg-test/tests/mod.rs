@@ -9,6 +9,8 @@ mod collections_gc;
 mod eval;
 mod function;
 mod gc;
+mod handle_scope;
+mod isolates;
 mod jsg_oneof;
 mod jsg_struct;
 mod local_cast;

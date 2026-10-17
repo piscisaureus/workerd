@@ -18,6 +18,7 @@
 #include <kj/string.h>
 
 #include <memory>
+#include <new>
 
 #if V8_MAJOR_VERSION >= 15
 #define Utf8LengthV2 Utf8Length
@@ -104,15 +105,6 @@ size_t Wrappable::jsgGetMemorySelfSize() const {
 }
 
 // Local<T>
-void local_drop(Local value) {
-  // Convert from FFI representation and let v8::Local destructor handle cleanup
-  local_from_ffi<v8::Value>(kj::mv(value));
-}
-
-Local local_clone(const Local& value) {
-  return Local{.ptr = value.ptr};
-}
-
 Global local_to_global(Isolate* isolate, Local value) {
   v8::Global<v8::Value> global(isolate, local_from_ffi<v8::Value>(kj::mv(value)));
   return to_ffi(kj::mv(global));
@@ -610,10 +602,14 @@ DEFINE_TYPED_ARRAY_NEW(bigint64_array, BigInt64Array, int64_t)
 DEFINE_TYPED_ARRAY_NEW(biguint64_array, BigUint64Array, uint64_t)
 
 // Wrappers
-Local wrap_resource(Isolate* isolate, kj::Rc<Wrappable> wrappable, const Global& tmpl) {
+MaybeLocal wrap_resource(Isolate* isolate, kj::Rc<Wrappable> wrappable, const Global& tmpl) {
+  if (wrappable->hasWrapper() && wrappable->wrapperIsolate != isolate) {
+    return MaybeLocal{.ptr = 0};
+  }
+
   // Check if already wrapped
   KJ_IF_SOME(handle, wrappable->tryGetHandle(isolate)) {
-    return to_ffi(v8::Local<v8::Value>::Cast(handle));
+    return maybe_local_to_ffi(v8::MaybeLocal<v8::Value>(handle));
   }
 
   auto& global_tmpl = global_as_ref_from_ffi<v8::FunctionTemplate>(tmpl);
@@ -624,6 +620,7 @@ Local wrap_resource(Isolate* isolate, kj::Rc<Wrappable> wrappable, const Global&
   // attachWrapper sets up CppgcShim, TracedReference, internal fields, etc.
   wrappable->attachWrapper(isolate, object, true,
       static_cast<v8::CppHeapPointerTag>(::workerd::jsg::kNonResourceWrappableTag));
+  wrappable->wrapperIsolate = isolate;
 
   // Override tag to identify as Rust object for unwrapping
   auto tagAddress = const_cast<uint16_t*>(&::workerd::jsg::Wrappable::WORKERD_RUST_WRAPPABLE_TAG);
@@ -631,7 +628,7 @@ Local wrap_resource(Isolate* isolate, kj::Rc<Wrappable> wrappable, const Global&
       tagAddress,
       static_cast<v8::EmbedderDataTypeTag>(::workerd::jsg::Wrappable::WRAPPABLE_TAG_FIELD_INDEX));
 
-  return to_ffi(v8::Local<v8::Value>::Cast(object));
+  return maybe_local_to_ffi(v8::MaybeLocal<v8::Value>(object));
 }
 
 void wrappable_attach_wrapper(kj::Rc<Wrappable> wrappable, FunctionCallbackInfo& args) {
@@ -641,6 +638,7 @@ void wrappable_attach_wrapper(kj::Rc<Wrappable> wrappable, FunctionCallbackInfo&
   // attachWrapper sets up CppgcShim, TracedReference, internal fields, etc.
   wrappable->attachWrapper(isolate, object, true,
       static_cast<v8::CppHeapPointerTag>(::workerd::jsg::kNonResourceWrappableTag));
+  wrappable->wrapperIsolate = isolate;
 
   // Override tag to identify as Rust object for unwrapping
   auto tagAddress = const_cast<uint16_t*>(&::workerd::jsg::Wrappable::WORKERD_RUST_WRAPPABLE_TAG);
@@ -908,6 +906,37 @@ void wrappable_visit_ref(
   } else {
     *ref_parent = 0;
   }
+}
+
+// HandleScope
+// Rust reserves this many words for each scope (see scope.rs).
+constexpr size_t HANDLE_SCOPE_WORDS = 4;
+constexpr size_t ESCAPABLE_HANDLE_SCOPE_WORDS = 5;
+static_assert(sizeof(v8::HandleScope) <= HANDLE_SCOPE_WORDS * sizeof(size_t));
+static_assert(alignof(v8::HandleScope) <= alignof(size_t));
+static_assert(sizeof(v8::EscapableHandleScope) <= ESCAPABLE_HANDLE_SCOPE_WORDS * sizeof(size_t));
+static_assert(alignof(v8::EscapableHandleScope) <= alignof(size_t));
+
+void handle_scope_open(Isolate* isolate, size_t storage) {
+  // The scopes declare their own (deleted) operator new, which hides placement new.
+  ::new (reinterpret_cast<void*>(storage)) v8::HandleScope(isolate);
+}
+
+void handle_scope_close(size_t storage) {
+  reinterpret_cast<v8::HandleScope*>(storage)->~HandleScope();
+}
+
+void escapable_handle_scope_open(Isolate* isolate, size_t storage) {
+  ::new (reinterpret_cast<void*>(storage)) v8::EscapableHandleScope(isolate);
+}
+
+void escapable_handle_scope_close(size_t storage) {
+  reinterpret_cast<v8::EscapableHandleScope*>(storage)->~EscapableHandleScope();
+}
+
+Local escapable_handle_scope_escape(size_t storage, Local value) {
+  auto* scope = reinterpret_cast<v8::EscapableHandleScope*>(storage);
+  return to_ffi(scope->Escape(local_from_ffi<v8::Value>(kj::mv(value))));
 }
 
 // FunctionCallbackInfo
@@ -1186,6 +1215,10 @@ void isolate_terminate_execution(Isolate* isolate) {
 
 bool isolate_is_locked(Isolate* isolate) {
   return v8::Locker::IsLocked(isolate);
+}
+
+bool isolate_in_context(Isolate* isolate) {
+  return isolate->InContext();
 }
 
 }  // namespace workerd::rust::jsg

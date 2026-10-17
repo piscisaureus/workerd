@@ -5,6 +5,7 @@
 use std::future::Future;
 use std::num::ParseIntError;
 use std::ops::Deref;
+use std::pin::Pin;
 
 pub mod feature_flags;
 pub mod lenient;
@@ -12,6 +13,7 @@ pub mod macros;
 pub mod modules;
 pub mod nullable;
 pub mod resource;
+mod scope;
 pub mod v8;
 mod wrappable;
 
@@ -21,6 +23,13 @@ pub use nullable::Nullable;
 pub use resource::Rc;
 pub use resource::Resource;
 pub use resource::Weak;
+pub use scope::CallbackScope;
+pub use scope::CallbackScopeParam;
+pub use scope::EscapableHandleScope;
+pub use scope::EscapableLock;
+pub use scope::HandleScope;
+pub use scope::Lock;
+pub use scope::allow_scopes_of_another_isolate;
 pub use v8::ArrayBuffer;
 pub use v8::ArrayBufferView;
 pub use v8::BackingStore;
@@ -161,14 +170,17 @@ impl_error_constructors! {
     ReferenceError => new_reference_error,
 }
 
-impl FromJS for Error {
+impl<'s> FromJS<'s> for Error {
     type ResultType = Self;
 
     /// Creates an Error from a V8 value (typically an exception).
     ///
     /// If the value is a native error, extracts the name and message properties.
     /// Otherwise, converts the value to a string for the message.
-    fn from_js(lock: &mut Lock, value: v8::Local<v8::Value>) -> Result<Self::ResultType, Error> {
+    fn from_js(
+        lock: &mut Lock<'s>,
+        value: v8::Local<'s, v8::Value>,
+    ) -> Result<Self::ResultType, Error> {
         if value.is_native_error() {
             let obj: v8::Local<v8::Object> = value.into();
 
@@ -226,7 +238,8 @@ impl Error {
         unsafe_code,
         reason = "creates the V8 exception object through the FFI"
     )]
-    pub fn to_local<'a>(&self, isolate: v8::IsolatePtr) -> v8::Local<'a, v8::Value> {
+    pub fn to_local<'s>(&self, lock: &mut Lock<'s>) -> v8::Local<'s, v8::Value> {
+        let isolate = lock.isolate();
         let message = self.message.as_bytes();
         // Strings longer than i32::MAX bytes are truncated to satisfy V8's
         // int-typed length parameter; V8 rejects strings that large anyway.
@@ -594,57 +607,34 @@ impl std::fmt::Display for Number {
     }
 }
 
-/// Proof that the V8 isolate is valid and exclusively locked by the current thread.
-///
-/// A `Lock` instance can only be created when the C++ `jsg::Lock` (or equivalent)
-/// is held, meaning:
-/// - The `v8::Isolate` pointer is valid and has not been disposed.
-/// - The current thread holds the isolate lock (`v8::Locker` is active).
-/// - No other thread can enter the isolate concurrently.
-///
-/// `Lock` is passed to resource methods and callbacks to perform V8 operations
-/// like creating objects, wrapping values, and accessing the `Realm`. It is
-/// analogous to `jsg::Lock&` in C++ JSG.
-///
-/// `Lock` is neither `Send` nor `Sync` — it cannot escape the thread that
-/// created it.
-pub struct Lock {
-    isolate: v8::IsolatePtr,
-}
-
 #[expect(
     unsafe_code,
     reason = "`Lock` holds the raw isolate pointer and calls V8 through the FFI"
 )]
-impl Lock {
-    /// # Safety
-    /// The caller must ensure that `args` is a valid pointer to `FunctionCallbackInfo`.
-    pub unsafe fn from_args(args: *mut v8::ffi::FunctionCallbackInfo) -> Self {
-        // SAFETY: args is a valid FunctionCallbackInfo pointer (guaranteed by caller).
-        unsafe { Self::from_isolate_ptr(v8::ffi::fci_get_isolate(args)) }
+impl<'s> Lock<'s> {
+    /// Returns `undefined`.
+    pub fn undefined(&mut self) -> v8::Local<'s, v8::Value> {
+        // SAFETY: Lock guarantees the isolate is valid and locked.
+        unsafe {
+            v8::Local::from_ffi(
+                self.isolate(),
+                v8::ffi::local_new_undefined(self.isolate().as_ffi()),
+            )
+        }
     }
 
-    /// Creates a Lock from a raw isolate pointer.
-    ///
-    /// # Safety
-    /// The caller must ensure that `isolate` is a valid pointer to an `Isolate`.
-    ///
-    /// # Panics
-    /// Panics if the isolate is not currently locked.
-    pub unsafe fn from_isolate_ptr(isolate: *mut v8::ffi::Isolate) -> Self {
-        // SAFETY: isolate pointer is valid (guaranteed by caller).
-        let isolate = unsafe { v8::IsolatePtr::from_ffi(isolate) };
-        // SAFETY: Lock guarantees the isolate is valid
-        assert!(unsafe { isolate.is_locked() });
-        Self { isolate }
+    /// Returns `null`.
+    pub fn null(&mut self) -> v8::Local<'s, v8::Value> {
+        // SAFETY: Lock guarantees the isolate is valid and locked.
+        unsafe {
+            v8::Local::from_ffi(
+                self.isolate(),
+                v8::ffi::local_new_null(self.isolate().as_ffi()),
+            )
+        }
     }
 
-    /// Returns the isolate associated with this lock.
-    pub fn isolate(&self) -> v8::IsolatePtr {
-        self.isolate
-    }
-
-    pub fn new_object<'a>(&mut self) -> v8::Local<'a, v8::Object> {
+    pub fn new_object(&mut self) -> v8::Local<'s, v8::Object> {
         // SAFETY: Lock guarantees the isolate is valid and locked
         unsafe {
             v8::Local::from_ffi(
@@ -658,21 +648,21 @@ impl Lock {
     ///
     /// Mirrors C++ `jsg::Lock::error()`. The returned object can have additional
     /// properties attached before being thrown or returned.
-    pub fn error<'a>(&mut self, message: &str) -> v8::Local<'a, v8::Object> {
+    pub fn error(&mut self, message: &str) -> v8::Local<'s, v8::Object> {
         self.create_error(ExceptionType::Error, message)
     }
 
     /// Creates a JavaScript `TypeError` object with the given message.
     ///
     /// Mirrors C++ `jsg::Lock::typeError()`.
-    pub fn type_error<'a>(&mut self, message: &str) -> v8::Local<'a, v8::Object> {
+    pub fn type_error(&mut self, message: &str) -> v8::Local<'s, v8::Object> {
         self.create_error(ExceptionType::TypeError, message)
     }
 
     /// Creates a JavaScript `RangeError` object with the given message.
     ///
     /// Mirrors C++ `jsg::Lock::rangeError()`.
-    pub fn range_error<'a>(&mut self, message: &str) -> v8::Local<'a, v8::Object> {
+    pub fn range_error(&mut self, message: &str) -> v8::Local<'s, v8::Object> {
         self.create_error(ExceptionType::RangeError, message)
     }
 
@@ -681,44 +671,44 @@ impl Lock {
     ///
     /// Invalid UTF-8 sequences are replaced with U+FFFD rather than rejected,
     /// so this accepts arbitrary byte input (e.g. filesystem paths).
-    pub fn error_from_bytes<'a>(&mut self, message: &[u8]) -> v8::Local<'a, v8::Object> {
+    pub fn error_from_bytes(&mut self, message: &[u8]) -> v8::Local<'s, v8::Object> {
         self.create_error_from_bytes(ExceptionType::Error, message)
     }
 
     /// Like [`Lock::type_error`], but builds the message from raw bytes.
     /// See [`Lock::error_from_bytes`].
-    pub fn type_error_from_bytes<'a>(&mut self, message: &[u8]) -> v8::Local<'a, v8::Object> {
+    pub fn type_error_from_bytes(&mut self, message: &[u8]) -> v8::Local<'s, v8::Object> {
         self.create_error_from_bytes(ExceptionType::TypeError, message)
     }
 
     /// Like [`Lock::range_error`], but builds the message from raw bytes.
     /// See [`Lock::error_from_bytes`].
-    pub fn range_error_from_bytes<'a>(&mut self, message: &[u8]) -> v8::Local<'a, v8::Object> {
+    pub fn range_error_from_bytes(&mut self, message: &[u8]) -> v8::Local<'s, v8::Object> {
         self.create_error_from_bytes(ExceptionType::RangeError, message)
     }
 
-    fn create_error<'a>(
+    fn create_error(
         &mut self,
         exception_type: ExceptionType,
         message: &str,
-    ) -> v8::Local<'a, v8::Object> {
+    ) -> v8::Local<'s, v8::Object> {
         // A &str is always valid UTF-8, so delegating to the byte-based path
         // produces identical output (no invalid sequences to replace) while
         // keeping a single exception-construction implementation.
         self.create_error_from_bytes(exception_type, message.as_bytes())
     }
 
-    fn create_error_from_bytes<'a>(
+    fn create_error_from_bytes(
         &mut self,
         exception_type: ExceptionType,
         message: &[u8],
-    ) -> v8::Local<'a, v8::Object> {
+    ) -> v8::Local<'s, v8::Object> {
         // Strings longer than i32::MAX bytes are truncated to satisfy V8's
         // int-typed length parameter; V8 rejects strings that large anyway.
         let len = i32::try_from(message.len()).unwrap_or(i32::MAX);
         // SAFETY: Lock guarantees the isolate is valid and locked; message.as_ptr()
         // and len describe a valid byte slice.
-        let value: v8::Local<'a, v8::Value> = unsafe {
+        let value: v8::Local<'s, v8::Value> = unsafe {
             v8::Local::from_ffi(
                 self.isolate(),
                 v8::ffi::exception_create_from_bytes(
@@ -742,10 +732,10 @@ impl Lock {
         clippy::unimplemented,
         reason = "`await_io` is not implemented for Rust resources yet"
     )]
-    pub fn await_io<F, C, I, R>(self, _fut: F, _callback: C) -> Result<R>
+    pub fn await_io<F, C, I, R>(&mut self, _fut: F, _callback: C) -> Result<R>
     where
         F: Future<Output = I>,
-        C: FnOnce(Self, I) -> Result<R>,
+        C: for<'t> FnOnce(&mut Lock<'t>, I) -> Result<R>,
     {
         unimplemented!("Lock::await_io is not yet implemented for Rust resources")
     }
@@ -780,7 +770,7 @@ impl Lock {
         unsafe {
             v8::ffi::isolate_throw_exception(
                 self.isolate().as_ffi(),
-                err.to_local(self.isolate()).into_ffi(),
+                err.to_local(self).into_ffi(),
             );
         }
     }
@@ -833,7 +823,7 @@ pub trait Type: Sized {
 
     /// Returns true if the V8 value is exactly this type (no coercion).
     /// Used by `NonCoercible<T>` to reject values that would require coercion.
-    fn is_exact(value: &v8::Local<v8::Value>) -> bool;
+    fn is_exact(value: v8::Local<'_, v8::Value>) -> bool;
 }
 
 /// Represents a constant value that can be exposed to JavaScript.
@@ -947,6 +937,7 @@ pub trait Struct: Type {}
 /// `CppgcShim` destruction triggers cleanup of the underlying `Wrappable`.
 pub struct Realm {
     isolate: v8::IsolatePtr,
+    id: scope::IsolateId,
     pub(crate) resources: resource::Resources,
     /// Parsed `CompatibilityFlags` capnp message, initialized at construction.
     feature_flags: FeatureFlags,
@@ -957,6 +948,7 @@ impl Realm {
     pub fn new(isolate: v8::IsolatePtr, feature_flags: FeatureFlags) -> Self {
         Self {
             isolate,
+            id: scope::IsolateId::next(),
             resources: resource::Resources::default(),
             feature_flags,
         }
@@ -964,6 +956,10 @@ impl Realm {
 
     pub fn isolate(&self) -> v8::IsolatePtr {
         self.isolate
+    }
+
+    pub(crate) fn id(&self) -> scope::IsolateId {
+        self.id
     }
 }
 
@@ -995,7 +991,8 @@ fn realm_take_resource_templates(realm: &mut Realm) -> Vec<v8::ffi::Global> {
     realm.resources.take_template_handles()
 }
 
-/// Executes `f`, catching any panic and converting it to a JS internal error.
+/// Opens `scope` and runs `f` with its lock, catching any panic and converting it to a JS
+/// internal error.
 ///
 /// `extern "C"` V8 callbacks generated by `jsg-macros` call this so that a
 /// Rust panic is handled the same way as `KJ_ASSERT(false)` in C++ JSG
@@ -1009,14 +1006,26 @@ fn realm_take_resource_templates(realm: &mut Realm) -> Vec<v8::ffi::Global> {
 /// mirrors what C++ `KJ_ASSERT` effectively does inside an isolate context and
 /// closes the window where a panicked resource with partially-mutated `jsg::Rc`
 /// fields could be observed by a subsequent GC trace before isolate teardown.
+///
+/// Opening the scope is part of what is caught, so a callback entered while a scope of
+/// another isolate is open on the thread throws too, instead of unwinding into V8.
 #[doc(hidden)]
-pub fn catch_panic<F: FnOnce()>(lock: &mut Lock, f: F) {
+#[expect(
+    unsafe_code,
+    reason = "throws without a lock if the scope did not open"
+)]
+pub fn catch_panic<F>(scope: Pin<&mut CallbackScope>, f: F)
+where
+    F: for<'s> FnOnce(&'s mut Lock<'s>),
+{
+    let isolate = scope.isolate();
     // SAFETY: `f` is called from an `extern "C"` V8 callback generated by
     // jsg-macros. Raw pointers captured by `f` are valid for the entire
     // duration of the callback (V8 guarantees this), and V8 is
     // single-threaded, so there is no aliasing hazard on unwind.
     // `AssertUnwindSafe` is therefore correct here.
-    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(scope.open())))
+    {
         let msg = if let Some(s) = payload.downcast_ref::<&str>() {
             *s
         } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -1024,8 +1033,14 @@ pub fn catch_panic<F: FnOnce()>(lock: &mut Lock, f: F) {
         } else {
             "<non-string panic payload>"
         };
-        lock.throw_internal_error(msg);
-        lock.terminate_execution();
+        // The scope may not have opened, so there may be no lock to throw with.
+        // SAFETY: the caller of `CallbackScope::new` keeps the isolate locked, with a context
+        // entered and a `HandleScope` open, while `scope` lives. The unwind closed the scopes
+        // opened inside `f`.
+        unsafe {
+            v8::ffi::isolate_throw_internal_error(isolate.as_ffi(), msg);
+            v8::ffi::isolate_terminate_execution(isolate.as_ffi());
+        }
     }
 }
 

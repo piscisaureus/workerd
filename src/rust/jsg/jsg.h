@@ -25,8 +25,10 @@ struct RustModuleRegistry: public ::workerd::rust::jsg::ModuleRegistry {
   virtual ~RustModuleRegistry() = default;
   RustModuleRegistry(Registry& registry): registry(registry) {}
 
-  void addBuiltinModule(
-      ::rust::Str specifier, ModuleCallback moduleCallback, ModuleType moduleType) override {
+  void addBuiltinModule(::rust::Str specifier,
+      ModuleCallback moduleCallback,
+      size_t data,
+      ModuleType moduleType) override {
     ::workerd::jsg::ModuleType jsgModuleType;
     switch (moduleType) {
       case ModuleType::Bundle:
@@ -43,11 +45,11 @@ struct RustModuleRegistry: public ::workerd::rust::jsg::ModuleRegistry {
     }
 
     registry.addBuiltinModule(kj::str(specifier),
-        [kj_specifier = kj::str(specifier), callback = kj::mv(moduleCallback)](
+        [kj_specifier = kj::str(specifier), callback = kj::mv(moduleCallback), data](
             ::workerd::jsg::Lock& js, ::workerd::jsg::ModuleRegistry::ResolveMethod,
             kj::Maybe<const kj::Path&>&) mutable
         -> kj::Maybe<::workerd::jsg::ModuleRegistry::ModuleInfo> {
-      auto localValue = callback(js.v8Isolate);
+      auto localValue = callback(js.v8Isolate, data);
       auto value = local_from_ffi<v8::Value>(kj::mv(localValue));
       KJ_DASSERT(value->IsObject());
 
@@ -65,7 +67,8 @@ struct RustModuleRegistry: public ::workerd::rust::jsg::ModuleRegistry {
 // Adapter for registering Rust-implemented modules into the NEW module registry
 // (jsg::modules::ModuleBundle::BuiltinBuilder). Translates Rust ModuleCallback
 // into BuiltinBuilder::addSynthetic calls. Each Rust module callback receives a
-// v8::Isolate* and returns a v8::Local<v8::Value> (the module's default export).
+// v8::Isolate* plus its registration data word and returns a v8::Local<v8::Value>
+// (the module's default export).
 //
 // Usage:
 //   RustBuiltinModuleAdapter adapter(builder);
@@ -76,8 +79,10 @@ struct RustBuiltinModuleAdapter: public ::workerd::rust::jsg::ModuleRegistry {
   explicit RustBuiltinModuleAdapter(::workerd::jsg::modules::ModuleBundle::BuiltinBuilder& builder)
       : builder(builder) {}
 
-  void addBuiltinModule(
-      ::rust::Str specifier, ModuleCallback moduleCallback, ModuleType moduleType) override {
+  void addBuiltinModule(::rust::Str specifier,
+      ModuleCallback moduleCallback,
+      size_t data,
+      ModuleType moduleType) override {
     auto specifierPtr = kj::ArrayPtr<const char>(specifier.data(), specifier.size());
 
     // A BuiltinBuilder can only represent builtin modules.
@@ -100,10 +105,11 @@ struct RustBuiltinModuleAdapter: public ::workerd::rust::jsg::ModuleRegistry {
 
     KJ_IF_SOME(url, ::workerd::jsg::Url::tryParse(specifierPtr)) {
       builder.addSynthetic(url,
-          [callback = kj::mv(moduleCallback)](::workerd::jsg::Lock& js, const ::workerd::jsg::Url&,
+          [callback = kj::mv(moduleCallback), data](::workerd::jsg::Lock& js,
+              const ::workerd::jsg::Url&,
               const ::workerd::jsg::modules::Module::ModuleNamespace& ns,
               const ::workerd::jsg::CompilationObserver&) mutable {
-        auto localValue = callback(js.v8Isolate);
+        auto localValue = callback(js.v8Isolate, data);
         auto value = local_from_ffi<v8::Value>(kj::mv(localValue));
         KJ_DASSERT(value->IsObject());
         ns.setDefault(js, ::workerd::jsg::JsValue(value));
