@@ -1506,11 +1506,17 @@ static int syscall_mem_ok(gk_thread *t, long nr, const long a[7]) {
     // ring-3 thread has no business exiting its host thread by hand.
     case SYS_exit: return t->guest_thread ? 1 : 0;
     case SYS_fcntl:
-      // Only the commands whose third argument is a scalar; the rest (F_GETLK,
-      // F_SETLK, F_GETOWN_EX, ...) carry a pointer gk does not size.
+      // The commands whose third argument is a scalar, and the record locks,
+      // whose third argument is a struct flock the kernel reads (F_SETLK,
+      // F_SETLKW) or fills in (F_GETLK); the rest (F_GETOWN_EX, ...) carry a
+      // pointer gk does not size.
       switch (a[2]) {
         case F_GETFD: case F_SETFD: case F_GETFL: case F_SETFL:
         case F_DUPFD: case F_DUPFD_CLOEXEC: case F_GETOWN: case F_SETOWN:
+          return 1;
+        case F_GETLK: case F_OFD_GETLK: WR(a[3], sizeof(struct flock)); return 1;
+        case F_SETLK: case F_SETLKW: case F_OFD_SETLK: case F_OFD_SETLKW:
+          RD(a[3], sizeof(struct flock));
           return 1;
         default: return 0;
       }
