@@ -9,6 +9,7 @@
 #ifdef WORKERD_HAS_JEMALLOC
 #include <jemalloc/jemalloc.h>
 
+#include <atomic>
 #include <cstdlib>
 #endif
 
@@ -46,6 +47,13 @@ bool threadCacheEnabled() {
   if (mallctl("opt.tcache", &enabled, &size, nullptr, 0) != 0) return true;
   return enabled;
 }
+
+// Whether a __cxa_atexit registration has to be placed in the shared heap, which it does from
+// the moment the first per-isolate heap arena exists; see __wrap___cxa_atexit at the end of this
+// file for what the registration would otherwise cost, and armSharedHeapAtexit() for why the
+// moment is that one. Constant-initialized, with no lazily initialized state behind it, because
+// the wrapper reads it from the program's first registration on, long before jemalloc is set up.
+std::atomic<bool> placeAtexitInSharedHeap{false};
 
 }  // namespace
 #endif  // WORKERD_HAS_JEMALLOC
@@ -127,6 +135,32 @@ void restoreThreadArena(unsigned index) {
 // The arena SharedHeapScope switches to. jemalloc creates arena 0 when it initializes and never
 // destroys it.
 constexpr unsigned SHARED_HEAP_ARENA_INDEX = 0;
+
+// Starts placing __cxa_atexit registrations in the shared heap, which stays so for the rest of
+// the process. HeapArena's constructor calls it, and that moment is both late enough and early
+// enough.
+//
+// Late enough that the wrapper can switch arenas at all. Switching reads two function-local
+// statics -- heapArenasAvailable()'s answer and the thread.arena MIB -- and a registration made
+// while either is still being initialized would re-enter it on the same thread, which aborts the
+// process ("__cxa_guard_acquire detected recursive initialization"). That is reachable, not
+// hypothetical: both statics are initialized through mallctl, which initializes jemalloc, and
+// jemalloc registers an atexit handler of its own from inside malloc_init_hard when stats_print
+// or prof is on. So the switch is made once here, where nothing is half-initialized, and the
+// flag is published only afterwards; from then on the wrapper reaches both statics complete.
+//
+// Early enough that nothing is missed: until the first arena exists, every thread allocates from
+// an automatic arena, so a registration before this point is in the shared heap already with the
+// wrapper doing nothing. Doing nothing is also the only safe thing for the wrapper to do until
+// then. The program's first registrations are made during static initialization, and a wrapper
+// that evaluated heapArenasAvailable() on its first call could latch that answer before
+// configureAllocatorForGuestKernel() has set malloc_conf, which would read the thread cache as
+// on and leave heap arenas off for the whole process.
+void armSharedHeapAtexit() {
+  // Enter and leave a scope, for its initialization of the statics rather than for its effect.
+  { SharedHeapScope scope; }
+  placeAtexitInSharedHeap.store(true, std::memory_order_release);
+}
 
 }  // namespace
 
@@ -225,6 +259,9 @@ HeapArena::HeapArena(uintptr_t begin, uintptr_t end)
   set("dirty_decay_ms", ssize_t(-1));
   set("muzzy_decay_ms", ssize_t(-1));
   set("retain_grow_limit", RETAIN_GROW_LIMIT);
+
+  // A turn can run on an arena from here on, so glibc's exit-function chain needs placing.
+  armSharedHeapAtexit();
 }
 
 HeapArena::~HeapArena() noexcept(false) {
@@ -348,5 +385,52 @@ SharedHeapScope::SharedHeapScope() {}
 SharedHeapScope::~SharedHeapScope() noexcept(false) {}
 
 #endif  // WORKERD_HAS_HEAP_ARENA
+
+#ifdef WORKERD_HAS_JEMALLOC
+extern "C" int __real___cxa_atexit(void (*func)(void*), void* arg, void* dso);
+
+// Every function-local static with a non-trivial destructor registers its destructor through
+// __cxa_atexit when it is first initialized, and glibc keeps those registrations in a chain of
+// 32-entry blocks whose first block is static. __new_exitfn walks the chain from its head on
+// every registration and calloc()s another block once the head block is full, so a registration
+// made inside a turn puts a block of process-wide state in that isolate's heap arena -- and from
+// then on every other isolate's turn faults *reading* that block on its way down the chain,
+// whatever it is registering. Scoping the code that registers is no remedy, which is why the
+// embedder scope V8's Intl builtins run under does not stop ICU's registration from faulting the
+// next isolate: what faults is the read of a block an earlier, unscoped registration placed.
+//
+// So no registration is left to place a block: each one runs in the shared heap, from the moment
+// the first arena exists (armSharedHeapAtexit() above). This interposes on the whole chain of
+// blocks rather than reserving blocks ahead of demand, because the number of statics first
+// reached inside a turn is not something the runtime bounds -- V8 and ICU have thousands -- so a
+// reserve could only postpone the fault by however many entries it guessed, and exhausting it
+// would bring the fault back silently.
+//
+// The reference the linker redirects here is the one compiler-generated static initialization
+// emits, which glibc's own atexit() shares; what stays with libc is what libc registers for
+// itself while the program starts, before any arena exists. The --wrap option comes from
+// jsg-core's linkopts, so it covers every binary that links this file and none that does not.
+//
+// glibc's other registration call, __cxa_thread_atexit_impl, is left alone. It prepends a node
+// to a list whose head is thread-local and which no other turn reads, so a node in an arena
+// faults nothing; placing the node would also not place the thread_local object whose destructor
+// it names, which is what would actually outlive the arena.
+extern "C" int __wrap___cxa_atexit(void (*func)(void*), void* arg, void* dso) {
+#ifndef WORKERD_GK_NEG_ATEXIT_SHARED_HEAP
+  if (placeAtexitInSharedHeap.load(std::memory_order_acquire)) {
+    SharedHeapScope scope;
+    return __real___cxa_atexit(func, arg, dso);
+  }
+  // Nothing to place: no arena exists yet, so the calling thread allocates from an automatic
+  // arena, which is the shared heap.
+#else
+  // WORKERD_GK_NEG_ATEXIT_SHARED_HEAP is a negative-test build, never shipped: registrations are
+  // left wherever the calling thread allocates, so the first isolate to register inside a turn
+  // puts a block of the chain in its own arena and the next isolate's registration faults
+  // walking to it. atexit-arena-test.sh must then fail.
+#endif
+  return __real___cxa_atexit(func, arg, dso);
+}
+#endif  // WORKERD_HAS_JEMALLOC
 
 }  // namespace workerd::jsg
