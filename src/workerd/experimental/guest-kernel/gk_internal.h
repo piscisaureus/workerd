@@ -1110,7 +1110,7 @@ static inline uint64_t region_gpa(const gk_region *n);
 static int region_clip_holes(uintptr_t *s, uintptr_t *gap_end);
 static int pte_leaf(uint64_t va, uint64_t flags, int pkey, int super, uint64_t *out);
 static uint64_t pte_reprotect(uint64_t e, const gk_reprot *rp, uintptr_t v);
-static void set_idt_gate(uint8_t *idt, int vec, uint64_t h);
+static void set_idt_gate(uint8_t *idt, int vec, uint64_t h, int ist);
 static int vcpu_init(gk_thread *t, int flags);
 static int map_handler_text(void);
 static void flush_stub_select(void);

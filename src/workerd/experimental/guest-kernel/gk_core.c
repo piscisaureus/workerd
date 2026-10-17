@@ -146,54 +146,6 @@ static int image_record(void) {
   return 0;
 }
 
-#if defined(__x86_64__)
-// XCR0 state components, in the groups XSETBV accepts: x87 is mandatory, SSE
-// is required for AVX, the three AVX-512 components go together and require
-// AVX, the two AMX components go together. KVM_SET_XCRS applies the same rules
-// and refuses a value the vCPU's CPUID does not support.
-#define XCR0_X87 (1ULL << 0)
-#define XCR0_SSE (1ULL << 1)
-#define XCR0_AVX (1ULL << 2)
-#define XCR0_AVX512 ((1ULL << 5) | (1ULL << 6) | (1ULL << 7))  // opmask, ZMM_Hi256, Hi16_ZMM
-#define XCR0_PKRU (1ULL << 9)
-#define XCR0_AMX ((1ULL << 17) | (1ULL << 18))                // XTILECFG, XTILEDATA
-
-// Pick the XCR0 every vCPU is given: the state components that the CPUID the
-// vCPUs get advertises (leaf 0xD subleaf 0, EDX:EAX, which KVM has already
-// cut down to what the host enables and lets a guest use), limited to the
-// groups above. The guest runs the host's own binaries, whose ifunc resolvers
-// and JITs choose a memcpy, strlen or code path from that CPUID: a component
-// the CPUID advertises but XCR0 leaves off makes the first such instruction
-// #UD (an AVX-512 memcpy inside the guest, say), and a component the CPUID
-// does not advertise is never selected. XCR0 therefore follows the CPUID,
-// which also keeps code inside the guest on the same instruction set as the
-// same code outside it. gk holds no XSAVE area of its own -- KVM sizes the
-// vCPU's from the components the CPUID permits, and glibc's lazy-binding
-// trampoline sized its save slot from the host's XCR0 at process start, of
-// which this value is a subset -- so a wider XCR0 costs nothing else. A value
-// equal to the host's XCR0 spares KVM an XSETBV pair per VM exit.
-static void xcr0_select(void) {
-  uint64_t have = 0;
-  for (unsigned i = 0; i < GK_CPUID->nent; i++) {
-    const struct kvm_cpuid_entry2 *e = &GK_CPUID->entries[i];
-    if (e->function == 0xd && e->index == 0) {
-      have = ((uint64_t)e->edx << 32) | e->eax;
-      break;
-    }
-  }
-  uint64_t x = XCR0_X87;
-  if (have & XCR0_SSE) x |= XCR0_SSE;
-  if ((x & XCR0_SSE) && (have & XCR0_AVX)) x |= XCR0_AVX;
-  if ((x & XCR0_AVX) && (have & XCR0_AVX512) == XCR0_AVX512) x |= XCR0_AVX512;
-  if (have & XCR0_PKRU) x |= XCR0_PKRU;
-  if ((have & XCR0_AMX) == XCR0_AMX) x |= XCR0_AMX;
-  G->xcr0 = x;
-  if (G->dbg)
-    fprintf(stderr, "[gk] XCR0 %#llx (CPUID leaf 0xD offers %#llx)\n",
-            (unsigned long long)x, (unsigned long long)have);
-}
-#endif
-
 int gk_init(void) {
   // The control block first: it is registered before anything is mapped, so
   // no root ever holds a user PTE for it (see the control-data note). Its
