@@ -817,7 +817,25 @@ placement experiment hit.
   caller's `jsg::exceptionToJs()`) are copied into the shared heap by
   `WorkerEntrypoint`; neither is visible to the census, since each is a
   read, and neither is driven by a probe that builds its subrequests from a
-  URL string and whose callees all answer.
+  URL string and whose callees all answer. The rest of the metadata is
+  enumerated in README.md: of its ten members the only other one a target's
+  turn reads is `restoredSelfTokenFactory`, made by the starting turn and
+  read by `ctx.restore()`, now placed at its three sites. And a response
+  body the caller drops mid-stream holds the callee's whole request
+  (`DelayedEofInputStream`), so the drop destroyed the callee's suspended
+  coroutine in the caller's turn; `ReadRelay` now drops the body on the
+  event loop.
+- **Durable Objects across workers, loaded workers, tail workers.** A
+  namespace bound in another worker is served from the turn that first
+  addresses the object: the class lookup in the object's worker's table
+  (`Worker::Actor::Actor`), the namespace's table of containers
+  (`ActorNamespace::getActorContainer`) and the `Worker::Actor` itself
+  (`ActorContainer::start`) are all made or read across arenas, and all are
+  placed. A loaded entrypoint's props are copied by the loader's turn
+  (`EntrypointService::startRequest`) for the loaded worker's turn to read;
+  placed. A buffered tail worker's turn reads the `Trace` the traced
+  worker's turns filled; `placeTraceForTailWorkers` copies it on the loop.
+  The census sees none of these either: each is a read.
 - **Service stubs.** `Fetcher::deserialize` does
   `IoContext::current().addObject(kj::addRef(channel))`
   (`api/http.c++:2466`), so one refcounted `SubrequestChannel` is owned by two

@@ -22,6 +22,7 @@
 #include <workerd/io/worker.h>
 #include <workerd/jsg/async-context.h>
 #include <workerd/jsg/guest-run.h>
+#include <workerd/jsg/heap-arena.h>
 #include <workerd/jsg/inspector.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/modules-new.h>
@@ -2277,6 +2278,18 @@ void Worker::processEntrypointClass(jsg::Lock& js,
     EntrypointClass cls,
     EntrypointClasses entrypointClasses,
     kj::String handlerName) {
+#ifndef WORKERD_GK_NEG_ACTOR_HEAP
+  // The actor classes are looked up by name from the turn that creates an actor
+  // (Worker::Actor's constructor), which for a Durable Object namespace bound in another worker
+  // is that worker's turn; the table is filled here, under this worker's lock, so under
+  // per-isolate heap arenas it goes on the shared heap, as the entrypoint names do
+  // (server.c++, EntrypointNameScope). What a lookup reads is the names and the entries; the
+  // class handle in an entry is dereferenced only under this worker's own lock. The name
+  // arrives on this worker's arena and is copied. The negative build WORKERD_GK_NEG_ACTOR_HEAP
+  // (server.c++) leaves both in this worker's arena.
+  jsg::SharedHeapScope sharedHeap;
+  handlerName = kj::str(handlerName);
+#endif
   js.withinHandleScope([&]() {
     jsg::JsObject handle(KJ_ASSERT_NONNULL(cls.tryGetHandle(js.v8Isolate)));
 

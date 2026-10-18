@@ -216,18 +216,39 @@ which runs each isolate's JS turn at guest ring 3.
   `--copt=-DWORKERD_GK_NEG_BODY_RELAY`, where the bodies cross through the
   bare pipe and the first route faults the reading isolate's turn.
 - `binding-crossing-test.sh` / `binding-crossing-test.capnp` /
-  `binding-crossing-front.js` / `binding-crossing-back.js` — end-to-end check
-  against a workerd built with per-isolate heap arenas of the crossings of an
-  in-process service binding that carry no body: the `cf` blob a request
-  brings beside the HTTP interface, on `bench/bench.capnp`'s cdn pair (served
-  as is: the incoming `Request` forwarded to an origin and its response passed
-  through as the init of a new one) and on a fetch init; and the error a
-  callee that throws or rejects hands back, over fetch and over JS RPC, each
-  followed by another request of the caller's. Negative builds:
-  `--copt=-DWORKERD_GK_NEG_CF_BLOB_HEAP`, where the blob stays in the
-  caller's arena and the origin's turn faults reading it, and
-  `--copt=-DWORKERD_GK_NEG_EXCEPTION_HEAP`, where a callee's exception stays
-  in its arena and the caller's turn faults converting it.
+  `binding-crossing-front.js` / `binding-crossing-back.js` /
+  `binding-crossing-do.js` / `binding-crossing-cache.js` /
+  `binding-crossing-traced.js` / `binding-crossing-tail.js` /
+  `binding-crossing-tail-stream.js` — end-to-end check against a workerd
+  built with per-isolate heap arenas of the crossings of an in-process
+  binding that carry no body: the `cf` blob a request brings beside the HTTP
+  interface, on `bench/bench.capnp`'s cdn pair (served as is: the incoming
+  `Request` forwarded to an origin and its response passed through as the
+  init of a new one) and on a fetch init; the error a callee that throws,
+  rejects, returns no `Response`, errors its body mid-stream or refuses a
+  tunnel hands back, over fetch, over `connect()` and over JS RPC, each
+  followed by another request of the caller's; a response body the caller
+  cancels, aborts, times out or whose client goes away mid-stream, and one
+  that comes back on the WebSocket path; the Cache API served by a worker;
+  a loaded worker's entrypoint with props, requested three times, and a
+  loopback stub's props through RPC; a callee and a Durable Object that
+  call `ctx.restore()`; a Durable Object in a third worker addressed from
+  two workers' turns; a traced worker reached through a binding, whose
+  buffered and streaming tail workers each serve what they received; and
+  streams as an RPC argument and result. `GK_BINDING_CROSSING_ONLY` selects
+  step groups. Negative builds, each failing the step named for it:
+  `--copt=-DWORKERD_GK_NEG_CF_BLOB_HEAP` (the blob stays in the caller's
+  arena), `--copt=-DWORKERD_GK_NEG_EXCEPTION_HEAP` (a callee's exception
+  stays in its arena), `--copt=-DWORKERD_GK_NEG_BODY_DROP_DEFER` (a body
+  dropped mid-stream is dropped in the dropping turn),
+  `--copt=-DWORKERD_GK_NEG_PROPS_HEAP` (a loaded entrypoint's props are
+  copied in the loader's arena), `--copt=-DWORKERD_GK_NEG_SELF_TOKEN_HEAP`
+  (a request's self-token factory stays in the caller's arena),
+  `--copt=-DWORKERD_GK_NEG_ACTOR_HEAP` (the actor class table, the
+  namespace's table and the actor are made where they are made) and
+  `--copt=-DWORKERD_GK_NEG_TRACE_HEAP` (a trace is handed to a tail worker
+  as is). Not covered, because neither is relayed and each faults on its
+  first byte: a `connect()` tunnel and a WebSocket through a binding.
 - `heap-region-test.sh` / `heap-region-test.capnp` / `heap-region-front.js` /
   `heap-region-back.js` — check against a workerd built with per-isolate heap
   arenas that an isolate serving large response bodies does not spend its heap
@@ -1549,13 +1570,36 @@ so a crossing a turn makes on every dereference belongs on that path.
   through body and the abort; a negative build,
   `--copt=-DWORKERD_GK_NEG_BODY_RELAY`, leaves the relays out and the test
   fails on its first body. Not relayed: a `connect()` tunnel through a
-  binding, whose two-way pipe crosses the same way, and a WebSocket's
-  frames, which are a separate item. What the relay does not change is a
-  drop of the response body inside the caller's turn (`handleHttpResponse()`
-  in `api/http.c++` returns early when the signal has aborted since the
-  response was delivered), which aborts the pipe's read end against what the
-  callee left on it and cancels the callee's request; that reaches the
-  callee's arena as it did before, and is not covered by the test.
+  binding, whose two-way pipe crosses the same way -- the callee's turn
+  faults on its first read, in `kj::TwoWayPipeEnd::tryReadSync`, against
+  the caller's buffer -- and a WebSocket's frames, where the caller's turn
+  faults on its first `send()`, in `kj::WebSocketPipeImpl::send`, against
+  the pipe state the callee's turn left. Both were driven by hand; neither
+  is in a probe, and each needs a relay of its own, the WebSocket one a pump
+  per direction that moves messages rather than `pumpTo()`, since the pipe
+  ends' own pump short-circuits into the other end.
+
+  What the relay does change, since it owns the response body, is where that
+  body is dropped. `kj`'s adapter ties the body to the callee's request --
+  `DelayedEofInputStream` holds the promise of the whole request -- so
+  dropping it mid-stream cancels the request and destroys the callee's
+  suspended request coroutine, which is the teardown "Cancelling a call"
+  above describes; the caller's turn did that whenever its JS gave the body
+  up -- `reader.cancel()`, an `AbortController`, an `AbortSignal.timeout()`
+  -- and faulted in `kj::Own<PromiseNode>::operator=(nullptr)`, destroying
+  the node the callee's turn built, with
+  `WorkerEntrypoint::requestImpl (.destroy)` above it. `~ReadRelay` hands
+  the body, with the `HttpClient` it came from and may not outlive, to the
+  event loop as a daemon promise, so the teardown runs there; a body read
+  to its end holds nothing of the callee's by then, so that drop was never
+  the problem. The same relay now fronts a body that comes back on the
+  WebSocket path, when a callee answers an upgrade request with a plain
+  response (`openWebSocket()` in `SharedHeapHttpClient`), which crossed
+  through the bare pipe and faulted in `kj::AsyncPipe::tryRead`. A client
+  that goes away mid-response tears nothing down in a turn: the listener's
+  teardown is the loop's. `binding-crossing-test.sh` drives all of these; a
+  negative build, `--copt=-DWORKERD_GK_NEG_BODY_DROP_DEFER`, drops the body
+  in the dropping turn and fails it on the first cancelled body.
 
   Three more things cross the same binding outside its bodies, and none of
   them through the kj HTTP interface whose url and headers `kj`'s adapter
@@ -1587,6 +1631,65 @@ so a crossing a turn makes on every dereference belongs on that path.
   probes before it forwarded a request or failed a callee -- each built its
   subrequests from a URL string and every callee answered -- which is how the
   pair faulted under the benchmark while twenty probes passed.
+
+  The rest of `IoChannelFactory::SubrequestMetadata` was enumerated after
+  that, member by member, since the blob was one of ten. `cfBlobJson` is
+  the one above. `restoredSelfTokenFactory` is made in the starting turn
+  for every request to a static worker (`EntrypointService::startRequest()`
+  and `WorkerService::startRequest()` in `server.c++`) and to an actor
+  (`ActorContainer::startRequest()`), kept by the target's `IoContext`, and
+  read by the target's turn in `IoContext::getSelfTokenFactory()` when it
+  calls `ctx.restore()`: that faulted, and the three sites place it.
+  `userSpanParent` is consumed on the caller's side, in `createEntrypoint()`
+  under its scope, into the trigger context the callee reads; `parentSpan`
+  is dropped there, as it is by the cache client and the actor channels,
+  so no span crosses an in-process binding. `featureFlagsForFl` is copied
+  by the caller's turn from a string the isolate made before any lock and
+  freed with the metadata in the same turn; nothing in workerd reads it,
+  and a reader in the callee's turn would fault exactly as the blob did.
+  `clientAddress` is set only by the listener, on the loop, and read by the
+  callee's `connect` handler. `startTime`, `actorRetryRequestMetadata`,
+  `reresolveActorPipeline` and `fromPersistentStub` are values.
+  `CacheClient::SubrequestMetadata`, the other struct of that name, carries
+  the blob, a span parent and the flags string to the same `startRequest()`
+  through `CacheHttpClientImpl`, which `cacheApiOutbound` to a worker
+  drives.
+
+  Four more crossings were found by driving what reaches a worker by a route
+  other than a service binding's fetch. A loaded worker's entrypoint with
+  props (`WorkerStub::getEntrypoint()`) reads a copy of them the starting
+  turn makes (`EntrypointService::startRequest()`): the first request goes
+  through the loader's startup promise and copies on the loop, every later
+  one copied in the loader's arena, and the loaded worker's turn faulted in
+  `v8::internal::ValueDeserializer::ReadHeader()`; the copy is placed. A
+  Durable Object whose namespace is bound in another worker is made from
+  the turn that first addresses it: `Worker::Actor`'s constructor looks the
+  class up in the object's worker's class table, filled under that worker's
+  lock (the addressing turn faulted in `memcmp` on a key),
+  `ActorNamespace::getActorContainer()` grows the namespace's table of
+  containers (the second worker's turn faulted inserting), and
+  `ActorContainer::start()` makes the `Worker::Actor` the object's own turns
+  run on (they faulted in `Worker::Actor::ensureConstructedImpl()`); the
+  class table (`io/worker.c++`), the id's copy (`getGlobalActor()`), the
+  container and the actor are placed, in that order of discovery, each
+  fault appearing once the one before it was placed. A buffered tail worker
+  reads the `Trace` the traced worker's turns filled -- `console.log`'s
+  message, the exception, the event's url -- and its turn faulted in
+  `TraceLog`'s constructor; `placeTraceForTailWorkers()` in `server.c++`
+  copies the trace through its serialization on the loop before the
+  `TraceCustomEvent` is made. A streaming tail worker needs nothing: its
+  events reach it through a Cap'n Proto call whose message the loop builds.
+
+  Driven and found not to fault, with the reason: a body that errors
+  mid-stream, in either direction, whose exception travels through the
+  callee's failed request and `exceptionToPropagate()`; a callee that
+  returns no `Response` or refuses a tunnel, whose exception the host makes
+  under the callee's lock and the same function places; a loopback stub
+  with props handed to another worker over RPC, whose `startRequest()`
+  capnp's `LocalClient` defers to the loop; streams as an RPC argument and
+  result, which cross as capnp `ByteStream` calls the loop dispatches; the
+  Cache API over `cacheApiOutbound`, which is a service binding's request
+  once the client is made; and a client that disconnects mid-response.
 
   What the relay also leaves as it was is how the response promise itself
   crosses. The caller's turn attaches its continuation to a promise whose head

@@ -142,18 +142,39 @@ namespace {
 // chunk, and no synchronous fast path, on bodies that cross an in-process binding; it is paid
 // only where per-isolate heap arenas are active (see asHttpClient() below).
 //
-// Dropping the relay drops the stream where the relay is dropped. For a response body that is
-// the event loop, where the caller's IoOwn of the stream is disposed of; a drop inside the
-// caller's turn (the response delivered to a fetch whose signal has aborted in the meantime,
-// api/http.c++ handleHttpResponse()) would abort the pipe's read end against whatever the
-// callee left on it and cancel the callee's request, which is memory the caller's turn cannot
-// address, and that was so before the relay existed.
+// A response body the relay owns is dropped on the event loop whichever turn drops the relay.
+// kj's HttpClient adapter ties the body to the callee's request: the body holds the promise of
+// the callee's whole request, so dropping it mid-body cancels that request, and cancelling it
+// destroys the callee's request coroutine, whose suspended frame holds the promise node its own
+// turn built for the `co_await` it is parked on, in the callee's arena. The caller's turn drops
+// the body whenever its JS cancels the stream -- reader.cancel(), an AbortController, an
+// AbortSignal.timeout() -- so the relay hands the body, with the client it came from and may
+// not outlive, to the event loop instead, where every arena is addressable, as a daemon of the
+// loop. A body read to its end holds nothing of the callee's by then (the callee's coroutine
+// has completed and its locals are gone), so that drop was never the problem; the mid-body one
+// was.
 class ReadRelay final: public kj::AsyncInputStream {
  public:
-  // Over a stream this relay owns: a response body.
-  explicit ReadRelay(kj::Own<kj::AsyncInputStream> owned): inner(*owned), owned(kj::mv(owned)) {}
+  // Over a stream this relay owns: a response body, with the client it was obtained from.
+  ReadRelay(kj::Own<kj::AsyncInputStream> owned, kj::Own<kj::HttpClient> client)
+      : inner(*owned),
+        owned(kj::mv(owned)),
+        client(kj::mv(client)) {}
   // Over a stream someone else owns for the relay's lifetime: a request body.
   explicit ReadRelay(kj::AsyncInputStream& inner): inner(inner) {}
+
+  ~ReadRelay() noexcept(false) {
+    KJ_IF_SOME(o, owned) {
+#ifndef WORKERD_GK_NEG_BODY_DROP_DEFER
+      // The promise and the loop's record of it are made here, in whichever turn drops the body,
+      // and run by the loop. A negative build, never shipped, WORKERD_GK_NEG_BODY_DROP_DEFER,
+      // drops the body in the dropping turn; the guest kernel's binding-crossing-test.sh must
+      // then fail on a body cancelled mid-stream.
+      jsg::SharedHeapScope sharedHeap;
+      kj::evalLater([body = o.attach(kj::mv(client))](){}).detach([](kj::Exception&&){});
+#endif
+    }
+  }
 
   kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
     if (minBytes == 0) return size_t(0);
@@ -199,6 +220,7 @@ class ReadRelay final: public kj::AsyncInputStream {
 
   kj::AsyncInputStream& inner;
   kj::Maybe<kj::Own<kj::AsyncInputStream>> owned;
+  kj::Own<kj::HttpClient> client;
 };
 
 // Whether bodies cross an in-process call through a ReadRelay: only where per-isolate heap
@@ -250,7 +272,7 @@ class BodyRelayService final: public kj::HttpService {
 // and the response object the adapter makes, the entrypoint and its coroutine frame, the new
 // request's IoContext -- is created here, and would otherwise lie in the calling isolate's heap
 // arena, where the target's turns fault on it.
-class SharedHeapHttpClient final: public kj::HttpClient {
+class SharedHeapHttpClient final: public kj::HttpClient, public kj::Refcounted {
  public:
   explicit SharedHeapHttpClient(kj::Own<kj::HttpClient> inner): inner(kj::mv(inner)) {}
 
@@ -263,8 +285,8 @@ class SharedHeapHttpClient final: public kj::HttpClient {
     if (bodiesRelayed()) {
       // The response body is read by the caller's turns and written by the callee's: see
       // ReadRelay. The relay is made where the response is delivered, on the event loop.
-      result.response = result.response.then([](Response response) {
-        response.body = kj::heap<ReadRelay>(kj::mv(response.body));
+      result.response = result.response.then([self = kj::addRef(*this)](Response response) mutable {
+        response.body = kj::heap<ReadRelay>(kj::mv(response.body), kj::mv(self));
         return kj::mv(response);
       });
     }
@@ -274,7 +296,18 @@ class SharedHeapHttpClient final: public kj::HttpClient {
   kj::Promise<WebSocketResponse> openWebSocket(
       kj::StringPtr url, const kj::HttpHeaders& headers) override {
     jsg::SharedHeapScope sharedHeap;
-    return inner->openWebSocket(url, headers);
+    auto promise = inner->openWebSocket(url, headers);
+    if (bodiesRelayed()) {
+      // A callee that answers an upgrade request with a plain response hands back a body that
+      // crosses like any other: it gets the same relay. A WebSocket is not relayed.
+      promise = promise.then([self = kj::addRef(*this)](WebSocketResponse response) mutable {
+        KJ_IF_SOME(body, response.webSocketOrBody.tryGet<kj::Own<kj::AsyncInputStream>>()) {
+          body = kj::heap<ReadRelay>(kj::mv(body), kj::mv(self));
+        }
+        return kj::mv(response);
+      });
+    }
+    return promise;
   }
 
   ConnectRequest connect(kj::StringPtr host,
@@ -293,9 +326,9 @@ kj::Own<kj::HttpClient> asHttpClient(kj::Own<WorkerInterface> workerInterface) {
   if (bodiesRelayed()) {
     auto relay = kj::heap<BodyRelayService>(*workerInterface);
     auto client = kj::newHttpClient(*relay).attach(kj::mv(relay)).attach(kj::mv(workerInterface));
-    return kj::heap<SharedHeapHttpClient>(kj::mv(client));
+    return kj::refcounted<SharedHeapHttpClient>(kj::mv(client));
   }
-  return kj::heap<SharedHeapHttpClient>(
+  return kj::refcounted<SharedHeapHttpClient>(
       kj::newHttpClient(*workerInterface).attach(kj::mv(workerInterface)));
 }
 
