@@ -23,8 +23,16 @@
 # /__gk_loop_clear leaves the pointer null, the other state such a turn can leave, and the one a
 # fault can leave as well.
 #
-# In both cases the host must find the loop the turn ran on. Two host-side lookups report it,
-# both through kj::EventLoop::Id::current(), the host's own path to the loop: the first once the
+# /__gk_loop_firing does the same for the other half of that state, the event this thread is
+# firing (threadLocalCurrentlyFiring in kj/async.c++). kj clears that one when the fire() that ran
+# the turn returns, and with a constant rather than a saved value, so nothing a turn leaves in it
+# outlives that fire() -- but the rest of that fire() is host code running on what the turn left,
+# and ~Event() compares the pointer with every event destroyed on the thread from a noexcept
+# function that aborts the process on a match. The host-side report for this one is taken inside
+# that same fire(), where it must find the event the turn ran under.
+#
+# In the first two cases the host must find the loop the turn ran on. Two host-side lookups report
+# it, both through kj::EventLoop::Id::current(), the host's own path to the loop: the first once the
 # turn is over but while the isolate lock is still held (Worker::Lock::runAtNextReleaseForTest,
 # run from ~Worker::Lock), the second on the event loop once the lock is gone. "restored" is the
 # loop the turn ran on, "repointed" the loop the turn built, "cleared" the lookup failing
@@ -35,7 +43,7 @@
 #   GK_LOOP_TEST_HELLO_PORT / GK_LOOP_TEST_VICTIM_PORT override the ports (8805 / 8804).
 #
 # Negative build, never shipped, which this script must fail:
-#   --copt=-DWORKERD_GK_NEG_LOOP_POINTER  the pointer the turn left stands, so the host looks at
+#   --copt=-DWORKERD_GK_NEG_LOOP_POINTER  neither pointer is put back, so the host looks at
 #       the loop the turn chose: the first lookup after the turn logs it repointed, and the
 #       process then dies releasing the isolate lock, on ~AsyncLockWaiter's noexcept assert that
 #       the loop's local map still names the waiter -- the map it looks in is the one belonging to
@@ -138,15 +146,32 @@ echo "6. $after"
 [ "$(last_field "$after")" = restored ] ||
   fail "the event loop found no loop of its own ($(last_field "$after"))"
 
+# The event the thread is firing, the other half of the same state.
+s=$(status "$victim/__gk_loop_firing")
+echo "7. GET $victim/__gk_loop_firing -> $s (the in-turn rewrite of the firing event must land)"
+[ "$s" = 200 ] || fail "the request that rewrote the firing event did not complete"
+over=$(wait_line "rewrote the firing event from inside the JS turn" 1)
+[ -n "$over" ] || fail "the firing event was not rewritten"
+echo "   $over"
+[ "$(field 'addr(FIRING_SENTINEL_FOR_TEST)' "$over")" = "$(field 'addr(readBack)' "$over")" ] ||
+  fail "the in-turn write of the firing event did not land"
+held=$(wait_line "the firing event on the host after the turn" 1)
+[ -n "$held" ] || fail "the host-side read of the firing event did not run"
+echo "8. $held"
+[ "$(last_field "$held")" = restored ] ||
+  fail "host code in the fire() that ran the turn read the event the turn left ($(last_field "$held"))"
+
 grep -q "No event loop is running on this thread" "$log" &&
   fail "a host-side lookup of the thread's event loop failed"
+grep -q "Promise callback destroyed itself" "$log" &&
+  fail "an event was destroyed while the thread was recorded as firing it"
 grep -q "isolate condemned" "$log" && fail "an isolate was condemned"
 s=$(status "$victim/")
-echo "7. GET $victim/ -> $s (the worker keeps serving after the rewrites)"
+echo "9. GET $victim/ -> $s (the worker keeps serving after the rewrites)"
 [ "$s" = 200 ] || fail "the victim stopped serving"
 s=$(status "$hello/")
-echo "8. GET $hello/ -> $s (the other worker keeps serving)"
+echo "10. GET $hello/ -> $s (the other worker keeps serving)"
 [ "$s" = 200 ] || fail "the other worker stopped serving"
 kill -0 "$pid" 2>/dev/null || fail "workerd died"
 
-echo "PASS: a turn that left this thread's event loop pointer naming a loop of its own, and one that left it null, did not reach the host: both the first host-side lookup after each turn and one on the event loop afterwards found the loop the turn ran on, and the process kept serving"
+echo "PASS: a turn that left this thread's event loop pointer naming a loop of its own, one that left it null, and one that left a sentinel in the event the thread is firing, did not reach the host: the host-side lookups after each turn found the loop the turn ran on and the event it ran under, and the process kept serving"

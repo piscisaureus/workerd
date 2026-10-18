@@ -46,12 +46,15 @@
 #ifdef __linux__
 #include <signal.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 #endif
 
 #include <kj/encoding.h>
+#include <kj/thread.h>
 
+#include <atomic>
 #include <cstring>
 
 #ifdef WORKERD_HAS_GUEST_KERNEL
@@ -511,6 +514,20 @@ void checkWasmDescriptorsForTest(kj::StringPtr url) {
 // event loop afterwards report what kj::EventLoop::Id::current() finds against the loop the turn
 // ran on.
 //
+// With the same variable set, /__gk_loop_firing does the same for the event this thread is firing
+// (threadLocalCurrentlyFiring in kj/async.c++), which kj clears when the fire() that ran the turn
+// returns -- leaving the rest of that fire() to run on what the turn left, where ~Event() compares
+// the pointer with every event destroyed on the thread from a noexcept function that aborts the
+// process on a match. The turn leaves a sentinel, and the host-side report, taken inside that same
+// fire(), must find the event the turn ran under.
+//
+// With the same variable set, /__gk_loop_other_arm, /__gk_loop_other_poison and
+// /__gk_loop_other_check ask whether a turn reaches another thread's copy of the loop pointer,
+// which no save in this thread's frame could put back (event-loop-cross-test.sh). The arm starts a
+// parked host thread with a loop of its own and identifies its slot, both host-side, since a turn
+// could do neither; the poison reads and writes that word from inside a turn; the check reports
+// host-side what the word holds and puts the thread's own value back.
+//
 // With the same variable set, four request paths exercise the isolate's lock slot, the V8 data
 // slot jsg::Lock::from reads, which is in the C++ isolate object in the shared heap and so
 // writable from any isolate's turn (lock-slot-test.sh). /__gk_lock_slot overwrites this isolate's
@@ -550,6 +567,110 @@ kj::StringPtr currentLoopVerdictForTest() {
   }
   return "unrecorded"_kj;
 }
+
+kj::String hexAddrForTest(const void* p) {
+  return kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(p)));
+}
+
+// The event this thread was firing when a turn began, so the host can tell the value it put back
+// from the one the turn left (see /__gk_loop_firing below).
+thread_local kj::_::Event* firingEventBeforeTurnForTest = nullptr;
+kj::_::Event* const FIRING_SENTINEL_FOR_TEST = reinterpret_cast<kj::_::Event*>(0x1);
+
+#ifdef __linux__
+// Cross-thread reach of kj's event-loop thread-locals (see /__gk_loop_other_poison below). The
+// save and restore around a turn (runTrampolineInGuest) covers the thread the turn runs on; this
+// asks the other half, whether a turn can reach the same pointer belonging to a different thread,
+// whose own turns would then run on a loop this one chose -- which no save in this thread's frame
+// could undo.
+//
+// The other thread is a parked host thread with an event loop of its own. Its copy of kj's
+// current-loop pointer is found by offset: a thread-local of this file's own is the anchor, and
+// the distance from the anchor to kj's pointer is the same in every thread's static TLS block, so
+// the offset at which this thread's anchor neighbourhood holds this thread's loop and the other
+// thread's holds the other thread's loop names the slot. Two values matching at one offset is
+// what identifies it; the count of matching offsets is logged so a coincidence shows up.
+thread_local uint64_t tlsAnchorForTest = 0;
+constexpr uint64_t TLS_ANCHOR_MAGIC = 0x5a5a5a5a5a5a5a5aull;
+constexpr uint64_t TLS_CROSS_SENTINEL = 0xdeadbeefdeadbeefull;
+
+struct OtherThreadLoopForTest {
+  uint64_t* anchor;
+  kj::EventLoop* loop;
+  kj::EventLoop** slot;  // null if no offset identified it
+};
+kj::Maybe<OtherThreadLoopForTest> otherThreadLoopForTest;
+
+// Reads one word of this process's own memory without faulting on an unmapped page: the search
+// below walks off the end of a TLS block.
+bool peekWordForTest(const void* addr, uint64_t& out) {
+  iovec local{&out, sizeof(out)};
+  iovec remote{const_cast<void*>(addr), sizeof(out)};
+  return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(sizeof(out));
+}
+
+struct PublishedTlsForTest {
+  std::atomic<uint64_t*> anchor{nullptr};
+  std::atomic<kj::EventLoop*> loop{nullptr};
+};
+
+// Host-side, on the event loop: start the other thread and identify its slot.
+void armOtherThreadLoopForTest(kj::StringPtr url) {
+  if (otherThreadLoopForTest != kj::none) return;
+  // Never freed, because the thread below is never joined.
+  auto* published = new PublishedTlsForTest();
+  {
+    kj::Thread thread([published]() {
+      tlsAnchorForTest = TLS_ANCHOR_MAGIC;
+      kj::EventLoop loop;
+      kj::WaitScope waitScope(loop);
+      published->loop.store(kj::EventLoop::saveCurrentLoopPointer());
+      published->anchor.store(&tlsAnchorForTest);
+      // Parked for the life of the process, so neither the loop nor the wait scope is destroyed.
+      for (;;) ::pause();
+    });
+    thread.detach();
+  }
+  for (uint i = 0; i < 1000 && published->anchor.load() == nullptr; i++) {
+    ::usleep(1000);
+  }
+
+  uint64_t* mineAnchor = &tlsAnchorForTest;
+  kj::EventLoop* mineLoop = kj::EventLoop::saveCurrentLoopPointer();
+  uint64_t* theirAnchor = published->anchor.load();
+  kj::EventLoop* theirLoop = published->loop.load();
+  kj::EventLoop** slot = nullptr;
+  uint matches = 0;
+  if (theirAnchor != nullptr) {
+    constexpr int WORDS = 4096;  // the search covers 32 KiB either side of the anchor
+    for (int d = -WORDS; d <= WORDS; d++) {
+      uint64_t mineWord = 0;
+      uint64_t theirWord = 0;
+      if (!peekWordForTest(mineAnchor + d, mineWord)) continue;
+      if (mineWord != reinterpret_cast<uint64_t>(mineLoop)) continue;
+      if (!peekWordForTest(theirAnchor + d, theirWord)) continue;
+      if (theirWord != reinterpret_cast<uint64_t>(theirLoop)) continue;
+      if (matches++ == 0) slot = reinterpret_cast<kj::EventLoop**>(theirAnchor + d);
+    }
+  }
+  otherThreadLoopForTest = OtherThreadLoopForTest{theirAnchor, theirLoop, slot};
+  auto mineAnchorAt = hexAddrForTest(mineAnchor);
+  auto mineLoopAt = hexAddrForTest(mineLoop);
+  auto theirAnchorAt = hexAddrForTest(theirAnchor);
+  auto theirLoopAt = hexAddrForTest(theirLoop);
+  auto slotAt = hexAddrForTest(slot);
+  KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: another thread's event loop pointer", url, mineAnchorAt,
+      mineLoopAt, theirAnchorAt, theirLoopAt, slotAt, matches);
+}
+
+// The word a turn reads and writes: the other thread's copy of kj's current-loop pointer, or, if
+// no offset identified it, the anchor word, which is in the same TLS block and so on the same
+// pages and answers the same question.
+uint64_t* otherThreadTargetForTest(const OtherThreadLoopForTest& other) {
+  if (other.slot != nullptr) return reinterpret_cast<uint64_t*>(other.slot);
+  return other.anchor;
+}
+#endif  // __linux__
 
 void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   static const bool faultEnabled =
@@ -800,6 +921,71 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
           currentLoopVerdictForTest());
     }));
   }
+  // The event this thread is firing (see the comment above and runTrampolineInGuest).
+  if (probeEnabled && url.endsWith("/__gk_loop_firing")) {
+    firingEventBeforeTurnForTest = kj::EventLoop::saveCurrentlyFiringEvent();
+    // As the turn's last act in the guest, like the paths above.
+    jsg::setGuestTurnTailHookForTest([addr, url = kj::str(url)]() {
+      kj::_::Event* was = kj::EventLoop::saveCurrentlyFiringEvent();
+      kj::EventLoop::restoreCurrentlyFiringEvent(FIRING_SENTINEL_FOR_TEST);
+      kj::_::Event* readBack = kj::EventLoop::saveCurrentlyFiringEvent();
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: rewrote the firing event from inside the JS turn",
+          url, addr(was), addr(FIRING_SENTINEL_FOR_TEST), addr(readBack));
+    });
+    Worker::Lock::runAtNextReleaseForTest([addr](Worker::Lock&) {
+      // Host-side, after the turn, inside the fire() that ran it: what ~Event() would compare
+      // every event destroyed from here on against.
+      kj::_::Event* cur = kj::EventLoop::saveCurrentlyFiringEvent();
+      kj::StringPtr verdict = cur == FIRING_SENTINEL_FOR_TEST ? "leaked"_kj
+          : cur == firingEventBeforeTurnForTest               ? "restored"_kj
+                                                              : "other"_kj;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the firing event on the host after the turn",
+          addr(cur), verdict);
+    });
+  }
+#ifdef __linux__
+  // Another thread's copy of the same pointer (see the comment above armOtherThreadLoopForTest).
+  if (probeEnabled && url.endsWith("/__gk_loop_other_arm")) {
+    // Host-side: the thread is started and the slot identified outside the guest, which a turn
+    // could not do -- it is clone() plus process_vm_readv().
+    IoContext::current().addTask(
+        kj::evalLater([url = kj::str(url)]() { armOtherThreadLoopForTest(url); }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_loop_other_poison")) {
+    KJ_IF_SOME(other, otherThreadLoopForTest) {
+      // At ring 3, inside the turn: one read and one write of another thread's word. Memory the
+      // arena does not map faults the turn here, which fails this request and condemns this
+      // isolate and is the safe outcome; a write that lands reaches a thread the save and restore
+      // around this turn cannot speak for.
+      volatile uint64_t* word =
+          reinterpret_cast<volatile uint64_t*>(otherThreadTargetForTest(other));
+      uint64_t before = *word;
+      *word = TLS_CROSS_SENTINEL;
+      uint64_t readBack = *word;
+      auto wordAt = hexAddrForTest(const_cast<uint64_t*>(word));
+      auto wasHex = kj::str("0x", kj::hex(before));
+      auto nowHex = kj::str("0x", kj::hex(readBack));
+      kj::StringPtr which = other.slot != nullptr ? "kj's loop pointer"_kj : "the anchor word"_kj;
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: read and wrote another thread's TLS from inside the JS turn", url,
+          wordAt, wasHex, nowHex, which);
+    }
+  }
+  if (probeEnabled && url.endsWith("/__gk_loop_other_check")) {
+    IoContext::current().addTask(kj::evalLater([]() {
+      KJ_IF_SOME(other, otherThreadLoopForTest) {
+        uint64_t* word = otherThreadTargetForTest(other);
+        kj::StringPtr verdict = *word == TLS_CROSS_SENTINEL ? "overwritten"_kj : "intact"_kj;
+        auto wordAt = hexAddrForTest(word);
+        auto heldHex = kj::str("0x", kj::hex(*word));
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: another thread's TLS on the host", wordAt, heldHex,
+            verdict);
+        // Put the other thread's own value back either way, so it is not left broken.
+        *word = other.slot != nullptr ? reinterpret_cast<uint64_t>(other.loop) : TLS_ANCHOR_MAGIC;
+      }
+    }));
+  }
+#endif  // __linux__
   if (probeEnabled && url.endsWith("/__gk_vfs_rewrite")) {
     // SQLite's native VFS keeps the directory descriptor for its path syscalls in a thread-local
     // a turn can write (currentVfsRoot in util/sqlite.c++); the guest kernel's turn directory is

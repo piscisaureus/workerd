@@ -157,9 +157,22 @@ which runs each isolate's JS turn at guest ring 3.
   `kj::EventLoop` the turn built inside itself, another leaves it cleared, and
   in both cases the first host-side lookup after the turn, made while the
   isolate lock is still held, and one on the event loop afterwards must find
-  the loop the turn ran on. Negative build:
-  `--copt=-DWORKERD_GK_NEG_LOOP_POINTER`, where the pointer the turn left
-  stands.
+  the loop the turn ran on. A third request does the same for the event the
+  thread is firing (`threadLocalCurrentlyFiring`), which kj clears only when
+  the `fire()` that ran the turn returns, leaving the rest of that `fire()` --
+  host code, in which `~Event()` aborts the process if the pointer names an
+  event being destroyed -- to run on what the turn left. Negative build:
+  `--copt=-DWORKERD_GK_NEG_LOOP_POINTER`, where neither pointer is put back.
+- `event-loop-cross-test.sh` / `event-loop-cross-test.capnp` — end-to-end
+  check against a built workerd of the half the save and restore above
+  cannot reach: another thread's copy of the same pointer. A parked host
+  thread with an event loop of its own is started, and its copy of kj's
+  current-loop pointer is identified host-side by the offset from a
+  thread-local of workerd's own; a JS turn on a different worker then reads
+  and writes that word. Both land: a thread's static TLS block is process
+  memory the arena maps, so a thread between turns can be made to run its
+  next one on a loop a foreign turn chose. The probe pins that residual
+  rather than preventing it, so a build that closed it fails here.
 - `disk-sqlite-test.sh` / `disk-sqlite-test.capnp` / `disk-sqlite-test.js` —
   end-to-end check against a built workerd that a SQLite-backed Durable Object
   stored on local disk works with its JS turns at guest ring 3, where SQLite's
@@ -1651,8 +1664,27 @@ so a crossing a turn makes on every dereference belongs on that path.
   adds; `runTrampolineInGuest()` holds it in the frame that entered the guest
   and puts it back the moment the guest returns, ahead of the fault path's
   condemn and abort, which arm events on the loop. It is not cleared for the
-  turn's duration: in-turn code arms its own events through it.
-  `event-loop-test.sh` drives both states a turn can leave.
+  turn's duration: in-turn code arms its own events through it. The event the
+  thread is firing (`threadLocalCurrentlyFiring`) is put back in the same
+  frame, for a narrower reason: kj clears it when the `fire()` that ran the
+  turn returns, so what a turn leaves there is read only by the rest of that
+  `fire()` -- but `~Event()` reads it for every event the host destroys
+  there, from a `noexcept` function that aborts the process when it matches,
+  and the fault path destroys many. `event-loop-test.sh` drives all three
+  states a turn can leave.
+
+  Both are put back only for the thread the turn runs on. A thread's static
+  TLS block is ordinary process memory, which every arena maps writable, so a
+  turn can write another thread's copy of either pointer, and no frame on
+  that thread will put it back: a thread between turns can be made to run its
+  next one on a loop a foreign turn chose. `event-loop-cross-test.sh` reads
+  the loop another thread made current and leaves a sentinel in its place.
+  What that costs depends on a thread model this tree does not exercise: the
+  server's services share one event loop thread, and the only other
+  `kj::Thread`s in it are the inspector's and the fallback service's. So the
+  probe establishes the reach rather than an exploit here. The residual has
+  the shape of the isolate lock slot's, and like it closes only by placing
+  the storage out of the guest's reach rather than by saving it in a frame.
 
   Disarming is not covered. Unlinking a queued event writes both its
   neighbors' link fields (`*prev = next; next->prev = prev`), so destroying
