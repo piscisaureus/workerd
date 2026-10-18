@@ -2293,15 +2293,16 @@ reached by a chatty close. It reproduces six times in six on `/ws-leave/100`
 `/ws-leave/1000`, and the same routes awaiting the reply are clean five times
 in five; `GK_WS_LEAVE=1 socketrelay.py` keeps the reproducer. A step added to
 `binding-crossing-test.sh` with the same shape -- a hundred echoed messages,
-then `close()` and return -- did not reproduce it: that step awaited each
-echo in turn, which drains the queue so nothing of the callee's is left
-armed at teardown. Bursting the sends -- all of them before any reply, then
-`close()` and return -- reproduces it from that script's own configuration,
-compatibility flags and `WorkerEntrypoint` callee, so none of those bear on
-it; the serial echo was the difference. No relay can close it: whatever
-node a turn destroys, its queue neighbours are whoever armed next to it on
-the loop. It needs the loop-level treatment the README leaves open, which is
-a design decision.
+then `close()` and return -- awaited each echo in turn, which drains the
+queue so nothing of the callee's is left armed at teardown. Bursting the
+sends -- all of them before any reply, then `close()` and return --
+reproduces it from that script's own configuration, compatibility flags and
+`WorkerEntrypoint` callee, so none of those bear on it; the serial echo was
+the difference, and that shape is the script's `/ws-leave` step. No relay
+closes it: whatever node a turn destroys, its queue neighbours are whoever
+armed next to it on the loop. What does is the run queue's links being the
+loop's own rather than the events' (README.md's event-loop hazard section;
+"What the run queue's links cost" below prices it).
 
 It is worse than a condemnation. The turn is abandoned inside the destructor,
 with the event half unlinked and the coroutine frame half destroyed but still
@@ -2311,3 +2312,170 @@ exit status 1, after `IoContext` has logged the condemnation twice. Six runs
 in six. The first run of arm A saw this as a connection reset in the harness.
 A caller that closes a binding's WebSocket and does not await the reply
 therefore takes the whole workerd down under heap arenas today.
+
+
+## What the run queue's links cost
+
+### The question
+
+The run queue's links are the loop's own rather than the queued events'
+(README.md's event-loop hazard section says what that closes). It puts an
+indirection on every queue step -- the loop reaches an event through a link
+instead of holding it directly -- and a link behind every armed event. This
+queue is what everything asynchronous in the runtime turns on, so the cost
+question decides whether the change is worth making: what does a queue
+operation cost, what does a served request cost, and what does the layout
+cost in bytes.
+
+### Method
+
+Two measurements, because the queue operation and the request it serves
+differ by more than an order of magnitude and neither alone answers the
+question.
+
+`measure/queue-cost.c++` links kj and nothing else, so it prices the
+operations rather than a workload that happens to use them. Its cases are
+`rearm-depth` (one event that arms itself depth-first from `fire()`: a queue
+one deep, the shape of a `.then()` chain), `rearm-breadth` (k events that
+each arm themselves breadth-first: a queue k deep, where the link a turn
+reads is not one it just wrote), `arm-drain` (k events armed and then fired,
+with the arms and the turns in separate runs), `arm-disarm` (k events armed
+and then destroyed unfired: the disarm path on its own, which is the path the
+hazard ran through), `then-build` and `then-run` (a chain of `.then()`s on a
+settled promise, built and run with the two timed apart) and `eval-run` (the
+same through `kj::evalLater()`, which arms breadth-first). Fifty million
+operations per case, k = 1024, eight launches per arm, pinned to one CPU,
+alternating arms.
+
+`measure/queuecost.py` serves requests, with the guest kernel on and
+per-isolate heap arenas enabled, which is the configuration the links are
+for. Its routes are a small response, a chain of n timers awaited one after
+another, n timers outstanding at once, and n subrequests over a binding; the
+client is `httpbench` at one and at eight connections, eight seconds a case,
+five launches per arm, server and client tasksetted apart.
+
+An arm is a binary, not a build knob: the change is in kj, so the two arms
+are a workerd built at `c99961cae` and one built with the links moved, each
+`-c opt`, launched alternately so that whatever drifts across a sequence of
+launches drifts across both. Every launch is reported; a median over three
+launches is how a wrong figure reached a reader earlier in this work.
+
+The machine is the one "The machine and the build" describes, with
+`Mitigation: IBPB before exit to userspace` and `kvm.halt_poll_ns=200000`
+before and after every run. Raw data in `results/queue-links-ops.json`,
+`results/queue-links-depth.json` and `results/queue-links-served.json`.
+
+### What a queue operation costs
+
+Nanoseconds per operation, k = 1024, per launch, with the paired difference
+(links in the loop minus links in the events) taken launch by launch:
+
+| case | links in the events | links in the loop | paired difference |
+| --- | --- | --- | --- |
+| `rearm-depth` | 6.75 (6.73 to 7.26) | 6.46 (6.19 to 8.59) | -0.42 (-6.2%) |
+| `rearm-breadth` | 5.38 (5.29 to 5.47) | 6.63 (6.41 to 6.99) | +1.28 (+23.9%) |
+| `arm-drain` | 5.63 (5.62 to 5.65) | 9.24 (9.20 to 9.40) | +3.61 (+64.1%) |
+| `arm-disarm` | 2.35 (2.34 to 2.35) | 3.15 (3.14 to 3.25) | +0.81 (+34.3%) |
+| `then-build` | 2.99 (2.99 to 3.02) | 3.04 (3.04 to 3.05) | +0.05 (+1.7%) |
+| `then-run` | 23.06 (22.94 to 26.27) | 23.06 (22.84 to 23.23) | -0.07 (-0.3%) |
+| `eval-run` | 37.98 (37.93 to 38.03) | 38.08 (37.97 to 38.76) | +0.11 (+0.3%) |
+
+The depth-first chain is *faster*: `head()` no longer walks the guard
+sentinels `GuardedArmScope` used to link in, which cost more than the
+indirection it now pays. The other bare queue cases are slower by 0.8 to
+3.6 ns, and the two cases that include the promise machinery around the queue
+step -- which is what any real continuation is -- do not move: +0.3% and
+-0.3%, inside their own launch spread.
+
+What the slower cases pay is a cache line, not an instruction. The cost
+depends on how many events are queued at once (four launches per point):
+
+| case | k=4 | k=32 | k=256 | k=1024 | k=8192 |
+| --- | --- | --- | --- | --- | --- |
+| `rearm-breadth` | -0.08 | +0.06 | +0.76 | +1.35 | +1.12 |
+| `arm-drain` | +2.65 | +3.43 | +3.36 | +3.67 | +3.60 |
+| `arm-disarm` | +0.17 | +0.60 | +0.54 | +0.85 | +0.80 |
+| `eval-run` | +1.42 | +0.21 | +0.11 | -0.23 | -0.16 |
+
+`rearm-breadth` costs nothing until the live links stop fitting beside the
+events in the near caches, between k=32 and k=256; `arm-drain` pays
+throughout because it touches the event and its link with no reuse in
+between, which is two lines where it was one. `eval-run`, which is the same
+steps with a promise node and a lambda around each, shows nothing above its
+spread at any depth.
+
+### What a served request costs
+
+Requests per second, per launch, and the paired difference launch by launch.
+The guest kernel is on and heap arenas are enabled in both arms.
+
+| case | links in the events | links in the loop | paired difference |
+| --- | --- | --- | --- |
+| small, 1 conn | 5858 6001 5773 5999 5969 | 5799 5942 5842 5922 6018 | -58 (-0.97%) |
+| small, 8 conns | 8486 8521 8662 8479 8418 | 8429 8428 8461 8266 8571 | -93 (-1.09%) |
+| 50 timers, 1 conn | 18.0 x5 | 18.0 x5 | 0 (0.00%) |
+| 50 timers, 8 conns | 119 119 119 119 117 | 119 118 119 115 119 | -0.3 (-0.25%) |
+| 200 timers at once | 4.5 x5 | 4.4 x5 | -0.1 (-2.22%) |
+| 20 subrequests, 8 conns | 232 227 228 228 229 | 230 230 225 217 231 | -2 (-0.83%) |
+
+No case resolves a difference. The per-launch differences change sign in
+every case that has any spread at all (-77, -59, -58, +49, +68 on the small
+single-connection route; -213, -201, -93, -56, +154 at eight connections),
+and the medians, -0.25% to -1.1%, are smaller than the launch-to-launch range
+of either arm on its own. What this says is a bound, not a figure: whatever
+the links cost a served request, five launches at this spread cannot see it
+above about 1% of request rate.
+
+The two timer routes bound it at zero for the wrong reason and are reported
+only so that they are not mistaken for queue throughput: 50 awaited
+`setTimeout(0)`s take 55 ms, about 1.1 ms each, so they measure the timer
+tick and not the queue. The small routes and the subrequest route are what
+carry the result.
+
+### What the layout costs in bytes
+
+`kj::_::Event` loses its two inline link words and gains one pointer, so
+every event is 8 bytes smaller: the benchmark's event, which adds a vtable
+pointer, a counter and a mode to the base, goes from 64 to 56 bytes. Every
+promise node that waits on something has one.
+
+An armed event gains a 32-byte link. Measured rather than declared, by arming
+a million events at once and reading the resident set across it: 32.2 bytes
+per armed event, against 0.1 with the links inline. The links are only behind
+events that are armed at that moment, which is a far smaller set than the
+events that exist, and they are released back to the loop's free list as each
+event fires or is destroyed. The chunks they come in are not released until
+the loop is: they double from 4 KiB to a 256 KiB cap, so a loop that once
+held a million events armed keeps 32 MiB of them mapped, in about 130
+mappings.
+
+### The answer
+
+The cost is negligible and the change should land. A bare queue operation
+costs 0.8 to 3.6 ns more in the shapes that keep many events queued, and 0.4
+ns *less* in the depth-first chain that is kj's commonest, because retiring
+`GuardedArmScope` takes its guard sentinels out of `head()`'s walk. A
+continuation, which is what a queue step actually carries, costs 23 to 38 ns,
+and at that scale neither case moves above its own launch spread. On served
+requests nothing is resolvable, with a bound near 1% of request rate. Against
+that: a worker closing a WebSocket without awaiting the reply no longer aborts
+the process, and the class it belonged to -- any turn destroying an event the
+loop armed before the turn began -- is closed rather than narrowed.
+
+What it does not buy is confinement, and that should not be read into it. The
+links are in the shared, non-arena memory every page-table root maps, so a
+ring-3 escape with a write primitive can rewrite the queue, the loop's
+free-list head included, exactly as it can rewrite the rest of the C++ heap.
+Host memory would close that too and cannot hold these: a turn arms events
+itself, a guest access to host memory faults at every ring, and so every arm
+would become a hostcall -- 5.9 us by the VM-exit table in "Where the guest
+kernel's CPU goes" above, against the 6 ns an arm costs now, three orders of
+magnitude on the loop's hot path.
+
+One thing the links being allocated rather than inline brings with it:
+`PromiseNode::onReady()` is `noexcept` throughout kj and can arm an
+already-ready promise's event, so arming now runs on a `noexcept` path that
+can map memory. A failed `mmap` there ends the process instead of throwing.
+It takes a 4 KiB to 256 KiB mapping to fail, so it is the same memory
+exhaustion that ends the process anyway, but it is a path that did not exist
+before.
