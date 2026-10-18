@@ -60,21 +60,27 @@ which runs each isolate's JS turn at guest ring 3.
   Negative build: `--copt=-DWORKERD_GK_NEG_TIMEOUT_RUNNING`, where the fault
   path leaves the mark standing and the process dies on the assert.
 - `memory-cache-fault-test.sh` / `memory-cache-fault-test.capnp` /
-  `memory-cache-fault-test.js` — the fault taken inside a `MemoryCache`
-  fallback, whose frame holds the callback that releases the cache's
-  in-progress entry for the key: a process-wide entry, since workers
-  sharing a cache id share the cache, on which every later read of that key
-  from any of them waits. The callback is the request's IoContext's before
-  the fallback runs, so the teardown of the faulted request releases the
-  entry, and a co-tenant worker's read of the same key completes with its
-  own fallback. Negative build: `--copt=-DWORKERD_GK_NEG_CACHE_FALLBACK`,
-  where the entry is stranded and the co-tenant's read hangs, which the
-  script bounds and reports.
-  On a build with per-isolate heap arenas the script fails at its second step,
-  before the fault is injected: the cache instance is in the arena of the first
-  worker whose bindings were compiled, and the peer's first read faults on it.
+  `memory-cache-fault-test.js` — end-to-end check against a built workerd
+  that two workers configured with one memory cache id share the cache across
+  their isolates' arenas, and that a fault inside a `MemoryCache` fallback
+  fails only that request. The cache is a host object behind a hostcall
+  (`api/memory-cache.h`): a value one worker's fallback produced is read by
+  the other, copied into its own arena; a read that finds the other worker's
+  fallback in flight waits on it and is woken by the host after the leader's
+  turn, in its own context, with the leader's value; and the fault is taken
+  inside a fallback, whose frame holds the callback that releases the cache's
+  in-flight entry for the key, on which every later read of that key from any
+  sharer waits. The callback is the request's IoContext's before the fallback
+  runs, so the teardown of the faulted request releases the entry, and the
+  co-tenant's read of the same key completes with its own fallback. Negative
+  builds: `--copt=-DWORKERD_GK_NEG_CACHE_FALLBACK`, where the entry is
+  stranded and the co-tenant's read hangs, which the script bounds and
+  reports; `--copt=-DWORKERD_GK_NEG_CACHE_WAKE_IN_TURN`, where the leader
+  drains the wake queue from inside its own turn rather than leaving it to the
+  host after the turn: the queue is host memory, so the leader's turn faults
+  at its first publish and the script fails at its first step.
   `memory-classes.md`, "The shared memory cache", says why the shared heap is
-  not where the cache goes and what placement is.
+  not where the cache goes and what the placement is.
 - `surface-test.sh` / `surface-test.capnp` / `surface-test.js` / `add.wasm` /
   `oob.wasm` — end-to-end check against a built workerd that a broad V8 surface
   (Wasm including an out-of-bounds trap, WebCrypto, irregexp and a JIT-heavy

@@ -2,15 +2,12 @@
 
 #include <workerd/io/compatibility-date.capnp.h>
 #include <workerd/jsg/jsg.h>
-#include <workerd/util/checked-queue.h>
+#include <workerd/util/host-memory.h>
+#include <workerd/util/hostcall.h>
 
-#include <kj/hash.h>
-#include <kj/map.h>
+#include <kj/async.h>
 #include <kj/mutex.h>
-#include <kj/table.h>
 #include <kj/time.h>
-
-#include <set>
 
 namespace workerd {
 class SpanBuilder;
@@ -44,6 +41,8 @@ class CacheValueBacking {
   virtual ~CacheValueBacking() noexcept(false) = default;
 };
 
+// A serialized value as a turn holds it: the bytes a fallback produced, or the copy of a cached
+// value a read brought into the reader's own memory.
 struct CacheValue: kj::AtomicRefcounted {
   CacheValue(kj::Array<kj::byte>&& bytes): data(kj::mv(bytes)) {}
   CacheValue(kj::Own<CacheValueBacking> backing): data(kj::mv(backing)) {}
@@ -68,40 +67,6 @@ struct CacheValue: kj::AtomicRefcounted {
   kj::OneOf<kj::Array<kj::byte>, kj::Own<CacheValueBacking>> data;
 };
 
-struct MemoryCacheEntry {
-  // The key that this entry is associated with.
-  kj::String key;
-
-  // Whenever an entry is created, updated, or retrieved, its liveliness is
-  // set to the value of a monotonically increasing counter.
-  uint64_t liveliness;
-  // TODO(cleanup): The liveliness index accomplishes the same thing as
-  //   kj::InsertionOrderIndex.
-  //
-  // TODO(perf): Updating a cache entry's liveliness requires a re-insertion,
-  //   which means that cache reads require an exclusive lock. This may be
-  //   suboptimal for a read-heavy workload. WorkerSet avoids this by atomically
-  //   updating a `lastUsed` timestamp. The tradeoff is that LRU-eviction
-  //   becomes O(n) instead of O(1), since we can no longer use kj::Table's
-  //   index to find the LRU entry.
-
-  // The stored JavaScript value, serialized by V8. It is atomicRefcounted to
-  // allow threads to deserialize the value without having to lock the cache,
-  // so the value can even be deserialized while the cache entry is being
-  // evicted.
-  kj::Own<CacheValue> value;
-
-  inline size_t size() const {
-    return value->size();
-  }
-
-  // The expiration timestamp of this cache entry, usually the time at which the
-  // entry was created plus some TTL. This is measured in milliseconds and
-  // stored as a double so that it is compatible with api::dateNow() and
-  // EdgeWorkerPlatform::CurrentClockTimeMillis().
-  kj::Maybe<double> expiration;
-};
-
 struct CacheValueProduceResult {
   jsg::JsRef<jsg::JsValue> value;
   jsg::Optional<double> expiration;
@@ -112,17 +77,33 @@ class MemoryCacheProvider;
 
 // An in-memory cache that can be accessed by any number of workers/isolates
 // within the same process.
-// TODO(soon): We plan to explore replacing this implementation with a memcached-based
-// implementation in the near future. The memcached-based impl would likely be
-// fairly different from this implementation so quite a few of the details here
-// are expected to change.
+//
+// The instance is a host object (memory class H, util/host-memory.h): it, its tables, its keys
+// and its values are in host memory, which no JS turn can read or write, and a turn operates on
+// it through hostcalls (util/hostcall.h) whose handler runs host-side on the calling thread.
+// What two workers share is decided by configuration -- bindings with the same cache id share
+// one instance -- and the host enforces that contract rather than the memory layout: a binding
+// is a host-side record of {instance, limits, the arena of the isolate that made it}, the
+// MemoryCache object holds only a host slot handle to it, and the handler refuses a handle
+// whose record was not made by the arena the calling thread runs under, by gk's own record of
+// the thread. So a turn gets the values of the caches it is configured with, one copy per read
+// in its own memory, and nothing of the tables, and a worker with no binding gets nothing. See
+// "The shared memory cache" in experimental/guest-kernel/memory-classes.md.
+//
+// Reads, the leader's publish and abandon, and deletes are each one hostcall (one VM exit with
+// the guest kernel active, a direct call without it), so the ordinary test suite exercises the
+// same code. A hit copies the value into the caller's memory: through the frame when it fits,
+// otherwise into a buffer the turn names within its own arena, which the handler checks
+// against gk's record of that arena before writing. A read that finds its key in flight gets
+// "wait" and nothing in host memory to wait on: the turn makes its promise in its own memory,
+// registers its waiter record in the resolve table, and hands the host the handles of its
+// context and of that record, both values the host validates before use; when the leader
+// publishes or abandons, the handler moves the waiters to a wake list, and after the leader's
+// turn the host, from the event loop, queues an action in each waiter's own context, where the
+// waiter re-issues its read. Nothing the host dereferences is in a turn's memory, and no turn
+// writes into another's.
 class SharedMemoryCache: public kj::AtomicRefcounted {
- private:
-  struct InProgress;
-
  public:
-  struct ThreadUnsafeData;
-
   struct Limits {
     // The maximum number of keys that may exist within the cache at the same
     // time. The cache size grows at least linearly in the number of entries.
@@ -136,15 +117,7 @@ class SharedMemoryCache: public kj::AtomicRefcounted {
     // for keys and the overhead of the data structures themselves.
     uint64_t maxTotalValueSize;
 
-    bool operator<(const Limits& b) const {
-      if (maxTotalValueSize != b.maxTotalValueSize) {
-        return maxTotalValueSize < b.maxTotalValueSize;
-      }
-      if (maxKeys != b.maxKeys) {
-        return maxKeys < b.maxKeys;
-      }
-      return maxTotalValueSize < b.maxTotalValueSize;
-    }
+    bool operator==(const Limits& b) const = default;
 
     Limits normalize() const KJ_WARN_UNUSED_RESULT {
       // Avoid surprises due to misconfigured bindings that set one or more limits to 0.
@@ -167,16 +140,21 @@ class SharedMemoryCache: public kj::AtomicRefcounted {
 
     static Limits max(const Limits& a, const Limits& b) {
       return Limits{
-        std::max(a.maxKeys, b.maxKeys),
-        std::max(a.maxValueSize, b.maxValueSize),
-        std::max(a.maxTotalValueSize, b.maxTotalValueSize),
+        kj::max(a.maxKeys, b.maxKeys),
+        kj::max(a.maxValueSize, b.maxValueSize),
+        kj::max(a.maxTotalValueSize, b.maxTotalValueSize),
       };
     }
   };
 
-  KJ_DISALLOW_COPY_AND_MOVE(SharedMemoryCache);
-
+  // What an embedder's resize handler sees of the instance: the effective limits, which it may
+  // lower (a process-wide cap, see MemoryCachePolicy).
+  struct ThreadUnsafeData {
+    Limits effectiveLimits = Limits::min();
+  };
   using AdditionalResizeMemoryLimitHandler = kj::Function<void(ThreadUnsafeData&)>;
+
+  KJ_DISALLOW_COPY_AND_MOVE(SharedMemoryCache);
 
   SharedMemoryCache(kj::Maybe<const MemoryCacheProvider&> provider,
       kj::StringPtr id,
@@ -184,14 +162,31 @@ class SharedMemoryCache: public kj::AtomicRefcounted {
       const kj::MonotonicClock& timer);
   ~SharedMemoryCache() noexcept(false);
 
+  // The instance is constructed in host memory: kj::atomicRefcounted<SharedMemoryCache>() and
+  // the refcount's `delete this` go through these.
+  static void* operator new(size_t size);
+  static void operator delete(void* ptr, size_t size);
+
   kj::StringPtr getId() const {
-    return id;
+    return kj::StringPtr(id, idLength);
   }
 
   static kj::Own<const SharedMemoryCache> create(kj::Maybe<const MemoryCacheProvider&> provider,
       kj::StringPtr id,
       kj::Maybe<AdditionalResizeMemoryLimitHandler&> additionalResizeMemoryLimitHandler,
       const kj::MonotonicClock& timer);
+
+  // A binding's record: in host memory, named by a host slot handle, made host-side when the
+  // binding is created under the binder's isolate lock. The arena is gk's record of that thread,
+  // which the hostcall handler compares against the arena it runs under (see the class
+  // comment); the tag tells this slot's object from another host-memory tenant's.
+  struct WD_MEMORY_CLASS_HOST Binding {
+    uint64_t tag;
+    kj::Own<const SharedMemoryCache> cache;
+    Limits limits;
+    hostMemory::IsolateArena arena;
+  };
+  static constexpr uint64_t BINDING_TAG = 0x6d63616368652d62ull;
 
   // RAII class that attaches itself to a cache, suggests cache limits to the
   // cache it is attached to, and allows interacting with the cache.
@@ -200,7 +195,7 @@ class SharedMemoryCache: public kj::AtomicRefcounted {
     KJ_DISALLOW_COPY(Use);
 
     Use(kj::Own<const SharedMemoryCache> cache, const Limits& limits);
-    Use(Use&& other);
+    Use(Use&& other) = default;
     ~Use() noexcept(false);
 
     // Returns a cached value for the given key if one exists (and has not
@@ -226,57 +221,69 @@ class SharedMemoryCache: public kj::AtomicRefcounted {
 
     void delete_(const kj::String& key) const;
 
+    // A waiter inside a request; see getWithFallback().
+    class WaitHolder;
+
    private:
-    // Creates a new FallbackDoneCallback associated with the given
-    // InProgress struct. This is called whenever getWithFallback() wants to
-    // invoke a fallback but it does not call the fallback directly. The caller
-    // is responsible for passing the returned task and fulfiller to the
-    // respective I/O context in which the fallback will run.
-    FallbackDoneCallback prepareFallback(InProgress& inProgress) const;
-
-    // Called whenever a fallback has failed. The fallback might have thrown an
-    // error or it might have returned a Promise that rejected, or the I/O
-    // context in which the fallback should have been invoked has already been
-    // destroyed. If other concurrent read operations have queued fallbacks,
-    // this schedules the next fallback. Otherwise, the InProgress struct is
-    // erased.
-    void handleFallbackFailure(InProgress& inProgress) const;
-
-    kj::Own<const SharedMemoryCache> cache;
-    static constexpr auto memoryCachekLockWaitTimeTag = "memory_cache_lock_wait_time_ns"_kjc;
+    HostSlot<Binding> binding;
     Limits limits;
   };
 
- private:
-  struct InProgress {
-    const kj::String key;
+  // The hostcall every operation of a Use goes through, installed by workerd's main once
+  // gk_init() has run; installHostcall() also readies the host-side state the handler and the
+  // end-of-turn wake draw on, so that the handler's first use is not its initialization.
+  static const hostcall::Entry HOSTCALL;
+  static void installHostcall();
 
-    struct Waiter {
-      kj::Own<kj::CrossThreadPromiseFulfiller<Use::GetWithFallbackOutcome>> fulfiller;
-    };
-    workerd::util::Queue<Waiter> waiting;
-
-    InProgress(kj::String&& key): key(kj::mv(key)) {}
-
-    // Callbacks for a HashIndex that allow locating an InProgress struct
-    // based on the cache key.
-    class KeyCallbacks {
-     public:
-      inline const kj::String& keyForRow(const kj::Own<InProgress>& entry) const {
-        return entry->key;
-      }
-
-      template <typename KeyLike>
-      inline bool matches(const kj::Own<InProgress>& e, KeyLike&& key) const {
-        return e->key == key;
-      }
-
-      template <typename KeyLike>
-      inline auto hashCode(KeyLike&& key) const {
-        return kj::hashCode(key);
-      }
-    };
+  // Operations of the hostcall, in args[0]; args[1] is the binding's handle.
+  enum class Op : uint64_t {
+    READ = 1,        // in: ReadIn + key; out: ReadOut (+ the value when it fits the frame)
+    READ_RANGE = 2,  // args: a buffer in the caller's arena; the pinned value is copied there
+    READ_CHUNK = 3,  // args: an offset; out: the pinned value's bytes from there, one frame
+    PUBLISH = 4,     // in: PublishIn + key (+ the value inline or in an arena range); out: WriteOut
+    PUBLISH_BEGIN = 5,  // in: PublishIn + key: a value larger than the frame begins, staged
+    PUBLISH_CHUNK = 6,  // in: the staged value's next bytes
+    PUBLISH_END = 7,    // in: PublishIn + key: the staged value is stored; out: WriteOut
+    ABANDON = 8,        // in: AbandonIn + key: the leader gives the key up; out: WriteOut
+    DELETE = 9,         // in: DeleteIn + key
   };
+
+  // Host-side: wakes the waiters every instance has set aside since the last drain. Run at the
+  // end of each turn by the host (hostMemory::setTurnEndHook) and directly by a host-side
+  // publish or abandon.
+  static void drainWakes();
+
+  // Host-side, for a caller outside any turn that found its key in flight: waits on `fulfiller`
+  // with the key, if the key is still in flight under `ticket`.
+  bool addHostSideWaiter(kj::StringPtr key,
+      uint64_t ticket,
+      kj::Own<kj::CrossThreadPromiseFulfiller<void>> fulfiller) const;
+
+  // The instance's data structures, named here for the file-local helpers that operate on them.
+  struct Data;
+  struct Entry;
+  struct Value;
+  struct InFlight;
+  struct Waiter;
+  struct Wake;
+  struct SuggestedLimit;
+  struct PinState;
+
+ private:
+  friend class MemoryCacheProvider;
+
+  static long hostcallHandler(hostcall::Frame& frame);
+  static long handleCall(hostcall::Frame& frame);
+  long handleRead(hostcall::Frame& frame, const Binding& binding, PinState& pin) const;
+  long handleReadRange(hostcall::Frame& frame, PinState& pin) const;
+  long handleReadChunk(hostcall::Frame& frame, PinState& pin) const;
+  long handlePublish(hostcall::Frame& frame, const Binding& binding, PinState& pin, Op op) const;
+  long handleAbandon(hostcall::Frame& frame) const;
+  long handleDelete(hostcall::Frame& frame) const;
+  void unpin(PinState& pin) const;
+  // The wake action a waiter's context runs: resolves the waiter's record by its cookie, in the
+  // waiter's own turn, and has it read again.
+  static void wakeHolder(uint64_t cookie);
 
   // Called when initializing globals (i.e., bindings) for an isolate. Each
   // cache binding holds one SharedMemoryCache::Use, which automatically calls
@@ -287,212 +294,36 @@ class SharedMemoryCache: public kj::AtomicRefcounted {
   // Called when a cache global and its associated SharedMemoryCache::Use is
   // destroyed. This call might reduce the effective cache limits. If all uses
   // have been destroyed, the effective limits will be reset to Limits::min(),
-  // effectively clearing the cache.
-  void unsuggest(const Limits& limits) const;
+  // effectively clearing the cache. Every key the binding is leading a fallback for is
+  // abandoned first, so that its waiters are woken rather than stranded.
+  void unsuggest(const Binding& binding) const;
 
-  // Used internally by suggest() and unsuggest() to dynamically resize the
-  // cache as appropriate. This function also recomputed the effective cache
-  // limits and thus must be called even when the cache size is increased (which
-  // does not change the cache contents).
-  void resize(ThreadUnsafeData& data) const;
+  void resize(Data& data) const;
+  void setAsideWaiters(Data& data, InFlight& inFlight) const;
 
-  // Returns a cached value while the cache's data is already locked by the
-  // calling thread. If such a cache entry exists, it will be marked as the
-  // most recently used entry.
-  kj::Maybe<kj::Own<CacheValue>> getWhileLocked(
-      ThreadUnsafeData& data, const kj::String& key) const;
-
-  // Stores a value in the cache, with an optional expiration timestamp. It is
-  // marked as the most recently used entry.
-  void putWhileLocked(ThreadUnsafeData& data,
-      const kj::String& key,
-      kj::Own<CacheValue>&& value,
-      kj::Maybe<double> expiration) const;
-
-  // Evicts at least one cache entry. The cache's data must already be locked by
-  // the calling thread, and the cache must not be empty. Expiration timestamps
-  // are only considered if called from within an I/O context or if
-  // allowOutsideIoContext is true.
-  void evictNextWhileLocked(ThreadUnsafeData& data, bool allowOutsideIoContext = false) const;
-
-  // Removes the cache entry with the given key, if it exists.
-  void removeIfExistsWhileLocked(ThreadUnsafeData& data, const kj::String& key) const;
-
-  static Use::FallbackDoneCallback prepareFallback(
-      const SharedMemoryCache& cache, InProgress& inProgress);
-  static void handleFallbackFailure(const SharedMemoryCache& cache, InProgress& inProgress);
-
-  // Callbacks for a HashIndex that allow locating cache entries based on the
-  // cache key, which is a string. This is used for all key-based cache
-  // operations.
-  class KeyCallbacks {
-   public:
-    inline const kj::String& keyForRow(const MemoryCacheEntry& entry) const {
-      return entry.key;
-    }
-
-    template <typename KeyLike>
-    inline bool matches(const MemoryCacheEntry& e, KeyLike&& key) const {
-      return e.key == key;
-    }
-
-    template <typename KeyLike>
-    inline auto hashCode(KeyLike&& key) const {
-      return kj::hashCode(key);
-    }
-  };
-
-  // Callbacks for a TreeIndex that allow sorting cache entries by their
-  // liveliness. This is used to evict the least recently used entry.
-  class LivelinessCallbacks {
-   public:
-    inline const uint64_t& keyForRow(const MemoryCacheEntry& entry) const {
-      return entry.liveliness;
-    }
-
-    template <typename KeyLike>
-    inline bool matches(const MemoryCacheEntry& e, KeyLike&& key) const {
-      return e.liveliness == key;
-    }
-
-    template <typename KeyLike>
-    inline bool isBefore(const MemoryCacheEntry& e, KeyLike&& key) const {
-      return e.liveliness < key;
-    }
-  };
-
-  // Callbacks for a TreeIndex that allow sorting cache entries by the sizes
-  // of the serialized values. The entries are sorted in reverse order, i.e.,
-  // the first entry contains the largest value. This is used to quickly evict
-  // the largest cache values when the maximum value size is reduced, e.g.,
-  // when a new version of a worker is deployed.
-  class ValueSizeCallbacks {
-   public:
-    inline const MemoryCacheEntry& keyForRow(const MemoryCacheEntry& entry KJ_LIFETIMEBOUND) const {
-      return entry;
-    }
-
-    template <typename KeyLike>
-    inline bool matches(const MemoryCacheEntry& e, KeyLike&& key) const {
-      return e.size() == key.size() && e.key == key.key;
-    }
-
-    template <typename KeyLike>
-    inline bool isBefore(const MemoryCacheEntry& e, KeyLike&& key) const {
-      size_t szl = e.size(), szr = key.size();
-      if (szl != szr) return szl > szr;
-      return e.key < key.key;
-    }
-  };
-
-  // Callbacks for a TreeIndex that allow sorting cache entries by their
-  // expiration times. This is used to quickly evict expired entries even when
-  // they are not least recently used. Values with no expiration timestamp are
-  // at the very end, ordered by their cache keys.
-  class ExpirationCallbacks {
-   public:
-    inline const MemoryCacheEntry& keyForRow(const MemoryCacheEntry& entry KJ_LIFETIMEBOUND) const {
-      return entry;
-    }
-
-    template <typename KeyLike>
-    inline bool matches(const MemoryCacheEntry& e, KeyLike&& key) const {
-      return e.expiration == key.expiration && e.key == key.key;
-    }
-
-    template <typename KeyLike>
-    inline bool isBefore(const MemoryCacheEntry& e, KeyLike&& key) const {
-      const kj::Maybe<double>&expl = e.expiration, expr = key.expiration;
-      if (expl != expr) return isBefore(expl, expr);
-      return e.key < key.key;
-    }
-
-   private:
-    inline bool isBefore(const kj::Maybe<double>& a, const kj::Maybe<double>& b) const {
-      KJ_IF_SOME(da, a) {
-        KJ_IF_SOME(db, b) {
-          return da < db;
-        } else {
-          return false;
-        }
-      } else {
-        KJ_ASSERT(b != kj::none);
-        return true;
-      }
-    }
-  };
-
- public:
-  struct ThreadUnsafeData {
-    KJ_DISALLOW_COPY_AND_MOVE(ThreadUnsafeData);
-
-    ThreadUnsafeData() {}
-
-    // All limits that have been suggested by isolates that are currently using
-    // this cache.
-    std::multiset<Limits> suggestedLimits;
-
-    // The computed effective limits. These are updated whenever new isolates
-    // are attached to this cache.
-    Limits effectiveLimits = Limits::min();
-
-    // Returns the next liveliness and increments it so that the next call to
-    // this function will return a different value.
-    inline uint64_t stepLiveliness() {
-      return nextLiveliness++;
-    }
-
-    // We do not handle integer overflow, but a 64-bit counter should never wrap
-    // around, at least not in the foreseeable future. (Even at a billion cache
-    // operations per second, it would take almost 600 years.)
-    uint64_t nextLiveliness = 0;
-
-    // The sum of the sizes of all values that are currently stored in the cache.
-    // This is technically redundant information, but more efficient than
-    // iterating over all cache entries every time we need this information.
-    size_t totalValueSize = 0;
-
-    // The actual cache contents.
-    kj::Table<MemoryCacheEntry,              // row type
-        kj::HashIndex<KeyCallbacks>,         // index over keys
-        kj::TreeIndex<LivelinessCallbacks>,  // index over liveliness
-        kj::TreeIndex<ValueSizeCallbacks>,   // index over value sizes
-        kj::TreeIndex<ExpirationCallbacks>   // index over expiration
-        >
-        cache;
-
-    // Whenever a fallback is active for a particular key, this table will
-    // contain one corresponding row. Other concurrent read operations can add
-    // themselves to the InProgress struct to be notified once the fallback
-    // completes. When a fallback succeeds, this immediately notifies all
-    // waiting read operations, but when it fails, this behaves like a queue and
-    // and invokes the next available fallback only.
-    kj::Table<kj::Own<InProgress>, kj::HashIndex<InProgress::KeyCallbacks>> inProgress;
-  };
-
- private:
   // To ensure thread-safety, all mutable data is guarded by a mutex. Each cache
   // operation requires an exclusive lock. Even read-only operations need to
-  // update the liveliness of cache entries, which currently requires a lock.
-  kj::MutexGuarded<ThreadUnsafeData> data;
+  // update the recency of cache entries, which requires a lock.
+  HostOwn<kj::MutexGuarded<Data>> data;
 
   // The MemoryCacheProvider instance needs to be guaranteed to outlive the SharedMemoryCache
   // instance. When the SharedMemoryCache is destroyed, it will remove itself from the provider.
-  // TODO(cleanup): Eventually, assuming/once the kj::Ptr<T> work progresses, it would be safer
-  // to replace this with a kj::Ptr<MemoryCacheProvider>
   kj::Maybe<const MemoryCacheProvider&> provider;
 
-  // It's a bit unfortunate that we need to keep a copy of the id here as well as in the map
-  // in the MemoryCacheProvider, however, it's entirely possible (at least theoretically) that
-  // the map entry in the MemoryCacheProvider could be removed before the SharedMemoryCache is
-  // fully destroyed, leaving a dangling reference. This be safe and keep a copy.
-  kj::String id;
+  // The id, copied here because the provider's registry entry can be removed before the
+  // instance is fully destroyed. Host memory, like the instance.
+  char* id;
+  size_t idLength;
 
-  // Same as above, the MemoryCacheProvider owns the actual handler here. Since that is guaranteed
-  // to outlive this SharedMemoryCache instance, so is the handler.
+  // The provider owns the handler, and outlives the instance.
   kj::Maybe<AdditionalResizeMemoryLimitHandler&> additionalResizeMemoryLimitHandler;
 
   const kj::MonotonicClock& timer;
+
+  // The provider's registry of shared instances, and the queue of instances with waiters to
+  // wake: both intrusive, both in host memory.
+  SharedMemoryCache* registryNext = nullptr;
+  SharedMemoryCache* wakeNext = nullptr;
 };
 
 struct MemoryCachePolicy {
@@ -575,12 +406,15 @@ class MemoryCacheProvider {
   kj::Maybe<SharedMemoryCache::AdditionalResizeMemoryLimitHandler>
       additionalResizeMemoryLimitHandler;
 
-  // All existing in-memory *shared* caches. This table will not include caches created
-  // that do not have an id (and therefore cannot be shared).
-  // TODO(cleanup): Later, assuming progress is made on kj::Ptr<T>, it would be nice
-  // to avoid the use of the bare pointer to SharedMemoryCache* here. When the SharedMemoryCache
-  // is destroyed, it will remove itself from this cache by calling removeInstance.
-  kj::MutexGuarded<kj::HashMap<kj::String, const SharedMemoryCache*>> caches;
+  // All existing in-memory *shared* caches, by id: an intrusive list through the instances,
+  // whose head is in host memory, since an instance is reached from here host-side at binding
+  // creation and from its own destructor. Caches created without an id (and therefore not
+  // shareable) are not in it. An instance removes itself by calling removeInstance.
+  struct WD_MEMORY_CLASS_HOST Registry {
+    Registry(): head(nullptr) {}
+    kj::MutexGuarded<SharedMemoryCache*> head;
+  };
+  HostOwn<Registry> registry;
 
   kj::Maybe<kj::Own<MemoryCacheNamespace>> namespaceV2;
 

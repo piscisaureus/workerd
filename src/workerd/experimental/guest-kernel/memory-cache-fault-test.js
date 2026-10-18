@@ -9,13 +9,18 @@ export default {
     const url = new URL(req.url);
     if (
       url.pathname === '/read' ||
+      url.pathname === '/slow' ||
       url.pathname === '/__gk_fault_cache_fallback'
     ) {
       // The fault path is matched on the URL's end, so it carries no query: its key is fixed.
       const key = url.searchParams.get('key') ?? 'stranded';
-      const value = await env.CACHE.read(key, async (k) => ({
-        value: `${k} from ${env.NAME}`,
-      }));
+      // /slow holds its fallback open for a while, so that a co-tenant's read of the same key
+      // finds it in flight and waits on it.
+      const delay = url.pathname === '/slow' ? 500 : 0;
+      const value = await env.CACHE.read(key, async (k) => {
+        if (delay > 0) await scheduler.wait(delay);
+        return { value: `${k} from ${env.NAME}` };
+      });
       return new Response(`${env.NAME} read: ${value}\n`);
     }
     return new Response(`${env.NAME} ok\n`);
