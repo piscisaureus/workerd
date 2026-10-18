@@ -133,13 +133,6 @@ void runTrampolineInGuest(
   kj::AllowAsyncDestructorsScope asyncDestructorScope;
 #endif
 
-  // What the turn arms (a promise it fulfills, a continuation it attaches to a settled
-  // promise) is linked into this thread's event loop queue next to whatever is queued there,
-  // which may be another isolate's promise node, in memory the turn cannot address. For the
-  // turn's duration the loop's own guards sit between the turn's events and the rest of the
-  // queue.
-  kj::EventLoop::GuardedArmScope armGuard;
-
   allocCensus::enterTurn();
   long result = gk_run_here_user(fn, arg);
   allocCensus::leaveTurn();
