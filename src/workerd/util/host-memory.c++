@@ -11,6 +11,7 @@
 #endif
 
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <kj/mutex.h>
 #include <kj/time.h>
@@ -79,6 +80,109 @@ void deallocate(void* ptr, size_t size, size_t alignment) {
 #endif
   scrub(ptr, size);
   ::operator delete(ptr, std::align_val_t(alignment));
+}
+
+// =======================================================================================
+// HostPool
+
+HostPool::~HostPool() noexcept(false) {
+  for (unsigned i = 0; i < regionCount; i++) {
+    Region& r = regions[i];
+#ifdef WORKERD_HAS_GUEST_KERNEL
+    if (r.registered) {
+      int result = gk_host_range_unregister(reinterpret_cast<void*>(r.base), r.end - r.base);
+      KJ_ASSERT(result == 0, "guest-kernel: gk_host_range_unregister failed", result);
+    }
+#endif
+    munmap(reinterpret_cast<void*>(r.base), r.end - r.base);
+  }
+}
+
+bool HostPool::ensure(size_t capacity) {
+  if (capacity > MAX_RESERVATION) capacity = MAX_RESERVATION;
+  if (reserved >= capacity) return true;
+  if (regionCount == REGIONS) return false;
+  size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  size_t bytes = kj::max(capacity - reserved, MIN_REGION);
+  bytes = (bytes + page - 1) / page * page;
+  // Mapped readable and writable from the start: nothing is committed until a page is touched,
+  // and MAP_NORESERVE keeps the reservation off the overcommit ledger.
+  void* mem = mmap(
+      nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (mem == MAP_FAILED) return false;
+  bool registered = false;
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (guestKernelActive()) {
+    // Registered before anything is handed out of it, so no guest thread can have touched a
+    // page of it as a user page first.
+    if (gk_host_range_register(mem, bytes) != 0) {
+      munmap(mem, bytes);
+      return false;
+    }
+    registered = true;
+  }
+#endif
+  auto base = reinterpret_cast<uintptr_t>(mem);
+  regions[regionCount++] = Region{base, base + bytes, base, registered};
+  reserved += bytes;
+  return true;
+}
+
+unsigned HostPool::classOf(size_t size) {
+  unsigned k = 0;
+  while ((MIN_BLOCK << k) < size) k++;
+  return k;
+}
+
+const HostPool::Region* HostPool::regionOf(uintptr_t p) const {
+  for (unsigned i = 0; i < regionCount; i++) {
+    if (p >= regions[i].base && p < regions[i].end) return &regions[i];
+  }
+  return nullptr;
+}
+
+bool HostPool::contains(const void* ptr) const {
+  return regionOf(reinterpret_cast<uintptr_t>(ptr)) != nullptr;
+}
+
+void* HostPool::allocate(size_t size) {
+  if (size == 0) return nullptr;
+  unsigned k = classOf(size);
+  if (k >= CLASSES) return nullptr;
+  size_t block = MIN_BLOCK << k;
+  if (void* p = freeLists[k]; p != nullptr) {
+    freeLists[k] = *static_cast<void**>(p);
+    *static_cast<void**>(p) = nullptr;  // the rest was zeroed when it was freed
+    return p;
+  }
+  // Carved from a region's bump pointer at the block's own alignment, at most a page's; the
+  // newest region first, then the tails of the older ones.
+  size_t align = block < 4096 ? block : 4096;
+  for (unsigned i = regionCount; i > 0; i--) {
+    Region& r = regions[i - 1];
+    uintptr_t start = (r.bump + align - 1) & ~(align - 1);
+    if (start < r.bump || start > r.end || block > r.end - start) continue;
+    r.bump = start + block;
+    return reinterpret_cast<void*>(start);  // fresh pages are zero
+  }
+  return nullptr;
+}
+
+void HostPool::deallocate(void* ptr, size_t size) {
+  if (ptr == nullptr) return;
+  unsigned k = classOf(size);
+  size_t block = MIN_BLOCK << k;
+  auto p = reinterpret_cast<uintptr_t>(ptr);
+  size_t align = block < 4096 ? block : 4096;
+  // A pointer that is not the start of a block of this class in one of this pool's regions is
+  // a pointer loaded from memory the guest could rewrite: refused as fatal rather than written
+  // through, as the guest kernel refuses one on its own blocks.
+  const Region* r = regionOf(p);
+  KJ_ASSERT(r != nullptr && (p & (align - 1)) == 0 && block <= r->bump - p,
+      "HostPool::deallocate of a pointer that is not a block of that size");
+  scrub(ptr, block);
+  *static_cast<void**>(ptr) = freeLists[k];
+  freeLists[k] = ptr;
 }
 
 namespace {
@@ -1258,6 +1362,23 @@ bool ownedByTurn(ResolveHandle handle) {
   return tableResolve(handle) == nullptr;
 }
 
+IsolateArena currentIsolateArena() {
+  return currentArena();
+}
+
+bool ownedByCurrentArena(ResolveHandle handle) {
+  void* arena = currentArena();
+  if (arena == nullptr) return tableResolve(handle) != nullptr;
+  return tableOwnedBy(arena, handle);
+}
+
+bool arenaRangeOk(const void* addr, size_t len) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (guestKernelActive()) return gk_arena_range_ok(addr, len) != 0;
+#endif
+  return true;
+}
+
 void releaseJournaled(
     kj::FunctionParam<bool(ResolveHandle handle, void* ptr, const uint64_t* aux)> fn) {
   TurnJournal* journal = activeJournal();
@@ -1290,6 +1411,19 @@ ResolveTurn::ResolveTurn(ResolveTurnHooks hooks): pool(nullptr) {
   pool = &threadPool;
 }
 
+namespace {
+// Host memory would be the place for a pointer the host calls through, but this one is set once
+// before any turn runs and never again, so it is a plain static the way the handler table's
+// shim context is: a turn that rewrote it would redirect a call the host makes after the turn,
+// which is the status of every function pointer in the runtime's writable data.
+void (*turnEndHook)() = nullptr;
+}  // namespace
+
+void setTurnEndHook(void (*hook)()) {
+  KJ_REQUIRE(turnEndHook == nullptr || hook == nullptr, "the turn-end hook is set once");
+  turnEndHook = hook;
+}
+
 ResolveTurn::~ResolveTurn() noexcept(false) {
   if (pool == nullptr) return;
   // Everything below reads the pool and its journal through this frame's pointer, which the
@@ -1311,6 +1445,8 @@ ResolveTurn::~ResolveTurn() noexcept(false) {
   threadPool.turnArena = nullptr;
   journal.active = false;
   currentJournal = nullptr;
+  // Last, outside the turn's bookkeeping: what a handler of this turn left for the host to do.
+  if (turnEndHook != nullptr) turnEndHook();
 }
 
 void installResolveHostcall() {
