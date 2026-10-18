@@ -2311,3 +2311,137 @@ exit status 1, after `IoContext` has logged the condemnation twice. Six runs
 in six. The first run of arm A saw this as a connection reset in the harness.
 A caller that closes a binding's WebSocket and does not await the reply
 therefore takes the whole workerd down under heap arenas today.
+
+## What the memory cache's hostcall costs
+
+### The question
+
+The shared memory cache (`api/memory-cache.h`) is a host object behind a
+hostcall: a hit, which was a lock and a refcount taken inside the turn on a
+process-heap object, is now one VM exit under the guest kernel, with the value
+copied into the caller's memory, and a miss is an exit to lead and an exit to
+publish. The placement is what keeps one cache id's values out of every other
+isolate's reach under per-isolate heap arenas ("The shared memory cache" in
+`memory-classes.md`); the question is what a cache-heavy worker pays for it.
+The estimate going in was the hostcall round trip `gk_test` measures, 6.4 us.
+
+### Method
+
+`memcache.py`: one worker with one cache binding, before and after the move,
+interleaved launch by launch, four launches per arm, four seconds per case,
+one connection, the server on `12-17,36-41` and the client on `0-5,24-29`,
+the VMSCAPE mitigation reading `Mitigation: IBPB before exit to userspace` and
+`halt_poll_ns` 200000 before and after each run. The arms are the shipping
+configurations: N the jemalloc binary without the guest kernel (a direct call
+in place of the exit), G the plain binary under it (`GK_RUNNER=resident
+GK_RUNNER_PIN=other`, no arenas), A the jemalloc binary under it with
+per-isolate heap arenas. One worker is enough for the cost, and it is why the
+before-binary can serve every arm: nothing crosses an arena, so the old cache
+in the worker's own arena works, while two workers sharing an id fault on it
+(`memory-cache-fault-test.sh`, which the move is for).
+
+Routes, each answering a count so the client's traffic is the same at every
+n: `/hit/<n>` reads one cached 32-byte value n times, the synchronous hit
+path; `/hit-large/<n>` reads one cached 64 KiB value n times, larger than the
+hostcall frame, so the value is fetched into a buffer the turn names within its
+arena (A), or a frame at a time where the buffer is not in an arena (G), or
+copied directly (N); `/miss/<n>` reads n fresh keys with a synchronous
+fallback, so each read leads, runs the fallback and publishes. The control,
+`/actor-id/<n>`, mints a Durable Object id from a name n times: the actor-id
+hostcall (`server/actor-id-impl.h`), which ships already, one exit per call
+and no cache in it, measured on the after-binaries alone, two launches
+(`results/memcache-{native,gk,arena}.json`,
+`results/memcache-control-{native,gk,arena}.json`).
+
+### 1. Per launch, before and after
+
+p50 per launch in microseconds, the four launches of each arm in order, and
+the paired difference launch by launch.
+
+| N, jemalloc, no guest kernel | before | after | after minus before, paired |
+| --- | --- | --- | --- |
+| hit, 1 | 38.4 38.5 39.2 38.6 | 39.8 38.4 37.6 41.2 | +1.3 -0.0 -1.6 +2.6 |
+| hit, 100 | 203.6 204.0 211.9 203.2 | 198.5 186.1 185.7 205.9 | -5.1 -17.9 -26.1 +2.7 |
+| hit 64 KiB, 1 | 39.8 39.4 42.0 40.9 | 44.6 42.1 41.5 44.2 | +4.8 +2.6 -0.5 +3.3 |
+| hit 64 KiB, 100 | 319.2 316.4 334.5 314.2 | 491.0 486.2 483.7 503.4 | +171.9 +169.9 +149.2 +189.2 |
+| miss, 1 | 51.0 50.1 54.3 50.9 | 52.7 50.3 47.8 52.8 | +1.7 +0.2 -6.5 +1.9 |
+| miss, 100 | 864.1 865.4 873.0 853.7 | 820.9 795.0 796.5 824.5 | -43.2 -70.4 -76.5 -29.2 |
+
+| G, plain, guest kernel, no arenas | before | after | after minus before, paired |
+| --- | --- | --- | --- |
+| hit, 1 | 40.8 40.8 40.8 40.8 | 92.5 91.9 96.5 90.9 | +51.7 +51.2 +55.7 +50.1 |
+| hit, 100 | 219.0 221.2 219.6 220.4 | 2915.7 2428.9 2962.9 2805.5 | +2696.7 +2207.7 +2743.3 +2585.1 |
+| hit 64 KiB, 1 | 41.6 42.0 41.3 41.8 | 399.2 397.1 383.2 398.8 | +357.6 +355.1 +341.9 +357.0 |
+| hit 64 KiB, 100 | 414.5 421.2 432.4 435.9 | 33426 33004 31714 33451 | +33012 +32583 +31282 +33015 |
+| miss, 1 | 54.2 54.2 53.4 53.8 | 149.1 148.5 143.9 149.1 | +95.0 +94.3 +90.5 +95.3 |
+| miss, 100 | 1458.2 1455.3 1457.6 1464.0 | 7825.0 7709.3 7349.0 7834.7 | +6366.8 +6254.0 +5891.4 +6370.7 |
+
+| A, jemalloc, guest kernel, arenas | before | after | after minus before, paired |
+| --- | --- | --- | --- |
+| hit, 1 | 169.9 166.4 175.2 166.5 | 181.4 181.3 181.7 190.8 | +11.5 +14.9 +6.6 +24.4 |
+| hit, 100 | 364.5 361.5 384.2 360.8 | 2213.9 2128.8 2236.5 2220.1 | +1849.3 +1767.3 +1852.3 +1859.3 |
+| hit 64 KiB, 1 | 170.7 169.3 174.9 167.9 | 197.4 196.2 195.7 205.0 | +26.6 +26.9 +20.8 +37.1 |
+| hit 64 KiB, 100 | 499.5 500.7 524.6 511.7 | 3248.6 3290.6 3285.3 3323.4 | +2749.0 +2789.9 +2760.7 +2811.7 |
+| miss, 1 | 249.7 230.2 237.3 226.7 | 261.7 274.2 254.5 246.5 | +12.0 +44.0 +17.2 +19.8 |
+| miss, 100 | 6540.9 6383.6 6605.8 6417.1 | 8612.5 8601.7 8550.5 8902.8 | +2071.6 +2218.1 +1944.7 +2485.8 |
+
+No launch of any arm had an error, faulted or condemned an isolate.
+
+The control, the after-binaries, two launches each:
+
+| actor-id hostcall | 1 per request | 100 per request | per call |
+| --- | --- | --- | --- |
+| N | 36.9 37.0 | 102.3 97.7 | 0.6 us |
+| G | 93.9 94.1 | 2119.4 2117.7 | 20.4 us |
+| A | 176.2 185.0 | 1252.1 1345.0 | 11.3 us |
+
+### 2. What it says
+
+**Without the guest kernel the move costs nothing a launch can tell apart, and
+a 64 KiB hit costs the copy.** In N a small hit is 1.5 us before and after
+(the four paired differences at a hundred hits straddle zero, -26 to +3 us), a
+miss is 8.2 us before and 7.6 after, and a 64 KiB hit goes from 2.8 to 4.5 us:
+the value is copied into the instance's pool at publish and out of it at read,
+two 64 KiB copies where a refcount was, about 1.7 us.
+
+**Under the guest kernel a cache operation costs an exit, and an exit in this
+runtime is 11 to 20 us, not 6.4.** In A a hit goes from 2.0 to 20.5 us, a
+64 KiB hit from 3.4 to 31 (two exits: the read, and the fetch into the turn's
+buffer), a miss from 63 to 84 (the lead and the publish). In G, under the
+resident runner, a hit goes from 1.8 to 26 us, a miss from 14 to 77, and a
+64 KiB hit from 3.8 to 333: seventeen exits, the read and sixteen frames,
+since without arenas the value cannot be fetched into a buffer the turn
+names. The control puts the exit itself at 11.3 us in A and 20.4 in G for a
+hostcall that does nothing but an HMAC, so the cache hit is one exit plus
+about 6 to 9 us; the raw round trip `gk_test` measures is what the exit costs
+a loop with nothing to re-warm, and the rest is what "Why the front end is
+cold" above records for every return to userspace under the VMSCAPE
+mitigation -- an IBPB and the loss of every return prediction, which the
+handler, the turn's continuation and the deserialization of the copy all
+pay. A hundred hits in one request are +1.8 ms in A and +2.6 ms in G, five to
+twelve times the request.
+
+**The synchronous hit path survives in the sense that matters to JS and not
+in the sense that matters to cost.** A hit still resolves in the turn that
+asked, with no round through the event loop -- `read()` on a cached key is a
+promise already resolved when it is returned, as before -- but what it costs is
+an exit's worth, and the exit's aftermath, where it cost a lock. Whether that
+is acceptable is a trade: the alternative that keeps the lock is a cache per
+isolate when arenas are active, which drops sharing between workers configured
+to share, a behaviour change by build rather than by compatibility flag. A
+read-only copy of values in each sharer's arena, refreshed on a generation
+the host publishes, would give a hit back its lock at the price of a word
+every sharer can read and, with a write primitive, pin: staleness a co-tenant
+could already cause through the API. Neither is built.
+
+### Caveats
+
+One worker and one connection: the lock the old hit took was never contended
+here, and under contention the old path paid for that too. A 64 KiB value is
+the only large size measured; the copies scale with the value and the frames
+with its size over 4 KiB. The control's per-call figure includes an HMAC and
+a JS wrapper the cache hit does not pay, so "one exit plus 6 to 9 us" is an
+upper bound on what the cache adds beyond the exit. The wait path -- a read
+that finds its key in flight and is woken by the host after the leader's
+turn -- was checked for correctness across isolates by the probe and not
+measured.
