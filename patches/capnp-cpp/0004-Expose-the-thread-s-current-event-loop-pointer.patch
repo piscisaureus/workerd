@@ -8,8 +8,8 @@ pointer, which kj writes in enterScope() and leaveScope() and exposes no
 other way. An embedder that runs code it does not trust on a thread that
 has a loop cannot leave the host reaching the loop through that pointer:
 thread-local storage is ordinary memory the code can write, so the loop
-the host turns, arms events on and takes the cross-thread executor from
-would be one that code chose.
+the host arms events on, takes the cross-thread executor from and reads
+the event-loop locals of would be one that code chose.
 
 saveCurrentLoopPointer() and restoreCurrentLoopPointer() let such an
 embedder hold the pointer in a frame the untrusted code cannot reach for
@@ -17,14 +17,33 @@ as long as it runs, and put it back when the code returns. The restore
 writes the pointer whatever it holds then, including when it has been
 cleared, so it cannot go through enterScope(), whose requirement that
 the thread have no loop is what WaitScope relies on.
+
+The event the thread is currently firing gets the same pair, for the
+same reason. EventLoop::turn() sets it around Event::fire() and clears
+it when fire() returns, so what untrusted code called from inside a
+fire() leaves there is read by the rest of that fire(): by ~Event(),
+which compares it with the event being destroyed and aborts the process
+on a match, and by getAsyncTrace(), which dereferences it.
+
+The comment on id() goes back under it, having been left behind the
+GuardedArmScope class an earlier patch inserted.
 ---
 diff --git a/src/kj/async.h b/src/kj/async.h
 --- a/src/kj/async.h
 +++ b/src/kj/async.h
-@@ -1519,6 +1519,21 @@
+@@ -1498,6 +1498,7 @@
+   };
+ 
+   Id id() const;
++  // Returns the unique identifier of this EventLoop.
+ 
+   class GuardedArmScope {
+     // While a GuardedArmScope is active on a loop (the calling thread's current loop; a no-op
+@@ -1519,7 +1520,30 @@
    private:
      EventLoop* loop;
    };
+-  // Returns the unique identifier of this EventLoop.
 +
 +  static EventLoop* saveCurrentLoopPointer();
 +  static void restoreCurrentLoopPointer(EventLoop* loop);
@@ -40,17 +59,25 @@ diff --git a/src/kj/async.h b/src/kj/async.h
 +  // untrusted code chose, or nothing at all -- which is why it is not enterScope(): the
 +  // requirement that the thread have no loop yet, which WaitScope relies on, cannot be made
 +  // here. Give it only a pointer saveCurrentLoopPointer() returned on the same thread.
-   // Returns the unique identifier of this EventLoop.
++
++  static _::Event* saveCurrentlyFiringEvent();
++  static void restoreCurrentlyFiringEvent(_::Event* event);
++  // The same for the event this thread is currently firing, which turn() sets around
++  // Event::fire() and clears once fire() returns. Until then ~Event() compares it with every
++  // event destroyed on this thread, from a noexcept function that aborts the process on a match,
++  // and getAsyncTrace() dereferences it and calls through its vtable. An embedder that runs
++  // untrusted code from inside a fire() puts this back as well, so that the remainder of that
++  // fire() does not run on what the code left here.
  
  private:
+   inline _::Event* head() const {
 diff --git a/src/kj/async.c++ b/src/kj/async.c++
 --- a/src/kj/async.c++
 +++ b/src/kj/async.c++
-@@ -1881,6 +1881,14 @@
-   KJ_REQUIRE(threadLocalEventLoop == nullptr, "This thread already has an EventLoop.");
+@@ -1882,6 +1882,22 @@
    threadLocalEventLoop = this;
  }
-+
+ 
 +EventLoop* EventLoop::saveCurrentLoopPointer() {
 +  return threadLocalEventLoop;
 +}
@@ -58,6 +85,15 @@ diff --git a/src/kj/async.c++ b/src/kj/async.c++
 +void EventLoop::restoreCurrentLoopPointer(EventLoop* loop) {
 +  threadLocalEventLoop = loop;
 +}
- 
++
++_::Event* EventLoop::saveCurrentlyFiringEvent() {
++  return threadLocalCurrentlyFiring;
++}
++
++void EventLoop::restoreCurrentlyFiringEvent(_::Event* event) {
++  threadLocalCurrentlyFiring = event;
++}
++
  EventLoop::Id EventLoop::id() const { return Id(loopId); }
  
+ EventLoop::Id EventLoop::Id::current() { return currentEventLoop().id(); }
