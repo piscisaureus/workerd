@@ -1679,12 +1679,28 @@ so a crossing a turn makes on every dereference belongs on that path.
   that thread will put it back: a thread between turns can be made to run its
   next one on a loop a foreign turn chose. `event-loop-cross-test.sh` reads
   the loop another thread made current and leaves a sentinel in its place.
-  What that costs depends on a thread model this tree does not exercise: the
-  server's services share one event loop thread, and the only other
-  `kj::Thread`s in it are the inspector's and the fallback service's. So the
-  probe establishes the reach rather than an exploit here. The residual has
-  the shape of the isolate lock slot's, and like it closes only by placing
-  the storage out of the guest's reach rather than by saving it in a frame.
+  What that costs is a question about the threads this binary has. The
+  server's services share one event loop thread, and it is the only thread
+  that runs a turn or takes an isolate lock. V8's platform worker threads --
+  sixteen here, and present in every build -- read no thread-local of
+  workerd's or kj's, nor do the tokio blocking threads a DNS lookup grows,
+  the inotify thread under `--watch`, gk's own vCPU runner threads or the
+  shared-heap keeper. The inspector's thread (`server/server.c++`) has a loop
+  of its own and would read both of these, but it cannot exist beside the
+  guest kernel: `--inspector-addr` is refused (`enableInspector` in
+  `server/workerd.c++`), because the inspector runs JavaScript outside the
+  guest. That leaves the fallback service's thread
+  (`server/fallback-service.c++`), which sets up a loop of its own and drives
+  an HTTP client on it, and which a worker configured with `moduleFallback`
+  under `--experimental` starts for the life of the isolate: the
+  local-development path, and the one thread here whose next loop operation
+  can be made to start from a pointer a foreign turn chose. Which reader it
+  reaches first is not established -- its `WaitScope` asserts the pointer
+  still names its own loop, so an assert may come before a dereference. The
+  residual has the shape of the isolate lock slot's, and like it closes only
+  by placing the storage where ring 3 cannot name another thread's copy; the
+  R7 row in memory-classes.md has why neither placement already in use serves
+  a value the turn itself reads.
 
   Disarming is not covered. Unlinking a queued event writes both its
   neighbors' link fields (`*prev = next; next->prev = prev`), so destroying
