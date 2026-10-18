@@ -140,8 +140,34 @@ void runTrampolineInGuest(
   // queue.
   kj::EventLoop::GuardedArmScope armGuard;
 
+  // The pointer this thread finds that loop through (threadLocalEventLoop in kj/async.c++) is
+  // thread-local storage the turn can write, and it stands at the head of every host-side lookup
+  // of event-loop state: the loop an event is armed on, the executor getCurrentThreadExecutor
+  // hands out, and the local map EventLoop::getLocal reads, where the async lock queue keeps the
+  // waiter that proves an isolate lock was taken. Turning the loop is not one of them -- WaitScope
+  // holds its loop by reference and asserts the pointer still names it -- but nothing the host
+  // does reach through the pointer is bounded by an assert, so a turn that leaves it naming an
+  // EventLoop of its own has the host operating on that object, and one that leaves it cleared
+  // fails those lookups instead, from noexcept paths among others. kj exposes no accessor for the
+  // pointer, which is what
+  // patches/capnp-cpp/0004-Expose-the-thread-s-current-event-loop-pointer.patch adds. The
+  // pointer is left naming the real loop for the turn's duration -- in-turn code arms its own
+  // events and reaches the loop through it -- and put back once the guest has returned, whatever
+  // the turn left in it.
+  kj::EventLoop* eventLoop = kj::EventLoop::saveCurrentLoopPointer();
+
   allocCensus::enterTurn();
   long result = gk_run_here_user(fn, arg);
+#ifndef WORKERD_GK_NEG_LOOP_POINTER
+  // Put back before anything else the host does here: on the fault path below it condemns the
+  // isolate and aborts the request, which arms events on this thread's loop.
+  // (WORKERD_GK_NEG_LOOP_POINTER is a negative-test build, never shipped: the pointer the turn
+  // left stands, and experimental/guest-kernel/event-loop-test.sh must then fail -- the host
+  // finds the loop the turn chose.)
+  kj::EventLoop::restoreCurrentLoopPointer(eventLoop);
+#else
+  (void)eventLoop;
+#endif
   allocCensus::leaveTurn();
 
   for (uint i = 0; i < SET_DATA_SLOTS_IN_USE; i++) {
