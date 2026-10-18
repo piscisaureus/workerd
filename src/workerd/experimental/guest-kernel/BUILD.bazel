@@ -1,6 +1,6 @@
 load("@bazel_skylib//lib:selects.bzl", "selects")
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 
 # gk: run a process inside a KVM guest as guest ring 0 (see README.md). The
 # library is Linux only, on x86-64 and arm64 (it needs /dev/kvm and
@@ -120,4 +120,12 @@ cc_library(
         "//conditions:default": ["@platforms//:incompatible"],
     }),
     visibility = ["//visibility:public"],
+)
+
+# What the event loop's run queue costs per step (see measure/queue-cost.c++). It links kj and
+# nothing else, so it prices the queue rather than a workload that happens to use it.
+cc_binary(
+    name = "queue-cost",
+    srcs = ["measure/queue-cost.c++"],
+    deps = ["@capnp-cpp//src/kj:kj-async"],
 )

@@ -44,9 +44,13 @@ which runs each isolate's JS turn at guest ring 3.
   counts cycles, mispredicts, instruction fills and page walks per request
   on the event-loop thread, split into guest and host mode; `walk-cost.c`
   prices a nested page walk against a native one; `after-exit.c` prices what
-  one `KVM_RUN` round trip does to the host code that follows it).
-  `measure/findings.md` reports them and `measure/run-all.sh` reproduces
-  them.
+  one `KVM_RUN` round trip does to the host code that follows it). It also
+  holds what the isolation itself costs where the cost is in the runtime
+  rather than in the guest: `queue-cost.c++` prices the event loop's run
+  queue, against a kj that keeps its links inside the queued events, and
+  `queuecost.py` serves requests on two binaries to say what that is worth
+  per request. `measure/findings.md` reports them and `measure/run-all.sh`
+  reproduces the density measurements.
 - `gk.entitlements` — the hypervisor entitlement the macOS binary is signed with.
 - `fault-test.sh` / `fault-test.capnp` — end-to-end check against a built
   workerd that a fault inside the guest during a JS turn fails only that
@@ -320,9 +324,12 @@ which runs each isolate's JS turn at guest ring 3.
   WebSocket through back's fetch handler and through the Durable Object,
   accepted and hibernatable, echoed in both orders, a thousand small
   messages, a mebibyte message, closed by the callee, aborted by the
-  caller's signal, and handed to the script's own client
-  (`binding-crossing-ws-client.py`), which closes cleanly once and drops
-  the connection once. `GK_BINDING_CROSSING_ONLY` selects step groups.
+  caller's signal, closed by a caller that bursts its sends and returns
+  without awaiting the close reply (`/ws-leave`, six times over, which is the
+  event-disarm shape the event-loop hazard section describes), and handed to
+  the script's own client (`binding-crossing-ws-client.py`), which closes
+  cleanly once and drops the connection once.
+  `GK_BINDING_CROSSING_ONLY` selects step groups.
   Negative builds, each failing the step named for it:
   `--copt=-DWORKERD_GK_NEG_CF_BLOB_HEAP` (the blob stays in the caller's
   arena), `--copt=-DWORKERD_GK_NEG_EXCEPTION_HEAP` (a callee's exception

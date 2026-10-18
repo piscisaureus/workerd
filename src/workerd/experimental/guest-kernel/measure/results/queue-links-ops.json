@@ -1,0 +1,373 @@
+{
+  "binary": "bazel-built //src/workerd/experimental/guest-kernel:queue-cost, -c opt",
+  "commits": {
+    "post": "e277f1faf",
+    "pre": "c99961cae"
+  },
+  "events_queued_at_once": 1024,
+  "launches_per_arm": 8,
+  "layout": {
+    "post": [
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 32.2,
+        "event_bytes": 56,
+        "rss_delta_kb": 31488
+      },
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 32.2,
+        "event_bytes": 56,
+        "rss_delta_kb": 31488
+      },
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 32.2,
+        "event_bytes": 56,
+        "rss_delta_kb": 31488
+      },
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 32.2,
+        "event_bytes": 56,
+        "rss_delta_kb": 31488
+      },
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 32.2,
+        "event_bytes": 56,
+        "rss_delta_kb": 31488
+      },
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 32.2,
+        "event_bytes": 56,
+        "rss_delta_kb": 31488
+      },
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 32.2,
+        "event_bytes": 56,
+        "rss_delta_kb": 31488
+      },
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 32.2,
+        "event_bytes": 56,
+        "rss_delta_kb": 31488
+      }
+    ],
+    "pre": [
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 0.1,
+        "event_bytes": 64,
+        "rss_delta_kb": 64
+      },
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 0.1,
+        "event_bytes": 64,
+        "rss_delta_kb": 64
+      },
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 0.1,
+        "event_bytes": 64,
+        "rss_delta_kb": 64
+      },
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 0.1,
+        "event_bytes": 64,
+        "rss_delta_kb": 64
+      },
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 0.1,
+        "event_bytes": 64,
+        "rss_delta_kb": 64
+      },
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 0.1,
+        "event_bytes": 64,
+        "rss_delta_kb": 64
+      },
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 0.1,
+        "event_bytes": 64,
+        "rss_delta_kb": 64
+      },
+      {
+        "armed": 1000000,
+        "bytes_per_armed": 0.1,
+        "event_bytes": 64,
+        "rss_delta_kb": 64
+      }
+    ]
+  },
+  "machine": {
+    "halt_poll_ns": "200000",
+    "load": "0.25 1.38 3.22 1/965 2184390",
+    "vmscape": "Mitigation: IBPB before exit to userspace"
+  },
+  "ops_per_case": 50000000,
+  "pinned_to_cpu": 12,
+  "summary": {
+    "arm-disarm": {
+      "ns_per_op_post_launches": [
+        3.245,
+        3.243,
+        3.145,
+        3.244,
+        3.155,
+        3.147,
+        3.146,
+        3.143
+      ],
+      "ns_per_op_post_median": 3.151,
+      "ns_per_op_pre_launches": [
+        2.343,
+        2.351,
+        2.344,
+        2.347,
+        2.346,
+        2.352,
+        2.344,
+        2.344
+      ],
+      "ns_per_op_pre_median": 2.3449999999999998,
+      "paired_delta_ns_launches": [
+        0.9020000000000001,
+        0.8919999999999999,
+        0.8010000000000002,
+        0.8970000000000002,
+        0.8089999999999997,
+        0.7949999999999999,
+        0.802,
+        0.7989999999999999
+      ],
+      "paired_delta_ns_median": 0.8054999999999999,
+      "paired_delta_pct_median": 34.349680170575695
+    },
+    "arm-drain": {
+      "ns_per_op_post_launches": [
+        9.39,
+        9.402,
+        9.199,
+        9.366,
+        9.237,
+        9.232,
+        9.209,
+        9.21
+      ],
+      "ns_per_op_post_median": 9.2345,
+      "ns_per_op_pre_launches": [
+        5.628,
+        5.621,
+        5.627,
+        5.654,
+        5.628,
+        5.624,
+        5.623,
+        5.623
+      ],
+      "ns_per_op_pre_median": 5.6255,
+      "paired_delta_ns_launches": [
+        3.7620000000000005,
+        3.780999999999999,
+        3.572,
+        3.7119999999999997,
+        3.609,
+        3.6079999999999997,
+        3.5859999999999994,
+        3.5870000000000006
+      ],
+      "paired_delta_ns_median": 3.6085,
+      "paired_delta_pct_median": 64.14540929695139
+    },
+    "eval-run": {
+      "ns_per_op_post_launches": [
+        38.07,
+        38.02,
+        38.19,
+        38.759,
+        38.1,
+        38.001,
+        38.09,
+        37.97
+      ],
+      "ns_per_op_post_median": 38.08,
+      "ns_per_op_pre_launches": [
+        38.011,
+        37.99,
+        37.968,
+        37.968,
+        37.929,
+        38.03,
+        37.927,
+        38.022
+      ],
+      "ns_per_op_pre_median": 37.979,
+      "paired_delta_ns_launches": [
+        0.0589999999999975,
+        0.030000000000001137,
+        0.2219999999999942,
+        0.7909999999999968,
+        0.17099999999999937,
+        -0.029000000000003467,
+        0.1630000000000038,
+        -0.0519999999999996
+      ],
+      "paired_delta_ns_median": 0.11100000000000065,
+      "paired_delta_pct_median": 0.2922667790094543
+    },
+    "rearm-breadth": {
+      "ns_per_op_post_launches": [
+        6.878,
+        6.79,
+        6.599,
+        6.992,
+        6.652,
+        6.406,
+        6.532,
+        6.558
+      ],
+      "ns_per_op_post_median": 6.625500000000001,
+      "ns_per_op_pre_launches": [
+        5.289,
+        5.467,
+        5.346,
+        5.36,
+        5.338,
+        5.396,
+        5.406,
+        5.421
+      ],
+      "ns_per_op_pre_median": 5.378,
+      "paired_delta_ns_launches": [
+        1.5890000000000004,
+        1.3230000000000004,
+        1.2530000000000001,
+        1.6319999999999997,
+        1.314,
+        1.0099999999999998,
+        1.1260000000000003,
+        1.1369999999999996
+      ],
+      "paired_delta_ns_median": 1.2835,
+      "paired_delta_pct_median": 23.865749349200446
+    },
+    "rearm-depth": {
+      "ns_per_op_post_launches": [
+        6.209,
+        6.496,
+        6.454,
+        6.188,
+        6.5,
+        6.474,
+        6.216,
+        8.586
+      ],
+      "ns_per_op_post_median": 6.464,
+      "ns_per_op_pre_launches": [
+        6.746,
+        6.771,
+        6.772,
+        6.749,
+        6.755,
+        7.264,
+        6.735,
+        6.733
+      ],
+      "ns_per_op_pre_median": 6.752,
+      "paired_delta_ns_launches": [
+        -0.5370000000000008,
+        -0.27499999999999947,
+        -0.3180000000000005,
+        -0.5609999999999999,
+        -0.2549999999999999,
+        -0.79,
+        -0.5190000000000001,
+        1.8530000000000006
+      ],
+      "paired_delta_ns_median": -0.4185000000000003,
+      "paired_delta_pct_median": -6.19816350710901
+    },
+    "then-build": {
+      "ns_per_op_post_launches": [
+        3.039,
+        3.042,
+        3.043,
+        3.04,
+        3.044,
+        3.045,
+        3.039,
+        3.042
+      ],
+      "ns_per_op_post_median": 3.042,
+      "ns_per_op_pre_launches": [
+        2.987,
+        3.015,
+        2.991,
+        2.998,
+        2.989,
+        2.994,
+        2.99,
+        2.992
+      ],
+      "ns_per_op_pre_median": 2.9915000000000003,
+      "paired_delta_ns_launches": [
+        0.052000000000000046,
+        0.02699999999999969,
+        0.052000000000000046,
+        0.041999999999999815,
+        0.05500000000000016,
+        0.05099999999999971,
+        0.04899999999999993,
+        0.04999999999999982
+      ],
+      "paired_delta_ns_median": 0.05049999999999977,
+      "paired_delta_pct_median": 1.688116329600527
+    },
+    "then-run": {
+      "ns_per_op_post_launches": [
+        22.841,
+        23.103,
+        23.011,
+        23.001,
+        23.139,
+        23.061,
+        23.227,
+        23.052
+      ],
+      "ns_per_op_post_median": 23.0565,
+      "ns_per_op_pre_launches": [
+        23.02,
+        22.995,
+        26.27,
+        23.468,
+        23.102,
+        23.261,
+        23.012,
+        22.938
+      ],
+      "ns_per_op_pre_median": 23.061,
+      "paired_delta_ns_launches": [
+        -0.1789999999999985,
+        0.10800000000000054,
+        -3.2590000000000003,
+        -0.46699999999999875,
+        0.036999999999999034,
+        -0.1999999999999993,
+        0.21499999999999986,
+        0.11400000000000077
+      ],
+      "paired_delta_ns_median": -0.07099999999999973,
+      "paired_delta_pct_median": -0.30787910324790657
+    }
+  },
+  "what": "kj run-queue operations, links in the events (pre) against links in the loop (post)"
+}
