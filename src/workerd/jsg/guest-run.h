@@ -70,18 +70,19 @@ namespace workerd::jsg {
 //   of it that has an owner in jsg or above is handled that way: the thread-locals the host
 //   reads after a turn (GuestTurnThreadLocals in io/guest-turn-thread-locals.h), the isolate's
 //   jsg data slots, the count of jsg::Locks this thread holds, the flag that says this thread is
-//   inside a CppgcShim destructor, the scope that disallows destroying kj::AsyncObjects and the
-//   pointer this thread finds its event loop through (the last five in runTrampolineInGuest,
-//   guest-run.c++), the turn's resolve journal and the event loop's arm guard (runJsTurn and
-//   runTrampolineInGuest), and the running mark a timeout callback's TimeoutState holds, which
-//   ~TimeoutState asserts on when the IoContext is destroyed (runJsTurn in io/io-context.c++).
-//   That save and restore is also what keeps a turn from choosing the value the host reads, so
-//   each of those is one remedy for two problems; experimental/guest-kernel/memory-classes.md,
-//   rule R7, is the inventory. The restore is unconditional, which is what covers a turn that
-//   leaves such a thread-local cleared as well as one that leaves it dangling at an abandoned
-//   frame: every IoOwn disposal enters an AllowAsyncDestructorsScope of its own, so a fault
-//   inside one leaves the check disabled rather than dangling, and the host frame puts the
-//   host's value back either way.
+//   inside a CppgcShim destructor, the scope that disallows destroying kj::AsyncObjects, and the
+//   pointer this thread finds its event loop through together with the event it is firing (the
+//   last six in runTrampolineInGuest, guest-run.c++), the turn's resolve journal and the event
+//   loop's arm guard (runJsTurn and runTrampolineInGuest), and the running mark a timeout
+//   callback's TimeoutState holds, which ~TimeoutState asserts on when the IoContext is
+//   destroyed (runJsTurn in io/io-context.c++). That save and restore is also what keeps a turn
+//   from choosing the value the host reads, so each of those is one remedy for two problems;
+//   experimental/guest-kernel/memory-classes.md, rule R7, is the inventory, and says why it
+//   holds only for the thread the turn runs on. The restore is unconditional, which covers a turn
+//   that leaves such a thread-local cleared as well as one that leaves it dangling at an
+//   abandoned frame: every IoOwn disposal enters an AllowAsyncDestructorsScope of its own, so a
+//   fault inside one leaves the check disabled rather than dangling, and the host frame puts
+//   the host's value back either way.
 //
 //   What makes thread-wide state reachable at all, rather than only under an unfixed placement
 //   bug: a destructor running inside a turn can enter another IoContext's scope and run a nested

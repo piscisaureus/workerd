@@ -155,6 +155,17 @@ void runTrampolineInGuest(
   // events and reaches the loop through it -- and put back once the guest has returned, whatever
   // the turn left in it.
   kj::EventLoop* eventLoop = kj::EventLoop::saveCurrentLoopPointer();
+  // The event this thread is firing (threadLocalCurrentlyFiring, same file) is the other half of
+  // that state, and it is still set while this turn runs: EventLoop::turn() sets it around
+  // Event::fire(), and the frame that enters the guest is somewhere inside that fire(). kj clears
+  // it when fire() returns, and with a constant rather than a saved value, so nothing a turn
+  // leaves here outlives the fire() that ran the turn -- but the rest of that fire() is host code
+  // that runs on what the turn left. ~Event() compares the pointer with every event destroyed on
+  // this thread, from a noexcept function that aborts the process on a match, and the host
+  // destroys promise nodes in that window, the fault path's abort() most of all. So a turn could
+  // pick the moment the process dies. (kj::getAsyncTrace(), the one reader that dereferences the
+  // pointer and calls through its vtable, has no caller in this tree.)
+  kj::_::Event* firingEvent = kj::EventLoop::saveCurrentlyFiringEvent();
 
   allocCensus::enterTurn();
   long result = gk_run_here_user(fn, arg);
@@ -165,8 +176,10 @@ void runTrampolineInGuest(
   // left stands, and experimental/guest-kernel/event-loop-test.sh must then fail -- the host
   // finds the loop the turn chose.)
   kj::EventLoop::restoreCurrentLoopPointer(eventLoop);
+  kj::EventLoop::restoreCurrentlyFiringEvent(firingEvent);
 #else
   (void)eventLoop;
+  (void)firingEvent;
 #endif
   allocCensus::leaveTurn();
 
