@@ -2139,3 +2139,173 @@ binary's sampling thread could account for and was not pursued).
   `alloc` workers of the same config do not fault. It reproduces with the
   keeper suppressed, so it is not the keeper's, and is left for whoever next
   uses that config.
+
+## What the socket relays cost
+
+### The question
+
+A `connect()` tunnel through an in-process service binding is a `kj` two-way
+pipe and a WebSocket through one is a `kj` WebSocket pipe; where per-isolate
+heap arenas are active, `IoStreamRelay` and `WebSocketRelay`
+(`io/worker-interface.c++`) make every read and every receive from the event
+loop, as `ReadRelay` does for bodies. "What the body relay costs" above put the
+body relay at about a microsecond per crossing plus 8 to 14 us per MiB, and
+its unit is a `tryRead()` call, of which a body pays few because the reader asks
+in 128 to 512 KiB buffers. A socket's unit is whatever the worker's JS reads
+and a WebSocket's is a message, so a chatty protocol pays the relay's fixed
+cost per read or per message, and the body figures do not transfer. This is
+the number for small messages.
+
+### Method
+
+`socketrelay.py`, with `bodyrelay.py`'s arms and knob: N is the jemalloc
+binary without the guest kernel (no arenas, so the bare pipes are safe), G the
+plain binary under the guest kernel (`GK_RUNNER=resident GK_RUNNER_PIN=other`,
+no arenas), each a paired comparison of the relays forced off and on through
+the temporary `WORKERD_GK_FORCE_BODY_RELAY` knob in the three relay predicates,
+interleaved launch by launch; A is the shipping jemalloc binary under the guest
+kernel with arenas, where the relays are on by themselves. One connection, four
+launches per arm, four seconds per case, the server on `12-17,36-41` and the
+client on `0-5,24-29`, the VMSCAPE mitigation reading `Mitigation: IBPB before
+exit to userspace` and `halt_poll_ns` 200000 before and after each run
+(`results/socket-{native,gk,arena}.json`).
+
+A front worker connects to a back worker over its binding, or opens a
+WebSocket to it, and inside one request does n round trips of a four-byte
+message, answering the count: `/tunnel/<n>` writes a line and reads the echo n
+times, `/ws/<n>` sends a message and awaits the echo n times, `/ws-burst/<n>`
+sends all n before awaiting any echo, so that the relay's turns overlap the
+sender's. There is no tunnel burst: a `kj` pipe has no buffer, so a caller that
+writes n lines before reading an echo parks the callee's second echo, which
+stops the callee reading, which parks the caller -- on the bare pipe without
+the guest kernel just the same (the route hung at 10 s on the knob binary with
+the relays off), so it is not the relay's. The WebSocket routes await the
+callee's close reply before answering; the one that does not is a finding of
+its own, below.
+
+### 1. Per launch, relays off and on
+
+p50 per launch in microseconds, the four launches of each arm in order, and
+the paired difference launch by launch.
+
+| N, one connection | off | on | on minus off, paired |
+| --- | --- | --- | --- |
+| tunnel, 1 round trip | 203.5 206.8 205.8 209.7 | 209.8 206.0 211.2 212.0 | +6.4 -0.8 +5.4 +2.3 |
+| tunnel, 10 | 479.7 478.6 482.7 482.0 | 484.2 480.0 485.3 480.7 | +4.4 +1.3 +2.6 -1.3 |
+| tunnel, 100 | 3151 3149 3126 3115 | 3116 3120 3114 3128 | -35 -29 -12 +14 |
+| tunnel, 1000 | 29558 29298 29384 28912 | 29554 29343 29458 29529 | -4 +45 +74 +618 |
+| ws, 1 | 153.8 152.9 154.0 159.9 | 165.5 161.0 159.1 158.8 | +11.7 +8.1 +5.0 -1.1 |
+| ws, 10 | 267.6 262.5 268.5 272.7 | 283.7 279.0 275.6 275.9 | +16.1 +16.6 +7.1 +3.2 |
+| ws, 100 | 1342 1321 1333 1334 | 1391 1372 1359 1376 | +49 +52 +26 +42 |
+| ws, 1000 | 11850 11675 11818 11719 | 12303 12114 12021 12151 | +454 +440 +203 +432 |
+| ws burst, 100 | 1016 990 1004 1019 | 1052 1030 1035 1023 | +36 +40 +31 +4 |
+| ws burst, 1000 | 8425 8344 8357 8418 | 8760 8624 8629 8586 | +335 +280 +272 +168 |
+
+| G, one connection | off | on | on minus off, paired |
+| --- | --- | --- | --- |
+| tunnel, 1 round trip | 396.8 406.9 403.2 393.9 | 400.3 407.4 404.2 393.6 | +3.5 +0.5 +1.0 -0.3 |
+| tunnel, 10 | 934.3 945.6 943.2 934.8 | 951.6 951.7 940.4 936.8 | +17.3 +6.1 -2.8 +2.0 |
+| tunnel, 100 | 6491 6438 6556 6449 | 6539 6593 6483 6412 | +48 +155 -73 -37 |
+| tunnel, 1000 | 61298 62406 61145 62355 | 62111 61849 61764 61390 | +813 -556 +619 -965 |
+| ws, 1 | 178.7 177.4 178.1 179.3 | 179.7 183.6 182.4 182.9 | +1.0 +6.2 +4.3 +3.6 |
+| ws, 10 | 470.7 469.1 470.5 474.8 | 473.9 477.9 476.3 477.8 | +3.2 +8.8 +5.8 +3.0 |
+| ws, 100 | 3412 3464 3467 3473 | 3493 3517 3486 3513 | +81 +53 +19 +39 |
+| ws, 1000 | 33089 33078 33160 33255 | 33558 33544 33309 33599 | +469 +467 +149 +344 |
+| ws burst, 100 | 2522 2526 2528 2544 | 2586 2586 2584 2594 | +64 +60 +56 +50 |
+| ws burst, 1000 | 24179 24376 24419 24273 | 24661 24699 24614 24810 | +482 +323 +195 +536 |
+
+No launch of any arm had an error.
+
+**A WebSocket message costs the relay 0.2 to 0.5 us, a tunnel round trip
+nothing the launches can tell apart.** A thousand WebSocket round trips cost
++203 to +454 us in N (1.7 to 3.9 per cent of 11.8 ms) and +149 to +469 in G
+(0.4 to 1.4 per cent of 33 ms), with two relayed receives per round trip, so
+one relayed receive is 0.1 to 0.25 us and ten thousand small messages are 2 to
+5 ms on top of 120 to 330 ms. The burst, where the relay's turns overlap the
+sender's, costs the same per message or less. The tunnel's thousand round
+trips are -4 to +74 us in N with one launch at +618 (0.2 per cent of 29 ms)
+and within +-1 ms either way in G, where 61 ms is the base: a tunnel round trip
+already costs 29 us without the guest kernel and 61 under it, in the JS stream
+machinery on both sides and the two guest turns, against which an extra
+event-loop turn per read does not show. The reason a message costs so much
+less than the body relay's "about a microsecond per crossing" is that that
+figure is a whole request's worth of relay -- the staging buffer, the extra
+turn, the lost synchronous fast path on a reader that would otherwise have had
+one -- where a socket read or a WebSocket receive was already asynchronous and
+already a turn of its own.
+
+**There is no safe synchronous fast path to add.** `tryReadSync()` through the
+relay would run in the reader's turn against the pipe's state object, which is
+the writer's `BlockedWrite` whenever the writer arrived first, and the type of
+that object is known only by dereferencing it; even EOF, the one answer that
+needs none of the writer's bytes, is a `ShutdownedWrite` the writer's turn
+allocated. A read-ahead the loop fills before the reader asks would serve a
+synchronous read from host memory, at the cost of one chunk of flow control; at
+0.1 to 0.25 us a receive there is nothing for it to buy.
+
+### 2. The shipping configuration
+
+The shipping jemalloc binary under the guest kernel with arenas, the relays on
+by themselves, four launches, p50 per launch in microseconds and the server's
+CPU time per request from the launch's median:
+
+| A, one connection | p50 per launch | CPU us per request |
+| --- | --- | --- |
+| tunnel, 1 round trip | 442 435 463 448 | 1011 958 1103 1077 |
+| tunnel, 10 | 1082 1069 1107 1081 | 4085 4479 5883 4912 |
+| tunnel, 100 | 7662 7493 7799 7670 | 43721 32085 38326 31747 |
+| tunnel, 1000 | 73190 72518 74185 72759 | 400909 375833 384091 297931 |
+| ws, 1 | 235.7 232.6 233.8 231.4 | 573 588 592 598 |
+| ws, 10 | 588.5 585.7 595.1 586.7 | 1382 1407 1409 1344 |
+| ws, 100 | 4186 4169 4226 4137 | 9317 9320 9441 9209 |
+| ws, 1000 | 39625 39558 39993 39539 | 87677 87000 88081 87778 |
+| ws burst, 100 | 3116 3092 3142 3107 | 7088 7096 7258 7039 |
+| ws burst, 1000 | 29420 29148 29564 29316 | 65672 65333 66591 66165 |
+
+No launch had an error, and no launch faulted or condemned an isolate. A
+WebSocket round trip across a binding costs 40 us here against 33 in G and 12
+in N, a tunnel round trip 73 against 61 and 29; the step from G to A is the
+arenas (jemalloc with its thread cache off, the per-isolate placement, the
+relays), and the relays' share of it is what section 1 bounds at 0.1 to 0.25
+us a receive. The tunnel's CPU time per request is several times its latency
+at every n: the socket's two JS stream machineries spin the runner's vCPUs
+while the request waits on the loop, which the body relay's measurement saw
+as well and which is not the relay's.
+
+### 3. Found on the way: a close that is not awaited
+
+The first run of arm A condemned the back worker on its first WebSocket
+route, with the relays in place and the message traffic intact: the route
+answered its count and then the callee's turn faulted writing into the
+caller's arena, at `kj::Event::disarm()` inlined into
+`kj::_::CoroutineBase::~CoroutineBase()` (`mov %rdx,(%rcx)`: `*prev = next`),
+destroying the adapter pipe's `close()` coroutine under
+`LegacyWebSocketAdapter::pump (.destroy)`. The route's caller sent `close()`
+and returned at once, without awaiting the callee's close reply, so its
+request ended while the callee's close was still queued on the event loop,
+armed by the loop when the caller's relayed receive took it; the callee's turn
+then cancelled its pump, destroyed that queued event, and unlinking it wrote
+the link field of its queue neighbour, an event of the caller's. That is the
+event-disarm hazard README.md's heap-arena section records as not covered --
+a turn that destroys one of its own events queued before the turn began --
+reached by a chatty close. It reproduces six times in six on `/ws-leave/100`
+(three under the resident runner, three under the default) and once on
+`/ws-leave/1000`, and the same routes awaiting the reply are clean five times
+in five; `GK_WS_LEAVE=1 socketrelay.py` keeps the reproducer. A step added to
+`binding-crossing-test.sh` with the same shape -- a hundred echoed messages,
+then `close()` and return -- did not reproduce it in six runs, quiet box or
+loaded, with either runner; its workers differ in compatibility date and
+flags and in the callee being a `WorkerEntrypoint` class, and which of those
+moves the close off the queue in time was not chased. No relay can close it: whatever
+node a turn destroys, its queue neighbours are whoever armed next to it on
+the loop. It needs the loop-level treatment the README leaves open, which is
+a design decision.
+
+It is worse than a condemnation. The turn is abandoned inside the destructor,
+with the event half unlinked and the coroutine frame half destroyed but still
+on the loop's queue, and when the loop reaches it the call through its vtable
+aborts the process: `libc++abi: Pure virtual function called!`, signal 6,
+exit status 1, after `IoContext` has logged the condemnation twice. Six runs
+in six. The first run of arm A saw this as a connection reset in the harness.
+A caller that closes a binding's WebSocket and does not await the reply
+therefore takes the whole workerd down under heap arenas today.
