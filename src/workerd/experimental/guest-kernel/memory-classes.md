@@ -789,7 +789,13 @@ placement experiment hit.
   `:1918`). Both directions are B message buffers. Whether Cap'n Proto's
   in-process path copies the message or lets the callee alias the caller's
   builder could not be settled from the sources available, so aliasing must be
-  assumed.
+  assumed. A call that rejects crosses twice more. The `kj::Exception` the
+  callee's turn makes reaches the caller as the clone `kj::ForkBranch::get()`
+  makes on the event loop, since `LocalClient::call()` forks the dispatch
+  promise, so it needs no placement -- unlike a fetch's, whose adapter forks
+  nothing. And dropping the caller's exported capabilities inside the
+  callee's turn runs the caller's `IoContext::PendingEvent` destructor there,
+  whose hang-abort task is now placed under the same scope as the event.
 - **Streams over RPC.** The receiver's `ExternalPusherImpl::pushByteStream`
   creates a `kj::newOneWayPipe` (`io/external-pusher.c++:150`) and
   `unwrapStream` short-circuits through `getLocalServer` to hand the
@@ -804,7 +810,14 @@ placement experiment hit.
   callee side wrapped by `newSystemStream` (`api/global-scope.c++:343`).
   Both bodies now cross through `ReadRelay` (`io/worker-interface.c++`),
   which keeps every operation on the pipe between them on the event loop;
-  see README.md, "The in-process Cap'n Proto call".
+  see README.md, "The in-process Cap'n Proto call". Beside the bodies, the
+  request's `cf` blob (`IoChannelFactory::SubrequestMetadata`, serialized by
+  the caller's turn and read by the callee's `CfProperty`) and a failing
+  callee's `kj::Exception` (made under the callee's lock, read by the
+  caller's `jsg::exceptionToJs()`) are copied into the shared heap by
+  `WorkerEntrypoint`; neither is visible to the census, since each is a
+  read, and neither is driven by a probe that builds its subrequests from a
+  URL string and whose callees all answer.
 - **Service stubs.** `Fetcher::deserialize` does
   `IoContext::current().addObject(kj::addRef(channel))`
   (`api/http.c++:2466`), so one refcounted `SubrequestChannel` is owned by two

@@ -811,6 +811,13 @@ IoContext::PendingEvent::~PendingEvent() noexcept(false) {
 
   context.pendingEvent = kj::none;
 
+  // The last holder of the event may be a stub that crossed an in-process binding, released in
+  // the other isolate's turn (see registerPendingEvent()), so this runs under whichever lock
+  // that is, and what it allocates would go in that isolate's heap arena. The task is this
+  // context's: this isolate's next registerPendingEvent() cancels it from its own turn, which
+  // cannot address the other arena.
+  RpcSharedHeapScope sharedHeap;
+
   // We can't abort just yet. We need to run the event loop to see if any queued
   // events come back into JavaScript. If registerPendingEvent() is called in the meantime, this
   // will be canceled.

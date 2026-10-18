@@ -215,6 +215,19 @@ which runs each isolate's JS turn at guest ring 3.
   which tears the body pump down inside the caller's turn. Negative build:
   `--copt=-DWORKERD_GK_NEG_BODY_RELAY`, where the bodies cross through the
   bare pipe and the first route faults the reading isolate's turn.
+- `binding-crossing-test.sh` / `binding-crossing-test.capnp` /
+  `binding-crossing-front.js` / `binding-crossing-back.js` — end-to-end check
+  against a workerd built with per-isolate heap arenas of the crossings of an
+  in-process service binding that carry no body: the `cf` blob a request
+  brings beside the HTTP interface, on `bench/bench.capnp`'s cdn pair (served
+  as is: the incoming `Request` forwarded to an origin and its response passed
+  through as the init of a new one) and on a fetch init; and the error a
+  callee that throws or rejects hands back, over fetch and over JS RPC, each
+  followed by another request of the caller's. Negative builds:
+  `--copt=-DWORKERD_GK_NEG_CF_BLOB_HEAP`, where the blob stays in the
+  caller's arena and the origin's turn faults reading it, and
+  `--copt=-DWORKERD_GK_NEG_EXCEPTION_HEAP`, where a callee's exception stays
+  in its arena and the caller's turn faults converting it.
 - `heap-region-test.sh` / `heap-region-test.capnp` / `heap-region-front.js` /
   `heap-region-back.js` — check against a workerd built with per-isolate heap
   arenas that an isolate serving large response bodies does not spend its heap
@@ -1410,7 +1423,9 @@ so a crossing a turn makes on every dereference belongs on that path.
   Two things outside the call need the same placement, and neither is a
   Cap'n Proto object. A request's `IoContext::PendingEvent`
   (`io-context.c++`) is held by every capability the request exports, so a
-  stub released in the calling isolate's turn runs its destructor there. And a
+  stub released in the calling isolate's turn runs its destructor there -- and
+  the destructor schedules the context's hang-abort task, which the context's
+  own next turn cancels, so that allocation is placed as well. And a
   worker's entrypoint names (`Server::ErrorReporter`) are built while its own
   modules are evaluated but read by every caller that starts a subrequest to
   it, which for a service binding is a turn of the calling isolate.
@@ -1541,6 +1556,37 @@ so a crossing a turn makes on every dereference belongs on that path.
   response was delivered), which aborts the pipe's read end against what the
   callee left on it and cancels the callee's request; that reaches the
   callee's arena as it did before, and is not covered by the test.
+
+  Three more things cross the same binding outside its bodies, and none of
+  them through the kj HTTP interface whose url and headers `kj`'s adapter
+  clones in the shared heap. A request's `cf` blob travels as
+  `IoChannelFactory::SubrequestMetadata`: serialized by the caller's turn
+  (`Request::serializeCfBlobJson()`), read by the callee's turn (`CfProperty`
+  in `api/global-scope.c++`), and present on every request a worker forwards
+  rather than builds, since the listener makes a `{"clientIp": ...}` blob for
+  each connection; `WorkerEntrypoint`'s constructor copies it into the shared
+  heap. A callee that throws hands the caller the `kj::Exception` its turn
+  made from the JS error, whose storage is in the callee's arena and which the
+  caller's turn reads in `jsg::exceptionToJs()`; `exceptionToPropagate()` in
+  `io/worker-entrypoint.c++` clones it into the shared heap on the event
+  loop, where a response's headers already go. A JS RPC call's exception
+  crosses without help: `LocalClient::call()` forks the dispatch promise, and
+  each branch of a fork receives its own clone of the exception
+  (`kj::ForkBranch::get()`), made on the event loop; leaving the clone out of
+  `JsRpcTargetBase::call()` faults nothing. And a JS RPC call that rejects
+  drops the
+  caller's exported capabilities inside the callee's turn, so the caller's
+  `IoContext::PendingEvent` destructor runs there and the hang-abort task it
+  schedules went into the callee's arena, where the caller's next
+  `registerPendingEvent()` faulted cancelling it; the destructor now
+  allocates under the scope the event itself is made under. Each is a
+  confidentiality concession of the kind the shared heap's other tenants are:
+  the blob, the error's description and the task are readable from every
+  isolate's ring 3 for as long as they live. `binding-crossing-test.sh`
+  checks all three, on the benchmark's own cdn pair among others. None of the
+  probes before it forwarded a request or failed a callee -- each built its
+  subrequests from a URL string and every callee answered -- which is how the
+  pair faulted under the benchmark while twenty probes passed.
 
   What the relay also leaves as it was is how the response promise itself
   crosses. The caller's turn attaches its continuation to a promise whose head

@@ -12,8 +12,10 @@
 #include <workerd/io/io-context.h>
 #include <workerd/io/limit-enforcer.h>
 #include <workerd/io/tracer.h>
+#include <workerd/jsg/heap-arena.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/util/http-util.h>
+#include <workerd/util/own-util.h>
 #include <workerd/util/sentry.h>
 #include <workerd/util/strings.h>
 #include <workerd/util/thread-scopes.h>
@@ -273,7 +275,23 @@ WorkerEntrypoint::WorkerEntrypoint(kj::Badge<WorkerEntrypoint> badge,
       props(kj::mv(props)),
       cfBlobJson(kj::mv(cfBlobJson)),
       versionInfo(kj::mv(versionInfo)),
-      clientAddress(kj::mv(clientAddress)) {}
+      clientAddress(kj::mv(clientAddress)) {
+#ifndef WORKERD_GK_NEG_CF_BLOB_HEAP
+  // The cf blob is the one field of a subrequest's metadata that this worker's turn reads: the
+  // handler's turn copies it into the Request's CfProperty (api/global-scope.c++). For a service
+  // binding it was serialized by the calling isolate's turn, on that isolate's heap arena, and it
+  // reaches this worker beside the HTTP interface, as IoChannelFactory::SubrequestMetadata, not
+  // through kj's HttpClient adapter, whose clones of the url and headers are made under
+  // SharedHeapHttpClient's scope (io/worker-interface.c++). So it gets the same copy here, where
+  // every request to a worker takes ownership of it. A negative build, never shipped,
+  // WORKERD_GK_NEG_CF_BLOB_HEAP, leaves the blob where the caller made it; the guest kernel's
+  // binding-crossing-test.sh must then fail on a forwarded request.
+  if (jsg::heapArenasAvailable()) {
+    jsg::SharedHeapScope sharedHeap;
+    this->cfBlobJson = mapCopyString(this->cfBlobJson);
+  }
+#endif
+}
 
 void WorkerEntrypoint::init(kj::Own<const Worker> worker,
     kj::Maybe<kj::Own<Worker::Actor>> actor,
@@ -346,6 +364,27 @@ tracing::FetchEventInfo buildFetchEventInfo(kj::HttpMethod method,
   return tracing::FetchEventInfo(method, kj::str(url), kj::mv(cfJson), kj::mv(traceHeadersArray));
 }
 
+// Places an exception this worker's request raised where the caller's turn can read it. The
+// exception was made under this worker's lock -- by its turn converting the JS error, or by the
+// host with the lock held -- so under per-isolate heap arenas its storage is in this worker's
+// arena, which for a service binding the calling isolate's turn cannot address, and that turn
+// reads the description in jsg::exceptionToJs() when its fetch rejects. The headers a turn sends
+// cross the same binding through the shared heap (ResponseSentTracker::send()); the exception
+// gets the same copy, made here on the event loop. A JS RPC call's exception needs none: the
+// dispatch promise capnp's LocalClient::call() forks hands each branch a clone
+// (kj::ForkBranch::get()), made on the event loop as well. A negative build, never shipped,
+// WORKERD_GK_NEG_EXCEPTION_HEAP, leaves the exception where it was made; the guest kernel's
+// binding-crossing-test.sh must then fail on a callee that throws.
+kj::Exception placeExceptionForCaller(kj::Exception&& exception) {
+#ifndef WORKERD_GK_NEG_EXCEPTION_HEAP
+  if (jsg::heapArenasAvailable()) {
+    jsg::SharedHeapScope sharedHeap;
+    return exception.clone();
+  }
+#endif
+  return kj::mv(exception);
+}
+
 kj::Exception exceptionToPropagate(bool isInternalException, kj::Exception&& exception) {
   if (isInternalException) {
     // We've already logged it here, the only thing that matters to the client is that we failed
@@ -353,7 +392,7 @@ kj::Exception exceptionToPropagate(bool isInternalException, kj::Exception&& exc
     // will sanitize it as an internal error. Note that we use `setDescription()` to preserve
     // the exception type for `jsg::exceptionToJs(...)` downstream.
     exception.setDescription(kj::str("worker_do_not_log; Request failed due to internal error"));
-    return kj::mv(exception);
+    return placeExceptionForCaller(kj::mv(exception));
   } else {
     // We do not care how many remote capnp servers this went through since we are returning
     // it to the worker via jsg.
@@ -372,7 +411,7 @@ kj::Exception exceptionToPropagate(bool isInternalException, kj::Exception&& exc
     KJ_IF_SOME(description, newDescription) {
       exception.setDescription(kj::mv(description));
     }
-    return kj::mv(exception);
+    return placeExceptionForCaller(kj::mv(exception));
   }
 }
 
