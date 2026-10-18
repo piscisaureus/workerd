@@ -2293,10 +2293,12 @@ reached by a chatty close. It reproduces six times in six on `/ws-leave/100`
 `/ws-leave/1000`, and the same routes awaiting the reply are clean five times
 in five; `GK_WS_LEAVE=1 socketrelay.py` keeps the reproducer. A step added to
 `binding-crossing-test.sh` with the same shape -- a hundred echoed messages,
-then `close()` and return -- did not reproduce it in six runs, quiet box or
-loaded, with either runner; its workers differ in compatibility date and
-flags and in the callee being a `WorkerEntrypoint` class, and which of those
-moves the close off the queue in time was not chased. No relay can close it: whatever
+then `close()` and return -- did not reproduce it: that step awaited each
+echo in turn, which drains the queue so nothing of the callee's is left
+armed at teardown. Bursting the sends -- all of them before any reply, then
+`close()` and return -- reproduces it from that script's own configuration,
+compatibility flags and `WorkerEntrypoint` callee, so none of those bear on
+it; the serial echo was the difference. No relay can close it: whatever
 node a turn destroys, its queue neighbours are whoever armed next to it on
 the loop. It needs the loop-level treatment the README leaves open, which is
 a design decision.
