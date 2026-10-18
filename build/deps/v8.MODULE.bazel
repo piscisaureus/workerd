@@ -74,6 +74,7 @@ PATCHES = [
     "0049-Run-Intl-builtins-under-an-embedder-shared-allocation-scope.patch",
     "0050-Canonicalize-wasm-types-under-an-embedder-shared-allocation-scope.patch",
     "0051-Index-wasm-code-ranges-under-an-embedder-shared-allocation-scope.patch",
+    "0052-Add-Isolate-CollectGarbageForExternalMemory.patch",
 ]
 
 http_archive(

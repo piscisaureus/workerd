@@ -2311,3 +2311,280 @@ exit status 1, after `IoContext` has logged the condemnation twice. Six runs
 in six. The first run of arm A saw this as a connection reset in the harness.
 A caller that closes a binding's WebSocket and does not await the reply
 therefore takes the whole workerd down under heap arenas today.
+
+## Collecting once for reported external memory
+
+### The question
+
+"Whether the soft-limit collection belongs in every build" above settled that
+the collection stays, and named the lever if its cost ever needed reducing:
+`ExternalMemoryTarget::applyLocked` (`jsg/jsg.c++`) asked for it with
+`MemoryPressureNotification(kCritical)`, which is the one level V8 acts on
+without incremental marking but also its near-OOM path, and a V8 patch
+exposing a plain collection "would halve the cost measured here and leave the
+caches alone". That is what this section does and measures. The doubt worth
+settling first was whether the plain collection is enough: the second
+collection `kCritical` runs was counted there, not explained, and if it were
+the one that frees the reported memory then a single collection would not
+bound the heap arena region and the trade would be a different one. It is not;
+the region is held to the same 100 MiB, to the megabyte, by one collection.
+
+### What kCritical does in this V8, read from the source
+
+`Isolate::MemoryPressureNotification(kCritical)` (`src/api/api.cc`) decides
+whether the calling thread holds the isolate and hands off to
+`Heap::MemoryPressureNotification` (`src/heap/heap.cc`), which stores the level
+and, because the stored level is `kNone` whenever nobody is inside a
+notification, calls `CheckMemoryPressure()` on the spot. That does three
+things, in order:
+
+1. `FreeCachesOnMemoryPressure(isolate, kMemoryPressure)`:
+   `AbortConcurrentOptimization(kDontBlock)`, `ClearSerializerData()`,
+   `compilation_cache()->Clear()`,
+   `IsolateGroup::current()->memory_pool()->ReleaseAllImmediately()` and,
+   because `--flush-liftoff-code` defaults on,
+   `wasm::GetWasmEngine()->FlushLiftoffCode()`. `ReleaseAllImmediately`
+   (`src/heap/memory-pool.cc`) releases the local page and zone pools of
+   *every* isolate in the group and the shared pools besides, which in a
+   shared-heap workerd is the process; the per-isolate form,
+   `ReleaseImmediately(isolate)`, is what the reason `kLastResort` or
+   `kMemoryPressure` turns into the group-wide one.
+2. It resets the stored level to `kNone` -- so that a collection's finalizers
+   cannot recurse through it -- and calls `CollectGarbageOnMemoryPressure()`,
+   which collects: `CollectAllGarbage(GCFlag::kReduceMemoryFootprint,
+   kMemoryPressure, kGCCallbackFlagCollectAllAvailableGarbage)` followed by
+   `CompleteArrayBufferSweeping()`.
+3. It estimates `potential_garbage = (CommittedMemory() - SizeOfObjects()) +
+   external_memory()` and, if that is at least 8 MB *and* at least a tenth of
+   `CommittedMemory()`, collects a second time with the same flags (or, had the
+   first taken over 50 ms, would have started incremental marking, which
+   workerd has off).
+
+So the second collection is not a consequence of the first having failed to
+free anything, and it is not driven by the reported memory alone. Of the two
+terms in the estimate, `CommittedMemory() - SizeOfObjects()` is a nearly empty
+but committed heap -- for `back` a 0.2 MB live heap in a megabyte of old space
+plus a committed new space -- and `external_memory()` is what remains reported
+after the collection, which is the part that is still live. Neither is
+something a further collection can reduce, so the estimate clears the
+threshold on every trigger and the second collection always runs. The trace
+shows it finding nothing: `0.4 (0.8) -> 0.2 (0.5) MB` for the first of a pair
+and `0.2 (0.5) -> 0.2 (0.5) MB` for the second.
+
+`GCFlag::kReduceMemoryFootprint` is a cost of its own inside the collection,
+separate from the caches: the mark-compact releases this isolate's pooled
+chunks and its finished wasm stacks (`heap.cc`), the sweeper discards unused
+system pages page by page (`sweeper.cc`), and compaction switches to the
+fragmentation target and evacuation budget meant for shrinking. None of that
+is needed to free memory the embedder holds in `kj`, which a major collection
+frees through its weak callbacks.
+
+### The patch
+
+`patches/v8/0052` adds `Isolate::CollectGarbageForExternalMemory()`:
+`CollectAllGarbage(GCFlag::kNoFlags,
+GarbageCollectionReason::kExternalMemoryPressure)`, one full mark-compact and
+nothing else -- no cache or pool drops, no second collection, and not
+memory-reducing. `applyLocked` calls it in place of the pressure notification.
+The reason is V8's own `kExternalMemoryPressure`, which the trace prints as
+"external memory pressure" so the collections this asks for are told apart
+from any other in a `--trace-gc` log.
+
+### Method
+
+The arms are `critical` (the pressure notification, as it was), `plain` (the
+patch, as committed) and `off` (the report left in place, no collection),
+selected per launch from one binary by a never-committed
+`WORKERD_GK_MEASURE_EXTERNAL_GC` knob in `applyLocked` (`measure/extgc/cost.sh`
+describes it), so that no build difference can enter a delta. Otherwise the
+method is the section above's: the heap-region workload of 3,050 responses of
+4 MiB, 12 GB after the warm-up, sampled through the `__gk_heap_region` probe
+after each burst of 250 (`measure/extgc/region.sh`); and the `cost-*.js`
+workers under oha at one connection (eight for the second `hello` row), six
+seconds after two of warm-up, workerd on CPUs 12-17,36-41 and oha on
+0-5,24-29, the arms interleaved round by round with a fresh launch each, six
+launches per arm. The production-like cell is the default build (tcmalloc,
+guest kernel off) with `--max-old-space-size=128`; the arena cell is the
+jemalloc build with the guest kernel on and no limit. GC counts and pauses are
+from one further launch per cell with `--trace-gc` and one worker per launch
+(`measure/extgc/gcsum.py`).
+
+A second never-committed knob, `WORKERD_GK_MEASURE_LINEBUF`, line-buffers
+`stdout` for the traced launches. `jsg/setup.c++` gives `stdout` a static
+`BUFSIZ` buffer and workerd does not flush it when it is signalled, so without
+the knob the last 8 KiB of a `--trace-gc` log -- about 39 lines -- never
+reaches the file. The counts in the section above are short by up to that
+much.
+
+The VMSCAPE mitigation read `Mitigation: IBPB before exit to userspace` and
+`kvm.halt_poll_ns` 200000 before and after every run.
+
+### 1. The region, and that one collection bounds it
+
+`back`'s heap arena region in MiB, and the external memory reported for it,
+after the warm-up and each of the twelve bursts (`extgc3-region-*.txt`):
+
+| arm              | field  | warm | 1   | 2    | 3    | 4    | 5    | 6    | 7    | 8    | 9    | 10   | 11   | 12   |
+| ---------------- | ------ | ---- | --- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+| critical         | region | 100  | 100 | 100  | 100  | 100  | 100  | 100  | 100  | 100  | 100  | 100  | 100  | 100  |
+| critical         | ext    | 72   | 56  | 40   | 24   | 8    | 60   | 44   | 28   | 12   | 64   | 48   | 32   | 16   |
+| plain            | region | 100  | 100 | 100  | 100  | 100  | 100  | 100  | 100  | 100  | 100  | 100  | 100  | 100  |
+| plain            | ext    | 72   | 56  | 40   | 24   | 8    | 60   | 44   | 28   | 12   | 64   | 48   | 32   | 16   |
+| plain, 128 MiB   | region | 100  | 100 | 100  | 100  | 100  | 100  | 100  | 100  | 100  | 100  | 100  | 100  | 100  |
+| off              | region | 272  | 968 | 1800 | 1800 | 2440 | 3208 | 3208 | 3208 | 3528 | 4168 | 4168 | 4168 | 4168 |
+
+The `critical` and `plain` arms are the same run to the megabyte, in the region
+and in the sawtooth of reported memory between 8 and 72 MiB that the 64 MiB
+soft limit draws; the arm given `--max-old-space-size=128` is the same again.
+The `off` arm is the growth the collection exists to stop. What differs is the
+collecting: over the same 12 GB, `back` runs
+
+| arm      | mark-compacts | pause total | mean    | max     | scavenges |
+| -------- | ------------- | ----------- | ------- | ------- | --------- |
+| critical | 360           | 276.2 ms    | 0.77 ms | 3.64 ms | 192       |
+| plain    | 180           | 149.2 ms    | 0.83 ms | 3.70 ms | 203       |
+| off      | 4             | 8.0 ms      | 2.01 ms | 2.44 ms | 204       |
+
+Exactly two collections per trigger against exactly one, for the same bound.
+The mean rises because what the pair's second collection does is nothing, so
+it averages down; the work removed is a whole collection, not a cheap tail.
+
+### 2. What it costs, per launch
+
+Requests per second, six launches of each arm in round order. Default build,
+`--max-old-space-size=128` (`extgc3-cost-default-limit128.txt`):
+
+| workload     | critical                      | plain                         | off                           |
+| ------------ | ----------------------------- | ----------------------------- | ----------------------------- |
+| hello, c=1   | 22926 23099 22836 22148 22338 22963 | 22837 22711 22795 23009 22719 22876 | 23050 22914 22609 23239 23329 23271 |
+| hello, c=8   | 29003 28754 29014 29218 28686 29055 | 28987 28871 28943 28668 28966 28725 | 28833 28696 29260 28906 28712 28786 |
+| bigheap, c=1 | 22016 21979 22045 21444 21521 21718 | 21849 21922 21583 21875 21580 21975 | 22086 21852 21806 22209 22138 22199 |
+| bigbody, c=1 | 1253 1260 1269 1272 1252 1277 | 1291 1294 1299 1291 1283 1271 | 1000 1018 992 1013 1016 1007  |
+| bigheapbody  | 353 339 347 348 351 348       | 562 560 569 584 565 569       | 954 889 890 920 947 922       |
+
+jemalloc build, guest kernel on, no limit
+(`extgc3-cost-jemalloc-gk-nolimit.txt`):
+
+| workload     | critical                      | plain                         | off                           |
+| ------------ | ----------------------------- | ----------------------------- | ----------------------------- |
+| hello, c=1   | 5932 5927 5824 5859 5737 5940 | 5925 5811 5998 5839 5923 5859 | 5982 5840 6016 5909 5880 5769 |
+| hello, c=8   | 7955 8022 8308 8239 7255 8013 | 8122 7743 7954 7535 8976 8165 | 7764 7897 7326 7847 7581 7920 |
+| bigheap, c=1 | 6072 5977 5954 5929 6040 6076 | 6074 6047 5848 5906 6000 5982 | 6057 6088 5944 5999 5940 5825 |
+| bigbody, c=1 | 1053 1097 1047 1043 1054 1040 | 1087 1095 1094 1086 1093 1083 | 920 886 916 886 899 916       |
+| bigheapbody  | 419 411 413 415 409 424       | 577 590 596 615 587 598       | 515 658 869 770 770 644       |
+
+p99 in microseconds, same launches, the two rows where the collection fires:
+
+| cell, workload          | critical                            | plain                               | off                           |
+| ----------------------- | ----------------------------------- | ----------------------------------- | ----------------------------- |
+| default, bigbody        | 1547 1434 1420 1431 1432 1406       | 1197 1227 1191 1225 1216 1246       | 1508 1502 1512 1496 1511 1522 |
+| default, bigheapbody    | 39640 40363 40497 40183 39788 39606 | 20646 20519 20063 17889 19824 20752 | 1390 1509 1498 1500 1395 1520 |
+| jemalloc, bigbody       | 2114 2069 2129 2142 2116 2175       | 1545 1521 1524 1529 1524 1558       | 2247 2358 2247 2377 2338 2259 |
+| jemalloc, bigheapbody   | 30674 30437 30555 30349 30729 27658 | 18626 17908 17790 17610 18213 17717 | 4834 3422 2486 2601 2632 2569 |
+
+Resident memory at the end of each six-second window, GB: `bigbody` 1.0-1.2 /
+1.0 / 5.9-6.6 in the default build and 0.9-1.0 / 0.9-1.0 / 7.2-7.3 under the
+arenas; `bigheapbody` 1.1-1.3 / 1.1 / 9.6-15.7 and 1.0-1.1 / 1.1-1.2 /
+14.8-18.6, critical, plain and off in that order.
+
+Collections in the traced launch, one worker per launch
+(`extgc3-cost-trace1-*.txt`):
+
+| cell, workload        | arm      | mark-compacts | pause total | mean     | max      |
+| --------------------- | -------- | ------------- | ----------- | -------- | -------- |
+| default, bigbody      | critical | 1176          | 333.6 ms    | 0.28 ms  | 1.32 ms  |
+| default, bigbody      | plain    | 588           | 203.8 ms    | 0.35 ms  | 0.52 ms  |
+| default, bigheapbody  | critical | 328           | 5537.0 ms   | 16.88 ms | 38.34 ms |
+| default, bigheapbody  | plain    | 269           | 4135.5 ms   | 15.37 ms | 20.54 ms |
+| jemalloc, bigbody     | critical | 967           | 494.6 ms    | 0.51 ms  | 3.72 ms  |
+| jemalloc, bigbody     | plain    | 503           | 255.3 ms    | 0.51 ms  | 3.80 ms  |
+| jemalloc, bigheapbody | critical | 390           | 4692.3 ms   | 12.03 ms | 42.94 ms |
+| jemalloc, bigheapbody | plain    | 280           | 3372.5 ms   | 12.04 ms | 26.17 ms |
+
+The `off` arm's traced launches collect 0, 0, 7 and 2 times in the same
+windows. The counts are not in the ratio 2:1 wherever the throughput differs,
+because the arm that serves more responses in the same six seconds crosses the
+soft limit more often; per trigger it is two collections against one
+everywhere.
+
+What the rows say:
+
+- **The three workloads that paid nothing still pay nothing.** `hello` at one
+  and eight connections and `bigheap` never cross the soft limit; their six
+  launches per arm overlap entirely in both cells, as they did before.
+- **Where the collection was already a gain, it is a slightly larger one.**
+  `bigbody` goes from 1253-1277 to 1271-1299 requests per second in the
+  default build and from 1040-1097 to 1083-1095 under the arenas -- 2 and 3%,
+  at the edge of the spreads -- and its p99 from 1406-1547 to 1191-1246 us and
+  from 2069-2175 to 1521-1558 us, which is not. Half the collections at the
+  same per-collection cost: 1176 to 588 and 967 to 503 mark-compacts.
+- **Where it was the cost, about three fifths of the cost goes.** With 42.5 MB
+  live, `bigheapbody` goes from 339-353 to 560-584 requests per second in the
+  default build, a factor of 1.63, and from 409-424 to 577-615 under the
+  arenas, a factor of 1.43. Measured against the `off` arm, which is what the
+  collection is being charged for, the penalty falls from 2.65x to 1.62x and
+  from 1.70x to 1.19x. p99 halves, 40 ms to 20 and 30 ms to 18, and the
+  longest pause in the trace with it, 38.3 ms to 20.5 and 42.9 to 26.2. The
+  per-collection mean barely moves (16.88 to 15.37 ms, 12.03 to 12.04), so
+  what the pair's second collection costs is a whole collection's work for
+  nothing.
+- **The bound is untouched.** `heap-region-test.sh` passes on the committed
+  jemalloc build with `back`'s region growing 0 MiB over 12 GB served and
+  `front`'s 13 MiB, the same figures as the binary before the change.
+
+### The verdict
+
+Landed. The collection stays unconditional in every build with the same 64 MiB
+soft limit; what changes is that it is one plain mark-compact instead of V8's
+near-OOM sequence. Nothing measured here is worse, the region is held to the
+same 100 MiB to the megabyte, and the worst case this was aimed at -- a large
+live heap and large bodies together -- keeps 1.63x of the 2.65x it was paying.
+
+This changes when and how much garbage is collected in every build, not only
+the arena one, exactly as the report and the collection themselves did; GC
+timing is not part of the API surface a worker can observe, and the change only
+removes work, so it takes no compatibility flag. What it does not remove is the
+rest of the cost: a mark-compact of the whole live heap per 64 MiB of bodies is
+still proportional to the heap, so the policy lever the section above named --
+a soft limit that grows with the live heap -- is where any further reduction
+has to come from, and is still left to whoever has the production numbers.
+
+### Found on the way
+
+**V8 drops the same caches once per isolate at startup, for `kModerate`.**
+`worker.c++` tells a new isolate's heap that there is moderate memory pressure,
+on the reasoning that a machine serving thousands of tenants always has some.
+`CheckMemoryPressure` tests `HighMemoryPressure()`, which is true of any level
+but `kNone`, before it looks at which level it is, so `kModerate` runs
+`FreeCachesOnMemoryPressure` in full -- compilation cache, serializer data,
+concurrent optimization jobs, the group's page and zone pools, Liftoff code --
+and only then finds that there is nothing for `kModerate` to do without
+incremental marking. It is once per isolate rather than once per 64 MiB of
+bodies, so it is not what this section is about, but an isolate created while
+others are serving empties their page pools as it starts.
+
+### Caveats
+
+- **Whether a plain collection is cheaper than `kCritical`'s first one was not
+  separated.** A `critical` trigger's pair costs 33.8 ms at 42.5 MB live
+  against 15.37 ms for one plain collection, so the second collection is
+  roughly as expensive as the first; how much of the remaining 3 ms is
+  `kReduceMemoryFootprint`'s page discarding and compaction budget rather than
+  measurement spread is not known, because the trace does not label the two
+  collections of a pair.
+- **The pooled pages a group-wide drop would cost were not measured.** Every
+  trace line in these runs reads `pooled: 0.0 MB`: one worker per isolate
+  serving one shape of request keeps no pooled pages, so
+  `ReleaseAllImmediately` had nothing to release and the process-wide drop that
+  `kCritical` performs cost nothing here. The saving it represents is an
+  argument from the source, not a figure.
+- **The large heap was still 42.5 MB, not 128.** As before, what a worker at
+  the production limit would pay is extrapolated from the pause's
+  proportionality to live size, not measured.
+- **Six seconds and one connection**, as before: the `off` arm's deferred
+  collections do not appear within the window, and the cost is a mutator-side
+  pause that concurrency would spread without changing.
+- **The `off` arm of `bigheapbody` under the arenas is spread 515 to 869**
+  requests per second across its six launches, the widest spread in either
+  table. Nothing here depends on its mean, but a three-launch median of it
+  would have been worth little.

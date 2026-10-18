@@ -5,8 +5,9 @@
 # Usage: region.sh <tag> <workerd> <capnp> [bursts] [burst_size]
 #   The capnp is one of the region-*.capnp beside this script, which differ in the V8 flags they
 #   set process-wide (a heap limit or none, --trace-gc). The environment is passed through to
-#   workerd; the arm with the soft-limit collection off needs a binary with the uncommitted knob
-#   described in cost.sh and WORKERD_GK_MEASURE_NO_EXTERNAL_GC=1. GKM_OUT names the directory
+#   workerd, so an arm other than the committed one needs a binary with the uncommitted knobs
+#   cost.sh describes and WORKERD_GK_MEASURE_EXTERNAL_GC set to the arm (and, for a --trace-gc
+#   capnp, WORKERD_GK_MEASURE_LINEBUF=1). GKM_OUT names the directory
 #   for logs and results (default /tmp/gk-extgc). Needs /dev/kvm, curl and bc, and a workerd
 #   with per-isolate heap arenas (--//src/workerd/server:allocator=jemalloc).
 set -u

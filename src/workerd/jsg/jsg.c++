@@ -593,7 +593,7 @@ namespace {
 // limit exactly as with none (measure/findings.md in experimental/guest-kernel). With a shared
 // heap that is bloat; with a per-isolate heap arena (heap-arena.h), whose region is fixed, it
 // exhausts the isolate's memory. So the soft limit is applied here, the way V8 applies it with
-// incremental marking on, through the collection V8 offers an embedder on the spot.
+// incremental marking on, through a collection on the spot.
 constexpr int64_t EXTERNAL_MEMORY_SOFT_LIMIT = 64 * 1024 * 1024;
 }  // namespace
 
@@ -620,11 +620,16 @@ void ExternalMemoryTarget::applyLocked(v8::Isolate* isolate, int64_t amount) con
     // flag keeps that from asking for another collection from inside this one.
     collecting.store(true, std::memory_order_relaxed);
     KJ_DEFER(collecting.store(false, std::memory_order_relaxed));
-    // Critical pressure is the one level V8 acts on without incremental marking: a full,
-    // memory-reducing collection on the spot (the thread holds the isolate locked), a second
-    // one if the first found a lot to free, and V8's caches of optimization jobs, compiled
-    // sources and pooled pages dropped first.
-    isolate->MemoryPressureNotification(v8::MemoryPressureLevel::kCritical);
+    // One full collection on the spot (the thread holds the isolate locked), which is all this
+    // needs: a major mark-compact runs the weak callbacks that detach the wrappers of the dead
+    // objects holding the reported memory, so the memory is freed before the call returns. The
+    // level V8 acts on without incremental marking through its public pressure notification is
+    // kCritical, which is a near-OOM path: besides collecting it drops the compilation cache,
+    // the serializer data and the concurrent optimization jobs, releases the pooled pages of
+    // every isolate in the group -- the process, with a shared heap -- and collects a second
+    // time whenever committed-minus-live plus the reported total is over 8 MB and a tenth of
+    // committed, which for a small heap it almost always is. See patches/v8/0052.
+    isolate->CollectGarbageForExternalMemory();
   }
 }
 

@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 # Per-launch latency and throughput of workloads that do and do not report external memory in
-# bulk, with the soft-limit collection of ExternalMemoryTarget (jsg/jsg.c++) on and off, the
+# bulk, over the arms of the soft-limit collection of ExternalMemoryTarget (jsg/jsg.c++), the
 # arms interleaved round by round so that each launch is its own measurement.
 #
-# The "off" arm needs a knob that is not committed, because it is a configuration nobody should
-# ship: in applyLocked(), the collection is skipped when WORKERD_GK_MEASURE_NO_EXTERNAL_GC is
-# set, with the report left in place. One binary then serves both arms and no build difference
-# can enter the delta. The knob the measurement used was
+# The arms need a knob that is not committed, because two of the three are configurations
+# nobody should ship: WORKERD_GK_MEASURE_EXTERNAL_GC selects, in applyLocked(), between
+# "plain" (the committed Isolate::CollectGarbageForExternalMemory(), and the default),
+# "critical" (MemoryPressureNotification(kCritical)) and "off" (the report left in place and
+# no collection). One binary then serves every arm and no build difference can enter a delta.
+# The knob the measurement used read the environment once into a function-local static and
+# tested it in the two places the arms differ,
 #
-#   } else if (total - low > EXTERNAL_MEMORY_SOFT_LIMIT && !measureNoExternalGc() &&
+#   } else if (total - low > EXTERNAL_MEMORY_SOFT_LIMIT && measureGc() != MeasureGc::OFF &&
 #       !collecting.load(std::memory_order_relaxed)) {
 #
-# with measureNoExternalGc() a function-local static read of getenv().
+# and around the call itself. A traced arm also wants WORKERD_GK_MEASURE_LINEBUF, a knob in
+# setup.c++ beside the setvbuf() call that line-buffers stdout: workerd does not flush stdout
+# when it is signalled, so otherwise the last BUFSIZ of a --trace-gc log is lost. GKM_LINEBUF
+# passes it through from here.
 #
 # Usage: cost.sh <tag> <workerd> <capnp> <rounds> <gk 0|1> [workloads...]
 #   The capnp is one of the cost-*.capnp beside this script (a heap limit or none, --trace-gc or
@@ -29,8 +35,9 @@ out=$out_dir/res/cost-$tag.txt
 SERVER_CPUS=${SERVER_CPUS:-12-17,36-41}; CLIENT_CPUS=${CLIENT_CPUS:-0-5,24-29}
 DUR=${DUR:-6}; WARM=${WARM:-2}
 for r in $(seq 1 "$R"); do
-  for arm in on off; do
-    e=(); [ "$arm" = off ] && e+=(WORKERD_GK_MEASURE_NO_EXTERNAL_GC=1); [ "$GK" = 1 ] && e+=(WORKERD_EXPERIMENTAL_GUEST_KERNEL=1)
+  for arm in critical plain off; do
+    e=(WORKERD_GK_MEASURE_EXTERNAL_GC=$arm); [ "$GK" = 1 ] && e+=(WORKERD_EXPERIMENTAL_GUEST_KERNEL=1)
+    [ -n "${GKM_LINEBUF:-}" ] && e+=(WORKERD_GK_MEASURE_LINEBUF=1)
     log=$out_dir/logs/cost-$tag-$r-$arm.log
     env "${e[@]}" taskset -c "$SERVER_CPUS" "$W" serve "$CFG" >"$log" 2>&1 &
     pid=$!
