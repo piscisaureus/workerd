@@ -46,6 +46,70 @@ void deallocate(void* ptr, size_t size, size_t alignment);
 // including when `ptr` came from allocate(), since it is then ordinary heap memory.
 bool contains(const void* ptr);
 
+// A pool: host memory for a tenant whose footprint is configured rather than small -- a cache's
+// keys, entries and values, bounded by an operator's limits -- which allocate() above is not
+// sized for (the guest kernel serves it blocks of at most 1 MiB from a bounded total shared by
+// every host-memory tenant in the process, so a configured store would starve the runtime's
+// own records). A pool is reservation of its own: anonymous memory the pool maps itself, in
+// regions, each registered with the guest kernel as refused (gk_host_range_register in
+// experimental/guest-kernel/gk.h), after which a guest access anywhere in it faults as an
+// access to any host memory does; without the guest kernel it is ordinary memory, and the pool
+// behaves the same. Pages materialize as they are first touched, so the pool's footprint is
+// its high-water mark and never the reservation.
+//
+// Blocks are served by power-of-two size class from 16 bytes up to a region, carved from a
+// region's bump pointer and recycled through per-class free lists kept inside the freed blocks
+// themselves, as the guest kernel's own allocator does: no splitting, no coalescing, internal
+// fragmentation bounded by a factor of two, and address space reused through the lists. A
+// block is scrubbed when freed and comes back zero-filled. allocate() returns nullptr, never
+// throws, when the reservation is spent, so that a tenant on a path that cannot throw -- a
+// hostcall handler -- refuses its operation instead; ensure() is where the reservation grows,
+// host-side, when the tenant's limits do. The pool takes no lock of its own: the tenant
+// serializes its use under the lock that guards the tenant. The pool is itself host memory
+// (a member of a host object, say), since its free-list heads are pointers the host
+// dereferences.
+class WD_MEMORY_CLASS_HOST HostPool {
+ public:
+  // At most this much reservation per pool, over at most REGIONS regions: configured limits
+  // beyond it are served up to it.
+  static constexpr size_t MAX_RESERVATION = size_t{64} << 30;
+  static constexpr size_t MIN_REGION = size_t{64} << 20;
+  static constexpr size_t MIN_BLOCK = 16;
+  static constexpr unsigned REGIONS = 16;
+
+  HostPool() = default;
+  ~HostPool() noexcept(false);
+  KJ_DISALLOW_COPY_AND_MOVE(HostPool);
+
+  // Grows the reservation to at least `capacity` bytes (clamped to MAX_RESERVATION) by mapping
+  // and registering another region. False if that failed, after which the pool is as it was.
+  bool ensure(size_t capacity);
+  size_t reservation() const {
+    return reserved;
+  }
+
+  void* allocate(size_t size);
+  // `size` must be the size the block was allocated with.
+  void deallocate(void* ptr, size_t size);
+  bool contains(const void* ptr) const;
+
+ private:
+  static constexpr unsigned CLASSES = 40;  // 2^4 .. 2^43, past MAX_RESERVATION
+  struct Region {
+    uintptr_t base;
+    uintptr_t end;
+    uintptr_t bump;
+    bool registered;
+  };
+  Region regions[REGIONS] = {};
+  unsigned regionCount = 0;
+  size_t reserved = 0;
+  void* freeLists[CLASSES] = {};
+
+  static unsigned classOf(size_t size);
+  const Region* regionOf(uintptr_t p) const;
+};
+
 // Host slots: a block of host memory named by a handle rather than a pointer, so that the owner
 // keeps nothing outside host memory that the host would dereference. The table that maps handles
 // to blocks is the guest kernel's (gk_host_slot_alloc in experimental/guest-kernel/gk.h): it
@@ -259,6 +323,35 @@ bool noteInTurn(const uint64_t (&words)[NOTE_WORDS]);
 // how a hook run for a registration the host makes itself (OwnedObjectList::add outside a turn)
 // sees it. Without the guest kernel there are no arenas and it is true.
 bool ownedByTurn(ResolveHandle handle);
+
+// Whether `handle` names a live committed entry of the isolate whose arena the calling thread
+// is in, by gk's record of the thread: the comparison ownedByTurn makes for a journal's words,
+// for a hostcall handler handed a handle in its frame. A thread on no arena -- host code outside
+// any isolate's lock -- is not a turn, and the answer there is whether the entry is live at all.
+// Without the guest kernel there are no arenas and a live entry is anyone's.
+bool ownedByCurrentArena(ResolveHandle handle);
+
+// The arena of the calling thread by gk's record of it, as registerResolveFor() takes one: for
+// a host-side record that must remember which isolate made it (a cache binding's record of its
+// binder, say), and for a hostcall handler comparing that record against the thread it runs on.
+// Null on a thread with no arena -- host code outside any isolate's lock -- and always without
+// the guest kernel.
+IsolateArena currentIsolateArena();
+
+// Whether [addr, addr + len) lies within the arena of the calling thread, by gk's record of the
+// thread (gk_arena_range_ok in experimental/guest-kernel/gk.h): for a hostcall handler handed a
+// range the turn named for the host to write into or read from, which is admissible only into
+// the caller's own arena. False on a thread with no arena. Without the guest kernel there are no
+// arenas, the handler is a direct call from the caller's own frame, and the answer is true.
+bool arenaRangeOk(const void* addr, size_t len);
+
+// A hook the host runs at the end of every turn (see ResolveTurn), host-side, after the turn's
+// journal has been processed: for work a hostcall handler found to do but may not do itself,
+// such as waking another isolate's waiters, which allocates and may queue for another context.
+// One per process, set once host-side before any turn runs; the hook must not make a hostcall
+// and runs under the isolate lock of the turn that ended, so what it allocates for others goes
+// under a SharedHeapScope (jsg/heap-arena.h).
+void setTurnEndHook(void (*hook)());
 
 // What the host does with the entries a turn registered and released and the notes it made.
 // All run host-side, with the table already updated for the entry: committed() once the table

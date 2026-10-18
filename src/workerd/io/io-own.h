@@ -360,6 +360,13 @@ class IoCrossContextExecutor {
   // True if the target IoContext has been destroyed, i.e. tryExecute() would drop the action.
   bool isTargetDestroyed() const;
 
+  // The handle of the target context's entry in the resolve table: a value, not a pointer, which
+  // a holder may hand to the host for the host to validate and queue through (DeleteQueue), as a
+  // cache's waiter does to be woken in its own context.
+  hostMemory::ResolveHandle getContextHandle() const {
+    return deleteQueue.getContext();
+  }
+
  private:
   friend class IoContext;
   friend class DeleteQueue;
