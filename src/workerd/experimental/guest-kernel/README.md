@@ -1660,15 +1660,86 @@ so a crossing a turn makes on every dereference belongs on that path.
   That configuration needs the evaluation taken out of the turn before any
   placement in it is worth something.
 
-  The thread's event loop needs more than placement. Its run queue is an
-  intrusive doubly linked list through the queued events, so arming an event
-  from a turn (fulfilling a promise, attaching a continuation to a settled
-  one) writes the link of the neighbor at the insert point, which may be
-  another isolate's promise node. `kj::EventLoop::GuardedArmScope`
-  (`patches/capnp-cpp/0003-Add-EventLoop-GuardedArmScope.patch`), which
-  `jsg::runInGuest()` enters around every turn, links guard sentinels of the
-  loop's own next to each insert point for the turn's duration, so a turn's
-  events are inserted next to a guard or next to each other.
+  The thread's event loop needs more than placement. Its run queue is a doubly
+  linked list, and an intrusive one would keep the links inside the queued
+  events: arming an event from a turn (fulfilling a promise, attaching a
+  continuation to a settled one) would write the link of the neighbor at the
+  insert point, and unlinking one would write both of its neighbors'
+  (`*prev = next; next->prev = prev`). Either way it is a promise node that
+  may be another isolate's, in memory the turn cannot address.
+
+  So the links are the loop's own
+  (`patches/capnp-cpp/0003-Move-the-event-queue-links-into-the-loop.patch`).
+  The queue runs through `kj::_::EventLink` nodes the loop allocates, an armed
+  event holds a pointer to the one standing in for it, and the loop's insert
+  points are links too. Arming takes a link off the loop's free list and links
+  it in; disarming unlinks it and returns it. Both write the loop's memory and
+  the event's own `link` field, and nothing of another event's, so neither the
+  arm nor the disarm can reach another arena. The links come in chunks the
+  loop maps from the OS rather than taking from the C++ heap, since a chunk
+  allocated while a turn runs would land in that isolate's arena, out of every
+  other isolate's reach; a chunk is never moved or freed while the loop lives,
+  because an event holds a link's address, and destroying the loop cuts every
+  still armed event loose from its link before unmapping, so that destroying
+  one of those events afterwards writes nothing.
+
+  That closes the class rather than one instance of it, which is what the
+  problem needs: the hazard is a property of the queue and not of any one API.
+  A timer callback cancelled while already due, a `fetch` aborted while its
+  response is queued, and a WebSocket closed without awaiting the reply all
+  reach it the same way, and the last is what `binding-crossing-test.sh`'s
+  `/ws-leave` step and `measure/socketrelay.py`'s `/ws-leave` route
+  (`GK_WS_LEAVE=1`) exercise. A caller that bursts its sends -- several
+  messages before awaiting any reply -- and then calls `close()` and returns
+  without awaiting the close reply ends its request while the callee's close
+  coroutine still has its awaiter event armed by the loop, and the turn that
+  ends it cancels the pump (`kj::Canceler`) and destroys that still queued
+  coroutine. With the links in the events, `kj::Event::disarm()`, inlined into
+  `~CoroutineBase`, writes the neighboring event's link, which is the callee's,
+  and the turn faults on the write; the turn is then abandoned inside the
+  destructor with the half-destroyed coroutine still on the queue, and the
+  loop's next call through its vtable aborts the whole process (`Pure virtual
+  function called`), taking every co-tenant isolate with it. It needs no
+  sandbox escape, only ordinary JS that closes a socket and returns, so of the
+  cross-tenant denial of service paths recorded here it would rank first: the
+  stranded memory-cache entry above hangs one key's readers and the unbudgeted
+  refusal-log flood (see "A budget on what the refusal paths say") degrades
+  the box, while that one ends the process for every tenant at once. A caller
+  that awaits each reply in turn drains the queue, so nothing of the callee's
+  is left armed at teardown and the disarm is a no-op; that is why the traffic
+  shape matters, and a serially awaited echo is what kept an earlier probe
+  step from reproducing it.
+
+  Nothing narrower holds. No relay closes it, since the queue neighbors of
+  whatever a turn destroys are whoever the loop armed next to it, and the
+  destruction is driven from the callee's pump teardown, which the relay does
+  not hold. Deferring the destruction to the loop, as the relay ends'
+  `DROP_DEFER` does, is only ever site by site: the drop is driven from
+  whichever frame releases the promise graph, here the pump's `Canceler` deep
+  in the WebSocket lifecycle with no safe handle to hand to the loop, and
+  there is no way to know the list of such sites is complete. A disarm that
+  writes no neighbors -- a tombstone, an epoch, an index -- does not help an
+  intrusive list: removing an interior node rewrites its neighbors however the
+  node is marked, and the node's storage is freed by the very destruction that
+  disarms it, so the loop cannot be left to unlink it later.
+
+  What the loop owning the links does not buy is confinement. They sit in the
+  shared, non-arena memory every root maps, so a ring-3 escape with a write
+  primitive can rewrite the queue, the loop's free-list head included, exactly
+  as it can rewrite the rest of the C++ heap (see the Limitations). Host
+  memory, which no root maps at all, would close that as well, but it cannot
+  hold these: a turn arms events itself, and a guest access to host memory
+  faults at ring 3 and at ring 0 alike (see "Host memory"), so every arm would
+  have to become a hostcall -- a microsecond on a path that costs nanoseconds.
+  Taking the links out of the events is what removes the fault; taking them
+  out of the guest's reach is part of the remaining work memory-classes.md
+  records for the runtime's own state.
+
+  `measure/queue-cost.c++` prices the queue and `measure/findings.md` ("What
+  the run queue's links cost") has the figures. None of this is the
+  abandoned-frame bookkeeping `jsg/guest-run.h` records as a TODO: that is
+  RAII state leaked when a turn faults, whereas this is what used to cause the
+  fault.
 
   The pointer the thread finds that loop through needs its own remedy, for a
   different reason. It is a single thread-local (`threadLocalEventLoop` in
@@ -1722,79 +1793,6 @@ so a crossing a turn makes on every dereference belongs on that path.
   by placing the storage where ring 3 cannot name another thread's copy; the
   R7 row in memory-classes.md has why neither placement already in use serves
   a value the turn itself reads.
-
-  Disarming is not covered. Unlinking a queued event writes both its
-  neighbors' link fields (`*prev = next; next->prev = prev`), so destroying
-  one from a turn faults if a neighbor is in another arena. The guards make
-  this safe for an event the turn armed during the turn: it sits in a run
-  bounded by guards, so its neighbors are either guard sentinels (the loop's
-  own memory) or other events the same turn armed (its own arena). The gap is
-  an event that was armed before the turn began, or armed by the loop on
-  another party's behalf, and is still queued when the turn destroys it: its
-  neighbors are whatever the queue held next to it, which may be another
-  isolate's node. So the hazard is a property of the queue, not of any one
-  API -- a timer callback cancelled while already due, or a fetch aborted
-  while its response is queued, reaches it the same way -- but it is narrower
-  than every in-turn disarm: only the destruction of a pre-existing, still
-  queued event is unsafe, which is why the overwhelming majority of turns,
-  which arm and consume their own events inside the guarded region, never
-  touch it.
-
-  A WebSocket through a binding reaches it, on one traffic shape. A caller
-  that bursts its sends -- sends several messages before awaiting any reply --
-  and then calls `close()` and returns without awaiting the close reply ends
-  its request while the callee's close coroutine still has its awaiter event
-  armed by the loop (the relayed receive took it). The caller's turn then
-  cancels the pump (`kj::Canceler`) and destroys that still queued coroutine,
-  and `kj::Event::disarm()`, inlined into `~CoroutineBase`, writes the
-  neighboring event's link in the caller's arena. A caller that awaits each
-  reply in turn drains the queue, so nothing of the callee's is left armed at
-  teardown and the disarm is a no-op; that is why the shape matters.
-  `measure/socketrelay.py`'s `/ws-leave` route (`GK_WS_LEAVE=1`) bursts and
-  reproduces it; `measure/findings.md` ("What the socket relays cost") has the
-  trace. The same shape reproduces from `binding-crossing-test.sh`'s own
-  configuration, compatibility flags and `WorkerEntrypoint` callee as soon as
-  the route bursts rather than echoing serially, so those differences do not
-  bear on it; a serially awaited echo was the one thing that kept an earlier
-  probe step from reproducing.
-
-  It is worse than a condemnation, and needs no sandbox escape -- ordinary JS
-  that closes a socket and returns. The turn is abandoned inside the
-  destructor with the half-destroyed coroutine still on the loop's queue, and
-  the loop's next call through its vtable aborts the whole process (`Pure
-  virtual function called`), taking every co-tenant isolate down with it. That
-  defeats the confinement gk exists to give, so among the cross-tenant denial
-  of service paths recorded here it ranks first: the stranded memory-cache
-  entry above hangs one key's readers, and the unbudgeted refusal-log flood
-  (see "A budget on what the refusal paths say") degrades the box, but only
-  this one ends the process for all tenants.
-
-  The fix is a `kj` change; no relay closes it, since the queue neighbors of
-  whatever a turn destroys are whoever the loop armed next to it, and the
-  destruction is driven from the callee's pump teardown, which the relay does
-  not hold. Three shapes were weighed. Deferring the destruction to the loop,
-  as the relay ends' `DROP_DEFER` does, is only ever site by site: the drop is
-  driven from whichever frame releases the promise graph, here the pump's
-  `Canceler` deep in the WebSocket lifecycle with no safe handle to hand to
-  the loop, and there is no way to know the list of such sites is complete. A
-  disarm that writes no neighbors -- a tombstone, an epoch, an index -- does
-  not help an intrusive list: removing an interior node rewrites its neighbors
-  however the node is marked, and the node's storage is freed by the very
-  destruction that disarms it, so the loop cannot be left to unlink it later.
-  What closes the class rather than one instance is to move the queue linkage
-  out of arena memory into memory the loop owns and a ring-3 turn never writes
-  (`gk_host_alloc`; see "Host memory"): the `Event`'s inline `next`/`prev`
-  become a handle into a host-side table or a loop-owned node wrapper, every
-  arm and unlink writes only that host memory and the event's own handle
-  field (its own arena), and the loop, which runs on the base root where every
-  arena is mapped, reclaims the slots of events disarmed during a turn after
-  the turn. It makes arming safe too and retires `GuardedArmScope`, at the
-  cost of one indirection per queue step and a slot per armed event on the
-  loop's hot path, which must be measured because this queue is the loop's
-  core. This is not an instance of the abandoned-frame bookkeeping that
-  `jsg/guest-run.h` records as a TODO: that is about RAII state leaked when a
-  turn faults, whereas this is what causes the fault, and it can be closed on
-  its own.
 
   With this, two workers using `Intl` with different locales, two using
   `setTimeout`, and two plain workers serve concurrently under load without

@@ -1,0 +1,513 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Sat, 18 Oct 2026 12:00:00 +0000
+Subject: Move the event queue links into the loop
+
+The event loop's run queue was an intrusive doubly linked list through
+the queued events, so arming an event wrote the links of its new
+neighbors and unlinking one wrote the links of the neighbors it had.
+An embedder that runs units of work under memory isolation, where a
+unit may address only its own objects, cannot let a unit write a
+neighbor another unit queued: with the events on one queue, every arm
+and every disarm does.
+
+The queue now runs through EventLink nodes the loop allocates, and an
+armed event holds a pointer to the one standing in for it. Arming takes
+a link off the loop's free list and links it in; disarming unlinks it
+and returns it. Both write the loop's memory and the event's own `link`
+field, and nothing of another event's. The loop's sentinels become
+links too, and a link without an event is one of them (or one on the
+free list), which is what a walk of the queue skips and what head()
+now reports as an empty queue, in place of the tail sentinel.
+
+The links come in chunks mapped from the OS, never moved or freed until
+the loop is destroyed, since an event holds a link's address. They do
+not come from the C++ heap because the embedder gives each unit of work
+its own heap: a chunk allocated while a unit runs would land in that
+unit's heap, out of every other unit's reach. Destroying the loop cuts
+each still armed event loose from its link before unmapping, so that
+destroying such an event afterwards writes nothing.
+---
+diff --git a/src/kj/async.h b/src/kj/async.h
+--- a/src/kj/async.h
++++ b/src/kj/async.h
+@@ -1297,6 +1297,49 @@
+ namespace _ {  // private
+ 
+ class TraceBuilder;
++class Event;
++
++struct EventLink {
++  // An event's place in an event loop's run queue. The queue is a doubly linked list through
++  // these links rather than through the events themselves: an armed event points at the link the
++  // loop gave it, and the link points back at the event. The loop owns the links -- it allocates
++  // them from its own memory and recycles them -- so arming or disarming an event writes the
++  // loop's memory and the event's own `link` field, never another event's.
++  //
++  // That is what an embedder needs when it runs the loop's work under memory isolation, where a
++  // unit of work may address only its own objects. With the links inside the events, unlinking a
++  // queued event writes the link fields of whichever events happen to be queued beside it, which
++  // may belong to another unit and be unaddressable from this one.
++
++  EventLink* next;
++  // The next link in the queue, or null at the end of one.
++
++  EventLink** prev;
++  // Points at the `next` field that points at this link.
++
++  Event* event;
++  // The event whose place this is, or null for one of the loop's own sentinels and for a link on
++  // the loop's free list. A walk of the queue skips a link with no event.
++
++  kj::EventLoop* loop;
++  // The loop that owns the link, which is where a disarm returns it. Null for the sentinels,
++  // which are never returned.
++
++  inline void unlink() {
++    *prev = next;
++    next->prev = prev;
++  }
++
++  inline void insertBefore(EventLink& other) {
++    // Insert this link before `other` in the list.
++    prev = other.prev;
++    *prev = this;
++    next = &other;
++    other.prev = &next;
++  }
++
++  inline void insertAfter(EventLink& other) { insertBefore(*other.next); }
++};
+ 
+ class Event: private AsyncObject {
+   // An event waiting to be executed.  Not for direct use by applications -- promises use this
+@@ -1374,25 +1417,9 @@
+   friend class kj::EventLoop;
+   kj::EventLoop& requireEventLoop();
+ 
+-  inline void unlink() {
+-    *prev = next;
+-    next->prev = prev;
+-    next = nullptr;
+-    prev = nullptr;
+-  }
+-
+-  inline void insertBefore(Event& other) {
+-    // Insert this event before 'other' in the list.
+-    prev = other.prev;
+-    *prev = this;
+-    next = &other;
+-    other.prev = &next;
+-  }
+-
+-  inline void insertAfter(Event& other) { insertBefore(*other.next); }
+-
+-  Event* next;
+-  Event** prev;
++  EventLink* link;
++  // Where the event sits in the loop's run queue, or null when it is not armed. The loop owns
++  // what it points at; see EventLink.
+ 
+   SourceLocation location;
+ };
+@@ -1502,29 +1529,30 @@
+ 
+ private:
+   inline _::Event* head() const {
+-    _::Event* event = headSentinel.next;
+-    if (event == &depthFirstInsertPoint) {
+-      event = event->next;
+-    }
+-    if (event == &breadthFirstInsertPoint) {
+-      event = event->next;
++    // The first event in the queue, or null when it holds none. The insert points are links
++    // without an event, so they are skipped.
++    for (_::EventLink* link = headLink.next; link != nullptr; link = link->next) {
++      if (link->event != nullptr) return link->event;
+     }
+-    return event;
++    return nullptr;
+   }
+ 
+-  class Sentinel final: public _::Event {
+-    // Sentinel node for event queues. These nodes are never removed, allowing branchless
+-    // list operations on normal event nodes.
+-  public:
+-    Sentinel(): _::Event({}) {};
+-    ~Sentinel() {
+-      // prevent `disarm` in ~Event from doing anything
+-      prev = nullptr;
+-    }
++  inline _::EventLink* allocLink(_::Event& event) {
++    // Takes a link off the free list to hold `event`'s place, mapping another chunk of them when
++    // the list is empty.
++    _::EventLink* link = freeLinks;
++    if (KJ_UNLIKELY(link == nullptr)) link = growLinks();
++    freeLinks = link->next;
++    link->event = &event;
++    return link;
++  }
+ 
+-    void fire() override { KJ_UNREACHABLE; }
+-    void traceEvent(_::TraceBuilder& builder) override { KJ_UNREACHABLE; }
+-  };
++  inline void freeLink(_::EventLink& link) {
++    // Returns a link that is no longer in any queue to the free list.
++    link.event = nullptr;
++    link.next = freeLinks;
++    freeLinks = &link;
++  }
+ 
+   size_t loopId;
+   // Unique identifier for this EventLoop, assigned from a global atomic counter on construction.
+@@ -1542,24 +1570,36 @@
+   bool lastRunnableState = false;
+   // What did we last pass to port.setRunnable()?
+ 
+-  Sentinel headSentinel;
+-  Sentinel tailSentinel;
+-  // Main event queue.
++  _::EventLink headLink;
++  _::EventLink tailLink;
++  // Main event queue, which runs from headLink to tailLink. tailLink.next is null, which is
++  // what ends a walk of the queue.
+ 
+-  Sentinel depthFirstInsertPoint;
++  _::EventLink depthFirstInsertPoint;
+   // Part of the main queue. Moved to the head of the queue on every loop turn.
+   // `armDepthFirst` inserts events right before `depthFirstInsertPoint`.
+ 
+-  Sentinel breadthFirstInsertPoint;
++  _::EventLink breadthFirstInsertPoint;
+   // Part of the main queue, doesn't move.
+   // `armBreadthFirst` inserts events right before `breadthFirstInsertPoint`.
+   // `armLast` inserts events right after `breadthFirstInsertPoint`.
+ 
+-  Sentinel wouldSleepTail;
+-  Sentinel wouldSleepHead;
++  _::EventLink wouldSleepTail;
++  _::EventLink wouldSleepHead;
+   // A totally separate list of events to run if we get to the point where we otherwise would
+   // sleep. (See yieldUntilWouldSleep().)
+ 
++  _::EventLink* freeLinks = nullptr;
++  // Links that are in no queue, chained through `next`.
++
++  struct LinkChunk;
++  LinkChunk* linkChunks = nullptr;
++  size_t nextChunkBytes = FIRST_LINK_CHUNK_BYTES;
++  // The pool the links come from: a list of chunks mapped from the OS, each twice the size of
++  // the one before up to MAX_LINK_CHUNK_BYTES, none of them freed or moved before the loop is
++  // destroyed, so that a link keeps its address for as long as an event holds it. See
++  // growLinks().
++
+   kj::Maybe<Own<Executor>> executor;
+   // Allocated the first time getExecutor() is requested, making cross-thread request possible.
+ 
+@@ -1569,7 +1609,13 @@
+ 
+   Own<TaskSet> daemons;
+ 
++  static constexpr size_t FIRST_LINK_CHUNK_BYTES = 4096;
++  static constexpr size_t MAX_LINK_CHUNK_BYTES = 256 * 1024;
++
+   void resetDepthFirstQueue();
++  _::EventLink* growLinks();
++  static size_t linksPerChunk(size_t chunkBytes);
++  static _::EventLink* chunkLinks(LinkChunk* chunk);
+   bool turn();
+   void setRunnable(bool runnable);
+   void enterScope();
+
+diff --git a/src/kj/async.c++ b/src/kj/async.c++
+--- a/src/kj/async.c++
++++ b/src/kj/async.c++
+@@ -1749,21 +1749,97 @@
+ // Global counter used to assign a unique id to each EventLoop.
+ }  // namespace
+ 
++struct EventLoop::LinkChunk {
++  // A chunk of run-queue links, followed in memory by the links themselves.
++  LinkChunk* next;
++  size_t bytes;
++};
++
++namespace {
++
++void* mapLinkChunk(size_t bytes) {
++  // A link chunk comes straight from the OS rather than from the C++ heap because an embedder
++  // that runs the loop's work under memory isolation gives each unit of work a heap of its own,
++  // and a chunk allocated while a unit runs would land in that unit's heap, where no other unit
++  // can address it. A fresh OS mapping belongs to no unit.
++#if _WIN32 || __CYGWIN__
++  void* result = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
++  KJ_ASSERT(result != nullptr, "VirtualAlloc(event queue links) failed");
++  return result;
++#else
++#ifndef MAP_ANONYMOUS
++#define MAP_ANONYMOUS MAP_ANON
++#endif
++  void* result = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
++                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++  if (result == MAP_FAILED) {
++    KJ_FAIL_SYSCALL("mmap(event queue links)", errno);
++  }
++  return result;
++#endif
++}
++
++void unmapLinkChunk(void* ptr, size_t bytes) {
++#if _WIN32 || __CYGWIN__
++  (void)bytes;
++  VirtualFree(ptr, 0, MEM_RELEASE);
++#else
++  KJ_SYSCALL(munmap(ptr, bytes)) { break; }
++#endif
++}
++
++}  // namespace
++
++size_t EventLoop::linksPerChunk(size_t chunkBytes) {
++  return (chunkBytes - sizeof(LinkChunk)) / sizeof(_::EventLink);
++}
++
++_::EventLink* EventLoop::chunkLinks(LinkChunk* chunk) {
++  return reinterpret_cast<_::EventLink*>(chunk + 1);
++}
++
++_::EventLink* EventLoop::growLinks() {
++  size_t bytes = nextChunkBytes;
++  nextChunkBytes = kj::min(bytes * 2, MAX_LINK_CHUNK_BYTES);
++
++  LinkChunk* chunk = reinterpret_cast<LinkChunk*>(mapLinkChunk(bytes));
++  chunk->next = linkChunks;
++  chunk->bytes = bytes;
++  linkChunks = chunk;
++
++  // Push the new links on the free list back to front, so that the first arm takes the first of
++  // them and a run of arms walks the chunk forwards.
++  _::EventLink* links = chunkLinks(chunk);
++  for (size_t i = linksPerChunk(bytes); i > 0; i--) {
++    _::EventLink& link = links[i - 1];
++    link.event = nullptr;
++    link.loop = this;
++    link.next = freeLinks;
++    freeLinks = &link;
++  }
++  return freeLinks;
++}
++
+ EventLoop::EventLoop(kj::Maybe<EventLoopObserver&> observer)
+     : loopId(nextEventLoopId.fetch_add(1, std::memory_order_relaxed)),
+       observer(observer), daemons(kj::heap<TaskSet>(_::LoggingErrorHandler::instance)) {
+-  auto link = [](_::Event& prev, _::Event& next) {
++  for (_::EventLink* sentinel: {&headLink, &tailLink, &depthFirstInsertPoint,
++                                &breadthFirstInsertPoint, &wouldSleepTail, &wouldSleepHead}) {
++    *sentinel = _::EventLink{nullptr, nullptr, nullptr, nullptr};
++  }
++
++  auto chain = [](_::EventLink& prev, _::EventLink& next) {
+     prev.next = &next;
+     next.prev = &prev.next;
+   };
+ 
+-  // head -> depthFirstInsertPoint -> breadthFirstInsertPoint -> tail
+-  link(headSentinel, depthFirstInsertPoint);
+-  link(depthFirstInsertPoint, breadthFirstInsertPoint);
+-  link(breadthFirstInsertPoint, tailSentinel);
++  // headLink -> depthFirstInsertPoint -> breadthFirstInsertPoint -> tailLink
++  chain(headLink, depthFirstInsertPoint);
++  chain(depthFirstInsertPoint, breadthFirstInsertPoint);
++  chain(breadthFirstInsertPoint, tailLink);
+ 
+   // wouldSleepHead -> wouldSleepTail
+-  link(wouldSleepHead, wouldSleepTail);
++  chain(wouldSleepHead, wouldSleepTail);
+ }
+ 
+ EventLoop::EventLoop(EventPort& port, kj::Maybe<EventLoopObserver&> observer)
+@@ -1794,20 +1870,34 @@
+   // EventLoop itself, so if there are events on the loop, this indicates a memory leak.
+   _::Event* firstEvent = head();
+ 
+-  KJ_REQUIRE(firstEvent == &tailSentinel,
++  KJ_REQUIRE(firstEvent == nullptr,
+              "EventLoop destroyed with events still in the queue.  Memory leak?",
+              firstEvent->traceEvent()) {
++    break;
++  }
+ 
+-    // Unlink all the events and hope that no one ever fires them...
+-    for (_::Event* event = firstEvent; event != &tailSentinel;) {
+-      // no need to handle sentinels separately - unlinking them doesn't hurt.
+-      _::Event* next = event->next;
+-      event->next = nullptr;
+-      event->prev = nullptr;
+-      event = next;
++  // Whatever is still armed -- on the main queue or on the would-sleep one -- holds a link in a
++  // chunk about to go away, and would write through it when it is destroyed, so cut every event
++  // loose from its link before unmapping. (An event with no link is unarmed, which is what it
++  // would have become anyway.)
++  for (LinkChunk* chunk = linkChunks; chunk != nullptr; chunk = chunk->next) {
++    _::EventLink* links = chunkLinks(chunk);
++    for (size_t i = linksPerChunk(chunk->bytes); i > 0; i--) {
++      _::EventLink& link = links[i - 1];
++      if (link.event != nullptr) {
++        link.event->link = nullptr;
++        link.event = nullptr;
++      }
+     }
+-    break;
+   }
++  for (LinkChunk* chunk = linkChunks; chunk != nullptr;) {
++    LinkChunk* next = chunk->next;
++    size_t bytes = chunk->bytes;
++    unmapLinkChunk(chunk, bytes);
++    chunk = next;
++  }
++  linkChunks = nullptr;
++  freeLinks = nullptr;
+ 
+   threadLocalEventLoop = nullptr;
+ }
+@@ -1828,20 +1918,19 @@
+ bool EventLoop::turn() {
+   _::Event* event = head();
+ 
+-  if (event == &tailSentinel) {
++  if (event == nullptr) {
+     // No events in the queue.
+     return false;
+   }
+ 
+-  // Remove event from the list
+-  event->unlink();
++  // Remove event from the list, returning its link to the pool.
++  event->disarm();
+ 
+   auto resetDepthFirstInsertPoint = [this]() {
+     // move depthFirstInsertPoint to the head of the list
+-    if (headSentinel.next == &depthFirstInsertPoint) return;
+-    *depthFirstInsertPoint.prev = depthFirstInsertPoint.next;
+-    depthFirstInsertPoint.next->prev = depthFirstInsertPoint.prev;
+-    depthFirstInsertPoint.insertAfter(headSentinel);
++    if (headLink.next == &depthFirstInsertPoint) return;
++    depthFirstInsertPoint.unlink();
++    depthFirstInsertPoint.insertAfter(headLink);
+   };
+   resetDepthFirstInsertPoint();
+ 
+@@ -1856,7 +1945,7 @@
+ }
+ 
+ bool EventLoop::isRunnable() {
+-  return head() != &tailSentinel;
++  return head() != nullptr;
+ }
+ 
+ const Executor& EventLoop::getExecutor() {
+@@ -1956,7 +2045,7 @@
+ 
+   if (!isRunnable() && wouldSleepHead.next != &wouldSleepTail) {
+     // We got nothing by polling. So, enqueue the next would-sleep event instead.
+-    _::Event* event = wouldSleepHead.next;
++    _::Event* event = wouldSleepHead.next->event;
+     event->disarm();
+     event->armDepthFirst();
+   }
+@@ -2204,7 +2293,7 @@
+ }
+ 
+ Event::Event(SourceLocation location)
+-    : next(nullptr), prev(nullptr), location(location) {}
++    : link(nullptr), location(location) {}
+ 
+ kj::EventLoop& Event::requireEventLoop() {
+   return KJ_REQUIRE_NONNULL(threadLocalEventLoop, "No event loop is running on this thread.");
+@@ -2225,33 +2314,41 @@
+ }
+ 
+ void Event::armDepthFirst() {
+-  if (prev == nullptr) {
++  if (link == nullptr) {
+     auto& loop = requireEventLoop();
+-    insertBefore(loop.depthFirstInsertPoint);
++    EventLink& queued = *loop.allocLink(*this);
++    queued.insertBefore(loop.depthFirstInsertPoint);
++    link = &queued;
+     loop.setRunnable(true);
+   }
+ }
+ 
+ void Event::armBreadthFirst() {
+-  if (prev == nullptr) {
++  if (link == nullptr) {
+     auto& loop = requireEventLoop();
+-    insertBefore(loop.breadthFirstInsertPoint);
++    EventLink& queued = *loop.allocLink(*this);
++    queued.insertBefore(loop.breadthFirstInsertPoint);
++    link = &queued;
+     loop.setRunnable(true);
+   }
+ }
+ 
+ void Event::armLast() {
+-  if (prev == nullptr) {
++  if (link == nullptr) {
+     auto& loop = requireEventLoop();
+-    insertAfter(loop.breadthFirstInsertPoint);
++    EventLink& queued = *loop.allocLink(*this);
++    queued.insertAfter(loop.breadthFirstInsertPoint);
++    link = &queued;
+     loop.setRunnable(true);
+   }
+ }
+ 
+ void Event::armWhenWouldSleep() {
+-  if (prev == nullptr) {
++  if (link == nullptr) {
+     auto& loop = requireEventLoop();
+-    insertAfter(loop.wouldSleepHead);
++    EventLink& queued = *loop.allocLink(*this);
++    queued.insertAfter(loop.wouldSleepHead);
++    link = &queued;
+     loop.setRunnable(true);
+   }
+ }
+@@ -2262,7 +2359,12 @@
+ }
+ 
+ void Event::disarm() noexcept {
+-  if (prev != nullptr) unlink();
++  if (link != nullptr) {
++    EventLink& queued = *link;
++    link = nullptr;
++    queued.unlink();
++    queued.loop->freeLink(queued);
++  }
+ }
+ 
+ String Event::traceEvent() {
+diff --git a/src/kj/async-coroutine-test.c++ b/src/kj/async-coroutine-test.c++
+index 7ba54b0..cdcc3be 100644
+--- a/src/kj/async-coroutine-test.c++
++++ b/src/kj/async-coroutine-test.c++
+@@ -30,14 +30,14 @@ namespace kj {
+ namespace {
+ 
+ #if _WIN32
+-static_assert(sizeof(void*) != 8 || sizeof(_::CoroutineBase) == 112,
++static_assert(sizeof(void*) != 8 || sizeof(_::CoroutineBase) == 104,
+     "CoroutineBase must retain its 64-bit Windows ABI layout");
+-static_assert(sizeof(void*) != 8 || sizeof(_::UnwindAwareCoroutineBase) == 120,
++static_assert(sizeof(void*) != 8 || sizeof(_::UnwindAwareCoroutineBase) == 112,
+     "UnwindAwareCoroutineBase must retain its 64-bit Windows ABI layout");
+ #else
+-static_assert(sizeof(void*) != 8 || sizeof(_::CoroutineBase) == 104,
++static_assert(sizeof(void*) != 8 || sizeof(_::CoroutineBase) == 96,
+     "CoroutineBase must retain its 64-bit ABI layout");
+-static_assert(sizeof(void*) != 8 || sizeof(_::UnwindAwareCoroutineBase) == 112,
++static_assert(sizeof(void*) != 8 || sizeof(_::UnwindAwareCoroutineBase) == 104,
+     "UnwindAwareCoroutineBase must retain its 64-bit ABI layout");
+ #endif
+ static_assert(sizeof(void*) != 8 || alignof(_::CoroutineBase) == 8,
