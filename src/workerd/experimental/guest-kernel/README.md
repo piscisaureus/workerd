@@ -299,6 +299,9 @@ int  gk_mapping_syscall_ok(long nr, long a1, ..., long a6); // a filter's range 
 
 void *gk_host_alloc(size_t);                 // host memory: mapped into no guest root
 void  gk_host_free(void*, size_t);
+int   gk_host_range_register(void*, size_t); // an embedder-mapped range, refused like host memory
+int   gk_host_range_unregister(void*, size_t);
+int   gk_arena_range_ok(const void*, size_t); // whether a range lies in the calling thread's arena
 gk_host_handle gk_host_slot_alloc(size_t);   // a host-memory block named by a handle
 void *gk_host_slot_get(gk_host_handle);      // validated against gk's table; NULL otherwise
 void  gk_host_slot_free(gk_host_handle);
