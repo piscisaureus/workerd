@@ -456,6 +456,21 @@ export default {
           await next();
           return new Response(`ws-many n=${n}\n`);
         }
+        case '/ws-leave': {
+          // A burst of a hundred messages, then close() and return without awaiting the close
+          // reply. The caller's request ends with the callee's close still armed on the event
+          // loop, and the turn that ends it cancels the pump that would have read it, so it
+          // destroys an event the loop armed before the turn began -- the event-disarm shape
+          // README.md's event-loop hazard section describes.
+          const { ws, next } = await wsOpen(env.BACK, 'http://back/ws-echo');
+          let n = 0;
+          for (let i = 0; i < 100; i++) ws.send(`m${i}`);
+          for (let i = 0; i < 100; i++) {
+            if ((await next()).data === `echo:m${i}`) n++;
+          }
+          ws.close(1000, 'done');
+          return new Response(`ws-leave n=${n}\n`);
+        }
         case '/ws-big': {
           // A mebibyte message each way, as text and as bytes.
           const { ws, next } = await wsOpen(env.BACK, 'http://back/ws-echo');
