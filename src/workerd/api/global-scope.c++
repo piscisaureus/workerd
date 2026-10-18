@@ -434,6 +434,19 @@ void checkWasmDescriptorsForTest(kj::StringPtr url) {
 // -- what releases the cache's in-progress entry for the key -- as that frame left it
 // (memory-cache-fault-test.sh).
 //
+// Two more paths take the fault with state a turn's frame holds that costs more than the turn
+// (fault-leak-test.sh). /__gk_fault_disallow_dtors faults inside a scope that disallows
+// destroying kj::AsyncObjects, which is what Wrappable::maybeDeferDestruction enters around
+// every destruction of a JS heap object inside a turn: the scope is reached through a
+// thread-local pointer to the scope object on the stack, so the fault leaves that pointer
+// naming an abandoned frame and the next ~AsyncObject on the thread dereferences it from a
+// noexcept function. /__gk_fault_gc_dtor faults with the flag that says this thread is inside a
+// CppgcShim destructor set, which is what a cppgc destructor running inside a turn leaves
+// behind; /__gk_gc_dtor_check then reports what the host reads on the event loop afterwards.
+// Both are stand-ins for their real sites, as the Wasm signal timer is for the CPU limiter:
+// each leaves the state its site leaves, without having to make the collection or the drop
+// land on the fault.
+//
 // With WORKERD_GK_TEST_PROBE set, a request whose path is /__gk_probe_host instead reads one
 // byte of the channel token key, and one whose path is /__gk_probe_host_entropy one byte of the
 // host entropy buffer, from inside the JS turn; both are host-memory tenants registered through
@@ -520,6 +533,21 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   if (faultEnabled && url.endsWith("/__gk_fault_cache_fallback")) {
     faultInNextMemoryCacheFallbackForTest = true;
   }
+  if (faultEnabled && url.endsWith("/__gk_fault_disallow_dtors")) {
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_FAULT: forcing a guest fault inside a scope that disallows async "
+        "destructors",
+        url);
+    kj::DisallowAsyncDestructorsScope disallow(
+        "guest-kernel probe: a turn's frame that disallows async destructors");
+    *static_cast<volatile int*>(nullptr) = 0;
+  }
+  if (faultEnabled && url.endsWith("/__gk_fault_gc_dtor")) {
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_FAULT: forcing a guest fault with the cppgc-destructor flag set", url);
+    jsg::setInGcDestructorForTest(true);
+    *static_cast<volatile int*>(nullptr) = 0;
+  }
   static const bool probeEnabled =
       jsg::isGuestKernelEnabled() && getenv("WORKERD_GK_TEST_PROBE") != nullptr;
   auto probeHost = [&](kj::StringPtr name) {
@@ -538,6 +566,17 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   }
   if (probeEnabled && url.endsWith("/__gk_probe_actor_key")) {
     probeHost("actor-id-key");
+  }
+  if (probeEnabled && url.endsWith("/__gk_gc_dtor_check")) {
+    // Host-side, on the event loop and on the thread an earlier turn faulted on: the flag
+    // jsg::isInGcDestructor() reads, which the host consults when it destroys a Data and when
+    // it tears an isolate down. Reported from here rather than from the faulted request, whose
+    // IoContext is aborted by the fault and runs no further tasks.
+    IoContext::current().addTask(kj::evalLater([]() {
+      kj::StringPtr cppgcFlag = jsg::isInGcDestructor() ? "leaked"_kj : "clear"_kj;
+      KJ_LOG(
+          WARNING, "WORKERD_GK_TEST_PROBE: the cppgc-destructor flag on the event loop", cppgcFlag);
+    }));
   }
 #ifdef WORKERD_HAS_HEAP_ARENA
   if (probeEnabled && url.endsWith("/__gk_heap_region")) {

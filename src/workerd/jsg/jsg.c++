@@ -769,6 +769,10 @@ bool isInGcDestructor() {
   return HeapTracer::isInCppgcDestructor();
 }
 
+void setInGcDestructorForTest(bool value) {
+  HeapTracer::restoreInCppgcDestructorAfterGuestTurn(value);
+}
+
 bool USVString::isValidUtf8() const {
   return simdutf::validate_utf8(cStr(), size());
 }

@@ -104,6 +104,34 @@ void runTrampolineInGuest(
   // it is thread-local storage the turn can write, and the Lock constructor reads it after the
   // turn to tell a recursive lock from a bare v8::Locker (see saveLockDepthForGuestTurn).
   uint lockDepth = saveLockDepthForGuestTurn();
+  // The flag that says this thread is inside a CppgcShim destructor gets it too (see
+  // HeapTracer::saveInCppgcDestructorForGuestTurn): a CppgcShim destructor runs inside the turn,
+  // so a turn's frame sets it, and the host reads it after the turn -- Data's destructor skips
+  // resetting a TracedReference while it is set, which leaks the node, and clearWrappers()
+  // asserts it is clear when any isolate on this thread is torn down.
+  bool inCppgcDestructor = HeapTracer::saveInCppgcDestructorForGuestTurn();
+
+  // The scope that disallows destroying kj::AsyncObjects (DISALLOW_KJ_IO_DESTRUCTORS_SCOPE in
+  // wrappable.h) is reached through a thread-local pointer to the scope object on the stack, and
+  // Wrappable::maybeDeferDestruction enters one around every destruction of a JS heap object the
+  // isolate lock is held for -- inside the turn, where the pointer names a frame of the turn's.
+  // A fault abandons that frame, and the pointer then names reused stack memory, which the next
+  // ~AsyncObject on this thread -- the next promise node the event loop destroys -- dereferences
+  // from a noexcept function and aborts the process on. The turn can also write the pointer
+  // itself, so the host would dereference an address of the turn's choosing.
+  //
+  // kj::AllowAsyncDestructorsScope is the save/restore pair for it: its constructor clears the
+  // thread-local and its destructor puts back what it found, and this one is in a host frame, so
+  // it runs whether the turn returns or faults. For the turn's duration the thread-local is
+  // clear, so a scope entered *above* the guest boundary -- a host-side destruction that enters
+  // an IoContext and runs a nested turn -- does not disallow destructors inside that turn; the
+  // scopes the turn's own frames enter are unaffected, which is every site that runs in a turn.
+  // (WORKERD_GK_NEG_DISALLOW_DTORS is a negative-test build, never shipped: the pointer the turn
+  // left stands, and experimental/guest-kernel/fault-leak-test.sh must then fail -- the process
+  // dies once the fault's unwinding destroys an async object.)
+#ifndef WORKERD_GK_NEG_DISALLOW_DTORS
+  kj::AllowAsyncDestructorsScope asyncDestructorScope;
+#endif
 
   // What the turn arms (a promise it fulfills, a continuation it attaches to a settled
   // promise) is linked into this thread's event loop queue next to whatever is queued there,
@@ -126,6 +154,13 @@ void runTrampolineInGuest(
   restoreLockDepthAfterGuestTurn(lockDepth);
 #else
   (void)lockDepth;
+#endif
+#ifndef WORKERD_GK_NEG_CPPGC_FLAG
+  // WORKERD_GK_NEG_CPPGC_FLAG is a negative-test build, never shipped: the flag the turn left
+  // stands, and fault-leak-test.sh must then fail -- the host reads the turn's value back.
+  HeapTracer::restoreInCppgcDestructorAfterGuestTurn(inCppgcDestructor);
+#else
+  (void)inCppgcDestructor;
 #endif
   if (result != 0) {
     // The guest faulted (or gk otherwise could not complete the turn) and control is back here

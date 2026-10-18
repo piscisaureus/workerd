@@ -59,6 +59,29 @@ which runs each isolate's JS turn at guest ring 3.
   condemned, the IoContext is torn down, and the process keeps serving.
   Negative build: `--copt=-DWORKERD_GK_NEG_TIMEOUT_RUNNING`, where the fault
   path leaves the mark standing and the process dies on the assert.
+- `fault-leak-test.sh` / `fault-leak-test.capnp` — the same fault taken with
+  each of the two pieces of thread-wide state a turn's frames hold that the
+  host reads after the turn: the scope that disallows destroying
+  `kj::AsyncObject`s, which `Wrappable::maybeDeferDestruction` enters around
+  every destruction of a JS heap object under the isolate lock, and the flag
+  that says this thread is inside a `CppgcShim` destructor. Both are
+  thread-wide, so leaking one costs more than the condemned isolate: the
+  first is a thread-local pointer to the scope object on the turn's stack,
+  which `~AsyncObject` dereferences from a `noexcept` function, so the next
+  promise node the thread destroys -- which the fault's own unwinding does --
+  takes the process down; the second leaves every `Data` the host destroys
+  afterwards skipping the reset of its `TracedReference`, and
+  `HeapTracer::clearWrappers()` asserting, for any isolate on the thread.
+  Both are saved in the host frame that runs the turn and put back whether it
+  returns or faults (`runTrampolineInGuest` in `jsg/guest-run.c++`), which is
+  also what keeps a turn from choosing the value the host reads; the leak list
+  on `runInGuest` in `jsg/guest-run.h` says which of the turn's state that
+  covers and which it cannot. The faulted requests fail, their isolates are
+  condemned, the process keeps serving and the host reads the flag clear.
+  Negative builds: `--copt=-DWORKERD_GK_NEG_DISALLOW_DTORS`, where the
+  pointer the turn left stands and the process dies during the faulted
+  request's teardown, and `--copt=-DWORKERD_GK_NEG_CPPGC_FLAG`, where the
+  host reads the flag the turn left set.
 - `memory-cache-fault-test.sh` / `memory-cache-fault-test.capnp` /
   `memory-cache-fault-test.js` — the fault taken inside a `MemoryCache`
   fallback, whose frame holds the callback that releases the cache's

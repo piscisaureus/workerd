@@ -61,8 +61,32 @@ namespace workerd::jsg {
 // from inside the guest is not supported. Such mismatches are detected and counted, not
 // supported.
 //
-// TODO(guest-kernel): RAII state held by the abandoned frames leaks; there is no bookkeeping
-//   that could release it. Known leaks per faulted turn:
+// TODO(guest-kernel): RAII state held by the abandoned frames leaks, and no general bookkeeping
+//   could release it: the frames are not enumerable and the state is reached through whatever
+//   each frame happens to hold. What the fault path does release is the state that is
+//   thread-wide, because that outlives the condemned isolate and so costs more than the turn.
+//   Thread-wide state is reachable without enumerating anything, by saving it in the host frame
+//   that runs the turn and putting it back whether the turn returns or faults, and every piece
+//   of it that has an owner in jsg or above is handled that way: the thread-locals the host
+//   reads after a turn (GuestTurnThreadLocals in io/guest-turn-thread-locals.h), the isolate's
+//   jsg data slots, the count of jsg::Locks this thread holds, the flag that says this thread is
+//   inside a CppgcShim destructor and the scope that disallows destroying kj::AsyncObjects (the
+//   last four in runTrampolineInGuest, guest-run.c++), the turn's resolve journal and the event
+//   loop's arm guard (runJsTurn and runTrampolineInGuest), and the running mark a timeout
+//   callback's TimeoutState holds, which ~TimeoutState asserts on when the IoContext is
+//   destroyed (runJsTurn in io/io-context.c++). That save and restore is also what keeps a turn
+//   from choosing the value the host reads, so each of those is one remedy for two problems;
+//   experimental/guest-kernel/memory-classes.md, rule R7, is the inventory.
+//
+//   What makes thread-wide state reachable at all, rather than only under an unfixed placement
+//   bug: a destructor running inside a turn can enter another IoContext's scope and run a nested
+//   JS turn there (see runInContextScope in io/io-context.c++), so user JS runs synchronously
+//   under whatever the frames below it hold, and an escape faults at its own site inside it.
+//   Wrappable::maybeDeferDestruction is the frame that matters, because it enters the
+//   disallow-async-destructors scope around every destruction of a JS heap object the isolate
+//   lock is held for, and those destructions are where the nested turns come from.
+//
+//   Known leaks per faulted turn:
 //   - for a JS turn, the IoContext::PendingEvent that IoContext::runImpl's turn registers, so
 //     that IoContext is never seen as idle by hang detection (moot once it is aborted and
 //     destroyed), and the limit enforcer's enterJs() scope, so it never sees the matching exit.
@@ -86,16 +110,56 @@ namespace workerd::jsg {
 //     or resuming a parked read between the fault and the teardown -- turns all three sites
 //     into host-side use-after-frees. The fix then is to give each wrapper an owner that
 //     outlives the turn (IoContext::addObject before the handler runs) rather than to neuter
-//     from the fault path, which has no handle to per-request state in api/;
+//     from the fault path, which has no handle to per-request state in api/. A lock is the one
+//     member of this bullet whose cost is not confined to the faulted request: its next locker
+//     blocks, whatever isolate that locker serves. The costliest one is not a KJ mutex but V8's
+//     ThreadIsolation::jit_pages_mutex_, a process-wide base::Mutex held by a MutexGuard on the
+//     stack across every registration, split and lookup of the JIT-page index -- which a turn
+//     reaches whenever it allocates code -- and whose next locker is any isolate on any thread,
+//     including this one on its own next allocation. Releasing it from the fault path would be
+//     worse than leaking it, which is the general shape of this item: the frame was abandoned
+//     part-way through mutating what the lock protects (RegisterJitPage faults walking the
+//     index's nodes with the lock held, which is how the index's own misplacement showed up;
+//     see jsg/thread-isolated-allocator.h), so unlocking hands the next locker a half-mutated
+//     structure. Only the sites can answer it, by not holding a lock across code a fault can
+//     reach, and nothing could tell whether such a site list were complete, since any call
+//     inside the window may take a lock of its own;
 //   - the guard of any function-local static the frames were initializing, which stays owned by
 //     the thread, so this one costs more than the turn: the next turn to reach that static dies
 //     on "__cxa_guard_acquire detected recursive initialization", taking the process with it, if
 //     it runs on the same thread, and waits forever for an initialization that will never finish
 //     if it runs on another. Aborting the guard instead would let the next caller construct the
 //     static again over whatever a half-run constructor left in its storage, so there is nothing
-//     the fault path can do about it;
+//     the fault path can do about it. The guard belongs to libc, which exposes no way to release
+//     or abandon one, and the only remedy is for no fault to be possible inside an
+//     initialization: experimental/guest-kernel/atexit-arena-test.sh covers the one such window
+//     that is reached on every turn, the __cxa_atexit registration a static with a non-trivial
+//     destructor makes while it holds its own guard, and reports the abort when it sees it;
+//   - the state SQLite keeps for the call a turn is inside. Two pieces are confined to the
+//     faulted isolate's database, since that is what holds them: the running statement and the
+//     regulator SqliteDatabase::Query::nextRow sets, which leave the next nextRow() on that
+//     database asserting. The third is thread-wide: `currentVfsRoot` (util/sqlite.c++), which
+//     NativeVfsCall sets for the length of one native VFS call and whose constructor asserts
+//     the thread has none, so a fault inside such a call leaves every later native VFS call on
+//     the thread failing that assert, for any actor the thread serves, and leaves the guest
+//     kernel's turn directory naming the faulted database's directory. Its bookkeeping would be
+//     the save and restore above plus a gk_turn_dir_set(GK_TURN_DIR_NONE) in the fault path;
+//     what is missing is a reason to expect a fault there, since no JS runs inside a native VFS
+//     call. `vfsErrorListener`, the other thread-local of that file, needs nothing: every
+//     consumer is inside a SqliteCallScope, whose constructor sets the thread-local before any
+//     use, so a stale one is overwritten rather than read;
 //   - on the V8 side, the abandoned HandleScopes' handles, and the isolate itself, which is
 //     never freed because nothing evicts a condemned isolate (see Worker::Isolate::condemn).
+//
+//   What divides the two halves of this list is not how wide the state is but whether its value
+//   stands on its own. A flag, a count, a pointer or a thread-local can be put back, because the
+//   saved value is the whole of the state and nothing else has to agree with it; the fault path
+//   restores every such piece it can name. A lock, a guard variable or a half-run constructor
+//   cannot, because what the frame was abandoned in the middle of is a multi-word invariant that
+//   the saved value says nothing about, and restoring the one word publishes the broken
+//   invariant. For those the remedy is at the site -- not holding the thing across code a fault
+//   can reach -- and no mechanism here can be complete, because what a fault can reach inside
+//   such a window is every call the window makes.
 template <typename Func>
 auto runInGuest(Lock& js,
     Func&& body,

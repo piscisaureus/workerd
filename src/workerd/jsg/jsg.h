@@ -3500,6 +3500,11 @@ auto runInV8Stack(auto callback) {
 // occurring.
 bool isInGcDestructor();
 
+// Test-only, for the guest kernel's end-to-end check that the flag isInGcDestructor() reads does
+// not carry a turn's value past it (experimental/guest-kernel/fault-leak-test.sh): a turn sets
+// it and faults, and the host reads it back on the event loop afterwards.
+void setInGcDestructorForTest(bool value);
+
 // =======================================================================================
 // inline implementation details
 
