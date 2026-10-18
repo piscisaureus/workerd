@@ -1,0 +1,657 @@
+{
+  "binary": "bazel-built //src/workerd/experimental/guest-kernel:queue-cost, -c opt",
+  "commits": {
+    "post": "e277f1faf",
+    "pre": "c99961cae"
+  },
+  "launches_per_arm": 4,
+  "ops_per_case": 20000000,
+  "pinned_to_cpu": 12,
+  "summary": {
+    "arm-disarm": {
+      "1024": {
+        "ns_per_op_post_launches": [
+          3.247,
+          3.144,
+          3.251,
+          3.156
+        ],
+        "ns_per_op_post_median": 3.2015000000000002,
+        "ns_per_op_pre_launches": [
+          2.343,
+          2.356,
+          2.356,
+          2.344
+        ],
+        "ns_per_op_pre_median": 2.3499999999999996,
+        "paired_delta_ns_median": 0.8535000000000001,
+        "paired_delta_pct_median": 36.31914893617022
+      },
+      "256": {
+        "ns_per_op_post_launches": [
+          2.834,
+          2.828,
+          2.827,
+          2.825
+        ],
+        "ns_per_op_post_median": 2.8274999999999997,
+        "ns_per_op_pre_launches": [
+          2.284,
+          2.287,
+          2.282,
+          2.284
+        ],
+        "ns_per_op_pre_median": 2.284,
+        "paired_delta_ns_median": 0.5430000000000001,
+        "paired_delta_pct_median": 23.774080560420323
+      },
+      "32": {
+        "ns_per_op_post_launches": [
+          2.753,
+          2.746,
+          2.753,
+          3.076
+        ],
+        "ns_per_op_post_median": 2.753,
+        "ns_per_op_pre_launches": [
+          2.171,
+          2.155,
+          2.152,
+          2.151
+        ],
+        "ns_per_op_pre_median": 2.1535,
+        "paired_delta_ns_median": 0.5960000000000001,
+        "paired_delta_pct_median": 27.6758764801486
+      },
+      "4": {
+        "ns_per_op_post_launches": [
+          3.062,
+          3.196,
+          3.22,
+          3.184
+        ],
+        "ns_per_op_post_median": 3.1900000000000004,
+        "ns_per_op_pre_launches": [
+          3.015,
+          2.905,
+          2.872,
+          3.537
+        ],
+        "ns_per_op_pre_median": 2.96,
+        "paired_delta_ns_median": 0.16900000000000004,
+        "paired_delta_pct_median": 5.7094594594594605
+      },
+      "8192": {
+        "ns_per_op_post_launches": [
+          3.284,
+          3.146,
+          3.158,
+          3.159
+        ],
+        "ns_per_op_post_median": 3.1585,
+        "ns_per_op_pre_launches": [
+          2.357,
+          2.338,
+          2.389,
+          2.368
+        ],
+        "ns_per_op_pre_median": 2.3625,
+        "paired_delta_ns_median": 0.7994999999999999,
+        "paired_delta_pct_median": 33.84126984126984
+      }
+    },
+    "arm-drain": {
+      "1024": {
+        "ns_per_op_post_launches": [
+          9.39,
+          9.221,
+          9.423,
+          9.205
+        ],
+        "ns_per_op_post_median": 9.3055,
+        "ns_per_op_pre_launches": [
+          5.634,
+          5.635,
+          5.625,
+          5.629
+        ],
+        "ns_per_op_pre_median": 5.6315,
+        "paired_delta_ns_median": 3.6710000000000003,
+        "paired_delta_pct_median": 65.18689514338986
+      },
+      "256": {
+        "ns_per_op_post_launches": [
+          9.086,
+          9.01,
+          8.925,
+          8.944
+        ],
+        "ns_per_op_post_median": 8.977,
+        "ns_per_op_pre_launches": [
+          5.595,
+          5.627,
+          5.615,
+          5.611
+        ],
+        "ns_per_op_pre_median": 5.6129999999999995,
+        "paired_delta_ns_median": 3.3580000000000005,
+        "paired_delta_pct_median": 59.825405309103886
+      },
+      "32": {
+        "ns_per_op_post_launches": [
+          9.281,
+          9.234,
+          9.43,
+          9.69
+        ],
+        "ns_per_op_post_median": 9.3555,
+        "ns_per_op_pre_launches": [
+          6.002,
+          5.916,
+          5.879,
+          5.95
+        ],
+        "ns_per_op_pre_median": 5.933,
+        "paired_delta_ns_median": 3.4345,
+        "paired_delta_pct_median": 57.88808360020226
+      },
+      "4": {
+        "ns_per_op_post_launches": [
+          9.124,
+          9.031,
+          9.056,
+          9.117
+        ],
+        "ns_per_op_post_median": 9.086500000000001,
+        "ns_per_op_pre_launches": [
+          6.363,
+          6.361,
+          6.434,
+          6.95
+        ],
+        "ns_per_op_pre_median": 6.3985,
+        "paired_delta_ns_median": 2.646,
+        "paired_delta_pct_median": 41.353442213018674
+      },
+      "8192": {
+        "ns_per_op_post_launches": [
+          9.271,
+          9.249,
+          9.194,
+          9.195
+        ],
+        "ns_per_op_post_median": 9.222000000000001,
+        "ns_per_op_pre_launches": [
+          5.614,
+          5.623,
+          5.741,
+          5.63
+        ],
+        "ns_per_op_pre_median": 5.6265,
+        "paired_delta_ns_median": 3.5955000000000004,
+        "paired_delta_pct_median": 63.90295921087711
+      }
+    },
+    "eval-run": {
+      "1024": {
+        "ns_per_op_post_launches": [
+          38.618,
+          37.953,
+          37.972,
+          37.932
+        ],
+        "ns_per_op_post_median": 37.962500000000006,
+        "ns_per_op_pre_launches": [
+          37.923,
+          37.908,
+          38.482,
+          38.495
+        ],
+        "ns_per_op_pre_median": 38.2025,
+        "paired_delta_ns_median": -0.23249999999999815,
+        "paired_delta_pct_median": -0.6085989136836546
+      },
+      "256": {
+        "ns_per_op_post_launches": [
+          39.024,
+          38.303,
+          38.362,
+          38.394
+        ],
+        "ns_per_op_post_median": 38.378,
+        "ns_per_op_pre_launches": [
+          38.399,
+          38.101,
+          38.362,
+          38.386
+        ],
+        "ns_per_op_pre_median": 38.374,
+        "paired_delta_ns_median": 0.10499999999999687,
+        "paired_delta_pct_median": 0.27362276541407426
+      },
+      "32": {
+        "ns_per_op_post_launches": [
+          39.295,
+          38.424,
+          38.421,
+          38.454
+        ],
+        "ns_per_op_post_median": 38.439,
+        "ns_per_op_pre_launches": [
+          38.293,
+          38.186,
+          38.248,
+          38.288
+        ],
+        "ns_per_op_pre_median": 38.268,
+        "paired_delta_ns_median": 0.20550000000000068,
+        "paired_delta_pct_median": 0.5370021950454705
+      },
+      "4": {
+        "ns_per_op_post_launches": [
+          48.453,
+          49.388,
+          49.404,
+          48.567
+        ],
+        "ns_per_op_post_median": 48.9775,
+        "ns_per_op_pre_launches": [
+          48.239,
+          47.567,
+          47.513,
+          47.556
+        ],
+        "ns_per_op_pre_median": 47.561499999999995,
+        "paired_delta_ns_median": 1.4160000000000004,
+        "paired_delta_pct_median": 2.9771979437149807
+      },
+      "8192": {
+        "ns_per_op_post_launches": [
+          38.644,
+          38.556,
+          38.366,
+          38.519
+        ],
+        "ns_per_op_post_median": 38.537499999999994,
+        "ns_per_op_pre_launches": [
+          38.532,
+          39.38,
+          38.517,
+          38.683
+        ],
+        "ns_per_op_pre_median": 38.6075,
+        "paired_delta_ns_median": -0.15750000000000242,
+        "paired_delta_pct_median": -0.4079518228323574
+      }
+    },
+    "rearm-breadth": {
+      "1024": {
+        "ns_per_op_post_launches": [
+          6.885,
+          6.497,
+          6.735,
+          6.67
+        ],
+        "ns_per_op_post_median": 6.702500000000001,
+        "ns_per_op_pre_launches": [
+          5.412,
+          5.456,
+          5.353,
+          5.35
+        ],
+        "ns_per_op_pre_median": 5.3825,
+        "paired_delta_ns_median": 1.3510000000000004,
+        "paired_delta_pct_median": 25.099860659544827
+      },
+      "256": {
+        "ns_per_op_post_launches": [
+          6.119,
+          6.029,
+          5.704,
+          6.024
+        ],
+        "ns_per_op_post_median": 6.0265,
+        "ns_per_op_pre_launches": [
+          5.318,
+          5.312,
+          5.254,
+          5.193
+        ],
+        "ns_per_op_pre_median": 5.2829999999999995,
+        "paired_delta_ns_median": 0.7589999999999999,
+        "paired_delta_pct_median": 14.366837024417944
+      },
+      "32": {
+        "ns_per_op_post_launches": [
+          5.309,
+          5.343,
+          5.364,
+          5.597
+        ],
+        "ns_per_op_post_median": 5.3535,
+        "ns_per_op_pre_launches": [
+          5.289,
+          5.299,
+          5.285,
+          5.169
+        ],
+        "ns_per_op_pre_median": 5.287,
+        "paired_delta_ns_median": 0.061499999999999666,
+        "paired_delta_pct_median": 1.163230565538106
+      },
+      "4": {
+        "ns_per_op_post_launches": [
+          5.329,
+          5.313,
+          5.308,
+          5.315
+        ],
+        "ns_per_op_post_median": 5.314,
+        "ns_per_op_pre_launches": [
+          5.3,
+          5.266,
+          5.49,
+          5.684
+        ],
+        "ns_per_op_pre_median": 5.395,
+        "paired_delta_ns_median": -0.07650000000000023,
+        "paired_delta_pct_median": -1.4179796107506997
+      },
+      "8192": {
+        "ns_per_op_post_launches": [
+          6.466,
+          6.683,
+          6.482,
+          6.627
+        ],
+        "ns_per_op_post_median": 6.5545,
+        "ns_per_op_pre_launches": [
+          5.405,
+          5.303,
+          5.451,
+          5.444
+        ],
+        "ns_per_op_pre_median": 5.4245,
+        "paired_delta_ns_median": 1.1219999999999999,
+        "paired_delta_pct_median": 20.683934003133928
+      }
+    },
+    "rearm-depth": {
+      "1024": {
+        "ns_per_op_post_launches": [
+          6.488,
+          6.5,
+          6.235,
+          6.357
+        ],
+        "ns_per_op_post_median": 6.4225,
+        "ns_per_op_pre_launches": [
+          6.758,
+          6.748,
+          6.722,
+          7.254
+        ],
+        "ns_per_op_pre_median": 6.753,
+        "paired_delta_ns_median": -0.37849999999999984,
+        "paired_delta_pct_median": -5.604916333481413
+      },
+      "256": {
+        "ns_per_op_post_launches": [
+          6.215,
+          6.205,
+          6.488,
+          6.22
+        ],
+        "ns_per_op_post_median": 6.217499999999999,
+        "ns_per_op_pre_launches": [
+          6.73,
+          7.219,
+          6.717,
+          7.201
+        ],
+        "ns_per_op_pre_median": 6.9655000000000005,
+        "paired_delta_ns_median": -0.7480000000000002,
+        "paired_delta_pct_median": -10.738640442179314
+      },
+      "32": {
+        "ns_per_op_post_launches": [
+          6.499,
+          6.472,
+          6.5,
+          6.571
+        ],
+        "ns_per_op_post_median": 6.499499999999999,
+        "ns_per_op_pre_launches": [
+          6.75,
+          7.22,
+          7.146,
+          6.767
+        ],
+        "ns_per_op_pre_median": 6.9565,
+        "paired_delta_ns_median": -0.4485000000000001,
+        "paired_delta_pct_median": -6.4472076475239
+      },
+      "4": {
+        "ns_per_op_post_launches": [
+          6.219,
+          6.23,
+          6.49,
+          6.23
+        ],
+        "ns_per_op_post_median": 6.23,
+        "ns_per_op_pre_launches": [
+          6.75,
+          6.748,
+          7.071,
+          6.743
+        ],
+        "ns_per_op_pre_median": 6.7490000000000006,
+        "paired_delta_ns_median": -0.5244999999999997,
+        "paired_delta_pct_median": -7.771521706919539
+      },
+      "8192": {
+        "ns_per_op_post_launches": [
+          8.909,
+          6.439,
+          6.329,
+          6.483
+        ],
+        "ns_per_op_post_median": 6.461,
+        "ns_per_op_pre_launches": [
+          6.725,
+          7.25,
+          7.215,
+          7.235
+        ],
+        "ns_per_op_pre_median": 7.225,
+        "paired_delta_ns_median": -0.7815000000000003,
+        "paired_delta_pct_median": -10.816608996539797
+      }
+    },
+    "then-build": {
+      "1024": {
+        "ns_per_op_post_launches": [
+          3.062,
+          3.049,
+          3.047,
+          3.048
+        ],
+        "ns_per_op_post_median": 3.0484999999999998,
+        "ns_per_op_pre_launches": [
+          2.999,
+          3.008,
+          2.993,
+          2.989
+        ],
+        "ns_per_op_pre_median": 2.996,
+        "paired_delta_ns_median": 0.05650000000000022,
+        "paired_delta_pct_median": 1.8858477970627576
+      },
+      "256": {
+        "ns_per_op_post_launches": [
+          2.911,
+          2.93,
+          2.897,
+          2.954
+        ],
+        "ns_per_op_post_median": 2.9205,
+        "ns_per_op_pre_launches": [
+          2.793,
+          2.773,
+          2.783,
+          2.794
+        ],
+        "ns_per_op_pre_median": 2.7880000000000003,
+        "paired_delta_ns_median": 0.13749999999999996,
+        "paired_delta_pct_median": 4.931850789096124
+      },
+      "32": {
+        "ns_per_op_post_launches": [
+          3.222,
+          3.281,
+          3.327,
+          3.12
+        ],
+        "ns_per_op_post_median": 3.2515,
+        "ns_per_op_pre_launches": [
+          3.114,
+          3.129,
+          3.137,
+          3.229
+        ],
+        "ns_per_op_pre_median": 3.133,
+        "paired_delta_ns_median": 0.13000000000000012,
+        "paired_delta_pct_median": 4.149377593361
+      },
+      "4": {
+        "ns_per_op_post_launches": [
+          8.537,
+          8.415,
+          8.498,
+          8.414
+        ],
+        "ns_per_op_post_median": 8.456499999999998,
+        "ns_per_op_pre_launches": [
+          8.131,
+          8.131,
+          8.139,
+          8.144
+        ],
+        "ns_per_op_pre_median": 8.135,
+        "paired_delta_ns_median": 0.32149999999999945,
+        "paired_delta_pct_median": 3.9520590043023907
+      },
+      "8192": {
+        "ns_per_op_post_launches": [
+          3.063,
+          3.009,
+          3.013,
+          3.035
+        ],
+        "ns_per_op_post_median": 3.024,
+        "ns_per_op_pre_launches": [
+          3.084,
+          3.056,
+          3.063,
+          3.069
+        ],
+        "ns_per_op_pre_median": 3.066,
+        "paired_delta_ns_median": -0.04049999999999998,
+        "paired_delta_pct_median": -1.320939334637964
+      }
+    },
+    "then-run": {
+      "1024": {
+        "ns_per_op_post_launches": [
+          23.044,
+          23.015,
+          23.152,
+          23.09
+        ],
+        "ns_per_op_post_median": 23.067,
+        "ns_per_op_pre_launches": [
+          22.926,
+          22.902,
+          23.067,
+          22.858
+        ],
+        "ns_per_op_pre_median": 22.914,
+        "paired_delta_ns_median": 0.11550000000000082,
+        "paired_delta_pct_median": 0.5040586540979349
+      },
+      "256": {
+        "ns_per_op_post_launches": [
+          22.665,
+          22.565,
+          22.548,
+          22.772
+        ],
+        "ns_per_op_post_median": 22.615000000000002,
+        "ns_per_op_pre_launches": [
+          22.547,
+          22.526,
+          22.547,
+          22.456
+        ],
+        "ns_per_op_pre_median": 22.5365,
+        "paired_delta_ns_median": 0.07850000000000001,
+        "paired_delta_pct_median": 0.3483238302309587
+      },
+      "32": {
+        "ns_per_op_post_launches": [
+          17.583,
+          17.886,
+          17.431,
+          17.632
+        ],
+        "ns_per_op_post_median": 17.6075,
+        "ns_per_op_pre_launches": [
+          17.413,
+          17.596,
+          17.37,
+          17.762
+        ],
+        "ns_per_op_pre_median": 17.5045,
+        "paired_delta_ns_median": 0.11549999999999905,
+        "paired_delta_pct_median": 0.6598303293438775
+      },
+      "4": {
+        "ns_per_op_post_launches": [
+          15.872,
+          16.146,
+          15.873,
+          16.009
+        ],
+        "ns_per_op_post_median": 15.940999999999999,
+        "ns_per_op_pre_launches": [
+          15.287,
+          15.346,
+          15.233,
+          15.199
+        ],
+        "ns_per_op_pre_median": 15.260000000000002,
+        "paired_delta_ns_median": 0.7199999999999998,
+        "paired_delta_pct_median": 4.7182175622542575
+      },
+      "8192": {
+        "ns_per_op_post_launches": [
+          27.513,
+          28.477,
+          30.376,
+          28.393
+        ],
+        "ns_per_op_post_median": 28.435000000000002,
+        "ns_per_op_pre_launches": [
+          31.387,
+          27.018,
+          27.604,
+          27.595
+        ],
+        "ns_per_op_pre_median": 27.5995,
+        "paired_delta_ns_median": 1.1285000000000007,
+        "paired_delta_pct_median": 4.088842189170096
+      }
+    }
+  },
+  "what": "kj run-queue operations against the number of events queued at once"
+}
