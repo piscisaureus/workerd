@@ -1708,6 +1708,13 @@ guest kernel on and no limit. GC counts and pauses are from one further
 launch per cell with `--trace-gc` and one worker per launch
 (`measure/extgc/gcsum.py`), so that the isolate in the trace is known.
 
+**The counts this section takes from a trace are low.** The binary measured
+here gave `stdout` a fully buffered `BUFSIZ` buffer that nothing ever flushed,
+so the end of every log -- up to 8 KiB, 33 lines in the cell that was measured
+for it -- never reached the file. "A `--trace-gc` log that reaches the file"
+below says how much and which figures it touches. The throughput, latency,
+memory and region figures do not come from the trace and are unaffected.
+
 ### 1. The region under a 128 MiB heap limit
 
 `back`'s region, MiB, after the warm-up and each burst, collection off
@@ -1775,8 +1782,10 @@ What the rows say:
   15% under the arenas, because tcmalloc and jemalloc hand the next body the
   pages the last one freed, warm, where the off arm faults 4 MiB of fresh
   pages per response. The collection itself is 2 mark-compacts of 0.3 ms per
-  16 responses, 5.5% of the window (1,161 in the trace; the off arm's trace
-  has none at all in 6,050 responses).
+  16 responses, 5.5% of the window (1,161 in the trace, itself short by up to
+  a buffer's worth of lines; the off arm's whole trace fits inside one buffer
+  and so reached the file empty, which is why it appeared to collect not at
+  all in 6,050 responses -- re-measured, its launches collect 0 to 7 times).
 - **With a large heap it is the cost, and it grows with the heap.** At 42.5 MB
   live, `bigheapbody` runs at 345-355 against 874-972 requests per second in
   the default build: the trace shows 330 mark-compacts of 16.2 ms (35.9 max)
@@ -1850,8 +1859,8 @@ was the first thing written to `stdout` in these runs, from inside `back`'s
 turn, so the buffer went into `back`'s arena and the first scavenge `front`
 traced faulted on it (`cr2` in `back`'s slot, from `front`'s turn, during the
 warm-up of every run). Running under `stdbuf -o0` confirmed it: no fault, and
-the collection on its own never faulted. `jsg/setup.c++` now hands `stdout` a
-static buffer with `setvbuf()` beside the ICU hooks, which is the same cure
+the collection on its own never faulted. `jsg/setup.c++` hands `stdout` a
+static buffer with `setvbuf()` before V8 is initialized, which is the same cure
 for the same shape of problem, and the run that found it passes with the flag
 and without `stdbuf` on the committed build.
 
@@ -1880,6 +1889,10 @@ and without `stdbuf` on the committed build.
   are within 7% of one another; either every launch landed in one mode or
   the body path here, which does not cross a service binding, does not
   exercise it.
+- **Every count the trace gives is short by up to one buffer**, as the method
+  says. Where an arm of this section survives in the tree, the section after
+  it re-measured the same cells with the tail arriving, and those counts are
+  the ones to quote.
 
 ## Keeping the shared arena populated
 
@@ -2409,12 +2422,13 @@ jemalloc build with the guest kernel on and no limit. GC counts and pauses are
 from one further launch per cell with `--trace-gc` and one worker per launch
 (`measure/extgc/gcsum.py`).
 
-A second never-committed knob, `WORKERD_GK_MEASURE_LINEBUF`, line-buffers
-`stdout` for the traced launches. `jsg/setup.c++` gives `stdout` a static
-`BUFSIZ` buffer and workerd does not flush it when it is signalled, so without
-the knob the last 8 KiB of a `--trace-gc` log -- about 39 lines -- never
-reaches the file. The counts in the section above are short by up to that
-much.
+A second never-committed knob, `WORKERD_GK_MEASURE_LINEBUF`, line-buffered
+`stdout` for the traced launches. The binary measured here gave `stdout` a
+fully buffered `BUFSIZ` buffer and nothing flushed it, so without the knob the
+last 8 KiB of a `--trace-gc` log -- 33 lines of it -- did not reach the file;
+the counts in the section above, measured without the knob, are short by up to
+that much. `setup.c++` line-buffers `stdout` in every build now, so the knob
+has no successor; see "A `--trace-gc` log that reaches the file".
 
 The VMSCAPE mitigation read `Mitigation: IBPB before exit to userspace` and
 `kvm.halt_poll_ns` 200000 before and after every run.
@@ -2588,3 +2602,122 @@ others are serving empties their page pools as it starts.
   requests per second across its six launches, the widest spread in either
   table. Nothing here depends on its mean, but a three-launch median of it
   would have been worth little.
+
+## A `--trace-gc` log that reaches the file
+
+### The question
+
+Three sections above read GC counts out of `--trace-gc` logs, and the last of
+them needed a knob that was never committed to get them whole. Without it the
+end of every traced run was missing, which is how a three-burst run that was
+plainly collecting came to show no mark-compact at all. What is lost, why, and
+what the counts already measured are worth.
+
+### What loses it, read from the source
+
+Two things have to hold at once. The first is that `stdout` is fully buffered,
+which a pipe or a file is by the C library's default; the arena builds also made
+it so explicitly, because `setup.c++` has to hand stdio a buffer before a turn
+can allocate one inside an isolate's arena (the section above). The second is
+that nothing flushes it. `kj::TopLevelProcessContext::exit()` (`kj/main.c++`)
+calls `_exit()`, so a workerd that drains on SIGTERM and returns from its main
+function never runs stdio's exit-time flush either; nor does a process that dies
+on a fault, which several of the probes here arrange on purpose. A flush on the
+signal path would therefore cover one of the three ways a traced run ends.
+
+Line buffering covers all three, and what it costs is a `write(2)` per line on a
+stream that carries nothing in volume: a worker's own output reaches fd 1
+through the JSON logger, which writes to the descriptor directly, and the rest
+of workerd's logging is `KJ_LOG` to stderr, so V8's trace flags are all that
+stdio writes to `stdout` at all. `setup.c++` line-buffers it, for every build
+rather than only the arena ones, and still hands stdio the buffer to use.
+
+### Method
+
+The heap-region `bigbody` worker under the `--trace-gc` config
+(`measure/extgc/cost-bigbody.js`, `measure/extgc/cost-nolimit-trace.capnp`), a
+fixed 4,000 responses at one connection so that every launch collects the same
+number of times, then SIGTERM and, if that has not ended it in ten seconds,
+SIGKILL. `stdout` and `stderr` to separate files, so that the `stdout` file is
+exactly what stdio wrote. Three launches per cell, workerd on CPUs 12-17,36-41
+and oha on 0-5,24-29. Two binaries built from this tree, before the change and
+after, each in the default (tcmalloc) and the jemalloc-plus-guest-kernel
+configuration. The VMSCAPE mitigation read `Mitigation: IBPB before exit to
+userspace` and `kvm.halt_poll_ns` 200000 before and after.
+
+### 1. The tail, per launch
+
+Identical to the byte across the three launches of each cell:
+
+| binary | build         | `stdout` bytes    | newlines | `Mark-Compact` lines | the file ends in |
+| ------ | ------------- | ----------------- | -------- | -------------------- | ---------------- |
+| before | default       | 45056 = 11 x 4096 | 223      | 223                  | `[2424578:0`     |
+| before | jemalloc + gk | 40960 = 5 x 8192  | 202      | 203                  | `...) extern`    |
+| after  | default       | 47470             | 235      | 235                  | a complete line  |
+| after  | jemalloc + gk | 47470             | 235      | 235                  | a complete line  |
+
+Both `before` files end at an exact multiple of the stdio buffer in use and in
+the middle of a line, which is the signature of a buffer nobody emptied: the C
+library sizes a buffer of its own from the file's block size, 4096 here, and the
+`setvbuf()` call gave the arena builds `BUFSIZ`, 8192. What is missing is
+whatever was in the buffer when the process ended -- 2,414 bytes and 12 lines in
+the default build, 6,510 bytes and 33 lines under the arenas. All six launches
+ended on the SIGTERM, so nothing killed the process before it could have
+flushed; there is simply no flush. The `after` files carry all 235 collections
+the workload performs, in both builds and in every launch.
+
+**The buffer workerd supplies is not what loses the tail; it decides how much is
+lost.** The default build, which never called `setvbuf()`, loses 4 KiB of trace
+to the C library's own buffer. The arena builds' `BUFSIZ` buffer doubled that.
+So a traced run was being cut before the arenas existed, and building without
+the guest kernel is not a way around it.
+
+### 2. The arena fault did not come back
+
+The traced launches above ran under the guest kernel with the trace lines
+written from inside turns, which is the shape that found the fault: no
+unmappable fault, no condemned isolate and no failed request in any of them. The
+probes pass on both binaries built for this change -- 23 of 23 on the default
+build and 22 of 23 on the jemalloc one, whose failure is
+`memory-cache-fault-test.sh` at step 2, the one this branch leaves deliberately
+red, unchanged -- among them `fault-leak-test.sh` and `atexit-arena-test.sh`,
+the two that read thread-wide state a faulted turn leaves behind.
+
+### Where the earlier counts stand
+
+- **"Collecting once for reported external memory" is exact.** Its traced
+  launches used the knob, and its counts are what they say.
+- **"Whether the soft-limit collection belongs in every build" is low by up to
+  one buffer** -- 33 lines in the cell measured here -- in every count its trace
+  gives: the four mark-compacts of the `off` arm, the 359 and 360 of the `on`
+  arm, the 1,161 of `bigbody` and the 330 and 402 of `bigheapbody`. Its method
+  and its caveats now say so. Where an arm of it survives in the tree, the
+  section after it re-measured the same cells with the tail arriving, and those
+  are the counts to quote.
+- **One figure the loss broke rather than shortened** is `bigbody`'s `off` arm,
+  reported as collecting "none at all in 6,050 responses". That whole trace fits
+  inside one buffer, so the figure was the buffer and not the run: re-measured,
+  the `off` arm's traced launches collect 0, 0, 7 and 2 times.
+
+### The verdict
+
+Landed. `stdout` is line-buffered in every build, where a non-tty `stdout` was
+fully buffered before, and stdio is still handed the buffer it uses, which is
+what keeps it from allocating one in an isolate's arena. This changes the
+timing of diagnostic writes in builds without the guest kernel as well as with
+it. Nothing a worker can observe depends on it -- worker output does not pass
+through stdio -- so it takes no compatibility flag.
+
+### Caveats
+
+- **A line is only as whole as one `write(2)` makes it.** Line buffering is
+  enough for two isolates' trace lines not to interleave with each other, but
+  the JSON logger writes to fd 1 outside stdio and nothing orders it against
+  them.
+- **A line in progress when the process dies is still lost.** What is bounded
+  now is one line instead of one buffer, and SIGKILL is no worse than that.
+- **The cost of a write per line was not measured.** Nothing in this tree
+  writes to `stdout` through stdio in volume, which is a grep and not a figure;
+  a V8 flag that traced per allocation would pay a syscall a line.
+- **Only the SIGTERM path was exercised.** That a crash loses the buffer too
+  follows from `_exit()` having no flush, and was not measured.

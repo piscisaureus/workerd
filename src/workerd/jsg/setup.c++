@@ -15,6 +15,8 @@
 #include <v8-cppgc.h>
 #include <v8-initialization.h>
 
+#include <cstdio>
+
 #if !_WIN32
 #include <cxxabi.h>
 #include <ucontext.h>
@@ -209,6 +211,16 @@ void V8System::init(kj::Own<v8::Platform> platformParam,
     v8::V8::SetFlagsFromString("--expose-gc");
   }
 
+  // Everything stdio writes to stdout is diagnostic and low in volume -- V8's trace flags are
+  // the bulk of it -- because a worker's own output reaches fd 1 through the JSON logger, which
+  // writes to the descriptor directly, or stderr through KJ_LOG. Line-buffer it, so that a trace
+  // is whole however the process ends, and hand stdio the buffer to use: the C library otherwise
+  // allocates one on the first write to the stream, and under heap arenas a first write from
+  // inside a turn puts that buffer in the turn's arena, where every later write from another
+  // isolate's turn faults.
+  static char stdoutBuffer[BUFSIZ];
+  KJ_ASSERT(setvbuf(stdout, stdoutBuffer, _IOLBF, sizeof(stdoutBuffer)) == 0);
+
   if (heapArenasAvailable()) {
     // V8 keeps one compiled NativeModule per distinct set of wasm wire bytes for the whole
     // process, so two workers that supply the same module get the same NativeModule, its wire
@@ -231,14 +243,6 @@ void V8System::init(kj::Own<v8::Platform> platformParam,
     UErrorCode err = U_ZERO_ERROR;
     u_setMemoryFunctions(nullptr, &icuAlloc, &icuRealloc, &icuFree, &err);
     KJ_ASSERT(err == U_ZERO_ERROR, "u_setMemoryFunctions() failed", static_cast<int>(err));
-
-    // The C library allocates stdout's buffer on the first write to the stream, and when that
-    // write comes from inside a turn (V8's --trace-gc lines do) the buffer is in that isolate's
-    // arena, where every later write from another isolate's turn faults. Given a buffer, stdio
-    // allocates none.
-    static char stdoutBuffer[BUFSIZ];
-    KJ_ASSERT(setvbuf(stdout, stdoutBuffer, isatty(STDOUT_FILENO) ? _IOLBF : _IOFBF,
-                  sizeof(stdoutBuffer)) == 0);
   }
 
 #ifdef WORKERD_ICU_DATA_EMBED
