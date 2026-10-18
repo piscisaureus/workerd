@@ -275,6 +275,73 @@ int gk_host_owns(const void *ptr) {
   return owns;
 }
 
+// ---- host ranges -------------------------------------------------------------
+// An embedder-mapped range registered REFUSE (see gk_host_range_register in
+// gk.h). The registry entry is the whole of what gk keeps for it: the memory
+// is the embedder's, mapped and allocated over by the embedder, and the
+// registration is what makes every guest access to it a fault. The checks
+// below are what keep an embedder's mistake from reaching the registry:
+// an arena's span is refused because a REFUSE entry inside it would shadow
+// the arena's own pages, and an overlap with an existing entry because the
+// registry is kept sorted and non-overlapping and prot_class() searches it on
+// that assumption.
+
+static int host_range_args_ok(void *base, size_t len, uintptr_t *s, uintptr_t *e) {
+  uintptr_t b = (uintptr_t)base;
+  if (!base || len == 0 || (b & (GK_HOST_PAGE - 1)) || (len & (GK_HOST_PAGE - 1))) return 0;
+  if (b + len < b) return 0;  // wrap
+  *s = b;
+  *e = b + len;
+  return 1;
+}
+
+int gk_host_range_register(void *base, size_t len) {
+  uintptr_t s, e;
+  if (!G->initialized || !host_range_args_ok(base, len, &s, &e)) return -GK_EINVAL;
+  pthread_mutex_lock(&G->lock);
+  for (int i = 0; i < G->arena_n; i++) {
+    gk_arena *a = G->arenas[i];
+    if (s < a->end && e > a->base) {
+      pthread_mutex_unlock(&G->lock);
+      return -GK_EINVAL;
+    }
+  }
+  for (int i = 0; i < G->prot_n; i++) {
+    if (s < G->prot[i].end && e > G->prot[i].start) {
+      pthread_mutex_unlock(&G->lock);
+      return -GK_EBUSY;
+    }
+  }
+  if (G->prot_n >= GK_MAX_PROT_RANGES) {
+    pthread_mutex_unlock(&G->lock);
+    return -GK_ENOMEM;
+  }
+  prot_add(s, e, GK_PROT_REFUSE);
+  pthread_mutex_unlock(&G->lock);
+  return 0;
+}
+
+int gk_host_range_unregister(void *base, size_t len) {
+  uintptr_t s, e;
+  if (!G->initialized || !host_range_args_ok(base, len, &s, &e)) return -GK_EINVAL;
+  pthread_mutex_lock(&G->lock);
+  int found = 0;
+  for (int i = 0; i < G->prot_n; i++) {
+    if (G->prot[i].start == s && G->prot[i].end == e && G->prot[i].kind == GK_PROT_REFUSE) {
+      found = 1;
+      break;
+    }
+  }
+  if (found) {
+    // The range may hold no PTE in any root (REFUSE is never mapped), so
+    // nothing needs dropping; whatever the address is reused for is classified
+    // afresh at its next demand fault.
+    prot_remove(s, e);
+  }
+  pthread_mutex_unlock(&G->lock);
+  return found ? 0 : -GK_EINVAL;
+}
+
 // ---- host slots ------------------------------------------------------------
 // The handle table for host-memory blocks (see gk_host_slot_alloc in gk.h).
 // Every operation validates the handle against the table and touches nothing

@@ -140,6 +140,18 @@ gk_arena *gk_arena_current(void) {
   pthread_mutex_unlock(&G->lock);
   return a;
 }
+
+int gk_arena_range_ok(const void *addr, size_t len) {
+  if (!G->initialized || len == 0) return 0;
+  gk_thread *t = thread_cur();
+  gk_arena *a = t ? t->active_arena : NULL;
+  if (!a) return 0;
+  // Bound by subtraction so that no sum can wrap: the range starts inside the
+  // reservation and the reservation's remainder from there holds it.
+  uintptr_t s = (uintptr_t)addr;
+  if (s < a->base || s >= a->end) return 0;
+  return len <= a->end - s;
+}
 unsigned long gk_debug_arena_root(const gk_arena *a) {
   if (!a) return 0;
   pthread_mutex_lock(&G->lock);

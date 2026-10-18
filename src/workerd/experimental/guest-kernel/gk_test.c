@@ -2280,6 +2280,95 @@ static int host_memory_check(void) {
   return ok;
 }
 
+// ---- host ranges -------------------------------------------------------------
+// A range the embedder mapped itself and registered through
+// gk_host_range_register is refused to the guest at every ring and under any
+// root while the host reads and writes it; a second registration of the
+// same range, an unaligned or empty one, and one inside an arena's
+// reservation are refused with nothing registered; unregistering gives the
+// pages back to the user class, so a ring-3 read then succeeds; and
+// gk_arena_range_ok answers for the calling thread's arena by gk's record:
+// the sandbox part and the tail both count, memory outside the arena does
+// not, and a thread on the base root gets no.
+static int host_range_check(void) {
+  size_t page = (size_t)sysconf(_SC_PAGESIZE), len = 2 * page;
+  unsigned char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED) { printf("host ranges: mmap failed [FAIL]\n"); return 0; }
+  gk_stats s0, s1, s2;
+  gk_get_stats(&s0);
+  int reg = gk_host_range_register(m, len) == 0;
+  gk_get_stats(&s1);
+  int counted = s1.prot_ranges == s0.prot_ranges + 1;
+  m[7] = 0xAB;
+  m[page + 3] = 0xCD;
+  int host_rw = m[7] == 0xAB && m[page + 3] == 0xCD;
+  long r3 = gk_run_user(read_byte, m + 7);
+  unsigned long f3 = gk_fault_addr();
+  long w3 = gk_run_user(user_write_here, m + page + 3);
+  unsigned long fw3 = gk_fault_addr();
+  long r0 = gk_run(read_byte, m + 9);
+  unsigned long f0 = gk_fault_addr();
+  int dup = gk_host_range_register(m, len) == -EBUSY;
+  int part = gk_host_range_register(m + page, page) == -EBUSY;
+  int bad = gk_host_range_register(m + 1, page) == -EINVAL &&
+            gk_host_range_register(m, 0) == -EINVAL && gk_host_range_register(m, page + 1) == -EINVAL;
+  // Under an arena: the range still faults, an arena's own span is refused to
+  // the registry, and gk_arena_range_ok tells the arena's memory from the rest.
+  gk_arena *a = gk_arena_create(4096);
+  long r3a = -1; unsigned long f3a = 0;
+  int in_arena_refused = 0, range_in = 0, range_tail = 0, range_out = 0, range_wrap = 0,
+      range_base_root = gk_arena_range_ok(m, 16) == 0;
+  if (a) {
+    unsigned char *ab = gk_arena_base(a);
+    size_t as = gk_arena_size(a);
+    in_arena_refused = gk_host_range_register(ab, page) == -EINVAL;
+    gk_arena_enter(a);
+    r3a = gk_run_here_user(read_byte, m + 11);
+    f3a = gk_fault_addr();
+    range_in = gk_arena_range_ok(ab, 16) == 1 && gk_arena_range_ok(ab, as) == 1;
+    // The tail beyond the usable size is the arena's reservation too.
+    range_tail = gk_arena_range_ok(ab + as - 8, 16) == 1;
+    range_out = gk_arena_range_ok(m, 16) == 0 && gk_arena_range_ok(ab - 16, 16) == 0 &&
+                gk_arena_range_ok(ab, 0) == 0;
+    range_wrap = gk_arena_range_ok(ab + 16, (size_t)-1) == 0;
+    range_base_root = range_base_root && gk_arena_range_ok(ab, 16) == 1;
+    gk_arena_enter(NULL);
+    range_base_root = range_base_root && gk_arena_range_ok(ab, 16) == 0;
+    gk_arena_destroy(a);
+  }
+  int unreg = gk_host_range_unregister(m, len) == 0;
+  gk_get_stats(&s2);
+  int uncounted = s2.prot_ranges == s0.prot_ranges;
+  int unreg_again = gk_host_range_unregister(m, len) == -EINVAL;
+  // Back in the user class: a ring-3 read now completes and sees the host's byte.
+  long r3u = gk_run_user(read_byte, m + 7);
+  int readable = r3u == 0xAB;
+  munmap(m, len);
+  int ok = reg && counted && host_rw && r3 == GK_EFAULT && f3 == (unsigned long)(uintptr_t)(m + 7) &&
+           w3 == GK_EFAULT && fw3 == (unsigned long)(uintptr_t)(m + page + 3) && r0 == GK_EFAULT &&
+           f0 == (unsigned long)(uintptr_t)(m + 9) && dup && part && bad && a != NULL &&
+           in_arena_refused && r3a == GK_EFAULT && f3a == (unsigned long)(uintptr_t)(m + 11) &&
+           range_in && range_tail && range_out && range_wrap && range_base_root && unreg &&
+           uncounted && unreg_again && readable;
+  printf("host ranges: registered %s (+%d registry entries), host rw %s; ring 3 read -> %s "
+         "(fault %#lx, want %p), write -> %s (fault %#lx, want %p); ring 0 read -> %s (fault %#lx, "
+         "want %p); under an arena -> %s (fault %#lx, want %p); duplicate %s, partial %s, "
+         "unaligned/empty %s, inside an arena %s; arena range: inside %s, tail %s, outside %s, "
+         "wrap %s, base root %s; unregistered %s (registry back to %d), again %s, then ring-3 "
+         "read -> %s [%s]\n",
+         reg ? "ok" : "FAILED", s1.prot_ranges - s0.prot_ranges, host_rw ? "ok" : "WRONG",
+         r3 == GK_EFAULT ? "FAULT" : "READ", f3, (void *)(m + 7),
+         w3 == GK_EFAULT ? "FAULT" : "WROTE", fw3, (void *)(m + page + 3),
+         r0 == GK_EFAULT ? "FAULT" : "READ", f0, (void *)(m + 9),
+         r3a == GK_EFAULT ? "FAULT" : "READ", f3a, (void *)(m + 11),
+         dup ? "refused" : "WRONG", part ? "refused" : "WRONG", bad ? "refused" : "WRONG",
+         in_arena_refused ? "refused" : "WRONG", range_in ? "ok" : "WRONG",
+         range_tail ? "ok" : "WRONG", range_out ? "ok" : "WRONG", range_wrap ? "ok" : "WRONG",
+         range_base_root ? "ok" : "WRONG", unreg ? "ok" : "FAILED", s2.prot_ranges,
+         unreg_again ? "refused" : "WRONG", readable ? "READ" : "FAULT", ok ? "OK" : "FAIL");
+  return ok;
+}
+
 // ---- host slots --------------------------------------------------------------
 // A host slot names a host-memory block by a handle that is validated against
 // gk's own table, which lives in the supervisor control block: the handle
@@ -5129,6 +5218,13 @@ int main(void) {
   // host_slot_check).
   int ok29 = host_slot_check() == 1;
 
+  // ---- host ranges ------------------------------------------------------------
+  // A range the embedder maps itself and registers is refused to the guest
+  // like a gk_host_alloc block, a conflicting registration is refused with
+  // nothing registered, and gk_arena_range_ok answers for the calling
+  // thread's arena by gk's record (see host_range_check).
+  int ok38 = host_range_check() == 1;
+
   // ---- hostcalls --------------------------------------------------------------
   // A ring-3 guest calls a registered host handler by index and gets its
   // result synchronously; an index that names no handler fails with nothing
@@ -5207,7 +5303,7 @@ int main(void) {
   int all = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9 && ok10 && ok11 &&
             ok12 && ok13 && ok_broker && ok14 && ok15 && ok16 && ok17 && ok18 && ok19 &&
             ok20 && ok21 && ok22 && ok23 && ok24 && ok25 && ok26 && ok27 && ok28 && ok29 &&
-            ok30 && ok31 && ok32 && ok33 && ok34 && ok36 && ok37;
+            ok30 && ok31 && ok32 && ok33 && ok34 && ok36 && ok37 && ok38;
   printf("\n%s\n", all ? "PASS" : "FAIL");
   return all ? 0 : 1;
 }

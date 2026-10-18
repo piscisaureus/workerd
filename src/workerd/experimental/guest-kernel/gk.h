@@ -236,6 +236,18 @@ void gk_arena_destroy(gk_arena *a);
 // this thread ran under whatever that turn wrote in its own memory.
 gk_arena *gk_arena_current(void);
 
+// Whether [addr, addr + len) lies within the calling thread's active arena's
+// reservation -- the whole span the arena owns, its sandbox part and its
+// tail -- by gk's record of the thread, never by anything the caller holds.
+// For a host-side handler handed a range a turn named for the host to write
+// into or read from: the one direction in which a guest-named range is
+// admissible is into the caller's own arena, where the worst a lie can do
+// is clobber the liar's own memory, and this is the check that makes it so.
+// 0 when the thread is on the base root, when the range is empty or wraps,
+// and whenever any part of it lies outside the arena; 1 otherwise. No lock:
+// an arena cannot be destroyed while a thread has it active.
+int gk_arena_range_ok(const void *addr, size_t len);
+
 // Resource counters, for tests and diagnostics.
 typedef struct {
   int memslots;         // live guest-physical regions (KVM memslots; HVF stage-2 ranges)
@@ -314,6 +326,38 @@ void gk_host_free(void *ptr, size_t size);
 // Whether `ptr` lies in host memory: in a block gk_host_alloc has handed out
 // or could hand out. For tests and for an embedder's own assertions.
 int gk_host_owns(const void *ptr);
+
+// Host ranges: a range the embedder mapped itself, registered in the same
+// REFUSE class as gk_host_alloc's regions, for a host-memory tenant whose
+// footprint is configured rather than small -- a value store sized from an
+// operator's limits, say -- and that gk_host_alloc's bounds (GK_HOST_MAX_ALLOC
+// per block, GK_MAX_HOST_REGIONS regions in all) are not sized for. gk serves
+// no allocation over such a range: the embedder maps it (anonymous, private,
+// page-aligned), registers it once, and allocates inside it however it likes,
+// and from then on a guest access anywhere in it, at any ring and under any
+// root, faults at the accessed address as an access to a gk_host_alloc block
+// does, while the host reads and writes it as ordinary memory. A forwarded
+// mprotect, munmap or mremap over it is refused like any REFUSE range (see
+// gk_mapping_change_ok).
+//
+// gk_host_range_register takes `base` and `len`, both multiples of the host
+// page, and registers [base, base + len). It refuses, with nothing registered:
+// -EINVAL for a NULL or unaligned base, a zero or unaligned length, a range
+// that wraps, or a range that overlaps an arena's reservation (an arena's
+// span is its own, and a REFUSE entry inside it would be unreachable from the
+// arena's root anyway); -EBUSY for a range that overlaps one the registry
+// already holds, gk's own or an earlier registration; -ENOMEM when the
+// registry is full, which for an embedder registration is a refusal and not,
+// as for gk's own ranges, fatal. Any PTE a root already holds for the range
+// is dropped at registration, as for every registered range. Returns 0.
+//
+// gk_host_range_unregister removes exactly the range an earlier registration
+// made, for an embedder giving the memory back; it does not unmap it. -EINVAL
+// for a range the registry does not hold as an embedder registration. Both
+// are host-side only: they take gk's lock and are never on the fault or
+// syscall-forward path.
+int gk_host_range_register(void *base, size_t len);
+int gk_host_range_unregister(void *base, size_t len);
 
 // Host slots: host-memory blocks named by a handle instead of a pointer.
 //
