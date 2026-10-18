@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Sat, 18 Oct 2026 12:00:00 +0000
+Subject: Expose the thread's current event loop pointer
+
+Every lookup of a thread's event loop starts from one thread-local
+pointer, which kj writes in enterScope() and leaveScope() and exposes no
+other way. An embedder that runs code it does not trust on a thread that
+has a loop cannot leave the host reaching the loop through that pointer:
+thread-local storage is ordinary memory the code can write, so the loop
+the host turns, arms events on and takes the cross-thread executor from
+would be one that code chose.
+
+saveCurrentLoopPointer() and restoreCurrentLoopPointer() let such an
+embedder hold the pointer in a frame the untrusted code cannot reach for
+as long as it runs, and put it back when the code returns. The restore
+writes the pointer whatever it holds then, including when it has been
+cleared, so it cannot go through enterScope(), whose requirement that
+the thread have no loop is what WaitScope relies on.
+---
+diff --git a/src/kj/async.h b/src/kj/async.h
+--- a/src/kj/async.h
++++ b/src/kj/async.h
+@@ -1519,6 +1519,21 @@
+   private:
+     EventLoop* loop;
+   };
++
++  static EventLoop* saveCurrentLoopPointer();
++  static void restoreCurrentLoopPointer(EventLoop* loop);
++  // Read and put back the pointer through which this thread finds the event loop running on it.
++  // Every lookup of the current loop starts from that pointer: the loop currentEventLoop() and
++  // Id::current() find, the one getCurrentThreadExecutor() takes the executor from, and the one
++  // an event is armed on. It is ordinary thread-local storage, so an embedder that runs code it
++  // does not trust on a thread that has a loop can hold the pointer in a frame that code cannot
++  // reach for as long as it runs, and put it back when the code returns, rather than reaching
++  // the loop afterwards through a pointer the code may have changed.
++  //
++  // restoreCurrentLoopPointer() writes the pointer whatever it holds at the time -- a loop the
++  // untrusted code chose, or nothing at all -- which is why it is not enterScope(): the
++  // requirement that the thread have no loop yet, which WaitScope relies on, cannot be made
++  // here. Give it only a pointer saveCurrentLoopPointer() returned on the same thread.
+   // Returns the unique identifier of this EventLoop.
+ 
+ private:
+diff --git a/src/kj/async.c++ b/src/kj/async.c++
+--- a/src/kj/async.c++
++++ b/src/kj/async.c++
+@@ -1881,6 +1881,14 @@
+   KJ_REQUIRE(threadLocalEventLoop == nullptr, "This thread already has an EventLoop.");
+   threadLocalEventLoop = this;
+ }
++
++EventLoop* EventLoop::saveCurrentLoopPointer() {
++  return threadLocalEventLoop;
++}
++
++void EventLoop::restoreCurrentLoopPointer(EventLoop* loop) {
++  threadLocalEventLoop = loop;
++}
+ 
+ EventLoop::Id EventLoop::id() const { return Id(loopId); }
+ 
