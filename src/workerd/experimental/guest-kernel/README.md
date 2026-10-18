@@ -149,6 +149,17 @@ which runs each isolate's JS turn at guest ring 3.
   isolate's turn overwrites it from inside its own, and in both cases host code
   holding the lock after the turn gets its own lock from `jsg::Lock::from`, the
   slot is clear once the lock is released, and no lock is refused as recursive.
+- `event-loop-test.sh` / `event-loop-test.capnp` — end-to-end check against a
+  built workerd that a JS turn cannot leave the host looking at an event loop
+  of the turn's choosing. Every host-side lookup of event-loop state starts
+  from one thread-local pointer (`threadLocalEventLoop` in `kj/async.c++`),
+  which a turn at guest ring 3 can write: one request leaves it naming a
+  `kj::EventLoop` the turn built inside itself, another leaves it cleared, and
+  in both cases the first host-side lookup after the turn, made while the
+  isolate lock is still held, and one on the event loop afterwards must find
+  the loop the turn ran on. Negative build:
+  `--copt=-DWORKERD_GK_NEG_LOOP_POINTER`, where the pointer the turn left
+  stands.
 - `disk-sqlite-test.sh` / `disk-sqlite-test.capnp` / `disk-sqlite-test.js` —
   end-to-end check against a built workerd that a SQLite-backed Durable Object
   stored on local disk works with its JS turns at guest ring 3, where SQLite's
@@ -1624,6 +1635,24 @@ so a crossing a turn makes on every dereference belongs on that path.
   `jsg::runInGuest()` enters around every turn, links guard sentinels of the
   loop's own next to each insert point for the turn's duration, so a turn's
   events are inserted next to a guard or next to each other.
+
+  The pointer the thread finds that loop through needs its own remedy, for a
+  different reason. It is a single thread-local (`threadLocalEventLoop` in
+  `kj/async.c++`) at the head of every host-side lookup of event-loop state --
+  the loop an event is armed on, the executor `getCurrentThreadExecutor` hands
+  out, and the local map `EventLoop::getLocal` reads, where the async lock
+  queue keeps its waiter -- and thread-local storage is memory a turn at ring
+  3 can write, so a turn can leave the host looking at an `EventLoop` of the
+  turn's own, or at none at all. Turning the loop is not reached this way:
+  `WaitScope` holds its loop by reference and asserts the pointer still names
+  it. kj exposes
+  no accessor for the pointer, which is what
+  `patches/capnp-cpp/0004-Expose-the-thread-s-current-event-loop-pointer.patch`
+  adds; `runTrampolineInGuest()` holds it in the frame that entered the guest
+  and puts it back the moment the guest returns, ahead of the fault path's
+  condemn and abort, which arm events on the loop. It is not cleared for the
+  turn's duration: in-turn code arms its own events through it.
+  `event-loop-test.sh` drives both states a turn can leave.
 
   Disarming is not covered. Unlinking a queued event writes both its
   neighbors' link fields (`*prev = next; next->prev = prev`), so destroying

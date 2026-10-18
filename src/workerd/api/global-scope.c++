@@ -498,6 +498,19 @@ void checkWasmDescriptorsForTest(kj::StringPtr url) {
 // not holding the sentinel. This is how tls-test.sh shows the guest-writable thread-locals the
 // host reads after a turn do not carry a turn's value past it.
 //
+// With the same variable set, two request paths exercise the pointer this thread finds its event
+// loop through (threadLocalEventLoop in kj/async.c++, reached with
+// kj::EventLoop::saveCurrentLoopPointer), which stands at the head of every host lookup of
+// event-loop state and is thread-local storage a turn can write (event-loop-test.sh).
+// /__gk_loop_repoint builds an EventLoop of its own inside the turn and leaves the pointer naming
+// it, as the turn's last act in the guest -- the rest of the turn arms its own events through
+// that pointer -- and /__gk_loop_clear leaves the pointer null, the other state a hostile or
+// faulted turn can leave. The host must find its own loop either way: the frame that entered the
+// guest puts the pointer back as soon as the guest returns (runTrampolineInGuest), and both the
+// first host-side lookup after the turn, while the isolate lock is still held, and one on the
+// event loop afterwards report what kj::EventLoop::Id::current() finds against the loop the turn
+// ran on.
+//
 // With the same variable set, four request paths exercise the isolate's lock slot, the V8 data
 // slot jsg::Lock::from reads, which is in the C++ isolate object in the shared heap and so
 // writable from any isolate's turn (lock-slot-test.sh). /__gk_lock_slot overwrites this isolate's
@@ -515,6 +528,28 @@ void checkWasmDescriptorsForTest(kj::StringPtr url) {
 // Per thread: a request arms it from inside its JS turn and the fallback that consumes it runs
 // on the same event loop, so another thread's fallback must not take the fault instead.
 thread_local bool faultInNextMemoryCacheFallbackForTest = false;
+
+// The identity of this thread's event loop as a JS turn saw it, before the turn rewrote the
+// pointer the host finds that loop through (see /__gk_loop_repoint below). Test-only, and itself
+// thread-local storage a turn could write: it is the probe's record of what the host should find,
+// not something the host relies on.
+thread_local kj::Maybe<kj::EventLoop::Id> loopIdBeforeTurnForTest;
+
+// What kj::EventLoop::Id::current() -- the host's own lookup of this thread's event loop, which
+// starts from that pointer -- finds now, against that record. "cleared" is the lookup failing
+// outright, which is what a turn that leaves the pointer null costs the host.
+kj::StringPtr currentLoopVerdictForTest() {
+  kj::Maybe<kj::EventLoop::Id> current;
+  if (kj::runCatchingExceptions([&]() { current = kj::EventLoop::Id::current(); }) != kj::none) {
+    return "cleared"_kj;
+  }
+  KJ_IF_SOME(before, loopIdBeforeTurnForTest) {
+    KJ_IF_SOME(now, current) {
+      return now == before ? "restored"_kj : "repointed"_kj;
+    }
+  }
+  return "unrecorded"_kj;
+}
 
 void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
   static const bool faultEnabled =
@@ -731,6 +766,38 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
     IoContext::current().addTask(kj::evalLater([isolate, addr]() {
       KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the lock slot on the event loop after the lock",
           addr(isolate), addr(isolate->GetData(jsg::SET_DATA_LOCK)));
+    }));
+  }
+  // The pointer this thread finds its event loop through (see the comment above, and
+  // runTrampolineInGuest in jsg/guest-run.c++ for where the host puts it back).
+  if (probeEnabled && (url.endsWith("/__gk_loop_repoint") || url.endsWith("/__gk_loop_clear"))) {
+    loopIdBeforeTurnForTest = kj::EventLoop::Id::current();
+    bool clear = url.endsWith("/__gk_loop_clear");
+    // As the turn's last act in the guest: the rest of the turn arms its own events, at ring 3,
+    // and would arm them on whatever the pointer names.
+    jsg::setGuestTurnTailHookForTest([clear, addr, url = kj::str(url)]() {
+      kj::EventLoop* was = kj::EventLoop::saveCurrentLoopPointer();
+      // A loop of the turn's own, built inside the turn and left for the host to find, which is
+      // what a turn that aimed the pointer somewhere would leave. It is never destroyed:
+      // ~EventLoop makes itself current, and this one never is.
+      kj::EventLoop* chosen = clear ? nullptr : new kj::EventLoop();
+      kj::EventLoop::restoreCurrentLoopPointer(chosen);
+      // Read back here, at ring 3 inside the turn: the store landed rather than faulting the
+      // guest, which is what makes this thread-local a hazard in the first place.
+      kj::EventLoop* readBack = kj::EventLoop::saveCurrentLoopPointer();
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: rewrote this thread's event loop pointer from inside the JS turn",
+          url, addr(was), addr(chosen), addr(readBack));
+    });
+    Worker::Lock::runAtNextReleaseForTest([](Worker::Lock&) {
+      // Host-side, after the turn, with the isolate still locked: the first host lookup of this
+      // thread's event loop after the turn.
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the event loop pointer on the host after the turn",
+          currentLoopVerdictForTest());
+    });
+    IoContext::current().addTask(kj::evalLater([]() {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the event loop pointer on the event loop",
+          currentLoopVerdictForTest());
     }));
   }
   if (probeEnabled && url.endsWith("/__gk_vfs_rewrite")) {
