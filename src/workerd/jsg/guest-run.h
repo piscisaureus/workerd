@@ -76,7 +76,12 @@ namespace workerd::jsg {
 //   callback's TimeoutState holds, which ~TimeoutState asserts on when the IoContext is
 //   destroyed (runJsTurn in io/io-context.c++). That save and restore is also what keeps a turn
 //   from choosing the value the host reads, so each of those is one remedy for two problems;
-//   experimental/guest-kernel/memory-classes.md, rule R7, is the inventory.
+//   experimental/guest-kernel/memory-classes.md, rule R7, is the inventory. The restore is
+//   unconditional, which is what covers a turn that leaves such a thread-local cleared as
+//   well as one that leaves it dangling at an abandoned frame: every IoOwn disposal enters
+//   an AllowAsyncDestructorsScope of its own, so a fault inside one leaves the check
+//   disabled rather than dangling, and the host frame puts the host's value back either
+//   way.
 //
 //   What makes thread-wide state reachable at all, rather than only under an unfixed placement
 //   bug: a destructor running inside a turn can enter another IoContext's scope and run a nested
