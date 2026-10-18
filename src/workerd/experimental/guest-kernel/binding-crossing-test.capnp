@@ -29,6 +29,7 @@ const config :Workerd.Config = (
       compatibilityFlags = ["experimental", "enable_ctx_exports"],
       bindings = [
         (name = "BACK", service = "back"),
+        (name = "TUNNEL", service = (name = "back", entrypoint = "Tunnel")),
         (name = "PLAIN", service = "plain"),
         (name = "TRACED", service = "traced"),
         (name = "LOADER", workerLoader = ()),

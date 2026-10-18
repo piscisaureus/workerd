@@ -1,8 +1,8 @@
 // Driven by binding-crossing-test.sh: each route makes one crossing of a binding that
 // body-arena-test.sh does not -- a request that carries a cf blob, a call the callee fails, a
 // body the caller gives up on mid-stream, props a loaded worker reads, a Durable Object another
-// worker also addresses, a traced worker -- and reports what came back so that the script can
-// check it.
+// worker also addresses, a traced worker, a connect() tunnel, a WebSocket -- and reports what
+// came back so that the script can check it.
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
 const enc = new TextEncoder();
@@ -25,6 +25,80 @@ async function readAll(readable) {
     out += dec.decode(value);
   }
   return out;
+}
+
+// Newline-delimited messages over a socket, for the tunnel routes: one line at a time, then
+// the rest to EOF.
+function lineReader(readable) {
+  const reader = readable.getReader();
+  let buf = '';
+  return {
+    async line() {
+      for (;;) {
+        const i = buf.indexOf('\n');
+        if (i >= 0) {
+          const l = buf.slice(0, i);
+          buf = buf.slice(i + 1);
+          return l;
+        }
+        const { value, done } = await reader.read();
+        if (done) return null;
+        buf += dec.decode(value, { stream: true });
+      }
+    },
+    async rest() {
+      let n = buf.length;
+      buf = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) return n;
+        n += value.length;
+      }
+    },
+    cancel: (reason) => reader.cancel(reason),
+  };
+}
+
+// A WebSocket opened through a binding, with its events queued for the route to await in
+// order.
+async function wsOpen(fetcher, url, init = {}) {
+  const r = await fetcher.fetch(url, {
+    ...init,
+    headers: { Upgrade: 'websocket' },
+  });
+  const ws = r.webSocket;
+  if (!ws) throw new Error(`no websocket: status=${r.status}`);
+  ws.accept();
+  const queue = [];
+  const waiters = [];
+  const push = (ev) => {
+    const w = waiters.shift();
+    if (w) w(ev);
+    else queue.push(ev);
+  };
+  ws.addEventListener('message', (e) =>
+    push({ type: 'message', data: e.data })
+  );
+  ws.addEventListener('close', (e) =>
+    push({ type: 'close', data: `${e.code}:${e.reason}` })
+  );
+  ws.addEventListener('error', (e) => push({ type: 'error', data: e.message }));
+  const next = () =>
+    queue.length
+      ? Promise.resolve(queue.shift())
+      : new Promise((res) => waiters.push(res));
+  return { ws, next };
+}
+
+// A WebSocket's echo of each of `messages`, sent one at a time.
+async function wsEchoes(ws, next, messages) {
+  const got = [];
+  for (const m of messages) {
+    ws.send(m);
+    const ev = await next();
+    got.push(ev.type === 'message' ? ev.data : `${ev.type}:${ev.data}`);
+  }
+  return got;
 }
 
 const loaded = {
@@ -260,6 +334,189 @@ export default {
           // -- the event's url, a log line, an exception -- was made in this turn and its own.
           const r = await env.TRACED.fetch(`http://traced/${name.slice(7)}`);
           return new Response(`${name} status=${r.status}\n`);
+        }
+        case '/tunnel-echo': {
+          // A tunnel the caller writes into first: the callee's read finds the write parked on
+          // the pipe, in this isolate's arena.
+          const s = env.TUNNEL.connect('back:10');
+          const w = s.writable.getWriter();
+          const lr = lineReader(s.readable);
+          await w.write(enc.encode('ping\n'));
+          const got = await lr.line();
+          await w.close();
+          return new Response(
+            `tunnel-echo got=${got} rest=${await lr.rest()}\n`
+          );
+        }
+        case '/tunnel-greet': {
+          // A tunnel the callee writes into first: this isolate's read finds the callee's write.
+          const s = env.TUNNEL.connect('back:11');
+          const lr = lineReader(s.readable);
+          const first = await lr.line();
+          const w = s.writable.getWriter();
+          await w.write(enc.encode('ping\n'));
+          const then = await lr.line();
+          await w.close();
+          return new Response(`tunnel-greet first=${first} then=${then}\n`);
+        }
+        case '/tunnel-pingpong': {
+          // Two hundred round trips of a few bytes, so that both orders of read and write come
+          // up, many times.
+          const s = env.TUNNEL.connect('back:10');
+          const w = s.writable.getWriter();
+          const lr = lineReader(s.readable);
+          let n = 0;
+          for (let i = 0; i < 200; i++) {
+            await w.write(enc.encode(`${i}\n`));
+            if ((await lr.line()) === `echo:${i}`) n++;
+          }
+          await w.close();
+          await lr.rest();
+          return new Response(`tunnel-pingpong n=${n}\n`);
+        }
+        case '/tunnel-bulk': {
+          // A mebibyte each way, in chunks smaller and larger than the relay's staging buffer,
+          // with the caller's write side closed before it reads: a half-close.
+          const s = env.TUNNEL.connect('back:12');
+          const w = s.writable.getWriter();
+          const lr = lineReader(s.readable);
+          const total = 1048576;
+          await w.write(enc.encode(`${total}\n`));
+          const chunk = new Uint8Array(4096);
+          for (let sent = 0; sent < total; sent += chunk.length) {
+            await w.write(chunk);
+          }
+          await w.close();
+          const up = await lr.line();
+          const down = await lr.rest();
+          return new Response(`tunnel-bulk ${up} down=${down}\n`);
+        }
+        case '/tunnel-close-parked': {
+          // The callee writes twice without waiting to be read; the caller reads once and closes
+          // the socket with the second write parked on the pipe. The close drops the caller's end
+          // in this turn.
+          const s = env.TUNNEL.connect('back:13');
+          const lr = lineReader(s.readable);
+          const first = await lr.line();
+          await s.close();
+          return new Response(`tunnel-close-parked first=${first} closed=ok\n`);
+        }
+        case '/tunnel-throw-mid': {
+          // The callee reads one line and throws; the caller's next read must not hang.
+          const s = env.TUNNEL.connect('back:14');
+          const w = s.writable.getWriter();
+          const lr = lineReader(s.readable);
+          await w.write(enc.encode('ping\n'));
+          let then;
+          try {
+            const l = await lr.line();
+            then = l === null ? 'eof' : `line:${l}`;
+          } catch (e) {
+            then = `${e.name}:${e.message}`;
+          }
+          return new Response(`tunnel-throw-mid then=${then}\n`);
+        }
+        case '/ws-echo': {
+          // A WebSocket through the binding: three messages echoed, then closed from here.
+          const { ws, next } = await wsOpen(env.BACK, 'http://back/ws-echo');
+          const got = await wsEchoes(ws, next, ['one', 'two', 'three']);
+          ws.close(1000, 'done');
+          const close = await next();
+          return new Response(
+            `ws-echo got=${got.join(',')} close=${close.type}:${close.data}\n`
+          );
+        }
+        case '/ws-server-first': {
+          // The callee sends before this isolate receives anything.
+          const { ws, next } = await wsOpen(
+            env.BACK,
+            'http://back/ws-server-first'
+          );
+          const first = await next();
+          const [then] = await wsEchoes(ws, next, ['x']);
+          ws.close(1000, 'done');
+          await next();
+          return new Response(
+            `ws-server-first first=${first.data} then=${then}\n`
+          );
+        }
+        case '/ws-many': {
+          // A thousand small messages: five hundred one at a time, five hundred in a burst.
+          const { ws, next } = await wsOpen(env.BACK, 'http://back/ws-echo');
+          let n = 0;
+          for (let i = 0; i < 500; i++) {
+            ws.send(`m${i}`);
+            if ((await next()).data === `echo:m${i}`) n++;
+          }
+          for (let i = 500; i < 1000; i++) ws.send(`m${i}`);
+          for (let i = 500; i < 1000; i++) {
+            if ((await next()).data === `echo:m${i}`) n++;
+          }
+          ws.close(1000, 'done');
+          await next();
+          return new Response(`ws-many n=${n}\n`);
+        }
+        case '/ws-big': {
+          // A mebibyte message each way, as text and as bytes.
+          const { ws, next } = await wsOpen(env.BACK, 'http://back/ws-echo');
+          ws.send('z'.repeat(1048576));
+          const text = await next();
+          ws.send(new Uint8Array(1048576));
+          const bytes = await next();
+          ws.close(1000, 'done');
+          await next();
+          return new Response(
+            `ws-big text=${text.data.length} bytes=${bytes.data.byteLength}\n`
+          );
+        }
+        case '/ws-callee-close': {
+          // The callee closes after echoing the first message.
+          const { ws, next } = await wsOpen(
+            env.BACK,
+            'http://back/ws-callee-close'
+          );
+          const [first] = await wsEchoes(ws, next, ['a']);
+          const close = await next();
+          return new Response(
+            `ws-callee-close first=${first} close=${close.type}:${close.data}\n`
+          );
+        }
+        case '/ws-abort': {
+          // An upgrade fetch with a signal, aborted after the first echo: the abort drops this
+          // isolate's end, with the callee's request attached to it, in this turn.
+          const ac = new AbortController();
+          const { ws, next } = await wsOpen(env.BACK, 'http://back/ws-echo', {
+            signal: ac.signal,
+          });
+          const [first] = await wsEchoes(ws, next, ['a']);
+          ac.abort(new Error('ws-abort'));
+          const then = await next();
+          return new Response(
+            `ws-abort first=${first} then=${then.type}:${then.data}\n`
+          );
+        }
+        case '/ws-do': {
+          // A WebSocket served by the Durable Object in a third worker.
+          const stub = env.NS.get(env.NS.idFromName('ws'));
+          const { ws, next } = await wsOpen(stub, 'http://do/ws');
+          const got = await wsEchoes(ws, next, ['hi', 'there']);
+          ws.close(1000, 'done');
+          await next();
+          return new Response(`ws-do got=${got.join(',')}\n`);
+        }
+        case '/ws-do-hib': {
+          // The same object, on the hibernation API: its manager receives, its handler sends.
+          const stub = env.NS.get(env.NS.idFromName('ws'));
+          const { ws, next } = await wsOpen(stub, 'http://do/ws-hib');
+          const got = await wsEchoes(ws, next, ['hi', 'there']);
+          ws.close(1000, 'done');
+          await next();
+          return new Response(`ws-do-hib got=${got.join(',')}\n`);
+        }
+        case '/ws-proxy': {
+          // The client's own upgrade request forwarded to the callee, whose WebSocket is handed
+          // back to the client: this isolate's end is pumped by the server, on the event loop.
+          return env.BACK.fetch('http://back/ws-echo', req);
         }
         default:
           return new Response('front');

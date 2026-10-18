@@ -219,7 +219,8 @@ which runs each isolate's JS turn at guest ring 3.
   `binding-crossing-front.js` / `binding-crossing-back.js` /
   `binding-crossing-do.js` / `binding-crossing-cache.js` /
   `binding-crossing-traced.js` / `binding-crossing-tail.js` /
-  `binding-crossing-tail-stream.js` — end-to-end check against a workerd
+  `binding-crossing-tail-stream.js` / `binding-crossing-ws-client.py` —
+  end-to-end check against a workerd
   built with per-isolate heap arenas of the crossings of an in-process
   binding that carry no body: the `cf` blob a request brings beside the HTTP
   interface, on `bench/bench.capnp`'s cdn pair (served as is: the incoming
@@ -234,9 +235,18 @@ which runs each isolate's JS turn at guest ring 3.
   loopback stub's props through RPC; a callee and a Durable Object that
   call `ctx.restore()`; a Durable Object in a third worker addressed from
   two workers' turns; a traced worker reached through a binding, whose
-  buffered and streaming tail workers each serve what they received; and
-  streams as an RPC argument and result. `GK_BINDING_CROSSING_ONLY` selects
-  step groups. Negative builds, each failing the step named for it:
+  buffered and streaming tail workers each serve what they received;
+  streams as an RPC argument and result; a `connect()` tunnel through
+  back's `Tunnel` entrypoint, written into first by either side, two
+  hundred round trips, a mebibyte each way across a half-close, closed with
+  the callee's write parked, and failed by the callee mid-stream; and a
+  WebSocket through back's fetch handler and through the Durable Object,
+  accepted and hibernatable, echoed in both orders, a thousand small
+  messages, a mebibyte message, closed by the callee, aborted by the
+  caller's signal, and handed to the script's own client
+  (`binding-crossing-ws-client.py`), which closes cleanly once and drops
+  the connection once. `GK_BINDING_CROSSING_ONLY` selects step groups.
+  Negative builds, each failing the step named for it:
   `--copt=-DWORKERD_GK_NEG_CF_BLOB_HEAP` (the blob stays in the caller's
   arena), `--copt=-DWORKERD_GK_NEG_EXCEPTION_HEAP` (a callee's exception
   stays in its arena), `--copt=-DWORKERD_GK_NEG_BODY_DROP_DEFER` (a body
@@ -247,8 +257,14 @@ which runs each isolate's JS turn at guest ring 3.
   `--copt=-DWORKERD_GK_NEG_ACTOR_HEAP` (the actor class table, the
   namespace's table and the actor are made where they are made) and
   `--copt=-DWORKERD_GK_NEG_TRACE_HEAP` (a trace is handed to a tail worker
-  as is). Not covered, because neither is relayed and each faults on its
-  first byte: a `connect()` tunnel and a WebSocket through a binding.
+  as is), `--copt=-DWORKERD_GK_NEG_TUNNEL_RELAY` (no tunnel end is
+  relayed), `--copt=-DWORKERD_GK_NEG_TUNNEL_DROP_DEFER` (the caller's end
+  of a tunnel is dropped in the dropping turn),
+  `--copt=-DWORKERD_GK_NEG_WS_RELAY` (no WebSocket end is relayed),
+  `--copt=-DWORKERD_GK_NEG_WS_SEND_HEAP` (a send's copy is made in the
+  sender's arena) and `--copt=-DWORKERD_GK_NEG_WS_DROP_DEFER` (a WebSocket
+  end is dropped and aborted in the dropping turn, which faults on an
+  ordinary close as well as on an aborted upgrade).
 - `heap-region-test.sh` / `heap-region-test.capnp` / `heap-region-front.js` /
   `heap-region-back.js` — check against a workerd built with per-isolate heap
   arenas that an isolate serving large response bodies does not spend its heap
@@ -1526,7 +1542,19 @@ so a crossing a turn makes on every dereference belongs on that path.
   covered: a turn that destroys one of its own events that was queued before
   the turn began (a timer callback cancelled while already due, a fetch
   aborted while its response is queued) unlinks it from neighbors that may be
-  another isolate's, and faults.
+  another isolate's, and faults. A WebSocket through a binding reaches it
+  reliably: a caller that sends `close()` and returns without awaiting the
+  reply ends its request while the callee's close is still queued, armed by
+  the loop, and the callee's turn cancels its pump and destroys that event
+  (`kj::Event::disarm()` inlined into `~CoroutineBase`, writing the caller's
+  neighbouring event's link). `measure/socketrelay.py`'s `/ws-leave` route
+  (`GK_WS_LEAVE=1`) reproduces it six times in six; `measure/findings.md`
+  ("What the socket relays cost") has the trace. It is worse than a
+  condemnation: the turn is abandoned inside the destructor with the
+  half-destroyed event still on the loop's queue, and the loop's next call
+  through it aborts the process (`Pure virtual function called`). The
+  relays cannot close it, since the queue neighbours of whatever node a
+  turn destroys are whoever the loop armed next to it.
 
   With this, two workers using `Intl` with different locales, two using
   `setTimeout`, and two plain workers serve concurrently under load without
@@ -1569,15 +1597,62 @@ so a crossing a turn makes on every dereference belongs on that path.
   needs no deferral. `body-arena-test.sh` checks both directions, a passed-
   through body and the abort; a negative build,
   `--copt=-DWORKERD_GK_NEG_BODY_RELAY`, leaves the relays out and the test
-  fails on its first body. Not relayed: a `connect()` tunnel through a
-  binding, whose two-way pipe crosses the same way -- the callee's turn
-  faults on its first read, in `kj::TwoWayPipeEnd::tryReadSync`, against
-  the caller's buffer -- and a WebSocket's frames, where the caller's turn
-  faults on its first `send()`, in `kj::WebSocketPipeImpl::send`, against
-  the pipe state the callee's turn left. Both were driven by hand; neither
-  is in a probe, and each needs a relay of its own, the WebSocket one a pump
-  per direction that moves messages rather than `pumpTo()`, since the pipe
-  ends' own pump short-circuits into the other end.
+  fails on its first body.
+
+  A `connect()` tunnel through a binding is a two-way pipe, each direction
+  of which crosses exactly as a body does, and `IoStreamRelay` (same file)
+  gives each direction the same relay at its reading end: the caller's end
+  is wrapped where the tunnel is handed back
+  (`SharedHeapHttpClient::connect()`), the callee's where it is handed over
+  (`BodyRelayService::connect()`). Unrelayed, the second of the two
+  operations faulted on whichever side it ran: the callee's turn in
+  `kj::TwoWayPipeEnd::tryReadSync` against the caller's `BlockedWrite` when
+  the caller wrote first, and the callee's turn in
+  `kj::TwoWayPipeEnd::tryWriteSync` against the caller's `BlockedRead` when
+  the caller read first. With every read the loop's, what a writer's turn
+  finds on its pipe is the host's `BlockedRead` and staging buffer or
+  nothing, so the write side passes straight through, `shutdownWrite()`
+  included (the `ShutdownedWrite` it leaves is read by the loop's reads and
+  by the loop's `abortRead()`). The caller's end is dropped on the loop
+  whichever turn drops it: kj's adapter attaches the callee's whole
+  `connect()` call to that end, and its `~TwoWayPipeEnd` aborts the pipe
+  the callee writes, which reaches a write the callee's turn left parked
+  there; `Socket::close()` drops it inside the caller's turn.
+
+  A WebSocket through a binding is a kj WebSocket pipe, in the shared heap
+  already (`WorkerEntrypoint`'s `ResponseSentTracker` scopes
+  `acceptWebSocket()`), whose two directions each copy a message in
+  whichever of `send()` and `receive()` arrives second, from the sender's
+  buffer into an array the second operation allocates. Its ends' `pumpTo()`
+  does not go through `receive()`: it hands the destination to the pipe
+  itself, so a callee that couples its end to a `WebSocketPair` leaves a
+  `BlockedPumpTo` on the pipe that runs the caller's sends straight into
+  the pair, in the caller's turn, which is where the caller's first
+  `send()` faulted (`kj::WebSocketPipeImpl::send`); and the caller's first
+  `receive()` of a message the callee sent first faulted against the
+  callee's `BlockedSend` (`kj::WebSocketPipeEnd::receive`).
+  `WebSocketRelay` (same file) wraps both ends: every `receive()` is the
+  loop's; `send()`, `close()` and `disconnect()` run under a shared-heap
+  scope, so the array a send that arrives second makes in the sender's
+  turn is readable by the receiver's, as is the `BlockedSend` a send that
+  arrives first leaves for the loop; `pumpTo()` and `tryPumpFrom()` are
+  kj's defaults, which pump through the destination's `tryPumpFrom()` or a
+  `receive()`/`send()` loop, so every message still crosses through a
+  relayed receive; and `abort()` and the drop of an end are the loop's,
+  since aborting a direction fulfils the other side's `whenAborted()`, and
+  the caller's end also holds, through kj's `DelayedCloseWebSocket`, the
+  callee's whole request, which an `AbortSignal` on the upgrade fetch drops
+  inside the caller's turn. `binding-crossing-test.sh` drives both (its
+  `tunnel` and `ws` groups), and five negative builds --
+  `WORKERD_GK_NEG_TUNNEL_RELAY`, `_TUNNEL_DROP_DEFER`, `_WS_RELAY`,
+  `_WS_SEND_HEAP` and `_WS_DROP_DEFER` -- each fail it at the step named
+  for them. Neither relay can serve a read synchronously: what the pipe
+  holds is known only by dereferencing its state object, which is the
+  writer's, and the dereference is the fault. The cost is therefore the body
+  relay's fixed cost per read or per message rather than per mebibyte, and
+  measured it is 0.1 to 0.25 us per relayed receive and nothing a launch can
+  tell apart per tunnel read; `measure/findings.md` ("What the socket relays
+  cost") has the numbers, per launch.
 
   What the relay does change, since it owns the response body, is where that
   body is dropped. `kj`'s adapter ties the body to the callee's request --

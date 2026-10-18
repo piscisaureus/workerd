@@ -42,10 +42,21 @@
 # route answers wrongly, if any isolate is condemned, or if the guest kernel reports an
 # unmappable fault.
 #
-# Not covered, because neither is relayed yet and each faults on its first byte: a connect()
-# tunnel through a binding (the callee's turn reads the caller's buffer in
-# kj::TwoWayPipeEnd::tryReadSync) and a WebSocket through a binding (the caller's turn writes
-# the callee's pipe state in kj::WebSocketPipeImpl::send). README.md records both.
+# A connect() tunnel through a binding is a two-way pipe, each direction of which crosses as a
+# body does; IoStreamRelay (io/worker-interface.c++) relays the reads at both ends and drops the
+# caller's end on the event loop, since kj's adapter attaches the callee's whole connect() call
+# to it and its ~TwoWayPipeEnd aborts the pipe the callee writes. A WebSocket through a binding
+# is a kj WebSocket pipe whose directions copy each message in whichever of send() and receive()
+# arrives second, into an array the second operation makes; WebSocketRelay relays the receives,
+# sends under a shared-heap scope so that a copy made in the sender's turn is readable by the
+# receiver's, and aborts and drops its end on the loop. The tunnel routes go through back's
+# Tunnel entrypoint, the WebSocket routes through back's fetch handler and through the Durable
+# Object, accepted and hibernatable; the last two WebSocket steps hand the callee's WebSocket
+# to this script's own client (binding-crossing-ws-client.py), so that front's end is pumped by
+# the server on the event loop, once closed cleanly and once dropped. Every WebSocket route
+# awaits the callee's close reply: a caller that closes and returns at once reaches the
+# event-disarm hazard README.md records as not covered, which measure/socketrelay.py's
+# /ws-leave route reproduces (GK_WS_LEAVE=1) and this script's workers, in six runs, did not.
 #
 # Negative builds (never shipped), each failing this script at the step named:
 #   --copt=-DWORKERD_GK_NEG_CF_BLOB_HEAP      the cf blob stays in the caller's arena; step 1,
@@ -64,14 +75,25 @@
 #       the actor are made where they are made; /do faults the addressing turn
 #   --copt=-DWORKERD_GK_NEG_TRACE_HEAP        a trace is handed over as is; the buffered tail
 #       worker's turn faults on the first traced request
+#   --copt=-DWORKERD_GK_NEG_TUNNEL_RELAY      no tunnel end is relayed; /tunnel-echo faults the
+#       callee's turn on its first read
+#   --copt=-DWORKERD_GK_NEG_TUNNEL_DROP_DEFER the caller's end of a tunnel is dropped in the
+#       dropping turn; /tunnel-close-parked faults the caller's turn
+#   --copt=-DWORKERD_GK_NEG_WS_RELAY          no WebSocket end is relayed; /ws-echo faults the
+#       caller's turn on its first send
+#   --copt=-DWORKERD_GK_NEG_WS_SEND_HEAP      a send's copy is made in the sender's arena;
+#       /ws-echo faults the callee's turn on its first message
+#   --copt=-DWORKERD_GK_NEG_WS_DROP_DEFER     a WebSocket end is dropped and aborted in the
+#       dropping turn; /ws-echo faults the caller's turn on its close, where it is the last
+#       holder of the pipe, and /ws-abort on the callee's request the end carries
 #
 # Usage: binding-crossing-test.sh [path/to/workerd]
 #   defaults to bazel-bin/src/workerd/server/workerd in the repo root. Needs /dev/kvm and curl.
 #   GK_BINDING_CROSSING_PORT overrides front's port (8882); cdn takes the port below it, the
 #   plain worker the one below that, and the two tail workers the two above it.
 #   GK_BINDING_CROSSING_ONLY names the step groups to run (cdn cf fail cancel cache props
-#   restore actor tail rpc-stream), for checking that a negative build fails at the step named
-#   for it.
+#   restore actor tail rpc-stream tunnel ws), for checking that a negative build fails at the
+#   step named for it.
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -84,7 +106,7 @@ tail_port=$((port + 1))
 tail_stream_port=$((port + 2))
 front=http://127.0.0.1:$port
 cdn=http://127.0.0.1:$cdn_port
-only=${GK_BINDING_CROSSING_ONLY:-cdn cf fail cancel cache props restore actor tail rpc-stream}
+only=${GK_BINDING_CROSSING_ONLY:-cdn cf fail cancel cache props restore actor tail rpc-stream tunnel ws}
 log=$(mktemp)
 
 # workerd drains in-flight requests on SIGTERM, so the stop is bounded: a few seconds, then
@@ -291,6 +313,47 @@ if selected rpc-stream; then
   echo "   streams crossed as an RPC argument and as an RPC result"
 fi
 
+if selected tunnel; then
+  # Tunnels through back's Tunnel entrypoint: the caller writing first, the callee writing
+  # first, two hundred round trips, a mebibyte each way across a half-close, a close with the
+  # callee's write parked, and a callee that throws mid-stream.
+  check "tunnel-echo" "tunnel-echo got=echo:ping rest=0"
+  check "tunnel-greet" "tunnel-greet first=hello then=got:ping"
+  check "tunnel-pingpong" "tunnel-pingpong n=200"
+  check "tunnel-bulk" "tunnel-bulk up=1048576 down=1048576"
+  check "tunnel-close-parked" "tunnel-close-parked first=a closed=ok"
+  check "tunnel-throw-mid" "tunnel-throw-mid then=eof"
+  echo "   a tunnel's bytes crossed in both orders, in bulk, across a half-close and a close"
+fi
+
+if selected ws; then
+  # WebSockets through back's fetch handler and the Durable Object, and two handed to this
+  # script's client through front.
+  # The caller's close is answered as the plain build answers it: the callee's close reply
+  # finds the connection gone.
+  check "ws-echo" "ws-echo got=echo:one,echo:two,echo:three close=error:Uncaught Error: Network connection lost."
+  check "ws-server-first" "ws-server-first first=hello then=echo:x"
+  check "ws-many" "ws-many n=1000"
+  check "ws-big" "ws-big text=1048581 bytes=1048576"
+  check "ws-callee-close" "ws-callee-close first=echo:a close=close:4000:callee-close"
+  check "ws-abort" "ws-abort first=echo:a then=error:Uncaught Error: ws-abort"
+  check "ws-do" "ws-do got=do:hi,do:there"
+  check "ws-do-hib" "ws-do-hib got=hib:hi,hib:there"
+  step=$((step + 1))
+  got=$(python3 -I "$here/binding-crossing-ws-client.py" "$port" /ws-proxy clean p1 p2 p3 2>&1 | tr '\n' ' ')
+  echo "$step. WS $front/ws-proxy, closed cleanly -> $got"
+  [ "$got" = "1:echo:p1 1:echo:p2 1:echo:p3 close:1000:done " ] ||
+    fail "the proxied WebSocket did not echo and close: $got"
+  faulted "WS /ws-proxy"
+  step=$((step + 1))
+  got=$(python3 -I "$here/binding-crossing-ws-client.py" "$port" /ws-proxy abrupt q1 q2 2>&1 | tr '\n' ' ')
+  echo "$step. WS $front/ws-proxy, connection dropped -> $got"
+  [ "$got" = "1:echo:q1 1:echo:q2 dropped " ] || fail "the proxied WebSocket did not echo: $got"
+  sleep 1
+  faulted "WS /ws-proxy with the client gone"
+  echo "   WebSockets crossed in both orders, in bulk, through a Durable Object and out to a client"
+fi
+
 faults=$(grep -c "unmappable fault" "$log")
 step=$((step + 1))
 echo "$step. unmappable faults reported by the guest kernel: $faults"
@@ -309,4 +372,4 @@ kill -0 "$pid" 2>/dev/null || fail "workerd died"
 step=$((step + 1))
 echo "$step. every worker still serves"
 
-echo "PASS: a request's cf blob, a callee's errors, bodies given up on mid-stream, a loaded worker's props, a callee's self-token factory, a Durable Object two workers address, the Cache API and a traced worker's trace all crossed between isolates with per-isolate heap arenas: no turn faulted, no isolate was condemned"
+echo "PASS: a request's cf blob, a callee's errors, bodies given up on mid-stream, a loaded worker's props, a callee's self-token factory, a Durable Object two workers address, the Cache API, a traced worker's trace, tunnels and WebSockets all crossed between isolates with per-isolate heap arenas: no turn faulted, no isolate was condemned"

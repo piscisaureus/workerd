@@ -116,6 +116,31 @@ kj::Own<WorkerInterface> newPromisedWorkerInterface(kj::Promise<kj::Own<WorkerIn
 }
 
 namespace {
+// The relays below stage what crosses an in-process binding through buffers of at most this
+// size, allocated by the event loop.
+constexpr size_t RELAY_STAGING_BYTES = 64 * 1024;
+
+// Reads from `inner` into `dst` from the event loop, outside any turn, where every arena is
+// addressable: yields first, so that the read itself, the node it leaves on the pipe and the
+// staging buffer are the loop's, then copies into `dst`, which is in the reader's arena. Called
+// inside a jsg::SharedHeapScope, so that the coroutine's frame -- the event the writer's turn
+// arms when it fills the staging buffer -- is in the shared heap.
+kj::Promise<size_t> relayRead(
+    kj::AsyncInputStream& inner, byte* dst, size_t minBytes, size_t maxBytes) {
+  co_await kj::yield();
+  auto staging = kj::heapArray<byte>(kj::min(maxBytes, RELAY_STAGING_BYTES));
+  size_t total = 0;
+  while (total < minBytes) {
+    size_t want = kj::min(maxBytes - total, staging.size());
+    size_t need = kj::min(minBytes - total, want);
+    size_t n = co_await inner.tryRead(staging.begin(), need, want);
+    memcpy(dst + total, staging.begin(), n);
+    total += n;
+    if (n < need) break;  // EOF.
+  }
+  co_return total;
+}
+
 // Relays the reads of a body that crosses an in-process service binding, so that no isolate's
 // turn reaches the other isolate's side of the pipe the body travels through.
 //
@@ -131,16 +156,14 @@ namespace {
 // in the shared heap would therefore not be enough.
 //
 // The relay sits at the reading end, in front of the pipe, and makes every operation on the pipe
-// from the event loop, outside any turn, where every arena is addressable: a read first yields to
-// the event loop, then reads from the pipe into a staging buffer the host allocates, then copies
-// into the reader's buffer. The pipe only ever sees host-side reads, whose BlockedRead node and
-// staging buffer are in the shared heap; the writer's turn fills the staging buffer and arms the
-// relay's coroutine, whose frame is in the shared heap for exactly that; and the reader's buffer
-// is touched by the reader's own turn and by the host, never by the writer. The writer's end
-// needs nothing: what it leaves on the pipe is read only by the host, and its buffers keep their
-// isolate provenance, as do the reader's. The cost is one more copy and one event-loop turn per
-// chunk, and no synchronous fast path, on bodies that cross an in-process binding; it is paid
-// only where per-isolate heap arenas are active (see asHttpClient() below).
+// from the event loop (relayRead above). The pipe only ever sees host-side reads, whose
+// BlockedRead node and staging buffer are in the shared heap; the writer's turn fills the staging
+// buffer and arms the relay's coroutine, whose frame is in the shared heap for exactly that; and
+// the reader's buffer is touched by the reader's own turn and by the host, never by the writer.
+// The writer's end needs nothing: what it leaves on the pipe is read only by the host, and its
+// buffers keep their isolate provenance, as do the reader's. The cost is one more copy and one
+// event-loop turn per chunk, and no synchronous fast path, on bodies that cross an in-process
+// binding; it is paid only where per-isolate heap arenas are active (see asHttpClient() below).
 //
 // A response body the relay owns is dropped on the event loop whichever turn drops the relay.
 // kj's HttpClient adapter ties the body to the callee's request: the body holds the promise of
@@ -178,10 +201,8 @@ class ReadRelay final: public kj::AsyncInputStream {
 
   kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
     if (minBytes == 0) return size_t(0);
-    // The coroutine is the event the writer's turn arms when it fills the staging buffer, so its
-    // frame is in the shared heap whichever isolate's turn issues the read.
     jsg::SharedHeapScope sharedHeap;
-    return relay(inner, static_cast<byte*>(buffer), minBytes, maxBytes);
+    return relayRead(inner, static_cast<byte*>(buffer), minBytes, maxBytes);
   }
 
   kj::Maybe<size_t> tryReadSync(kj::ArrayPtr<byte> buffer, size_t minBytes) override {
@@ -198,34 +219,239 @@ class ReadRelay final: public kj::AsyncInputStream {
   // generic loop does, so the pipe still sees only the relay's host-side reads.
 
  private:
-  static constexpr size_t STAGING_BYTES = 64 * 1024;
-
-  static kj::Promise<size_t> relay(
-      kj::AsyncInputStream& inner, byte* dst, size_t minBytes, size_t maxBytes) {
-    co_await kj::yield();
-    // On the event loop now, outside any turn: the staging buffer and the nodes the read leaves
-    // on the pipe are the host's, and `dst`, in the reader's arena, is addressable from here.
-    auto staging = kj::heapArray<byte>(kj::min(maxBytes, STAGING_BYTES));
-    size_t total = 0;
-    while (total < minBytes) {
-      size_t want = kj::min(maxBytes - total, staging.size());
-      size_t need = kj::min(minBytes - total, want);
-      size_t n = co_await inner.tryRead(staging.begin(), need, want);
-      memcpy(dst + total, staging.begin(), n);
-      total += n;
-      if (n < need) break;  // EOF.
-    }
-    co_return total;
-  }
-
   kj::AsyncInputStream& inner;
   kj::Maybe<kj::Own<kj::AsyncInputStream>> owned;
   kj::Own<kj::HttpClient> client;
 };
 
-// Whether bodies cross an in-process call through a ReadRelay: only where per-isolate heap
-// arenas are active, which is the one configuration in which an isolate's turn cannot address
-// what another isolate's turn wrote. Everywhere else the pipe is used directly.
+// Relays the reads of a connect() tunnel that crosses an in-process service binding, at both
+// of its ends, so that neither isolate's turn reaches the other's side of the pipe.
+//
+// The tunnel is a kj two-way pipe: two one-way pipes, each written by one isolate and read by
+// the other, so each is the body's case over again (see ReadRelay) and gets the same treatment
+// at its reading end. The caller's end is wrapped where the tunnel is handed back
+// (SharedHeapHttpClient::connect()), the callee's where it is handed over
+// (BodyRelayService::connect()); every read on either end is the loop's, so what a writer's
+// turn finds on its pipe is the host's BlockedRead and staging buffer or nothing, and what it
+// leaves there -- its BlockedWrite, the pieces of a tryPumpFrom(), the ShutdownedWrite its
+// shutdownWrite() makes -- is read only by the loop. The write side therefore passes straight
+// through. abortRead() passes through too, although it is a read-side operation that would
+// fault on a parked BlockedWrite: nothing calls it from a turn. workerd's streams cancel a
+// read through a kj::Canceler and never abort the kj stream itself, kj's adapter and the
+// revocable interface above call it on the loop, and the one in ~TwoWayPipeEnd runs where
+// the end is dropped, which for the end this relay owns is the loop (below).
+//
+// The caller's end is dropped on the event loop whichever turn drops the relay. kj's adapter
+// attaches the callee's whole connect() call to that end, so dropping it mid-tunnel cancels the
+// callee's suspended coroutine as dropping a body does (ReadRelay above), and its ~TwoWayPipeEnd
+// aborts the read side of the pipe the callee writes, which reaches whatever write the callee's
+// turn left parked there. The caller's turn drops the end whenever its JS closes the socket
+// (Socket::close() releases the IoOwn inside the owning context) or lets it go.
+class IoStreamRelay final: public kj::AsyncIoStream {
+ public:
+  // Over the end the relay owns: the caller's, with the client it came from and may not outlive.
+  IoStreamRelay(kj::Own<kj::AsyncIoStream> owned, kj::Own<kj::HttpClient> client)
+      : inner(*owned),
+        owned(kj::mv(owned)),
+        client(kj::mv(client)) {}
+  // Over the end someone else owns for the relay's lifetime: the callee's.
+  explicit IoStreamRelay(kj::AsyncIoStream& inner): inner(inner) {}
+
+  ~IoStreamRelay() noexcept(false) {
+    KJ_IF_SOME(o, owned) {
+#ifndef WORKERD_GK_NEG_TUNNEL_DROP_DEFER
+      // As ~ReadRelay. A negative build, never shipped, WORKERD_GK_NEG_TUNNEL_DROP_DEFER, drops
+      // the end in the dropping turn; the guest kernel's binding-crossing-test.sh must then fail
+      // on a tunnel closed with the callee's write parked.
+      jsg::SharedHeapScope sharedHeap;
+      kj::evalLater([end = o.attach(kj::mv(client))](){}).detach([](kj::Exception&&){});
+#endif
+    }
+  }
+
+  // The read side, which is the loop's.
+
+  kj::Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
+    if (minBytes == 0) return size_t(0);
+    jsg::SharedHeapScope sharedHeap;
+    return relayRead(inner, static_cast<byte*>(buffer), minBytes, maxBytes);
+  }
+  kj::Maybe<size_t> tryReadSync(kj::ArrayPtr<byte> buffer, size_t minBytes) override {
+    // See ReadRelay::tryReadSync(): the pipe's state is the writer's, and even EOF is known only
+    // by reading it.
+    return kj::none;
+  }
+  kj::Maybe<uint64_t> tryGetLength() override {
+    return inner.tryGetLength();
+  }
+  // pumpTo() is the default, as for ReadRelay.
+  void abortRead() override {
+    inner.abortRead();
+  }
+
+  // The write side, which is the writer's own.
+
+  kj::Promise<void> write(kj::ArrayPtr<const byte> buffer) override {
+    return inner.write(buffer);
+  }
+  kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) override {
+    return inner.write(pieces);
+  }
+  bool tryWriteSync(kj::ArrayPtr<const byte> buffer) override {
+    return inner.tryWriteSync(buffer);
+  }
+  bool tryWriteSync(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) override {
+    return inner.tryWriteSync(pieces);
+  }
+  kj::Maybe<kj::Promise<uint64_t>> tryPumpFrom(
+      kj::AsyncInputStream& input, uint64_t amount) override {
+    return inner.tryPumpFrom(input, amount);
+  }
+  kj::Promise<void> whenWriteDisconnected() override {
+    return inner.whenWriteDisconnected();
+  }
+  void shutdownWrite() override {
+    inner.shutdownWrite();
+  }
+  void abortWrite(kj::Exception&& exception) override {
+    inner.abortWrite(kj::mv(exception));
+  }
+
+ private:
+  kj::AsyncIoStream& inner;
+  kj::Maybe<kj::Own<kj::AsyncIoStream>> owned;
+  kj::Own<kj::HttpClient> client;
+};
+
+// Relays a WebSocket that crosses an in-process service binding, at both of its ends, so that
+// neither isolate's turn reaches the other's side of the pipe its messages travel through.
+//
+// The WebSocket is a kj WebSocket pipe (made by kj's adapter when the callee accepts the
+// upgrade, in the shared heap: WorkerEntrypoint's ResponseSentTracker scopes acceptWebSocket()),
+// whose two directions each copy a message in whichever of send() and receive() arrives second,
+// from the sender's buffer into an array the second operation allocates, completing the first
+// operation's node. Unlike a byte pipe it has no reader's buffer to copy into: the array is
+// made where the copy is made and handed to the receiver's turn. The relay therefore does two
+// things. Every receive() is the loop's, so a sender's turn finds the host's BlockedReceive on
+// the pipe or nothing (ReadRelay's trick); and every send() and close() runs under a
+// jsg::SharedHeapScope, so the array a send that arrives second makes in the sender's turn is
+// in the shared heap, where the receiver's turn can read it, as is the BlockedSend a send that
+// arrives first leaves for the loop. disconnect() runs under the scope for the state it leaves
+// on the pipe, which the other side's turn reaches through its own sends.
+//
+// kj's pumps do not go through receive(): a WebSocketPipeEnd's pumpTo() hands the destination
+// to the pipe itself, which then runs the other side's sends straight into the destination, in
+// the other side's turn, and that is where a callee's turn coupling its end to a WebSocketPair
+// left the state the caller's first send() faulted on. The relay does not forward pumpTo() or
+// tryPumpFrom(): it keeps kj::WebSocket's defaults, which pump through the destination's
+// tryPumpFrom() or through a receive()/send() loop, so every message still crosses the pipe
+// through a relayed receive.
+//
+// abort() is the loop's, and so is the drop of the end. Aborting a direction completes
+// whatever the other side left parked there and fulfils the other side's whenAborted(), both
+// writes into the other side's arena; and dropping an end aborts both directions. The caller's
+// end also holds, through kj's DelayedCloseWebSocket, the callee's whole request, which dropping
+// it mid-stream cancels as dropping a body does (ReadRelay above): the caller's turn drops it
+// when an AbortSignal fires on the upgrade fetch, or lets it go. Both go to the loop as tasks
+// that share the end, so an abort scheduled before the drop runs on a live end.
+class WebSocketRelay final: public kj::WebSocket {
+ public:
+  // `client` is what the caller's end came from and may not outlive; the callee's end has none.
+  WebSocketRelay(kj::Own<kj::WebSocket> inner, kj::Maybe<kj::Own<kj::HttpClient>> client)
+      : end(kj::rc<End>(kj::mv(inner), kj::mv(client))) {}
+
+  ~WebSocketRelay() noexcept(false) {
+#ifndef WORKERD_GK_NEG_WS_DROP_DEFER
+    // As ~ReadRelay. A negative build, never shipped, WORKERD_GK_NEG_WS_DROP_DEFER, drops the end
+    // in the dropping turn and aborts it there; the guest kernel's binding-crossing-test.sh must
+    // then fail on an upgrade fetch aborted mid-stream.
+    jsg::SharedHeapScope sharedHeap;
+    kj::evalLater([end = kj::mv(end)](){}).detach([](kj::Exception&&){});
+#endif
+  }
+
+  kj::Promise<void> send(kj::ArrayPtr<const byte> message) override {
+    SendScope scope;
+    return end->ws->send(message);
+  }
+  kj::Promise<void> send(kj::ArrayPtr<const char> message) override {
+    SendScope scope;
+    return end->ws->send(message);
+  }
+  kj::Promise<void> close(uint16_t code, kj::StringPtr reason) override {
+    SendScope scope;
+    return end->ws->close(code, reason);
+  }
+  void disconnect() override {
+    SendScope scope;
+    end->ws->disconnect();
+  }
+
+  void abort() override {
+#ifndef WORKERD_GK_NEG_WS_DROP_DEFER
+    jsg::SharedHeapScope sharedHeap;
+    kj::evalLater([end = end.addRef()]() mutable {
+      end->ws->abort();
+    }).detach([](kj::Exception&&){});
+#else
+    end->ws->abort();
+#endif
+  }
+  kj::Promise<void> whenAborted() override {
+    // What this leaves on the pipe is fulfilled by the other side's abort(), which is the loop's.
+    return end->ws->whenAborted();
+  }
+
+  kj::Promise<Message> receive(size_t maxSize) override {
+    jsg::SharedHeapScope sharedHeap;
+    return relayReceive(*end->ws, maxSize);
+  }
+  // pumpTo() and tryPumpFrom() are kj::WebSocket's defaults: see above.
+
+  uint64_t sentByteCount() override {
+    return end->ws->sentByteCount();
+  }
+  uint64_t receivedByteCount() override {
+    return end->ws->receivedByteCount();
+  }
+  kj::Maybe<kj::String> getPreferredExtensions(ExtensionsContext ctx) override {
+    // Answered by the pipe from the WebSockets its ends are pumping to, which with the relay in
+    // front of both ends are none.
+    return end->ws->getPreferredExtensions(ctx);
+  }
+
+ private:
+  struct End final: public kj::Refcounted {
+    End(kj::Own<kj::WebSocket> ws, kj::Maybe<kj::Own<kj::HttpClient>> client): ws(kj::mv(ws)) {
+      KJ_IF_SOME(c, client) {
+        // Dropped after the WebSocket, which may not outlive it.
+        this->ws = this->ws.attach(kj::mv(c));
+      }
+    }
+    kj::Own<kj::WebSocket> ws;
+  };
+
+#ifdef WORKERD_GK_NEG_WS_SEND_HEAP
+  // A negative build, never shipped: a send's copy is made in the sender's arena; the guest
+  // kernel's binding-crossing-test.sh must then fail on the receiver's first message.
+  struct SendScope {};
+#else
+  using SendScope = jsg::SharedHeapScope;
+#endif
+
+  // The loop's receive: as relayRead(), for a message.
+  static kj::Promise<Message> relayReceive(kj::WebSocket& inner, size_t maxSize) {
+    co_await kj::yield();
+    co_return co_await inner.receive(maxSize);
+  }
+
+  kj::Rc<End> end;
+};
+
+// Whether bodies cross an in-process call through a ReadRelay, tunnels through IoStreamRelays
+// and WebSockets through WebSocketRelays: only where per-isolate heap arenas are active, which
+// is the one configuration in which an isolate's turn cannot address what another isolate's
+// turn wrote. Everywhere else the pipes are used directly.
 bool bodiesRelayed() {
 #ifdef WORKERD_GK_NEG_BODY_RELAY
   // A negative build, never shipped: bodies cross the binding through the bare pipe even with
@@ -236,10 +462,54 @@ bool bodiesRelayed() {
   return jsg::heapArenasAvailable();
 #endif
 }
+bool tunnelsRelayed() {
+#ifdef WORKERD_GK_NEG_TUNNEL_RELAY
+  // A negative build, never shipped: binding-crossing-test.sh must fail on its first tunnel.
+  return false;
+#else
+  return jsg::heapArenasAvailable();
+#endif
+}
+bool webSocketsRelayed() {
+#ifdef WORKERD_GK_NEG_WS_RELAY
+  // A negative build, never shipped: binding-crossing-test.sh must fail on its first WebSocket.
+  return false;
+#else
+  return jsg::heapArenasAvailable();
+#endif
+}
+
+// The Response an in-process callee answers into: puts a WebSocketRelay on the callee's end of
+// a WebSocket it accepts. A plain response passes through; its body is relayed at the reading
+// end (SharedHeapHttpClient::request()), and what accepting makes -- the pipe, the headers'
+// copy -- WorkerEntrypoint's ResponseSentTracker already places in the shared heap.
+class RelayResponse final: public kj::HttpService::Response {
+ public:
+  explicit RelayResponse(kj::HttpService::Response& inner): inner(inner) {}
+
+  kj::Own<kj::AsyncOutputStream> send(uint statusCode,
+      kj::StringPtr statusText,
+      const kj::HttpHeaders& headers,
+      kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
+    return inner.send(statusCode, statusText, headers, expectedBodySize);
+  }
+
+  kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
+    auto ws = inner.acceptWebSocket(headers);
+    if (webSocketsRelayed()) {
+      return kj::heap<WebSocketRelay>(kj::mv(ws), kj::none);
+    }
+    return ws;
+  }
+
+ private:
+  kj::HttpService::Response& inner;
+};
 
 // The HttpService side of an in-process call: puts a ReadRelay in front of the request body
-// before the target reads it. request() is called from the caller's turn, inside
-// SharedHeapHttpClient's scope, so the relay and this frame are in the shared heap.
+// before the target reads it, an IoStreamRelay in front of the callee's end of a tunnel, and a
+// RelayResponse behind the response. request() and connect() are called from the caller's turn,
+// inside SharedHeapHttpClient's scope, so the relays and these frames are in the shared heap.
 class BodyRelayService final: public kj::HttpService {
  public:
   explicit BodyRelayService(kj::HttpService& inner): inner(inner) {}
@@ -250,7 +520,8 @@ class BodyRelayService final: public kj::HttpService {
       kj::AsyncInputStream& requestBody,
       Response& response) override {
     ReadRelay relay(requestBody);
-    co_await inner.request(method, url, headers, relay, response);
+    RelayResponse relayResponse(response);
+    co_await inner.request(method, url, headers, relay, relayResponse);
   }
 
   kj::Promise<void> connect(kj::StringPtr host,
@@ -258,7 +529,11 @@ class BodyRelayService final: public kj::HttpService {
       kj::AsyncIoStream& connection,
       ConnectResponse& response,
       kj::HttpConnectSettings settings) override {
-    return inner.connect(host, headers, connection, response, kj::mv(settings));
+    if (!tunnelsRelayed()) {
+      co_return co_await inner.connect(host, headers, connection, response, kj::mv(settings));
+    }
+    IoStreamRelay relay(connection);
+    co_await inner.connect(host, headers, relay, response, kj::mv(settings));
   }
 
  private:
@@ -299,10 +574,18 @@ class SharedHeapHttpClient final: public kj::HttpClient, public kj::Refcounted {
     auto promise = inner->openWebSocket(url, headers);
     if (bodiesRelayed()) {
       // A callee that answers an upgrade request with a plain response hands back a body that
-      // crosses like any other: it gets the same relay. A WebSocket is not relayed.
+      // crosses like any other: it gets the same relay. A WebSocket gets the caller's end of a
+      // WebSocketRelay. Both are made where the response is delivered, on the event loop.
       promise = promise.then([self = kj::addRef(*this)](WebSocketResponse response) mutable {
-        KJ_IF_SOME(body, response.webSocketOrBody.tryGet<kj::Own<kj::AsyncInputStream>>()) {
-          body = kj::heap<ReadRelay>(kj::mv(body), kj::mv(self));
+        KJ_SWITCH_ONEOF(response.webSocketOrBody) {
+          KJ_CASE_ONEOF(body, kj::Own<kj::AsyncInputStream>) {
+            body = kj::heap<ReadRelay>(kj::mv(body), kj::mv(self));
+          }
+          KJ_CASE_ONEOF(ws, kj::Own<kj::WebSocket>) {
+            if (webSocketsRelayed()) {
+              ws = kj::heap<WebSocketRelay>(kj::mv(ws), kj::mv(self));
+            }
+          }
         }
         return kj::mv(response);
       });
@@ -314,7 +597,12 @@ class SharedHeapHttpClient final: public kj::HttpClient, public kj::Refcounted {
       const kj::HttpHeaders& headers,
       kj::HttpConnectSettings settings) override {
     jsg::SharedHeapScope sharedHeap;
-    return inner->connect(host, headers, kj::mv(settings));
+    auto result = inner->connect(host, headers, kj::mv(settings));
+    if (tunnelsRelayed()) {
+      // The caller's end of the tunnel: see IoStreamRelay.
+      result.connection = kj::heap<IoStreamRelay>(kj::mv(result.connection), kj::addRef(*this));
+    }
+    return result;
   }
 
  private:

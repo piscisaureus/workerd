@@ -2398,3 +2398,13 @@ point is an owner that outlives the turn -- `IoContext::addObject` on the
 wrapper before the handler runs, as the memory cache's fallback callback does
 -- and not neutering from the fault path, which sits in `io/` and has no
 handle to per-request state in `api/`.
+
+The tunnel relay (`IoStreamRelay` in `io/worker-interface.c++`, for a
+`connect()` that crosses an in-process binding under per-isolate heap arenas)
+sits between `connect()`'s wrapper and kj's guarded stream and borrows the
+stream exactly as the wrapper does, from a frame that the adapter's `connect()`
+promise owns. It adds no reader of its own: a relayed read is a coroutine the
+reader's promise owns, cancelled through the wrapper's `kj::Canceler` with
+every other read the `IoContext` owns, before the frame that holds the relay
+unwinds. The three invariants above are therefore what keep it safe too, and
+nothing new.
