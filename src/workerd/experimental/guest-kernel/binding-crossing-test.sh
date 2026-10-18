@@ -53,10 +53,12 @@
 # Tunnel entrypoint, the WebSocket routes through back's fetch handler and through the Durable
 # Object, accepted and hibernatable; the last two WebSocket steps hand the callee's WebSocket
 # to this script's own client (binding-crossing-ws-client.py), so that front's end is pumped by
-# the server on the event loop, once closed cleanly and once dropped. Every WebSocket route
-# awaits the callee's close reply: a caller that closes and returns at once reaches the
-# event-disarm hazard README.md records as not covered, which measure/socketrelay.py's
-# /ws-leave route reproduces (GK_WS_LEAVE=1) and this script's workers, in six runs, did not.
+# the server on the event loop, once closed cleanly and once dropped. /ws-leave bursts its sends
+# and then closes and returns without awaiting the close reply, so the caller's turn destroys an
+# event the loop armed before the turn began: the event-disarm shape README.md's event-loop
+# hazard section describes, which the run queue's links being the loop's own is what makes safe.
+# It is the one step here that depends on that, and the one that aborts the whole process when it
+# does not hold, so it runs six times.
 #
 # Negative builds (never shipped), each failing this script at the step named:
 #   --copt=-DWORKERD_GK_NEG_CF_BLOB_HEAP      the cf blob stays in the caller's arena; step 1,
@@ -334,6 +336,18 @@ if selected ws; then
   check "ws-echo" "ws-echo got=echo:one,echo:two,echo:three close=error:Uncaught Error: Network connection lost."
   check "ws-server-first" "ws-server-first first=hello then=echo:x"
   check "ws-many" "ws-many n=1000"
+  # A burst of messages, then close() and return without awaiting the close reply, six times
+  # over: the caller's turn destroys an event the loop armed before the turn began. Each attempt
+  # is its own request, since what it exercises is the end of one.
+  step=$((step + 1))
+  for i in $(seq 1 6); do
+    got=$(body "$front/ws-leave")
+    [ "$got" = "ws-leave n=100" ] ||
+      fail "GET /ws-leave answered '${got:-no-response}' on attempt $i, wanted 'ws-leave n=100'"
+    kill -0 "$pid" 2>/dev/null || fail "workerd died on /ws-leave, attempt $i"
+  done
+  echo "$step. GET $front/ws-leave, six times -> ws-leave n=100"
+  faulted "GET /ws-leave"
   check "ws-big" "ws-big text=1048581 bytes=1048576"
   check "ws-callee-close" "ws-callee-close first=echo:a close=close:4000:callee-close"
   check "ws-abort" "ws-abort first=echo:a then=error:Uncaught Error: ws-abort"
