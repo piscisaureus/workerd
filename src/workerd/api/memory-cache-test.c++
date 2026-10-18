@@ -1,16 +1,16 @@
 // Regression test: a FallbackDoneCallback returned by getWithFallback() must
 // remain safe to invoke even after the SharedMemoryCache::Use that created it
-// has been destroyed. Previously, the callback captured a bare pointer to the
-// Use, leading to a use-after-free when the callback outlived the Use.
+// has been destroyed. The callback names its binding by a host slot handle
+// that the handler validates, so once the binding is gone the call is refused
+// rather than reaching freed memory, and the binding's teardown has abandoned
+// the key, so a later reader leads its own fallback instead of waiting on the
+// destroyed one.
 //
 // This is representative of production behavior: MemoryCache::read() on a
-// shared cache can queue fallback callbacks across isolates via
-// CrossThreadPromiseFulfiller. If one worker's fallback fails,
-// handleFallbackFailure() ships a new FallbackDoneCallback to the next queued
-// worker — which may be on a different thread. If the originating worker's
-// isolate is torn down before that callback fires, the Use is destroyed while
-// the callback is still live. This test simulates that sequence: obtain a
-// callback, destroy the Use, then invoke it.
+// shared cache can leave fallback callbacks outstanding across isolates. If
+// the originating worker's isolate is torn down before such a callback fires,
+// the Use is destroyed while the callback is still live. This test simulates
+// that sequence: obtain a callback, destroy the Use, then invoke it.
 
 #include "memory-cache-v2-test.h"
 #include "memory-cache.h"
@@ -230,17 +230,39 @@ KJ_TEST("regression: FallbackDoneCallback survives Use destruction") {
   }
 
   auto& callback = KJ_ASSERT_NONNULL(savedCallback);
-  callback(kj::none, noopSpan);
+  {
+    // The callback's handle names the destroyed binding's slot, which the host reports as the
+    // stale handle it is and refuses; nothing is read through it.
+    KJ_EXPECT_LOG(ERROR, "host slot handle does not name a live slot");
+    callback(kj::none, noopSpan);
+  }
 
-  // If we reach here without crashing, the fix is working. The InProgress
-  // entry should have been cleaned up since there are no waiters.
+  // If we reach here without crashing, the fix is working. The in-flight
+  // entry was released by the binding's teardown, so there is nothing for the
+  // callback to settle.
 
-  // Verify the cache is still functional after the callback.
+  // Verify the cache is still functional after the callback: the key is not
+  // cached (no value was stored), and a new reader with a fallback leads
+  // rather than waiting on the destroyed binding's fallback.
   {
     SharedMemoryCache::Use useC(kj::atomicAddRef(*cache), limits);
     auto cached = useC.getWithoutFallback(key, noopSpan);
-    // Key should not be in cache (fallback failed, no value stored).
     KJ_ASSERT(cached == kj::none);
+
+    auto result = useC.getWithFallback(key, noopSpan);
+    KJ_ASSERT(result.is<kj::Promise<SharedMemoryCache::Use::GetWithFallbackOutcome>>());
+    auto& promise = result.get<kj::Promise<SharedMemoryCache::Use::GetWithFallbackOutcome>>();
+    KJ_ASSERT(promise.poll(waitScope));
+    auto outcome = promise.wait(waitScope);
+    KJ_ASSERT(outcome.is<SharedMemoryCache::Use::FallbackDoneCallback>());
+    auto bytes = kj::heapArray<kj::byte>(4);
+    bytes.asPtr().fill(0x7f);
+    outcome.get<SharedMemoryCache::Use::FallbackDoneCallback>()(
+        SharedMemoryCache::Use::FallbackResult{
+          kj::atomicRefcounted<CacheValue>(kj::mv(bytes)), kj::none},
+        noopSpan);
+    auto stored = KJ_ASSERT_NONNULL(useC.getWithoutFallback(key, noopSpan));
+    KJ_ASSERT(stored->asBytes().size() == 4 && stored->asBytes()[0] == 0x7f);
   }
 }
 

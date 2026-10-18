@@ -227,6 +227,7 @@ MemoryCacheProvider::MemoryCacheProvider(const kj::MonotonicClock& timer, Memory
         }
         data.effectiveLimits = data.effectiveLimits.normalize();
       }),
+      registry(hostOwned<Registry>()),
       timer(timer) {
   if (util::Autogate::isEnabled(util::AutogateKey::MEMORY_CACHE_V2)) {
     namespaceV2 = MemoryCacheNamespace::create(policy);

@@ -8,6 +8,7 @@
 #ifdef WORKERD_HAS_GUEST_KERNEL
 #include <workerd/experimental/guest-kernel/gk.h>
 #endif
+#include <workerd/api/memory-cache.h>
 #include <workerd/io/compatibility-date.capnp.h>
 #include <workerd/io/compatibility-date.h>
 #include <workerd/io/io-own.h>
@@ -1711,6 +1712,7 @@ int main(int argc, char* argv[]) {
     workerd::SqliteDatabase::Vfs::installHostcall();
     workerd::hostMemory::installResolveHostcall();
     workerd::OwnedObjectList::installHostcall();
+    workerd::api::SharedMemoryCache::installHostcall();
     // A turn's path syscalls land beneath the turn directory its VFS root hostcall set, or
     // nowhere (gk_confine_paths in gk.h). The test-only switch leaves them unconfined, so that
     // vfs-root-test.sh can show what the confinement prevents.
