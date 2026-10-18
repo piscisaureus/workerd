@@ -436,6 +436,24 @@ extern "C" void v8_wasm_shared_allocation_leave(uintptr_t token) {
   sharedAllocationLeave(token);
 }
 
+// The wasm code manager's index of code ranges (patches/v8/0051-Index-wasm-code-ranges-under-an-
+// embedder-shared-allocation-scope.patch): the map that resolves a program counter to the
+// NativeModule whose code space holds it is process-wide, and it grows from whichever isolate
+// compiled that module. Every isolate descends it, for a wasm trap, for stack iteration and for
+// the deoptimizer, so without this the second isolate to take a trap faults in
+// WasmCodeManager::LookupCode on a node the first isolate's compile placed.
+//
+// WORKERD_GK_NEG_WASM_CODE_MANAGER is a negative-test build, never shipped: the pair is inert, so
+// the patch is too and the nodes stay in the compiling isolate's arena.
+#ifndef WORKERD_GK_NEG_WASM_CODE_MANAGER
+extern "C" uintptr_t v8_wasm_code_manager_shared_allocation_enter() {
+  return sharedAllocationEnter();
+}
+extern "C" void v8_wasm_code_manager_shared_allocation_leave(uintptr_t token) {
+  sharedAllocationLeave(token);
+}
+#endif
+
 unsigned currentHeapArenaIndex() {
   auto& mib = threadArenaMib();
   unsigned index = 0;

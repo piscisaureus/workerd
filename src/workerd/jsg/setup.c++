@@ -210,6 +210,23 @@ void V8System::init(kj::Own<v8::Platform> platformParam,
   }
 
   if (heapArenasAvailable()) {
+    // V8 keeps one compiled NativeModule per distinct set of wasm wire bytes for the whole
+    // process, so two workers that supply the same module get the same NativeModule, its wire
+    // bytes, its decoded module and the shared_ptr that owns it -- all of it in the arena of
+    // whichever worker compiled first, where the other worker's instantiation faults
+    // incrementing the refcount (wasm::InstanceBuilder::InstanceBuilder). Each worker compiles
+    // its own copy instead. That keeps every part of a module that is derived from the worker's
+    // own bytes in that worker's arena, which placing the cache in the shared heap would not: it
+    // would make one worker's module bytes and compiled code readable by every isolate in the
+    // process, and the cache is keyed on those bytes, so its hits are a cross-tenant channel in
+    // their own right. The cost is that identical modules are compiled once per worker.
+    //
+    // WORKERD_GK_NEG_WASM_MODULE_CACHE is a negative-test build, never shipped: the cache stays
+    // on and the modules are shared again.
+#ifndef WORKERD_GK_NEG_WASM_MODULE_CACHE
+    v8::V8::SetFlagsFromString("--no-wasm-native-module-cache");
+#endif
+
     // Before ICU's first allocation, which u_setMemoryFunctions() requires.
     UErrorCode err = U_ZERO_ERROR;
     u_setMemoryFunctions(nullptr, &icuAlloc, &icuRealloc, &icuFree, &err);

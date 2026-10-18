@@ -2007,12 +2007,24 @@ reads it, and whether an embedder choke point reaches it:
 5. **V8's wasm engine registries** -- `WasmEngine`'s `NativeModuleInfo` map
    and the per-isolate sets `UseNativeModuleInIsolate` fills, the
    `NativeModuleCache` keyed on wire bytes, `WasmCodeManager`'s allocation
-   pool, and each `NativeModule`'s own code vectors and jump tables. 69
-   aggregates between them, grown at module compile under the compiling
-   isolate's lock and at lazy compilation inside a turn; `WasmCodeManager` and
-   the caches are read at ring 3 through `Runtime_WasmCompileLazy`. **V8
-   patch**: these are members of the process-wide `GlobalWasmState` with no
-   embedder allocator between them and `operator new`. Not previously known.
+   pool and code-range index, and each `NativeModule`'s own code vectors and
+   jump tables. 69 aggregates between them, grown at module compile under the
+   compiling isolate's lock and at lazy compilation inside a turn. Two of them
+   reach a turn and are answered differently (the branch README has the whole
+   account). The `NativeModuleCache` hands two workers that supply the same
+   bytes one `NativeModule`, and the second worker's instantiation faults on
+   its refcount; since the module's bytes and decoded form are the worker's
+   own, the cache is **off** under heap arenas
+   (`--no-wasm-native-module-cache`, `jsg/setup.c++`) rather than placed, and
+   each worker compiles its own copy into its own arena.
+   `WasmCodeManager::lookup_map_`, which `LookupCode()` descends from every
+   isolate for a trap, for stack iteration and for the deoptimizer, holds
+   nothing but code ranges and module pointers and is placed in the shared
+   heap by a **V8 patch**, `patches/v8/0051-...`. The rest -- the
+   `NativeModuleInfo` map, the per-isolate sets, the allocation pool -- is
+   grown at module compile, which `workerd` keeps outside every turn by
+   forbidding wasm code generation from JS, so none of it is placed. Not
+   previously known.
 6. **The thread's timer multimap** in `kj::TimerImpl`, which this workload
    does not exercise and the earlier one did. **Embedder**: a shared scope at
    `TimerChannel`.
@@ -2050,18 +2062,21 @@ each of which hid a member of the list above:
   this run although `guest-arena-test` faults inside it; what the census sees
   there is the canonicalizer's container frames and nothing above them.
 
-**And what it cannot see at all** is a read, which is the thing that actually
-faults. The list above pairs each site with a reader found by following the
+**And what it cannot see at all** is the dereference, which is the thing that
+actually faults -- usually a read, but a write that allocates nothing counts
+too: what the wasm engine's shared module faults on is the increment of a
+refcount. The list above pairs each site with a reader found by following the
 code, not by measuring. Two consequences: a registry that is established and
 read by the same isolate in every real workload would be on the list
 wrongly, and one established outside any lock -- so already in the shared
 heap, which `nolock` counts -- is on the list not at all, correctly.
 
-**Is the list long enough to change the judgement?** No. Five of the six have
-a fix written -- four of them scopes or hooks, and the JIT-page map an
-allocator of workerd's own behind the embedder interface
-(`jsg/thread-isolated-allocator.h`) -- and the sixth is a V8 patch of the same
-shape as the two that exist, only reached by a worker that uses wasm. The open-ended series is closed at six for this
+**Is the list long enough to change the judgement?** No. All six have a fix
+written -- four of them scopes or hooks, the JIT-page map an allocator of
+workerd's own behind the embedder interface
+(`jsg/thread-isolated-allocator.h`), and the wasm engine a V8 patch for the
+one of its registries that crosses plus a V8 flag that stops the other from
+being shared at all. The open-ended series is closed at six for this
 workload. What is not settled is how many more workloads add to it: this one
 does not exercise streams over RPC, hibernatable WebSockets, the shared memory
 cache, Pyodide, `WorkerLoader`, replica storage, `AbortSignal` over RPC or

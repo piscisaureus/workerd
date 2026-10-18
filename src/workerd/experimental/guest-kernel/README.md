@@ -126,6 +126,15 @@ which runs each isolate's JS turn at guest ring 3.
   module whose JS turn runs at guest ring 3, and that a turn overwriting the
   module's heap descriptor with a buffer of its choosing leaves the signal
   landing in the module's real memory and the chosen buffer untouched.
+- `wasm-share-test.sh` / `wasm-share-test.capnp` / `wasm-share-test.js` —
+  end-to-end check against a built workerd that two workers can instantiate,
+  call and trap in the same Wasm modules from their own turns. V8 holds a
+  compiled module and the index of its code ranges for the whole process, so
+  each step reads or writes what the other worker placed. Negative builds:
+  `--copt=-DWORKERD_GK_NEG_WASM_MODULE_CACHE`, where the second worker's
+  instantiation faults incrementing the shared module's refcount, and
+  `--copt=-DWORKERD_GK_NEG_WASM_CODE_MANAGER`, where its trap faults looking
+  the trapping address up.
 - `tls-test.sh` / `tls-test.capnp` — end-to-end check against a built workerd
   that the guest-writable thread-locals the host reads after a JS turn do not
   carry a turn's value past it: a turn overwrites, from inside itself, the heap
@@ -1362,15 +1371,20 @@ so a crossing a turn makes on every dereference belongs on that path.
   under-an-embedder-shared-allocation-scope.patch`; installing the
   `WebAssembly` JS API canonicalizes the builtins' signatures on every
   `Context::New`, so the first isolate in the process places the
-  canonicalizer's containers and a later one's rehash moves them), the
-  thread's timer queue
+  canonicalizer's containers and a later one's rehash moves them), what V8's
+  wasm code manager indexes (the hooks of `patches/v8/0051-Index-wasm-code-
+  ranges-under-an-embedder-shared-allocation-scope.patch`; its map of code
+  space regions answers "which `NativeModule` is this program counter in?" for
+  a wasm trap, for stack iteration and for the deoptimizer, and every isolate
+  asks), the thread's timer queue
   entries (`TimerChannel` in `server.c++`), and the V8 platform's worker-thread
   task queues and job state (`jsg::V8PlatformWrapper`). It also covers the
   whole of an in-process Cap'n Proto call, which is every service binding and
   every JS RPC call; that one is described on its own below. Each use is a
   confidentiality concession: subrequest URLs and headers, response headers, a
-  service-binding callee's `IoContext`, whatever `Intl` formats, and the
-  canonical wasm type table, are readable from every isolate's ring 3.
+  service-binding callee's `IoContext`, whatever `Intl` formats, the canonical
+  wasm type table, and where in the process each wasm module's code lies, are
+  readable from every isolate's ring 3.
 
   One registration is placed by interposing on the call that makes it rather
   than by a scope at its site. Every function-local static with a non-trivial
@@ -1537,21 +1551,69 @@ so a crossing a turn makes on every dereference belongs on that path.
   negative build, `--copt=-DWORKERD_GK_NEG_ABORT_DEFER`, puts `wrap()` back
   under the subrequest wraps so that the teardown runs in the turn again.
 
-  The list is not complete yet. There are further process-wide registries that
-  grow from whichever isolate first needs an entry, and each one faults the
-  next isolate that reads it.
+  The last of those registries is V8's wasm engine. Two parts of the
+  process-wide `GlobalWasmState` reach a turn, and they are answered
+  differently, because only one of them is bookkeeping about the process rather
+  than about one worker's module. Only a worker that uses wasm reaches either.
 
-  The one that remains is V8's wasm engine. `WasmEngine`'s `NativeModuleInfo`
-  map and the per-isolate sets `UseNativeModuleInIsolate` fills, the
-  `NativeModuleCache` keyed on wire bytes, `WasmCodeManager`'s allocation pool
-  and each `NativeModule`'s own code vectors are members of the process-wide
-  `GlobalWasmState`, with no embedder allocator between them and
-  `operator new`, so they need a V8 patch of the same shape as the two that
-  exist. The type canonicalizer, which patch `0050` places, is only one part of
-  that state: two workers instantiating the same module from a turn still fault
-  in `wasm::InstanceBuilder::InstanceBuilder`, reached from
-  `WasmEngine::SyncInstantiate`, on an entry the first worker's turn wrote.
-  Only a worker that uses wasm reaches it.
+  A compiled module is shared between workers. V8 keeps one `NativeModule` per
+  distinct set of wire bytes for the whole process (`NativeModuleCache`), so
+  two workers that supply the same module get the same `NativeModule`, the same
+  wire bytes, the same decoded `WasmModule` and the same `std::shared_ptr`
+  owning them, all in the arena of whichever worker compiled first. The second
+  worker's instantiation faults incrementing that refcount, `lock incq
+  0x8(%rax)` in `wasm::InstanceBuilder::InstanceBuilder` reached from
+  `WasmEngine::SyncInstantiate`. The shared heap is the wrong place for it: a
+  module's wire bytes and its decoded form are the worker's own, and the shared
+  heap is readable from every isolate's ring 3, which is the line the shared
+  memory cache fails (`memory-classes.md`, "The shared memory cache"). The
+  cache is keyed on those bytes besides, so a hit is a cross-tenant channel in
+  its own right. So the sharing is off instead: `jsg/setup.c++` sets
+  `--no-wasm-native-module-cache` whenever heap arenas are available, and each
+  worker compiles its own copy into its own arena. The cost is that identical
+  modules are compiled once per worker; the gain is that nothing a worker's
+  module is made of leaves that worker's arena.
+
+  The index of code ranges is about every module in the process rather than
+  about one. `WasmCodeManager::lookup_map_` maps each code space region to its
+  `NativeModule`, and `LookupCode()` descends it to resolve a program counter
+  for a wasm trap, for stack iteration and for the deoptimizer, from whichever
+  isolate is running. A second worker's trap faults in
+  `WasmCodeManager::LookupCode` on a node the first worker's compile placed.
+  That one goes in the shared heap, by `patches/v8/0051-Index-wasm-code-ranges-
+  under-an-embedder-shared-allocation-scope.patch`, which runs the map's two
+  insertions under a hook pair of the same shape as `0049`'s and `0050`'s. A
+  node holds a code address range and a `NativeModule*`, so what every ring 3
+  can read is where in the process each module's code lies and nothing of what
+  the module is or does.
+
+  Nothing else of that state reaches a turn in this configuration, because
+  `workerd` forbids wasm code generation from JS -- `new WebAssembly.Module`
+  throws "Wasm code generation disallowed by embedder" -- so every compilation
+  happens while a worker's modules are evaluated. `WasmEngine`'s
+  `NativeModuleInfo` map, the per-isolate sets `UseNativeModuleInIsolate` fills
+  and the code manager's allocation pool are grown under a lock and outside
+  every turn, and what a turn does reach through them -- the module the engine
+  hands it, the code the manager compiles lazily for it -- is its own.
+
+  `src/workerd/experimental/guest-kernel/wasm-share-test.sh` checks both halves
+  against a running server: two workers embedding the same two modules, each
+  instantiating, calling and trapping in both from its own turns, in both
+  orders. Each half has a negative build:
+  `--copt=-DWORKERD_GK_NEG_WASM_MODULE_CACHE`, where the second worker's
+  instantiation faults on the shared module's refcount, and
+  `--copt=-DWORKERD_GK_NEG_WASM_CODE_MANAGER`, where its trap faults looking
+  the trapping address up.
+
+  One configuration is not covered. With the `new_module_registry`
+  compatibility flag a worker's modules are evaluated inside a turn, so its
+  wasm compiles at ring 3 and the engine's own registries do cross: the second
+  worker's compile faults inserting into `WasmEngine::native_modules_`. Neither
+  that nor the rest of the compile path is placed, because a fault there costs
+  more than a fault in a turn: the isolate is condemned while its modules are
+  being evaluated, with no request to fail, so the worker never serves at all.
+  That configuration needs the evaluation taken out of the turn before any
+  placement in it is worth something.
 
   The thread's event loop needs more than placement. Its run queue is an
   intrusive doubly linked list through the queued events, so arming an event
