@@ -75,6 +75,26 @@ which runs each isolate's JS turn at guest ring 3.
   worker whose bindings were compiled, and the peer's first read faults on it.
   `memory-classes.md`, "The shared memory cache", says why the shared heap is
   not where the cache goes and what placement is.
+- `memory-cache-v2-arena-test.sh` / `memory-cache-v2-arena-test.capnp` /
+  `memory-cache-v2-arena-test.js` — end-to-end check against a built workerd of
+  what the Rust memory cache (`MEMORY_CACHE_V2`, `api/memory-cache-v2.c++` over
+  `src/rust/memory-cache`) does under per-isolate heap arenas, with four
+  workers: two configured with one cache id and two with none. The second of
+  the two sharers reads first, before the other has touched the cache, so that
+  what it faults on is fixed by bind order and not by use; its turn faults
+  inside the guest at the cache the first binder's arena holds, that request
+  fails, only that isolate is condemned, the first binder keeps serving the
+  same id, the workers with a cache of their own keep serving, and workerd
+  stays up. Without heap arenas the same configuration shares the cache across
+  the two isolates, which is the behaviour the id is documented to have. The
+  script runs both implementations against the same binary and compares where
+  in the arena each one faulted, which is what tells from outside which of them
+  ran: they have no behaviour a request can tell apart, by design. That
+  comparison is also how it shows that the `autogates` entry its own config
+  carries selects nothing — `serve` builds the `MemoryCacheProvider` that reads
+  the gate in `CliMain`'s constructor, before the config the gate list comes
+  from is parsed — and that what does select the crate is the presence of
+  `WORKERD_ALL_AUTOGATES` in the environment.
 - `surface-test.sh` / `surface-test.capnp` / `surface-test.js` / `add.wasm` /
   `oob.wasm` — end-to-end check against a built workerd that a broad V8 surface
   (Wasm including an out-of-bounds trap, WebCrypto, irregexp and a JIT-heavy

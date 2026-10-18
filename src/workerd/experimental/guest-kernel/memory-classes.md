@@ -1091,14 +1091,34 @@ the first binder's arena (`bind()` runs host-side under that lock), its entries
 and `Bytes` values in the leader's (`succeed()` runs in the leader's turn), a
 hit's `Bytes` clone is a refcount write into the leader's arena, and the
 `tokio::sync::watch` completion the leader sends wakes every waiter's future
-from the leader's turn, a write into each waiter's arena. It has not been run
-under heap arenas. Its FFI already crosses by value -- limits, decisions and
+from the leader's turn, a write into each waiter's arena.
+`memory-cache-v2-arena-test.sh` runs it there, and the first of those crossings
+is as far as a request gets: the second of two workers configured with one
+cache id faults inside the guest on its first cache read, at the `Cache` in the
+first binder's arena, with the entries, the `Bytes` clone and the `watch`
+completion all out of reach behind it. That request fails, only that isolate is
+condemned, the first binder goes on serving the same id, a worker whose binding
+has no id is served from its own arena, and workerd stays up: what breaks is
+the sharing the id promises, not the crate. The unplaced C++ cache faults in
+the same step at its own instance, a different place in the same arena, which
+is how the script tells which of the two implementations ran -- they have no
+behaviour a request can tell apart. Which it is, is not something a
+configuration file decides: `serve` builds the one `MemoryCacheProvider` in
+`CliMain`'s constructor, which is before the config carrying the `autogates`
+entry is parsed and so before `Autogate::initAutogate` has installed any gate
+list, so the entry (and `--all-autogates`, parsed later still) reaches the
+provider too late and selects nothing. What does select the crate is the
+presence of `WORKERD_ALL_AUTOGATES` in the environment, which
+`Autogate::isEnabled` falls back to while no gate list is installed.
+Its FFI already crosses by value -- limits, decisions and
 trace structs rather than pointers -- which is the shape the hostcall interface
 needs; its state would move to H memory the same way.
 
 While the cache is unplaced, `memory-cache-fault-test.sh` fails at its second
 step on the heap-arena build, which is the correct result for a placement that
-has not been made.
+has not been made. `memory-cache-v2-arena-test.sh` asserts that same fault from
+the other side, for both implementations, so placing either one turns its arm
+of that script into a failure rather than leaving the script quietly passing.
 
 ## Inventory: `util/`
 
