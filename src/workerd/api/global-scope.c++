@@ -44,10 +44,12 @@
 #include <v8-microtask-queue.h>
 
 #ifdef __linux__
+#include <setjmp.h>
 #include <signal.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 #endif
 
@@ -670,6 +672,197 @@ uint64_t* otherThreadTargetForTest(const OtherThreadLoopForTest& other) {
   if (other.slot != nullptr) return reinterpret_cast<uint64_t*>(other.slot);
   return other.anchor;
 }
+
+// __cxa_get_globals is part of the Itanium C++ ABI and statically linked into this binary, but it
+// is not declared in the public <cxxabi.h>; declare it here. It returns a pointer to the calling
+// thread's __cxa_eh_globals, whose first member is caughtExceptions.
+extern "C" void* __cxa_get_globals() noexcept;
+
+// Cross-thread reach of the C++ exception runtime's caughtExceptions pointer (see
+// /__gk_eh_poison below). This is the sharpest of the technique-A thread-locals: a write to it
+// steers __cxa_end_catch, on the Itanium ABI's foreign-exception path, into an indirect call
+// through a forged exception's exception_cleanup -- a jump to a guest-chosen address on a thread
+// holding no isolate lock.
+//
+// The victim is a thread that throws and catches a C++ exception without the isolate lock, which
+// in a serve configured with moduleFallback is the fallback-service thread
+// (FallbackServiceClient::threadMain throws and catches on every failed fetch). This reproduces
+// that thread with a stand-in, for the reason event-loop-cross-test.sh gives for the loop
+// pointer: the server's services share one event-loop thread, and that thread blocks in
+// FallbackServiceClient::tryResolve for the whole of a real resolution, so no concurrent JS turn
+// reaches the fallback thread's caughtExceptions in the window between __cxa_begin_catch and
+// __cxa_end_catch. The stand-in throws and catches a real kj::Exception and holds inside the real
+// catch handler, which lets a turn write the word in-window; the consumer is the real libc++abi
+// __cxa_end_catch either way.
+//
+// The forged __cxa_exception leaves its unwindHeader.exception_class zero, so __isOurException
+// Class treats it as foreign and __cxa_end_catch reaches _Unwind_DeleteException, which calls
+// unwindHeader.exception_cleanup. That pointer is a sentinel in unmapped memory, so control
+// reaching it faults at that exact rip; a SIGSEGV handler on the victim thread records it.
+// rip == the sentinel is the proof that the indirect call transferred control there, as distinct
+// from any incidental data fault.
+constexpr uintptr_t EH_CLEANUP_SENTINEL_FOR_TEST = 0x00005e5e5e5e5e5eull;
+constexpr uint64_t EH_CLASS_MASK_FOR_TEST = 0xffffffffffffff00ull;
+constexpr uint64_t EH_CLASS_CLANG_FOR_TEST = 0x434c4e47432b2b00ull;  // "CLNGC++\0"
+constexpr uint64_t EH_CLASS_GNU_FOR_TEST = 0x474e5543432b2b00ull;    // "GNUCC++\0"
+
+struct EhVictimForTest {
+  std::atomic<void**> ehGlobals{nullptr};    // &caughtExceptions on the victim thread
+  std::atomic<uint64_t*> anchor{nullptr};    // the victim's &tlsAnchorForTest, for the delta check
+  std::atomic<void*> nativeHeader{nullptr};  // the real __cxa_exception while held in-catch
+  std::atomic<bool> armed{false};            // the victim is in-catch and its state is published
+  std::atomic<bool> poisoned{false};         // a turn has written the forged pointer
+  std::atomic<bool> faulted{false};
+  std::atomic<bool> endCatchReturned{false};  // end_catch ran without reaching the sentinel
+  std::atomic<uintptr_t> faultRip{0};
+  std::atomic<uintptr_t> faultAddr{0};
+  sigjmp_buf recover;
+};
+EhVictimForTest* ehVictimForTest = nullptr;
+
+// The forged __cxa_exception, in this binary's .bss where the victim thread (host code) reads it.
+// Large enough to hold unwindHeader at whatever offset this toolchain's __cxa_exception puts it;
+// that offset is derived at arm time from a real native header.
+byte forgedCxaExceptionForTest[1024] = {};
+bool ehForgedReadyForTest = false;
+int ehHeaderOffsetForTest = -1;
+struct sigaction ehOldSegvForTest = {};
+
+// Async-signal-safe: write "...; rip=0x..; addr=0x..\n" to stderr, which is the workerd log.
+void writeEhFaultLineForTest(uintptr_t rip, uintptr_t addr) {
+  static const char kPrefix[] =
+      "WORKERD_GK_TEST_PROBE: the C++ unwinder called through the forged cleanup pointer; rip=0x";
+  static const char kAddr[] = "; addr=0x";
+  static const char kHex[] = "0123456789abcdef";
+  char buf[256];
+  size_t n = 0;
+  for (size_t i = 0; i < sizeof(kPrefix) - 1; i++) buf[n++] = kPrefix[i];
+  for (int s = 60; s >= 0; s -= 4) buf[n++] = kHex[(rip >> s) & 0xf];
+  for (size_t i = 0; i < sizeof(kAddr) - 1; i++) buf[n++] = kAddr[i];
+  for (int s = 60; s >= 0; s -= 4) buf[n++] = kHex[(addr >> s) & 0xf];
+  buf[n++] = '\n';
+  ssize_t r = ::write(STDERR_FILENO, buf, n);
+  (void)r;
+}
+
+void ehVictimSigsegvForTest(int sig, siginfo_t* si, void* uc) {
+  auto* ctx = static_cast<ucontext_t*>(uc);
+  // REG_RIP is index 16 of gregs on x86-64 Linux, where this probe runs.
+  uintptr_t rip = static_cast<uintptr_t>(ctx->uc_mcontext.gregs[16]);
+  if (ehVictimForTest != nullptr && rip == EH_CLEANUP_SENTINEL_FOR_TEST) {
+    uintptr_t addr = reinterpret_cast<uintptr_t>(si->si_addr);
+    ehVictimForTest->faultRip.store(rip);
+    ehVictimForTest->faultAddr.store(addr);
+    ehVictimForTest->faulted.store(true);
+    writeEhFaultLineForTest(rip, addr);
+    siglongjmp(ehVictimForTest->recover, 1);
+  }
+  // Not the steer: restore whatever handler was here before (V8's trap handler, or the default)
+  // and let the instruction re-run into it, so a genuine crash elsewhere is not swallowed.
+  ::sigaction(sig, &ehOldSegvForTest, nullptr);
+}
+
+// The victim thread: throw and catch a real kj::Exception (as a failed fallback fetch does), hold
+// inside the catch handler with the state published, and let __cxa_end_catch run once the turn
+// has poisoned caughtExceptions.
+void ehVictimThreadMainForTest() {
+  auto* v = ehVictimForTest;
+  tlsAnchorForTest = TLS_ANCHOR_MAGIC;
+  v->anchor.store(&tlsAnchorForTest);
+  {
+    struct sigaction sa {};
+    sa.sa_sigaction = &ehVictimSigsegvForTest;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    ::sigaction(SIGSEGV, &sa, &ehOldSegvForTest);
+  }
+  if (sigsetjmp(v->recover, 1) == 0) {
+    try {
+      kj::throwFatalException(
+          KJ_EXCEPTION(DISCONNECTED, "guest-kernel probe: a failed fallback fetch's exception"));
+    } catch (kj::Exception& exception) {
+      // Inside the real catch handler: __cxa_begin_catch has set caughtExceptions to this native
+      // exception. Publish eh_globals and the native header, then hold until a turn writes the
+      // forged pointer. The handler's scope closes below, running __cxa_end_catch against it.
+      (void)exception;
+      void** eh = reinterpret_cast<void**>(__cxa_get_globals());
+      v->ehGlobals.store(eh);
+      v->nativeHeader.store(eh[0]);
+      v->armed.store(true);
+      for (int i = 0; i < 100000 && !v->poisoned.load(); i++) ::usleep(1000);
+    }
+    // __cxa_end_catch returned without faulting: the forged value was not consumed. A build that
+    // closed the hole would land here.
+    v->endCatchReturned.store(true);
+  }
+  // Recovered from the steer, or end_catch returned: park for the life of the process.
+  for (;;) ::pause();
+}
+
+// Host-side, on the event loop: start the stand-in, identify its eh_globals the fixed-offset way,
+// and build the forged exception. A turn could do none of this; it does only the one write in
+// /__gk_eh_poison. Identification is by constant delta from the anchor, as the memory-classes.md
+// R7 row describes: eh_globals sits at the same offset from tlsAnchorForTest in every thread's
+// static TLS block, so the victim's eh_globals must be the same delta from the victim's anchor as
+// this thread's eh_globals is from this thread's anchor.
+void armEhVictimForTest(kj::StringPtr url) {
+  if (ehVictimForTest != nullptr) return;
+  ehVictimForTest = new EhVictimForTest();
+  {
+    kj::Thread thread([]() { ehVictimThreadMainForTest(); });
+    thread.detach();
+  }
+  auto* v = ehVictimForTest;
+  for (int i = 0; i < 2000 && !v->armed.load(); i++) ::usleep(1000);
+
+  void** mineEh = reinterpret_cast<void**>(__cxa_get_globals());
+  uint64_t* mineAnchor = &tlsAnchorForTest;
+  void** theirEh = v->ehGlobals.load();
+  uint64_t* theirAnchor = v->anchor.load();
+  int64_t mineDelta = reinterpret_cast<char*>(mineEh) - reinterpret_cast<char*>(mineAnchor);
+  int64_t theirDelta = 0;
+  bool deltaMatches = false;
+  if (theirEh != nullptr && theirAnchor != nullptr) {
+    theirDelta = reinterpret_cast<char*>(theirEh) - reinterpret_cast<char*>(theirAnchor);
+    deltaMatches = mineDelta == theirDelta;
+  }
+
+  // Derive the offset of unwindHeader within __cxa_exception from a real native header, and build
+  // the forged exception: exception_class left zero (foreign), exception_cleanup the sentinel.
+  int headerOffset = -1;
+  uint64_t classMagic = 0;
+  void* native = v->nativeHeader.load();
+  if (native != nullptr) {
+    auto* p = reinterpret_cast<const byte*>(native);
+    for (int off = 0; off + 8 <= 512; off += 8) {
+      uint64_t q = 0;
+      memcpy(&q, p + off, sizeof(q));
+      if ((q & EH_CLASS_MASK_FOR_TEST) == EH_CLASS_CLANG_FOR_TEST ||
+          (q & EH_CLASS_MASK_FOR_TEST) == EH_CLASS_GNU_FOR_TEST) {
+        headerOffset = off;
+        classMagic = q;
+        break;
+      }
+    }
+  }
+  if (headerOffset >= 0 &&
+      headerOffset + 16 <= static_cast<int>(sizeof(forgedCxaExceptionForTest))) {
+    memset(forgedCxaExceptionForTest, 0, sizeof(forgedCxaExceptionForTest));
+    uintptr_t sentinel = EH_CLEANUP_SENTINEL_FOR_TEST;
+    memcpy(forgedCxaExceptionForTest + headerOffset + 8, &sentinel, sizeof(sentinel));
+    ehHeaderOffsetForTest = headerOffset;
+    ehForgedReadyForTest = true;
+  }
+  auto mineEhAt = hexAddrForTest(mineEh);
+  auto theirEhAt = hexAddrForTest(theirEh);
+  auto theirAnchorAt = hexAddrForTest(theirAnchor);
+  kj::StringPtr deltaVerdict = deltaMatches ? "match"_kj : "mismatch"_kj;
+  kj::StringPtr forgedVerdict = ehForgedReadyForTest ? "forged"_kj : "not-forged"_kj;
+  auto classMagicHex = kj::str("0x", kj::hex(classMagic));
+  KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the fallback-thread stand-in's exception runtime", url,
+      mineEhAt, theirEhAt, theirAnchorAt, mineDelta, theirDelta, deltaVerdict, headerOffset,
+      classMagicHex, forgedVerdict);
+}
 #endif  // __linux__
 
 void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
@@ -982,6 +1175,52 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
             verdict);
         // Put the other thread's own value back either way, so it is not left broken.
         *word = other.slot != nullptr ? reinterpret_cast<uint64_t>(other.loop) : TLS_ANCHOR_MAGIC;
+      }
+    }));
+  }
+  // The C++ exception runtime's caughtExceptions pointer on a throwing thread that holds no
+  // isolate lock (see the comment above armEhVictimForTest). eh-globals-cross-test.sh.
+  if (probeEnabled && url.endsWith("/__gk_eh_arm")) {
+    // Host-side: start the stand-in, identify its eh_globals and build the forged exception.
+    IoContext::current().addTask(
+        kj::evalLater([url = kj::str(url)]() { armEhVictimForTest(url); }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_eh_poison")) {
+    if (ehVictimForTest != nullptr && ehForgedReadyForTest) {
+      auto* v = ehVictimForTest;
+      // At ring 3, inside the turn: the one write of the stand-in thread's caughtExceptions, the
+      // same reach /__gk_loop_other_poison shows for the loop pointer, aimed at eh_globals. A
+      // page the arena does not map would fault the turn here; this word is in the stand-in's
+      // static TLS block, which the arena maps, so it lands.
+      void** eh = v->ehGlobals.load();
+      void* volatile* w = reinterpret_cast<void* volatile*>(eh);
+      void* before = w[0];
+      w[0] = &forgedCxaExceptionForTest[0];
+      void* after = w[0];
+      auto wordAt = hexAddrForTest(eh);
+      auto beforeAt = hexAddrForTest(before);
+      auto afterAt = hexAddrForTest(after);
+      auto forgedAt = hexAddrForTest(&forgedCxaExceptionForTest[0]);
+      auto sentinelAt = kj::str("0x", kj::hex(EH_CLEANUP_SENTINEL_FOR_TEST));
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: wrote the fallback-thread stand-in's caughtExceptions from "
+          "inside the JS turn",
+          url, wordAt, beforeAt, afterAt, forgedAt, sentinelAt, ehHeaderOffsetForTest);
+      v->poisoned.store(true);
+    }
+  }
+  if (probeEnabled && url.endsWith("/__gk_eh_check")) {
+    IoContext::current().addTask(kj::evalLater([url = kj::str(url)]() {
+      if (ehVictimForTest != nullptr) {
+        auto* v = ehVictimForTest;
+        bool faulted = v->faulted.load();
+        uintptr_t rip = v->faultRip.load();
+        kj::StringPtr verdict = (faulted && rip == EH_CLEANUP_SENTINEL_FOR_TEST) ? "sentinel"_kj
+            : faulted                                                            ? "other-fault"_kj
+            : v->endCatchReturned.load() ? "end-catch-returned"_kj
+                                         : "pending"_kj;
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the steer's outcome on the stand-in thread", url,
+            kj::str("0x", kj::hex(rip)), kj::str("0x", kj::hex(v->faultAddr.load())), verdict);
       }
     }));
   }

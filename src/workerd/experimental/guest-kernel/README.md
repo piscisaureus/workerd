@@ -173,6 +173,27 @@ which runs each isolate's JS turn at guest ring 3.
   memory the arena maps, so a thread between turns can be made to run its
   next one on a loop a foreign turn chose. The probe pins that residual
   rather than preventing it, so a build that closed it fails here.
+- `eh-globals-cross-test.sh` / `eh-globals-cross-test.capnp` /
+  `eh-globals-cross-test.js` — end-to-end check against a built workerd of the
+  sharpest cross-thread thread-local steer: a JS turn writes the C++ exception
+  runtime's per-thread `caughtExceptions` pointer of a thread that throws and
+  catches a C++ exception while holding no isolate lock, and that thread's
+  `__cxa_end_catch` then calls through a forged `exception_cleanup` -- an
+  indirect call to a guest-chosen address. The config starts the real module
+  fallback service (`moduleFallback` plus `--experimental`), whose thread has
+  that shape, and `/__gk_fallback_poke` drives a real failed resolution so it
+  throws and catches for real; but the server's services share one event-loop
+  thread, which blocks in `FallbackServiceClient::tryResolve` for the whole of
+  a real resolution, so no concurrent turn reaches that thread's
+  `caughtExceptions` in the window between `__cxa_begin_catch` and
+  `__cxa_end_catch`. So, as `event-loop-cross-test.sh` does for the loop
+  pointer, the steer is driven against a stand-in that throws and catches a
+  real `kj::Exception` and holds inside the real catch handler; the consumer is
+  the real libc++abi `__cxa_end_catch` either way. The forged
+  `__cxa_exception`'s `exception_cleanup` is a sentinel in unmapped memory, so
+  a pass requires the faulting `rip` to be that sentinel, not any incidental
+  fault. A build that refused `moduleFallback` under the guest kernel (the
+  candidate remedy) would fail to start this config, failing the probe.
 - `disk-sqlite-test.sh` / `disk-sqlite-test.capnp` / `disk-sqlite-test.js` —
   end-to-end check against a built workerd that a SQLite-backed Durable Object
   stored on local disk works with its JS turns at guest ring 3, where SQLite's
