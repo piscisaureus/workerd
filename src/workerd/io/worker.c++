@@ -1296,13 +1296,18 @@ Worker::Isolate::Isolate(kj::Own<Api> apiParam,
     // stdout. Add a callback that instead writes the message to KJ_LOG
     lock->v8Isolate->AddMessageListener(messageCallback);
 
-    // By default, V8's memory pressure level is "none". This tells V8 that no one else on the
-    // machine is competing for memory so it might as well use all it wants and be lazy about GC.
-    //
-    // In our production environment, however, we can safely assume that there is always memory
-    // pressure, because every machine is handling thousands of tenants all the time. So we might
-    // as well just throw the switch to "moderate" right away.
-    lock->v8Isolate->MemoryPressureNotification(v8::MemoryPressureLevel::kModerate);
+    // V8's memory pressure level stays at "none". A kModerate notification would not raise it
+    // for long: Heap::CheckMemoryPressure() resets the level to kNone before it dispatches on
+    // it, so nothing that consults HighMemoryPressure() -- the incremental-marking limit,
+    // ShouldOptimizeForMemoryUsage(), the lazy-compilation choice -- ever sees the pressure.
+    // What a notification does reach is FreeCachesOnMemoryPressure(), which runs in full for any
+    // level but kNone. On an isolate this new its compilation cache and serializer data are
+    // empty and no optimization job is running, so what is left of it is flushing the wasm
+    // engine's Liftoff code, which is process-wide, and releasing the isolate group's page and
+    // zone pools -- those of every isolate in the process, except under the guest kernel, where
+    // each isolate has a group of its own. Either way, nothing is gained for this isolate.
+    // Isolate::SetMemorySaverMode() is the setting that does persist, for whoever has the
+    // production numbers to judge it by.
 
     // Register GC prologue and epilogue callbacks so that we can report GC CPU time via the
     // "request_context" Jaeger span.

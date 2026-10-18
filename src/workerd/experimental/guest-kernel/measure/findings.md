@@ -2565,17 +2565,17 @@ has to come from, and is still left to whoever has the production numbers.
 
 ### Found on the way
 
-**V8 drops the same caches once per isolate at startup, for `kModerate`.**
-`worker.c++` tells a new isolate's heap that there is moderate memory pressure,
+**V8 dropped the same caches once per isolate at startup, for `kModerate`.**
+`worker.c++` told a new isolate's heap that there is moderate memory pressure,
 on the reasoning that a machine serving thousands of tenants always has some.
 `CheckMemoryPressure` tests `HighMemoryPressure()`, which is true of any level
-but `kNone`, before it looks at which level it is, so `kModerate` runs
+but `kNone`, before it looks at which level it is, so `kModerate` ran
 `FreeCachesOnMemoryPressure` in full -- compilation cache, serializer data,
 concurrent optimization jobs, the group's page and zone pools, Liftoff code --
-and only then finds that there is nothing for `kModerate` to do without
-incremental marking. It is once per isolate rather than once per 64 MiB of
-bodies, so it is not what this section is about, but an isolate created while
-others are serving empties their page pools as it starts.
+and only then found that there is nothing for `kModerate` to do without
+incremental marking. It was once per isolate rather than once per 64 MiB of
+bodies, so it is not what this section is about; "The memory-pressure
+notification at isolate startup" below takes it up on its own.
 
 ### Caveats
 
@@ -2721,3 +2721,180 @@ through stdio -- so it takes no compatibility flag.
   a V8 flag that traced per allocation would pay a syscall a line.
 - **Only the SIGTERM path was exercised.** That a crash loses the buffer too
   follows from `_exit()` having no flush, and was not measured.
+
+## The memory-pressure notification at isolate startup
+
+### The question
+
+Every isolate, as it was created, told V8 that memory pressure is moderate
+(`io/worker.c++`), on the reasoning that a machine serving thousands of tenants
+always has some. V8 reacts to a notification before it looks at which level it
+is, and the reaction is the one it keeps for a process about to run out of
+memory. What the call was for, what it does, and what removing it costs.
+
+### What it was for
+
+It arrives with this repository's first commit (`a265d5c22`, September 2022) and
+has not been touched since, comment included: V8's default level says nobody
+else is competing for memory, so it "might as well use all it wants and be lazy
+about GC", and a production machine is never in that position. Nothing in the
+tree reads an effect of it back -- no test, no counter, and no other call to
+`MemoryPressureNotification` anywhere in `src/`. So what it was for is what the
+comment says: a standing state, V8 kept a little less lazy for the life of the
+isolate.
+
+### What kModerate does in this V8, read from the source
+
+`Isolate::MemoryPressureNotification` (`src/api/api.cc`) finds the isolate
+locked by the calling thread, which it is here -- `Worker::Isolate::Impl::Lock`
+holds a `v8::Locker` -- and so calls `Heap::CheckMemoryPressure()` inline rather
+than posting it. That function, in order:
+
+1. tests `HighMemoryPressure()`, true of any level but `kNone`, and on that runs
+   `FreeCachesOnMemoryPressure(isolate(), kMemoryPressure)`;
+2. exchanges the level back to `kNone`, so that a collection's finalizers cannot
+   recurse into it;
+3. dispatches on the level it just took away: `kCritical` collects, `kModerate`
+   starts incremental marking if `v8_flags.incremental_marking`, which
+   `--noincremental-marking` makes false in every workerd build.
+
+Step 3 therefore does nothing, and step 2 is why the standing state the comment
+asks for does not exist: by the time the call returns the level is `kNone`
+again, and everything that consults `HighMemoryPressure()` afterwards -- the
+incremental-marking limit, `ShouldOptimizeForMemoryUsage()`, the eager-compile
+choice in `src/codegen/compiler.cc` -- sees no pressure. The notification is not
+a setting; it is one event.
+
+What the event does is step 1, whose own comment says what it is for: the method
+"assumes that callsites are close to crashing and will very aggressively free
+memory". With the reason `kMemoryPressure` it takes that branch in full:
+`AbortConcurrentOptimization`, `ClearSerializerData()`,
+`compilation_cache()->Clear()`, `memory_pool()->ReleaseAllImmediately()` and,
+`v8_flags.flush_liftoff_code` being on by default,
+`wasm::GetWasmEngine()->FlushLiftoffCode()`.
+
+On an isolate this new the first three have nothing to do: its compilation cache
+and serializer data are empty and no optimization job of its own can be running.
+The last two reach past it. The Liftoff flush is engine-wide, so it discards the
+baseline code of every wasm module in the process. The pool release is
+group-wide: `ReleaseAllImmediately()` drops the pooled pages and zone
+reservations of every isolate in the group, and in every build but the arena one
+that is every isolate in the process, because `jsg::newIsolateGroup()` returns
+`IsolateGroup::GetDefault()` unless the guest kernel is on, where each isolate
+gets a group of its own. So what the notification achieves is that a new
+isolate's startup empties caches belonging to the isolates already serving.
+
+### Method
+
+`measure/coldstart.py` in `loader` mode: one workerd holding a worker-loader
+host, asked for a tenant it has never loaded, timing the request that creates
+the isolate and compiles its module, and the same request again as the warm
+baseline. That is the shape in which a group-wide pool drop should show, because
+the process accumulates isolates and every new one drops what the others
+pooled. One binary serves both arms through a knob that was reverted before
+committing and is not part of the tree, `WORKERD_GK_MEASURE_PRESSURE=notify`,
+which restores the notification in `Worker::Isolate`'s constructor; unset is the
+tree as committed. The default build (tcmalloc, guest kernel off), which is the
+cell where the group is shared, on CPUs 12-17,36-41, the arms interleaved round
+by round with a fresh launch each. Two cells: eight launches per arm of 60
+isolates, and four of 300. The VMSCAPE mitigation read `Mitigation: IBPB before
+exit to userspace` and `kvm.halt_poll_ns` 200000 before and after both.
+
+### 1. Cold start, per launch
+
+Microseconds, launches in round order. `cold p50` is the median over a launch's
+new tenants of the first response to one; `new isolate` is that minus the same
+request repeated warm.
+
+| cell | arm    | cold p50, per launch                      |
+| ---- | ------ | ----------------------------------------- |
+| 60   | notify | 1684 1667 1671 1693 1664 1704 1684 1656   |
+| 60   | none   | 1682 1660 1682 1655 1686 1702 1686 1693   |
+| 300  | notify | 1676 1653 1691 1685                       |
+| 300  | none   | 1662 1657 1651 1663                       |
+
+| cell | arm    | new isolate, per launch                   |
+| ---- | ------ | ----------------------------------------- |
+| 60   | notify | 1563 1547 1552 1571 1543 1582 1565 1538   |
+| 60   | none   | 1560 1542 1559 1535 1564 1582 1567 1569   |
+| 300  | notify | 1553 1536 1569 1563                       |
+| 300  | none   | 1543 1539 1533 1545                       |
+
+| cell | arm    | fastest new tenant of the launch          |
+| ---- | ------ | ----------------------------------------- |
+| 60   | notify | 1635 1626 1632 1645 1612 1672 1652 1623   |
+| 60   | none   | 1647 1624 1638 1617 1635 1639 1646 1643   |
+| 300  | notify | 1622 1609 1630 1648                       |
+| 300  | none   | 1613 1609 1609 1610                       |
+
+What the rows say:
+
+- **Nothing separates the arms.** In the 60-isolate cell `notify` spans
+  1656-1704 us and `none` 1655-1702, and which arm is faster changes from round
+  to round. In the 300-isolate cell `notify` spans 1653-1691 against 1651-1663,
+  so the notification's spread covers the other's and sits a little above it --
+  the direction the source predicts, and under 2% of a cold start, which four
+  launches cannot call.
+- **The pool the release empties was empty.** Every `--trace-gc` line in these
+  measurements, here and in the two sections above, reads `pooled: 0.0 MB`.
+  Workers that serve one shape of request do not give pages back, so
+  `ReleaseAllImmediately()` had nothing to release and the group-wide drop cost
+  what the clock says it cost: nothing measurable.
+
+### The verdict
+
+Removed. The call cannot do what its comment asks -- the level it sets is taken
+away again before anything reads it -- and what it does instead is drop caches
+that belong to other isolates, at a moment when its own are empty. Cold start,
+the metric a group-wide pool drop would move, does not move either way, so what
+is removed is work with no measured effect in the shape most likely to show one;
+the case for removing it is the source, and the measurement is what says nothing
+depended on it.
+
+This changes what V8 does at startup in every build, not only the arena one.
+What a process keeps that it used to discard is its wasm baseline code and its
+pooled pages, both of which V8 reclaims on its own terms under real pressure, so
+the change retains memory rather than releasing it and nothing a worker can
+observe differs. It takes no compatibility flag. Should the standing state the
+old comment asked for ever be wanted, `Isolate::SetMemorySaverMode()` is the
+setting that persists; that is a policy change with a cost of its own and is
+left to whoever has the production numbers to set it against.
+
+### Found on the way
+
+**A benchmark whose live heap grows with the iteration count it is given.**
+`bench-jsstring` builds a tree of concatenated strings per iteration and keeps
+every one of them: the handles belong to a scope outside the loop, so the live
+heap grows with the iteration count the benchmark library picks, and the library
+picks that from how fast the first iterations run. Removing the notification was
+enough to move it: under `bazel test` the benchmark passed three runs of three
+with the notification and failed three of three without, on V8's heap limit with
+1368 MB live, and run outside the test sandbox both arms fail while the row
+before the failure reports 316,546 to 318,470 iterations with the notification
+and 379,492 to 385,665 without. With a handle scope per iteration -- a commit of
+its own -- the same row measures 1.05 us where it used to report 14.6 us, the
+difference being the collection of the heap it was filling, nothing reaches the
+limit in either arm, and the arms become indistinguishable: 634,703 to 644,798
+iterations against 640,096 to 643,269. So the benchmark says nothing about the
+notification beyond this: where a workload fills a heap, the notification is not
+nothing, and a measurement that sensitive to GC timing is not the instrument to
+say what it is.
+
+### Caveats
+
+- **The Liftoff flush was not measured.** No wasm module was in any of these
+  processes, so what a flush of the engine's baseline code costs the tenants
+  that have one is not known. A process serving wasm tenants is where removing
+  the notification should be worth the most, and that cell was not built.
+- **The pool was never populated in the cells that were timed.** The argument
+  that releasing it is pure loss rests on the source; in these workloads there
+  was nothing in it to lose, so neither arm paid. The one place the arms did
+  differ was a benchmark filling a gigabyte of heap, below, and what in it
+  differed was not isolated.
+- **The arena build was not a cell.** Under the guest kernel each isolate is its
+  own group, so the group-wide part of the drop has nothing to reach, and the
+  default build is where the effect would be. The change is in both builds all
+  the same.
+- **Cold start is one metric.** It covers the new isolate's own compile and
+  first turn; what the drop does to the throughput of the isolates already
+  serving was not measured separately.
