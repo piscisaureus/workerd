@@ -86,6 +86,8 @@ enum Index : unsigned {
                      // context torn down inside a turn (io/io-own.h, OwnedObjectList)
   MEMORY_CACHE = 6,  // read, publish, abandon or delete on a shared memory cache's host-side
                      // instance (api/memory-cache.h, SharedMemoryCache)
+  EVENT_QUEUE = 7,   // apply a turn's journaled arms and disarms to its loop's host-memory run
+                     // queue when the turn's slab fills (util/host-event-queue.h)
 };
 
 // Calls `entry`'s handler on `frame` and returns its result: a negative errno-style value from

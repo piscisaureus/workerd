@@ -33,6 +33,7 @@ http.archive(
         "//:patches/capnp-cpp/0002-Expose-the-disposer-of-an-Own.patch",
         "//:patches/capnp-cpp/0003-Move-the-event-queue-links-into-the-loop.patch",
         "//:patches/capnp-cpp/0004-Expose-the-thread-s-current-event-loop-pointer.patch",
+        "//:patches/capnp-cpp/0005-Let-an-embedder-relocate-the-run-queue.patch",
     ],
     sha256 = "d24206085fa53789f7395324cd7e3cf97082701ab30b1fd48fd2e1c3f0164385",
     strip_prefix = "capnproto-capnproto-b6147c5/c++",

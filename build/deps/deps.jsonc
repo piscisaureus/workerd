@@ -47,7 +47,8 @@
         "//:patches/capnp-cpp/0001-Start-the-symbolizer-subprocess-without-throwing.patch",
         "//:patches/capnp-cpp/0002-Expose-the-disposer-of-an-Own.patch",
         "//:patches/capnp-cpp/0003-Move-the-event-queue-links-into-the-loop.patch",
-        "//:patches/capnp-cpp/0004-Expose-the-thread-s-current-event-loop-pointer.patch"
+        "//:patches/capnp-cpp/0004-Expose-the-thread-s-current-event-loop-pointer.patch",
+        "//:patches/capnp-cpp/0005-Let-an-embedder-relocate-the-run-queue.patch"
       ]
     },
     // We want to avoid version skew with v8, so we use identical versions. Keep this

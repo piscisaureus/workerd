@@ -22,6 +22,7 @@
 #include <workerd/server/workerd-capnp-schema.embed.h>
 #include <workerd/server/workerd.capnp.h>
 #include <workerd/util/autogate.h>
+#include <workerd/util/host-event-queue.h>
 #include <workerd/util/entropy.h>
 #include <workerd/util/sqlite.h>
 
@@ -1713,6 +1714,8 @@ int main(int argc, char* argv[]) {
     workerd::hostMemory::installResolveHostcall();
     workerd::OwnedObjectList::installHostcall();
     workerd::api::SharedMemoryCache::installHostcall();
+    // The run queue moves into host memory and in-turn arms/disarms journal into it.
+    workerd::installHostEventQueue();
     // A turn's path syscalls land beneath the turn directory its VFS root hostcall set, or
     // nowhere (gk_confine_paths in gk.h). The test-only switch leaves them unconfined, so that
     // vfs-root-test.sh can show what the confinement prevents.

@@ -1,0 +1,323 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Sat, 18 Oct 2026 12:00:00 +0000
+Subject: Let an embedder relocate the run queue out of its events reach
+
+The run queue runs through links the loop keeps in its own memory, and the
+loop walks and mutates that list itself: arming an event takes a link off
+the loop's free list and splices it in, disarming unlinks one and returns
+it, and head() walks from the loop's head link. An embedder that runs the
+loop's work under memory isolation, where a unit of work may address only
+its own objects, cannot leave that memory where the work can write it: the
+list the host walks in turn() would then run through links a unit chose.
+
+Such an embedder installs EventQueueHooks, which take over every queue
+operation -- arming, disarming, the head and would-sleep walks, the
+depth-first reset turn() does around a fire(), and the loop's setup and
+teardown -- so the loop keeps the queue wherever the embedder puts it,
+out of the work's reach, and the work journals its arms and disarms for
+the embedder to apply rather than writing the list directly. With no hooks
+installed, which is the default, the loop uses its own inline queue exactly
+as before, so a build that installs none is unaffected.
+
+An armed event still keeps eight bytes naming its place. With no hooks they
+hold the EventLink* the loop gave it; with hooks the loop treats them as
+opaque and the embedder stores what names the place, keeping the loop's
+`link == nullptr` test for "not armed" (a zero value is unarmed either way).
+The event's size is unchanged. The loop names its relocated queue with a
+handle rather than a pointer, so that a handle a unit of work forges in the
+loop resolves, through the embedder's table, to no queue at all rather than
+to memory the unit chose.
+---
+diff --git a/src/kj/async.c++ b/src/kj/async.c++
+index ce134ff..779fc2b 100644
+--- a/src/kj/async.c++
++++ b/src/kj/async.c++
+@@ -1820,6 +1820,11 @@ _::EventLink* EventLoop::growLinks() {
+   return freeLinks;
+ }
+ 
++namespace _ {
++const EventQueueHooks* eventQueueHooks = nullptr;
++void setEventQueueHooks(const EventQueueHooks* hooks) { eventQueueHooks = hooks; }
++}  // namespace _
++
+ EventLoop::EventLoop(kj::Maybe<EventLoopObserver&> observer)
+     : loopId(nextEventLoopId.fetch_add(1, std::memory_order_relaxed)),
+       observer(observer), daemons(kj::heap<TaskSet>(_::LoggingErrorHandler::instance)) {
+@@ -1840,6 +1845,9 @@ EventLoop::EventLoop(kj::Maybe<EventLoopObserver&> observer)
+ 
+   // wouldSleepHead -> wouldSleepTail
+   chain(wouldSleepHead, wouldSleepTail);
++
++  // An embedder that relocates the run queue sets it up here, before the loop runs any work.
++  if (KJ_UNLIKELY(_::eventQueueHooks != nullptr)) _::eventQueueHooks->onLoopConstructed(*this);
+ }
+ 
+ EventLoop::EventLoop(EventPort& port, kj::Maybe<EventLoopObserver&> observer)
+@@ -1876,28 +1884,34 @@ EventLoop::~EventLoop() noexcept(false) {
+     break;
+   }
+ 
+-  // Whatever is still armed -- on the main queue or on the would-sleep one -- holds a link in a
+-  // chunk about to go away, and would write through it when it is destroyed, so cut every event
+-  // loose from its link before unmapping. (An event with no link is unarmed, which is what it
+-  // would have become anyway.)
+-  for (LinkChunk* chunk = linkChunks; chunk != nullptr; chunk = chunk->next) {
+-    _::EventLink* links = chunkLinks(chunk);
+-    for (size_t i = linksPerChunk(chunk->bytes); i > 0; i--) {
+-      _::EventLink& link = links[i - 1];
+-      if (link.event != nullptr) {
+-        link.event->link = nullptr;
+-        link.event = nullptr;
++  if (KJ_UNLIKELY(_::eventQueueHooks != nullptr)) {
++    // The embedder owns the relocated queue and its link pool; it tears them down and cuts any
++    // still-armed event loose from its place, as the inline path below does for the inline pool.
++    _::eventQueueHooks->onLoopDestroyed(*this);
++  } else {
++    // Whatever is still armed -- on the main queue or on the would-sleep one -- holds a link in a
++    // chunk about to go away, and would write through it when it is destroyed, so cut every event
++    // loose from its link before unmapping. (An event with no link is unarmed, which is what it
++    // would have become anyway.)
++    for (LinkChunk* chunk = linkChunks; chunk != nullptr; chunk = chunk->next) {
++      _::EventLink* links = chunkLinks(chunk);
++      for (size_t i = linksPerChunk(chunk->bytes); i > 0; i--) {
++        _::EventLink& link = links[i - 1];
++        if (link.event != nullptr) {
++          link.event->link = nullptr;
++          link.event = nullptr;
++        }
+       }
+     }
++    for (LinkChunk* chunk = linkChunks; chunk != nullptr;) {
++      LinkChunk* next = chunk->next;
++      size_t bytes = chunk->bytes;
++      unmapLinkChunk(chunk, bytes);
++      chunk = next;
++    }
++    linkChunks = nullptr;
++    freeLinks = nullptr;
+   }
+-  for (LinkChunk* chunk = linkChunks; chunk != nullptr;) {
+-    LinkChunk* next = chunk->next;
+-    size_t bytes = chunk->bytes;
+-    unmapLinkChunk(chunk, bytes);
+-    chunk = next;
+-  }
+-  linkChunks = nullptr;
+-  freeLinks = nullptr;
+ 
+   threadLocalEventLoop = nullptr;
+ }
+@@ -1928,6 +1942,10 @@ bool EventLoop::turn() {
+ 
+   auto resetDepthFirstInsertPoint = [this]() {
+     // move depthFirstInsertPoint to the head of the list
++    if (KJ_UNLIKELY(_::eventQueueHooks != nullptr && queueHandleValue != 0)) {
++      _::eventQueueHooks->resetDepthFirst(*this);
++      return;
++    }
+     if (headLink.next == &depthFirstInsertPoint) return;
+     depthFirstInsertPoint.unlink();
+     depthFirstInsertPoint.insertAfter(headLink);
+@@ -2004,7 +2022,10 @@ void EventLoop::leaveScope() {
+ }
+ 
+ void EventLoop::wait() {
+-  if (wouldSleepHead.next != &wouldSleepTail) {
++  bool wouldSleepWaiting = KJ_UNLIKELY(_::eventQueueHooks != nullptr && queueHandleValue != 0)
++      ? !_::eventQueueHooks->wouldSleepEmpty(*this)
++      : (wouldSleepHead.next != &wouldSleepTail);
++  if (wouldSleepWaiting) {
+     // Oh, someone wants to know when we are going to sleep. Use poll() instead so that we don't
+     // actually sleep. poll() will queue the would-sleep waiter if needed.
+     poll();
+@@ -2059,9 +2080,14 @@ void EventLoop::poll() {
+     e->poll();
+   }
+ 
+-  if (!isRunnable() && wouldSleepHead.next != &wouldSleepTail) {
++  bool wouldSleepWaiting = KJ_UNLIKELY(_::eventQueueHooks != nullptr && queueHandleValue != 0)
++      ? !_::eventQueueHooks->wouldSleepEmpty(*this)
++      : (wouldSleepHead.next != &wouldSleepTail);
++  if (!isRunnable() && wouldSleepWaiting) {
+     // We got nothing by polling. So, enqueue the next would-sleep event instead.
+-    _::Event* event = wouldSleepHead.next->event;
++    _::Event* event = KJ_UNLIKELY(_::eventQueueHooks != nullptr && queueHandleValue != 0)
++        ? _::eventQueueHooks->firstWouldSleep(*this)
++        : wouldSleepHead.next->event;
+     event->disarm();
+     event->armDepthFirst();
+   }
+@@ -2332,6 +2358,10 @@ void Event::permitSelfDestruction() {
+ void Event::armDepthFirst() {
+   if (link == nullptr) {
+     auto& loop = requireEventLoop();
++    if (KJ_UNLIKELY(eventQueueHooks != nullptr && loop.queueHandle() != 0)) {
++      eventQueueHooks->arm(loop, *this, ArmKind::DEPTH_FIRST);
++      return;
++    }
+     EventLink& queued = *loop.allocLink(*this);
+     queued.insertBefore(loop.depthFirstInsertPoint);
+     link = &queued;
+@@ -2342,6 +2372,10 @@ void Event::armDepthFirst() {
+ void Event::armBreadthFirst() {
+   if (link == nullptr) {
+     auto& loop = requireEventLoop();
++    if (KJ_UNLIKELY(eventQueueHooks != nullptr && loop.queueHandle() != 0)) {
++      eventQueueHooks->arm(loop, *this, ArmKind::BREADTH_FIRST);
++      return;
++    }
+     EventLink& queued = *loop.allocLink(*this);
+     queued.insertBefore(loop.breadthFirstInsertPoint);
+     link = &queued;
+@@ -2352,6 +2386,10 @@ void Event::armBreadthFirst() {
+ void Event::armLast() {
+   if (link == nullptr) {
+     auto& loop = requireEventLoop();
++    if (KJ_UNLIKELY(eventQueueHooks != nullptr && loop.queueHandle() != 0)) {
++      eventQueueHooks->arm(loop, *this, ArmKind::LAST);
++      return;
++    }
+     EventLink& queued = *loop.allocLink(*this);
+     queued.insertAfter(loop.breadthFirstInsertPoint);
+     link = &queued;
+@@ -2362,6 +2400,10 @@ void Event::armLast() {
+ void Event::armWhenWouldSleep() {
+   if (link == nullptr) {
+     auto& loop = requireEventLoop();
++    if (KJ_UNLIKELY(eventQueueHooks != nullptr && loop.queueHandle() != 0)) {
++      eventQueueHooks->arm(loop, *this, ArmKind::WHEN_WOULD_SLEEP);
++      return;
++    }
+     EventLink& queued = *loop.allocLink(*this);
+     queued.insertAfter(loop.wouldSleepHead);
+     link = &queued;
+@@ -2376,6 +2418,13 @@ bool Event::isNext() {
+ 
+ void Event::disarm() noexcept {
+   if (link != nullptr) {
++    if (KJ_UNLIKELY(eventQueueHooks != nullptr && threadLocalEventLoop != nullptr &&
++            threadLocalEventLoop->queueHandle() != 0)) {
++      // The loop owns this event's place (its token is not an EventLink* in this mode); it is
++      // found through the loop running on this thread, which an armed event always has.
++      eventQueueHooks->disarm(*threadLocalEventLoop, *this);
++      return;
++    }
+     EventLink& queued = *link;
+     link = nullptr;
+     queued.unlink();
+diff --git a/src/kj/async.h b/src/kj/async.h
+index 622ab10..9eb6e66 100644
+--- a/src/kj/async.h
++++ b/src/kj/async.h
+@@ -1341,6 +1341,50 @@ struct EventLink {
+   inline void insertAfter(EventLink& other) { insertBefore(*other.next); }
+ };
+ 
++enum class ArmKind: uint8_t {
++  // Which of an event loop's insert points an arm places an event at; the names match the Event
++  // methods armDepthFirst(), armBreadthFirst(), armLast() and armWhenWouldSleep().
++  DEPTH_FIRST,
++  BREADTH_FIRST,
++  LAST,
++  WHEN_WOULD_SLEEP
++};
++
++struct EventQueueHooks {
++  // Function pointers an embedder installs with setEventQueueHooks() to run every EventLoop's run
++  // queue out of memory the loop's own events can reach. When they are installed the loop delegates
++  // each queue operation to them and never touches its inline queue; when none are installed (the
++  // default) the loop walks and mutates that inline queue itself, so a build that installs nothing
++  // behaves exactly as it would without this. An embedder that runs the loop's work under memory
++  // isolation keeps the queue in memory the work cannot address and lets the work journal its arms
++  // and disarms rather than write that memory directly; the hooks are where that redirection lives.
++  //
++  // arm() enqueues `event` at `kind`'s insert point; disarm() removes it if armed; both run for the
++  // loop whose turn, or whose host-side frame, is arming or disarming. head() returns the first
++  // event in the main queue or null when it holds none. wouldSleepEmpty() is whether the separate
++  // would-sleep queue is empty and firstWouldSleep() is its first event. resetDepthFirst() moves the
++  // depth-first insert point back to the head of the main queue, as turn() does around a fire().
++  // onLoopConstructed()/onLoopDestroyed() let the embedder set up and tear down the loop's relocated
++  // queue; onLoopDestroyed() replaces the inline teardown of the link pool.
++  void (*arm)(EventLoop& loop, Event& event, ArmKind kind);
++  void (*disarm)(EventLoop& loop, Event& event);
++  Event* (*head)(EventLoop& loop);
++  bool (*wouldSleepEmpty)(EventLoop& loop);
++  Event* (*firstWouldSleep)(EventLoop& loop);
++  void (*resetDepthFirst)(EventLoop& loop);
++  void (*onLoopConstructed)(EventLoop& loop);
++  void (*onLoopDestroyed)(EventLoop& loop);
++};
++
++extern const EventQueueHooks* eventQueueHooks;
++// The installed hooks, or null when the loop uses its own inline queue. Read on every queue
++// operation; declared here so EventLoop::head() can test it without a function call.
++
++inline const EventQueueHooks* getEventQueueHooks() { return eventQueueHooks; }
++void setEventQueueHooks(const EventQueueHooks* hooks);
++// Install (or, with null, remove) the queue hooks. Called once, host-side, before any loop runs
++// work the embedder does not trust.
++
+ class Event: private AsyncObject {
+   // An event waiting to be executed.  Not for direct use by applications -- promises use this
+   // internally.
+@@ -1403,6 +1447,14 @@ public:
+   String traceEvent();
+   // Helper that builds a trace and stringifies it.
+ 
++  uint64_t queueToken() const { return reinterpret_cast<uint64_t>(link); }
++  void setQueueToken(uint64_t value) { link = reinterpret_cast<EventLink*>(value); }
++  // The 8 bytes the loop keeps for this event's place in its run queue. With no queue hooks
++  // installed these hold an EventLink* (see `link`); with hooks installed the loop treats them as
++  // opaque, and the embedder's hooks store whatever names the event's place without the loop
++  // trusting the value. A zero token is an unarmed event in either case, so the loop's own
++  // `link == nullptr` test still means "not armed". Not for use outside the queue hooks.
++
+ protected:
+   virtual void fire() = 0;
+   // Fire the event. Possibly deletes itself, so event shouldn't be used after calling this.
+@@ -1544,6 +1596,20 @@ public:
+ 
+   static _::Event* saveCurrentlyFiringEvent();
+   static void restoreCurrentlyFiringEvent(_::Event* event);
++
++  uint64_t queueHandle() const { return queueHandleValue; }
++  void setQueueHandle(uint64_t handle) { queueHandleValue = handle; }
++
++  void setRunnableFromQueueHooks(bool runnable) { setRunnable(runnable); }
++  // Lets the installed queue hooks drive the port's runnable state, which an event arming or
++  // disarming the relocated queue does on the loop's behalf. Host-side only (setRunnable touches
++  // the port); an in-turn arm defers it, and the loop reconciles the state with isRunnable() when
++  // the turn ends, as it does after every run of events.
++  // The embedder's name for this loop's relocated run queue (see EventQueueHooks). Zero until
++  // onLoopConstructed() sets it, and zero whenever no hooks are installed. It is stored in the
++  // loop, which an untrusted unit of work may be able to write; a value such a unit forges names
++  // no queue the embedder's table knows and resolves to nothing, rather than to memory the unit
++  // chose, which is the point of naming the queue rather than pointing at it.
+   // The same for the event this thread is currently firing, which turn() sets around
+   // Event::fire() and clears once fire() returns. Until then ~Event() compares it with every
+   // event destroyed on this thread, from a noexcept function that aborts the process on a match,
+@@ -1554,7 +1620,11 @@ public:
+ private:
+   inline _::Event* head() const {
+     // The first event in the queue, or null when it holds none. The insert points are links
+-    // without an event, so they are skipped.
++    // without an event, so they are skipped. With queue hooks installed the queue lives in memory
++    // the loop reaches through them, so the walk goes there instead.
++    if (KJ_UNLIKELY(_::eventQueueHooks != nullptr && queueHandleValue != 0)) {
++      return _::eventQueueHooks->head(const_cast<EventLoop&>(*this));
++    }
+     for (_::EventLink* link = headLink.next; link != nullptr; link = link->next) {
+       if (link->event != nullptr) return link->event;
+     }
+@@ -1619,6 +1689,9 @@ private:
+   struct LinkChunk;
+   LinkChunk* linkChunks = nullptr;
+   size_t nextChunkBytes = FIRST_LINK_CHUNK_BYTES;
++
++  uint64_t queueHandleValue = 0;
++  // See queueHandle().
+   // The pool the links come from: a list of chunks mapped from the OS, each twice the size of
+   // the one before up to MAX_LINK_CHUNK_BYTES, none of them freed or moved before the loop is
+   // destroyed, so that a link keeps its address for as long as an event holds it. See

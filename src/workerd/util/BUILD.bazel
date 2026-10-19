@@ -190,6 +190,19 @@ wd_cc_library(
     ],
 )
 
+# The event loop's run queue, relocated out of guest-writable memory (see host-event-queue.h).
+wd_cc_library(
+    name = "host-event-queue",
+    srcs = ["host-event-queue.c++"],
+    hdrs = ["host-event-queue.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":host-memory",
+        ":hostcall",
+        "@capnp-cpp//src/kj:kj-async-core",
+    ],
+)
+
 wd_cc_library(
     name = "checked-queue",
     hdrs = ["checked-queue.h"],

@@ -10,6 +10,7 @@
 #include <workerd/io/tracer.h>
 #include <workerd/io/worker.h>
 #include <workerd/jsg/guest-run.h>
+#include <workerd/util/host-event-queue.h>
 #include <workerd/jsg/heap-arena.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/setup.h>
@@ -1483,6 +1484,10 @@ void IoContext::runJsTurn(Worker::Lock& workerLock, Func&& body) {
   // bookkeeping; the outermost turn's restore runs last.
   auto threadLocals = GuestTurnThreadLocals::save();
   KJ_DEFER(threadLocals.restore());
+  // The turn's arms and disarms of the loop's run queue, journaled during the turn and applied to
+  // the host-memory queue when it ends (util/host-event-queue.h). Outermost of the two turn scopes
+  // so its apply runs after the IoOwn journal is settled below.
+  HostEventQueueTurn hostEventQueueTurn;
   // The turn's IoOwn registrations, reserved before it and committed after it (host-memory.h),
   // with the owned list's hooks building the nodes host-side (io-own.h).
   hostMemory::ResolveTurn resolveTurn(OwnedObjectList::TURN_HOOKS);
