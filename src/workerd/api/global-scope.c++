@@ -34,6 +34,7 @@
 #include <workerd/jsg/setup.h>
 #include <workerd/jsg/util.h>
 #include <workerd/util/entropy.h>
+#include <workerd/util/host-event-queue.h>
 #include <workerd/util/host-memory.h>
 #include <workerd/util/sentry.h>
 #include <workerd/util/stream-utils.h>
@@ -577,6 +578,13 @@ kj::String hexAddrForTest(const void* p) {
 // The event this thread was firing when a turn began, so the host can tell the value it put back
 // from the one the turn left (see /__gk_loop_firing below).
 thread_local kj::_::Event* firingEventBeforeTurnForTest = nullptr;
+
+// The loop's run-queue handle a turn forged and the real one it replaced, carried from the in-turn
+// rewrite to the host-side resolution below (see /__gk_queue_head_poison). The fake queue is the
+// one the turn builds in its own memory for the forged handle to point at.
+thread_local uint64_t queueHandleRealForTest = 0;
+thread_local uint64_t queueHandleForgedForTest = 0;
+thread_local uint64_t fakeQueueForTest[16] = {};
 kj::_::Event* const FIRING_SENTINEL_FOR_TEST = reinterpret_cast<kj::_::Event*>(0x1);
 
 #ifdef __linux__
@@ -1134,6 +1142,46 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
                                                               : "other"_kj;
       KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the firing event on the host after the turn",
           addr(cur), verdict);
+    });
+  }
+  // The handle the loop names its (host-memory) run queue by, which a turn can write in the
+  // shared-heap loop object (EventLoop::queueHandle). The run-queue relocation: a handle a turn
+  // forges resolves, through the guest kernel's slot table, to no queue -- not to memory the turn
+  // chose -- so head()/turn() walk nothing the turn aimed them at, unlike the pre-relocation queue
+  // whose head a turn could write directly (event-loop-queue-test.sh).
+  if (probeEnabled && url.endsWith("/__gk_queue_head_poison")) {
+    jsg::setGuestTurnTailHookForTest([addr]() {
+      kj::EventLoop* loop = kj::EventLoop::saveCurrentLoopPointer();
+      uint64_t real = loop->queueHandle();
+      // A fake run queue the turn builds in its own memory, with a head of its choosing -- what the
+      // pre-relocation steer aimed EventLoop::head() at. `forged` is its address, a value the turn
+      // writes into the handle as a write primitive would.
+      fakeQueueForTest[0] = 0xdeadbeef;
+      uint64_t forged = reinterpret_cast<uint64_t>(&fakeQueueForTest);
+      loop->setQueueHandle(forged);
+      uint64_t readBack = loop->queueHandle();
+      // Put the real handle back before the turn returns, so the turn-end apply finds the real
+      // queue and the serving loop keeps working; the readback already shows the forged value
+      // landed at ring 3.
+      loop->setQueueHandle(real);
+      queueHandleRealForTest = real;
+      queueHandleForgedForTest = forged;
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: rewrote the loop's queue handle from inside the JS turn",
+          addr(reinterpret_cast<void*>(real)), addr(reinterpret_cast<void*>(forged)),
+          addr(reinterpret_cast<void*>(readBack)));
+    });
+    Worker::Lock::runAtNextReleaseForTest([addr](Worker::Lock&) {
+      // Host-side, after the turn: resolve each value through the slot table exactly as head()/
+      // turn() do. The real handle names the loop's queue; the forged one names no slot and
+      // resolves to null, so a turn's write to the handle redirects what turn() dereferences
+      // nowhere.
+      const void* realResolved = workerd::resolveQueueHandleForTest(queueHandleRealForTest);
+      const void* forgedResolved = workerd::resolveQueueHandleForTest(queueHandleForgedForTest);
+      kj::StringPtr verdict =
+          (forgedResolved == nullptr && realResolved != nullptr) ? "inert"_kj : "redirected"_kj;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: queue handle resolution on the host",
+          addr(realResolved), addr(forgedResolved), verdict);
     });
   }
 #ifdef __linux__
