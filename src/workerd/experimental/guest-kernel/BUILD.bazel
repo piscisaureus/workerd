@@ -129,3 +129,11 @@ cc_binary(
     srcs = ["measure/queue-cost.c++"],
     deps = ["@capnp-cpp//src/kj:kj-async"],
 )
+
+# SCRATCH prototype (piscisaureus/guest-kernel-event-journal): what journaling the run queue would
+# cost, and that a journaled turn's write to the queue head is inert. See measure/event-journal-cost.c++.
+cc_binary(
+    name = "event-journal-cost",
+    srcs = ["measure/event-journal-cost.c++"],
+    deps = ["@capnp-cpp//src/kj:kj-async"],
+)
