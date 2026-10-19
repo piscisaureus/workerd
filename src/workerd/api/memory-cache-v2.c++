@@ -235,10 +235,18 @@ MemoryCacheProvider::MemoryCacheProvider(const kj::MonotonicClock& timer, Memory
 
 kj::Own<MemoryCacheUse> MemoryCacheProvider::getUse(
     kj::Maybe<kj::StringPtr> cacheId, SharedMemoryCache::Limits limits) const {
+  // Guest-kernel per-isolate cache prototype: ignore the configured cache id so
+  // that each binding -- hence each isolate -- gets a private, unshared instance
+  // that lives in its own heap arena. This drops cross-isolate sharing; a hit
+  // stays an in-process lock rather than a cross-arena read. See
+  // memory-classes.md, section "The shared memory cache". Changing the observable
+  // sharing behaviour this way must be gated behind a compatibility flag before
+  // it could ship.
+  (void)cacheId;
   KJ_IF_SOME(cacheNamespace, namespaceV2) {
-    return cacheNamespace->getBinding(cacheId, limits);
+    return cacheNamespace->getBinding(kj::none, limits);
   }
-  return kj::heap<MemoryCacheUseV1>(getInstance(cacheId), limits);
+  return kj::heap<MemoryCacheUseV1>(getInstance(kj::none), limits);
 }
 
 kj::Own<MemoryCacheNamespace> MemoryCacheNamespace::create(MemoryCachePolicy policy) {
