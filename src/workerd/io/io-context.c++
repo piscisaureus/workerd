@@ -5,9 +5,13 @@
 #include "io-context.h"
 
 #include <workerd/io/access-info.h>
+#include <workerd/io/guest-turn-thread-locals.h>
 #include <workerd/io/io-gate.h>
 #include <workerd/io/tracer.h>
 #include <workerd/io/worker.h>
+#include <workerd/jsg/guest-run.h>
+#include <workerd/util/host-event-queue.h>
+#include <workerd/jsg/heap-arena.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/setup.h>
 #include <workerd/util/autogate.h>
@@ -25,6 +29,20 @@
 
 namespace workerd {
 
+namespace {
+#ifdef WORKERD_GK_NEG_RPC_SHARED_HEAP
+// A negative build, never shipped: the shared-heap placements an in-process Cap'n Proto call
+// needs are not made. See experimental/guest-kernel/rpc-arena-test.sh.
+struct RpcSharedHeapScope {};
+#else
+using RpcSharedHeapScope = jsg::SharedHeapScope;
+#endif
+}  // namespace
+
+// The IoContext current on this thread. Thread-local storage is memory a JS turn at guest ring 3
+// can write, so after a guest turn the host re-establishes this from a copy saved in a host frame
+// (GuestTurnThreadLocals, used by runJsTurn below) rather than trusting what the turn left here;
+// current() itself stays a plain read, with nothing added on that path.
 static thread_local IoContext* threadLocalRequest = nullptr;
 
 SuppressIoContextScope::SuppressIoContextScope(): cached(threadLocalRequest) {
@@ -88,6 +106,8 @@ class IoContext::TimeoutManagerImpl final: public TimeoutManager {
     timeouts.clear();
     timeoutTimes.clear();
   }
+
+  void abandonRunningCallback() override;
 
  private:
   struct IdAndIterator {
@@ -160,8 +180,9 @@ IoContext::IoContext(ThreadContext& thread,
       limitEnforcer(kj::mv(limitEnforcerParam)),
       id(nextId()),
       threadId(getThreadId()),
-      deleteQueue(kj::arc<DeleteQueue>()),
+      deleteQueue(worker->getIsolate().getGuestArena()),
       reverseIoOwnValidity(kj::arc<ReverseIoOwnValidity>()),
+      ownedObjects(deleteQueue.queue.getContext()),
       timeoutManager(kj::heap<TimeoutManagerImpl>()),
       waitUntilTasks(*this),
       tasks(*this),
@@ -485,9 +506,11 @@ void IoContext::logUncaughtException(
 
 void IoContext::logUncaughtExceptionAsync(
     UncaughtExceptionSource source, kj::Exception&& exception) {
-  if (getWorkerTracer() == kj::none && !worker->getIsolate().isInspectorEnabled()) {
-    // We don't need to take the isolate lock as neither inspecting nor tracing is enabled. We
-    // do still want to syslog if relevant, but we can do that without a lock.
+  if ((getWorkerTracer() == kj::none && !worker->getIsolate().isInspectorEnabled()) ||
+      worker->getIsolate().isCondemned()) {
+    // We don't need to take the isolate lock as neither inspecting nor tracing is enabled (or the
+    // isolate is condemned and must not be entered again, not even to report to them). We do
+    // still want to syslog if relevant, but we can do that without a lock.
     if (!jsg::isTunneledException(exception.getDescription()) &&
         !jsg::isDoNotLogException(exception.getDescription()) &&
         // TODO(soon): Figure out why client disconnects are getting logged here if we don't
@@ -509,7 +532,16 @@ void IoContext::logUncaughtExceptionAsync(
           exception(kj::mv(exception)) {}
     void run(Worker::Lock& lock) override {
       // TODO(soon): Add logUncaughtException to jsg::Lock.
+#ifdef WORKERD_HAS_GUEST_KERNEL
+      // Under the guest-kernel host-frame wall (see runJsTurn / gk.h), run() executes at guest
+      // ring 3 and this RunnableImpl, on the caller's stack above the guest boundary, is
+      // read-only for the turn. Moving the exception out would write to it, so the turn gets a
+      // copy, which it owns and destroys entirely inside the guest; the original is destroyed
+      // host-side with the ownership words it had before the turn.
+      lock.logUncaughtException(source, exception.clone());
+#else
       lock.logUncaughtException(source, kj::mv(exception));
+#endif
     }
   };
 
@@ -780,6 +812,13 @@ IoContext::PendingEvent::~PendingEvent() noexcept(false) {
 
   context.pendingEvent = kj::none;
 
+  // The last holder of the event may be a stub that crossed an in-process binding, released in
+  // the other isolate's turn (see registerPendingEvent()), so this runs under whichever lock
+  // that is, and what it allocates would go in that isolate's heap arena. The task is this
+  // context's: this isolate's next registerPendingEvent() cancels it from its own turn, which
+  // cannot address the other arena.
+  RpcSharedHeapScope sharedHeap;
+
   // We can't abort just yet. We need to run the event loop to see if any queued
   // events come back into JavaScript. If registerPendingEvent() is called in the meantime, this
   // will be canceled.
@@ -817,6 +856,12 @@ kj::Own<void> IoContext::registerPendingEvent() {
     // Cancel any already-scheduled finalization.
     abortFromHangTask = kj::none;
 
+    // A pending event of this context is held by every capability this request exports -- each
+    // RPC stub holds one through makeReentryCallback(), and a stub that crosses an in-process
+    // service binding is released in the *calling* isolate's turn, which runs the event's
+    // destructor. The first registration is usually made under this isolate's lock, so left in
+    // its heap arena the event is unaddressable from the turn that drops the last reference.
+    RpcSharedHeapScope sharedHeap;
     auto result = kj::refcounted<PendingEvent>(*this);
     pendingEvent = *result;
     return result;
@@ -838,12 +883,22 @@ IoContext::TimeoutManagerImpl::TimeoutState::~TimeoutState() {
 }
 
 void IoContext::TimeoutManagerImpl::TimeoutState::trigger(Worker::Lock& lock) {
+  // The mark is cleared when the callback returns or unwinds; when the turn running it is
+  // abandoned instead, by abandonRunningCallback().
   isRunning = true;
   auto cleanupGuard = kj::defer([&] { isRunning = false; });
 
   // Now it's safe to call the user's callback.
   KJ_IF_SOME(function, params.function) {
     (function)(lock);
+  }
+}
+
+void IoContext::TimeoutManagerImpl::abandonRunningCallback() {
+  // At most one callback runs at a time, but the mark is cleared wherever it stands rather than
+  // stopping at the first, so the state ~TimeoutState asserts on holds for every entry.
+  for (auto& [id, state]: timeouts) {
+    state.isRunning = false;
   }
 }
 
@@ -1371,7 +1426,7 @@ void IoContext::requireCurrent() {
 void IoContext::checkFarGet(const DeleteQueue& expectedQueue, const std::type_info& type) {
   requireCurrent();
 
-  if (&expectedQueue == deleteQueue.queue.get()) {
+  if (expectedQueue == deleteQueue.queue) {
     // same request or same actor, success
   } else {
     throwNotCurrentJsError(type);
@@ -1406,19 +1461,54 @@ void IoContext::runInContextScope(Worker::LockType lockType,
       v8::Isolate::PromiseContextScope promiseContextScope(
           lock.getIsolate(), getPromiseContextTag(lock));
 
-      {
-        // Handle any pending deletions that arrived while the worker was processing a different
-        // request.
-        auto l = deleteQueue.queue->crossThreadDeleteQueue.lockExclusive();
-        auto& state = KJ_ASSERT_NONNULL(*l);
-        for (auto& object: state.queue) {
-          OwnedObjectList::unlink(*object);
-        }
-        state.queue.clear();
-      }
+      // A context built inside a turn of another isolate holds an entry that no arena owns
+      // yet; claim it for this isolate, whose lock this thread holds and whose arena it is in.
+      // Before the turn enters the guest, so the turn below resolves its own context's handle.
+      deleteQueue.adoptEntry();
+
+      // Handle any pending deletions that arrived while the worker was processing a different
+      // request. Host-side: the queue is in host memory, and this runs before the turn enters
+      // the guest.
+      deleteQueue.drainDeletions();
 
       func(lock);
     });
+  });
+}
+
+template <typename Func>
+void IoContext::runJsTurn(Worker::Lock& workerLock, Func&& body) {
+  // The thread-locals the host reads after the turn, saved in this frame -- read-only to the
+  // guest under the host-frame wall -- and put back once the guest has returned, whatever the
+  // turn left in them. A nested turn runs this at ring 3 as well, where it is the turn's own
+  // bookkeeping; the outermost turn's restore runs last.
+  auto threadLocals = GuestTurnThreadLocals::save();
+  KJ_DEFER(threadLocals.restore());
+  // The turn's arms and disarms of the loop's run queue, journaled during the turn and applied to
+  // the host-memory queue when it ends (util/host-event-queue.h). Outermost of the two turn scopes
+  // so its apply runs after the IoOwn journal is settled below.
+  HostEventQueueTurn hostEventQueueTurn;
+  // The turn's IoOwn registrations, reserved before it and committed after it (host-memory.h),
+  // with the owned list's hooks building the nodes host-side (io-own.h).
+  hostMemory::ResolveTurn resolveTurn(OwnedObjectList::TURN_HOOKS);
+  jsg::runInGuest(workerLock, body, [&](const kj::Exception& e) {
+    // The turn faulted inside the guest. Condemn the isolate so no further JS turn is run on it
+    // -- while this thread still holds the isolate lock (`workerLock`), so a thread waiting for
+    // the lock finds the isolate condemned as soon as it acquires it -- and abort this request's
+    // IoContext so its pending work is cancelled instead of re-entering the isolate. The
+    // exception then fails the current request.
+    workerLock.getWorker().getIsolate().condemn(e.clone());
+    abort(e.clone());
+#ifndef WORKERD_GK_NEG_TIMEOUT_RUNNING
+    // The turn's frames never returned, so the marks they held through deferred actions were
+    // never cleared. The one the host later asserts on is a timeout callback's: TimeoutState::
+    // trigger() marks its state running for the callback's duration and ~TimeoutState asserts
+    // the mark is gone, which it checks when this IoContext is destroyed. No callback is running
+    // any more, so the mark is cleared here. (WORKERD_GK_NEG_TIMEOUT_RUNNING is a negative-test
+    // build, never shipped: the mark stands, and fault-timeout-test.sh must then fail -- the
+    // process dies on that assert when the faulted request's IoContext is destroyed.)
+    timeoutManager->abandonRunningCallback();
+#endif
   });
 }
 
@@ -1430,9 +1520,19 @@ void IoContext::runImpl(Runnable& runnable,
     KJ_REQUIRE(l.isFor(KJ_ASSERT_NONNULL(actor).getInputGate()));
   }
 
+  // A condemned isolate (see Worker::Isolate::condemn()) must not run JS again, so refuse the
+  // turn before runInContextScope() even tries to lock it. This is only a fast-fail: the isolate
+  // may still be condemned by the thread holding the lock while this one waits for it, which is
+  // caught by the authoritative check the lock itself performs once it is held. Exceptional
+  // turns, which only exist to report an exception to the inspector or tracer, are refused the
+  // same way; logUncaughtExceptionAsync() skips them for a condemned isolate before getting here.
+  worker->getIsolate().requireNotCondemned();
+
   getIoChannelFactory().getTimer().syncTime();
 
-  runInContextScope(lockType, kj::mv(inputLock), [&](Worker::Lock& workerLock) {
+  // One JS turn: the runnable plus the microtask / message-loop draining that must follow it,
+  // all under the isolate lock and inside the context scope.
+  auto turn = [&](Worker::Lock& workerLock) {
     kj::Own<void> event;
     if (!exceptional) {
       workerLock.requireNoPermanentException();
@@ -1579,7 +1679,10 @@ void IoContext::runImpl(Runnable& runnable,
         }
       }
     }
-  });
+  };
+
+  runInContextScope(lockType, kj::mv(inputLock),
+      [&](Worker::Lock& workerLock) { runJsTurn(workerLock, [&]() { turn(workerLock); }); });
 }
 
 static constexpr auto kAsyncIoErrorMessage =
@@ -1610,6 +1713,14 @@ kj::Maybe<IoContext&> IoContext::tryCurrent() {
 
 bool IoContext::hasCurrent() {
   return threadLocalRequest != nullptr && threadLocalRequest->isCurrent();
+}
+
+IoContext* IoContext::saveThreadLocalForGuestTurn() {
+  return threadLocalRequest;
+}
+
+void IoContext::restoreThreadLocalAfterGuestTurn(IoContext* value) {
+  threadLocalRequest = value;
 }
 
 bool IoContext::isCurrent() {
@@ -1735,7 +1846,7 @@ void IoContext::throwNotCurrentJsError(kj::Maybe<const std::type_info&> maybeTyp
 
 jsg::JsObject IoContext::getPromiseContextTag(jsg::Lock& js) {
   if (promiseContextTag == kj::none) {
-    auto deferral = kj::heap<IoCrossContextExecutor>(deleteQueue.queue.addRef());
+    auto deferral = kj::heap<IoCrossContextExecutor>(deleteQueue.queue);
     promiseContextTag = jsg::JsRef(js, js.opaque(kj::mv(deferral)));
   }
   return KJ_REQUIRE_NONNULL(promiseContextTag).getHandle(js);
@@ -1746,19 +1857,22 @@ kj::Promise<void> IoContext::startDeleteQueueSignalTask(IoContext* context) {
   // IoContext is destroyed, the promise will be canceled and the loop will
   // end. On each iteration of the loop we want to reset the cross thread
   // signal in the delete queue, then wait on the promise. Once the promise
-  // is fulfilled, we will run an empty task to prompt the IoContext to drain
-  // the DeleteQueue.
+  // is fulfilled, we take the queued actions out of the queue, host-side, and
+  // run a turn that runs them.
   try {
+    // The task starts in the constructor, which may run inside a JS turn, where the queue --
+    // in host memory -- cannot be reached; the first signal is installed from the event loop.
+    co_await kj::evalLater([]() {});
     for (;;) {
-      co_await context->deleteQueue.queue->resetCrossThreadSignal();
-      co_await context->run([](auto& lock) {
-        auto& context = IoContext::current();
-        auto l = context.deleteQueue.queue->crossThreadDeleteQueue.lockExclusive();
-        auto& state = KJ_ASSERT_NONNULL(*l);
-        for (auto& action: state.actions) {
-          action(lock);
+      co_await context->deleteQueue.resetCrossThreadSignal();
+      auto actions = context->deleteQueue.takeActions();
+      if (actions.size() == 0) continue;
+      co_await context->run([&actions](Worker::Lock& lock) {
+        for (auto& action: actions) {
+          (*action)(lock);
         }
-        state.actions.clear();
+        // Destroyed inside the turn, as the actions were built inside one.
+        actions.clear();
       });
     }
   } catch (...) {

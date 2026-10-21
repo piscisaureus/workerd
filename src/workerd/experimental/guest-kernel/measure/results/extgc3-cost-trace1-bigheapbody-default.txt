@@ -1,0 +1,4 @@
+trace-default-bigheapbody round=1 arm=critical wl=bigheapbody c=1 n=2141 p50=777 p90=1045 p99=39060 mean=2799 rps=356 non200=0 errors=1 rss_kb=210252 mc=329 sc=10
+trace-default-bigheapbody round=1 arm=plain wl=bigheapbody c=1 n=3449 p50=771 p90=994 p99=19662 mean=1735 rps=574 non200=0 errors=1 rss_kb=229028 mc=269 sc=10
+trace-default-bigheapbody round=1 arm=off wl=bigheapbody c=1 n=4456 p50=1262 p90=1366 p99=1516 mean=1309 rps=742 non200=0 errors=1 rss_kb=5519768 mc=0 sc=0
+DONE trace-default-bigheapbody

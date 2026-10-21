@@ -380,6 +380,16 @@ class HeapTracer: public v8::EmbedderRootsHandler {
   // object, which implies that we are collecting unreachable objects.
   static bool isInCppgcDestructor();
 
+  // The same flag, saved before a guest-kernel JS turn and put back after it (see
+  // runTrampolineInGuest in guest-run.c++). The flag is thread-local storage, which a turn at
+  // guest ring 3 can write, and it is also set by a frame a faulted turn abandons: a CppgcShim
+  // destructor runs inside the turn, and whatever it destroys runs there too. Either way the
+  // host reads the flag afterwards -- Data's destructor skips resetting a TracedReference while
+  // it is set, and clearWrappers() asserts it is clear -- so the value it reads must not be the
+  // turn's.
+  static bool saveInCppgcDestructorForGuestTurn();
+  static void restoreInCppgcDestructorAfterGuestTurn(bool value);
+
   void addWrapper(kj::Badge<Wrappable>, Wrappable& wrappable) {
     wrappers.add(wrappable);
   }

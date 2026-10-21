@@ -430,11 +430,10 @@ class JsRpcPromise: public JsRpcClientProvider {
   struct Resolved {
     jsg::Value result;
 
-    // Dummy IoPtr to self, used only to verify that we're running in the correct context.
-    // (Dereferencing from the wrong context would throw an exception.)
-    // Note: Can't use IoContext::WeakRef here because it's not thread-safe (it's only intended to
-    //   be held from KJ I/O objects, but this is a JSG object).
-    IoPtr<JsRpcPromise> ctxCheck;
+    // The context this was resolved in, used only to verify that we're running in the correct
+    // context (using it from the wrong context throws). An Id is a plain value, so it is safe to
+    // hold from a JSG object, unlike an IoContext::WeakRef.
+    IoContext::Id ctxId;
   };
   struct Disposed {};
 

@@ -561,16 +561,27 @@ kj::Promise<DeferredProxy<void>> pumpQueuedTsStream(jsg::Lock& js,
 // ownership of that heap buffer without changing its address, so view remains valid.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdangling-field"
-JsReadableStream::Buffer::Buffer(kj::Array<const kj::byte> data)
+JsReadableStream::Buffer::Buffer(jsg::Lock& js, kj::Array<const kj::byte> data)
     : owned(kj::mv(data)),
-      view(owned) {}
+      view(owned),
+#ifndef WORKERD_GK_NEG_BODY_BUFFER_UNACCOUNTED
+      accounted(js.getExternalMemoryAdjustment(owned.size())) {
+}
+#else
+      // WORKERD_GK_NEG_BODY_BUFFER_UNACCOUNTED is a negative-test build, never shipped: the
+      // bytes are not reported to V8, so an isolate that serves large bodies holds them until an
+      // unrelated major GC, and heap-region-test.sh in experimental/guest-kernel must fail.
+      accounted(js.getExternalMemoryAdjustment(0)) {
+}
+#endif
 #pragma clang diagnostic pop
 
 // Blob contents live in a V8 ArrayBuffer.  The streams built from this Buffer are read on the
 // kj event loop, where the isolate's MPK-protected sandbox pages are unreadable, so take a
 // kj-heap copy.  It is shared by every stream derived from this Buffer -- rewinds and tee
 // branches alike.
-JsReadableStream::Buffer::Buffer(jsg::Ref<Blob> data): Buffer(kj::heapArray(data->getData())) {}
+JsReadableStream::Buffer::Buffer(jsg::Lock& js, jsg::Ref<Blob> data)
+    : Buffer(js, kj::heapArray(data->getData())) {}
 
 namespace {
 
@@ -621,7 +632,7 @@ JsReadableStream::JsReadableStream(jsg::Lock&, jsg::JsRef<jsg::JsObject> obj)
       }) {}
 
 JsReadableStream::JsReadableStream(jsg::Lock& js, kj::Array<const kj::byte> data)
-    : impl(bufferBackedImpl(js, kj::rc<Buffer>(kj::mv(data)))) {}
+    : impl(bufferBackedImpl(js, kj::rc<Buffer>(js, kj::mv(data)))) {}
 
 JsReadableStream::JsReadableStream(jsg::Lock& js, kj::String data)
     : JsReadableStream(js, webstreams::stringToBytes(kj::mv(data))) {}
@@ -630,7 +641,7 @@ JsReadableStream::JsReadableStream(jsg::Lock& js, jsg::JsRef<jsg::JsBufferSource
     : JsReadableStream(js, view.getHandle(js).copy()) {}
 
 JsReadableStream::JsReadableStream(jsg::Lock& js, jsg::Ref<Blob> blob)
-    : impl(bufferBackedImpl(js, kj::rc<Buffer>(kj::mv(blob)))) {}
+    : impl(bufferBackedImpl(js, kj::rc<Buffer>(js, kj::mv(blob)))) {}
 
 JsReadableStream::JsReadableStream(jsg::Lock& js, jsg::Ref<api::URLSearchParams> urlSearchParams)
     : JsReadableStream(js, urlSearchParams->toString()) {}

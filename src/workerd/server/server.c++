@@ -649,8 +649,17 @@ class Server::ActorNamespace final {
         // We use a dedicated `ActorSelfTokenFactory` rather than an `ActorChannelImpl` so that we
         // don't hold a reference back to the `ActorContainer`, which would create a cycle
         // preventing actor eviction.
-        metadata.restoredSelfTokenFactory = kj::refcounted<ActorSelfTokenFactory>(
-            ns, Worker::Actor::cloneId(KJ_ASSERT_NONNULL(classAndId.tryGet<ClassAndId>()).id));
+        //
+        // This runs in the addressing turn when the actor is already started, so the factory is
+        // placed as the entrypoint's is (EntrypointService::startRequest()). The scope is a
+        // block of its own: it is thread state, and the coroutine may suspend above.
+        {
+#ifndef WORKERD_GK_NEG_SELF_TOKEN_HEAP
+          jsg::SharedHeapScope sharedHeap;
+#endif
+          metadata.restoredSelfTokenFactory = kj::refcounted<ActorSelfTokenFactory>(
+              ns, Worker::Actor::cloneId(KJ_ASSERT_NONNULL(classAndId.tryGet<ClassAndId>()).id));
+        }
       } else {
         // We're a facet. The only way we could have been called by anyone other than our direct
         // parent is if the `ctx.restore()` mechanism was used (because otherwise, the facet stub
@@ -811,9 +820,19 @@ class Server::ActorNamespace final {
           return getChannelTokenImpl(usage, c.id, persistent);
         }
         KJ_CASE_ONEOF(promise, kj::ForkedPromise<void>) {
-          return promise.addBranch().then([this, usage, persistent]() {
-            return getChannelTokenImpl(
-                usage, KJ_ASSERT_NONNULL(classAndId.tryGet<ClassAndId>()).id, persistent);
+          return promise.addBranch().then(
+              [this, usage, persistent]() -> kj::Promise<kj::Array<byte>> {
+            KJ_SWITCH_ONEOF(getChannelTokenImpl(usage,
+                                KJ_ASSERT_NONNULL(classAndId.tryGet<ClassAndId>()).id,
+                                persistent)) {
+              KJ_CASE_ONEOF(token, kj::Array<byte>) {
+                return kj::mv(token);
+              }
+              KJ_CASE_ONEOF(tokenPromise, kj::Promise<kj::Array<byte>>) {
+                return kj::mv(tokenPromise);
+              }
+            }
+            KJ_UNREACHABLE;
           });
         }
       }
@@ -1232,6 +1251,13 @@ class Server::ActorNamespace final {
 
     void start(kj::Own<ActorClass>& actorClass, Worker::Actor::Id& id) {
       KJ_REQUIRE(actor == kj::none);
+#ifndef WORKERD_GK_NEG_ACTOR_HEAP
+      // The actor is started by the turn that first addresses it, which for a namespace bound
+      // in another worker is that worker's turn, and the Worker::Actor made here is what the
+      // actor's own turns run on (Worker::Actor::ensureConstructedImpl() and everything after);
+      // see getActorContainer().
+      jsg::SharedHeapScope sharedHeap;
+#endif
 
       // Capture the actor's name (if it was created via `idFromName()`/`getByName()`) so the alarm
       // scheduler can persist it and restore `ctx.id.name` when the alarm later fires, even if this
@@ -1391,7 +1417,8 @@ class Server::ActorNamespace final {
       co_return ClassAndId(info.actorClass.downcast<ActorClass>(), kj::mv(info.id));
     }
 
-    kj::Array<byte> getChannelTokenImpl(IoChannelFactory::ChannelTokenUsage usage,
+    kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getChannelTokenImpl(
+        IoChannelFactory::ChannelTokenUsage usage,
         const Worker::Actor::Id& id,
         Persistent persistent) {
       kj::StringPtr uniqueKey = KJ_ASSERT_NONNULL(ns.getConfig().tryGet<Durable>()).uniqueKey;
@@ -1417,6 +1444,16 @@ class Server::ActorNamespace final {
       }
     }
 
+#ifndef WORKERD_GK_NEG_ACTOR_HEAP
+    // The namespace's table of actors is grown by the turn of whichever worker first addresses
+    // an actor, and every worker bound to the namespace addresses it from its own turns, so
+    // under per-isolate heap arenas the table, its entries and the containers they hold go on
+    // the shared heap, where the actor's own turns can reach the container too. A negative
+    // build, never shipped, WORKERD_GK_NEG_ACTOR_HEAP, grows it in the addressing turn's arena;
+    // the guest kernel's binding-crossing-test.sh must then fail on a Durable Object that two
+    // workers address.
+    jsg::SharedHeapScope sharedHeap;
+#endif
     return actors
         .findOrCreate(key, [&]() mutable {
       auto container = kj::refcounted<ActorContainer>(kj::mv(key), *this, kj::none,
@@ -3376,6 +3413,39 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
 
 }  // namespace
 
+namespace {
+#ifdef WORKERD_GK_NEG_ENTRYPOINT_NAME_HEAP
+// A negative build, never shipped: the entrypoint names stay in the heap arena of the isolate
+// whose modules declared them. See experimental/guest-kernel/rpc-arena-test.sh.
+struct EntrypointNameScope {};
+#else
+using EntrypointNameScope = jsg::SharedHeapScope;
+#endif
+
+// Places a request's trace where a tail worker's turn can read it. The trace is filled by the
+// traced worker's turns -- console.log's message, an uncaught exception's description, the
+// fetch event's url and headers (io/tracer.c++) -- so under per-isolate heap arenas its contents
+// are in that worker's arena, which a tail worker in another isolate cannot address when its
+// turn builds the TraceItem (api/trace.c++). This runs on the event loop, once per trace when
+// the traced request completes, and copies the trace through the serialization a tail worker
+// in another process receives it through, so the copy is on the shared heap and carries what
+// that path carries. A streaming tail worker needs none of this: its events reach it through a
+// Cap'n Proto call whose message the loop builds. A negative build, never shipped,
+// WORKERD_GK_NEG_TRACE_HEAP, hands the trace over as is; the guest kernel's
+// binding-crossing-test.sh must then fail on the first traced request.
+kj::Own<Trace> placeTraceForTailWorkers(kj::Own<Trace> trace) {
+#ifndef WORKERD_GK_NEG_TRACE_HEAP
+  if (jsg::heapArenasAvailable()) {
+    capnp::MallocMessageBuilder message;
+    auto builder = message.initRoot<rpc::Trace>();
+    trace->copyTo(builder);
+    return kj::refcounted<Trace>(builder.asReader());
+  }
+#endif
+  return trace;
+}
+}  // namespace
+
 // Shared ErrorReporter base implemnetation. The logic to collect entrypoint information is the
 // same regardless of where the code came from.
 struct Server::ErrorReporter: public Worker::ValidationErrorReporter {
@@ -3385,10 +3455,19 @@ struct Server::ErrorReporter: public Worker::ValidationErrorReporter {
   kj::HashSet<kj::String> actorClasses;
   kj::HashSet<kj::String> workflowClasses;
 
+  // These tables are filled while the worker's modules are evaluated, under its isolate's lock,
+  // and their names outlive that: `WorkerService::getEntrypoint()` hands a `kj::StringPtr` into
+  // `namedEntrypoints` to every `EntrypointService` of this worker, and
+  // `WorkerService::createEntrypoint()` copies it for each request -- which, for a service
+  // binding or a JS-RPC call, runs in a turn of the *calling* isolate. A name left in this
+  // worker's heap arena is unaddressable there, so each is copied into the shared heap as it is
+  // added. The strings handed in are copied rather than moved for the same reason: they are the
+  // isolate's too.
   void addEntrypoint(kj::Maybe<kj::StringPtr> exportName, kj::Array<kj::String> methods) override {
+    EntrypointNameScope sharedHeap;
     kj::HashSet<kj::String> set;
     for (auto& method: methods) {
-      set.insert(kj::mv(method));
+      set.insert(kj::str(method));
     }
     KJ_IF_SOME(e, exportName) {
       namedEntrypoints.insert(kj::str(e), kj::mv(set));
@@ -3398,6 +3477,7 @@ struct Server::ErrorReporter: public Worker::ValidationErrorReporter {
   }
 
   void addActorClass(kj::StringPtr exportName) override {
+    EntrypointNameScope sharedHeap;  // see addEntrypoint()
     actorClasses.insert(kj::str(exportName));
   }
 
@@ -3405,9 +3485,10 @@ struct Server::ErrorReporter: public Worker::ValidationErrorReporter {
     // At runtime, we need to add it into the normal namedEntrypoints for Workflows to appear
     // in `WorkerService`. This is a different method compared to `addEntrypoint` because we need to
     // check for `WorkflowEntrypoint` inheritance at validation time.
+    EntrypointNameScope sharedHeap;  // see addEntrypoint()
     kj::HashSet<kj::String> set;
     for (auto& method: methods) {
-      set.insert(kj::mv(method));
+      set.insert(kj::str(method));
     }
     namedEntrypoints.insert(kj::str(exportName), kj::mv(set));
     workflowClasses.insert(kj::str(exportName));
@@ -3699,6 +3780,9 @@ class Server::WorkerService final: public Service,
   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
     // Same logic as in EntrypointService::startRequest().
     if (!isDynamic) {
+#ifndef WORKERD_GK_NEG_SELF_TOKEN_HEAP
+      jsg::SharedHeapScope sharedHeap;  // see EntrypointService::startRequest()
+#endif
       metadata.restoredSelfTokenFactory =
           kj::refcounted<StaticServiceSelfTokenFactory>(kj::addRef(*this), kj::none);
     }
@@ -3876,6 +3960,10 @@ class Server::WorkerService final: public Service,
       kj::Maybe<kj::Own<Worker::Actor>> actor,
       bool isTracer,
       kj::Maybe<kj::Own<AccessInfo>> accessInfo) {
+    // A request's entrypoint and IoContext are created by whoever starts the request, which for
+    // a service binding is a turn of the calling isolate, on that isolate's heap arena; they
+    // belong to this worker's request and go in the shared heap instead.
+    jsg::SharedHeapScope sharedHeap;
     auto& channels = KJ_ASSERT_NONNULL(ioChannels.tryGet<LinkedIoChannels>());
 
     kj::Vector<kj::Own<WorkerInterface>> bufferedTailWorkers(channels.tails.size());
@@ -3963,6 +4051,7 @@ class Server::WorkerService final: public Service,
         waitUntilTasks.add(tracer->onComplete().then(
             kj::coCapture([tailWorkers = bufferedTailWorkers.releaseAsArray()](
                               kj::Own<Trace> trace) mutable -> kj::Promise<void> {
+          trace = placeTraceForTailWorkers(kj::mv(trace));
           for (auto& worker: tailWorkers) {
             auto event = kj::heap<workerd::api::TraceCustomEvent>(
                 workerd::api::TraceCustomEvent::TYPE, kj::arr(kj::addRef(*trace)));
@@ -4069,6 +4158,18 @@ class Server::WorkerService final: public Service,
         IoChannelFactory::SubrequestMetadata metadata, bool isTracer) {
       Frankenvalue props;
       KJ_IF_SOME(p, this->props) {
+#ifndef WORKERD_GK_NEG_PROPS_HEAP
+        // This runs in the turn that starts the request, and the copy is read by the target's
+        // turn when it builds ctx.props (Worker::Lock::getExportedHandler()). A dynamically
+        // loaded worker's entrypoint is started this way by its loader's turns, in whose heap
+        // arena the copy would otherwise lie: the first request to the entrypoint goes through
+        // the loader's startup promise and copies on the event loop, every later one copies
+        // here. The props themselves were made by the worker that holds the stub, which is the
+        // one that reads them here. A negative build, never shipped, WORKERD_GK_NEG_PROPS_HEAP,
+        // copies in the caller's arena; the guest kernel's binding-crossing-test.sh must then
+        // fail on the second request to a loaded worker's entrypoint with props.
+        jsg::SharedHeapScope sharedHeap;
+#endif
         props = p.clone();
       } else {
         // Calling ctx.exports loopback without specifying props. Use empty props.
@@ -4093,6 +4194,16 @@ class Server::WorkerService final: public Service,
         // fact, we MUST NOT accept a `restoredSelfTokenFactory` passed in from the caller as this
         // would potentially allow a malicious caller to read and manipulate the parameters to our
         // own `[restore]()` method.
+#ifndef WORKERD_GK_NEG_SELF_TOKEN_HEAP
+        // Made in the turn that starts the request, kept by the target's IoContext, and read by
+        // the target's turn in IoContext::getSelfTokenFactory() when it calls ctx.restore(), so
+        // under per-isolate heap arenas it goes on the shared heap; the actor's factory
+        // (ActorContainer::startRequest()) and the worker's (WorkerService::startRequest())
+        // likewise. A negative build, never shipped, WORKERD_GK_NEG_SELF_TOKEN_HEAP, leaves each
+        // in the starting turn's arena; the guest kernel's binding-crossing-test.sh must then
+        // fail on a callee that calls ctx.restore().
+        jsg::SharedHeapScope sharedHeap;
+#endif
         metadata.restoredSelfTokenFactory =
             kj::refcounted<StaticServiceSelfTokenFactory>(kj::addRef(*worker), kj::addRef(*this));
       }
@@ -4454,6 +4565,11 @@ class Server::WorkerService final: public Service,
     auto& ns = JSG_REQUIRE_NONNULL(
         channels.actor[channel], Error, "Actor namespace configuration was invalid.");
     KJ_REQUIRE(ns.getConfig().is<Durable>());  // should have been verified earlier
+#ifndef WORKERD_GK_NEG_ACTOR_HEAP
+    // The id's copy is the one the actor's container keeps and every turn that addresses the
+    // actor afterwards reads (ActorContainer::startRequest(), start()); see getActorContainer().
+    jsg::SharedHeapScope sharedHeap;
+#endif
     return ns.getActorChannel(id.clone(), persistent);
   }
 
@@ -4466,6 +4582,9 @@ class Server::WorkerService final: public Service,
     auto& ns = JSG_REQUIRE_NONNULL(
         channels.actor[channel], Error, "Actor namespace configuration was invalid.");
     KJ_REQUIRE(ns.getConfig().is<Ephemeral>());  // should have been verified earlier
+#ifndef WORKERD_GK_NEG_ACTOR_HEAP
+    jsg::SharedHeapScope sharedHeap;  // see getGlobalActor()
+#endif
     return ns.getActorChannel(kj::str(id));
   }
 
@@ -4607,10 +4726,16 @@ class Server::WorkerService final: public Service,
     // stale and the delay will effectively be shortened by that staleness, causing the timer
     // to fire too early. Instead, we compute the target time using a fresh reading from the
     // monotonic clock so the delay is measured from the actual present.
+    //
+    // The timer is the thread's, and its queue holds every isolate's entries: an entry goes in
+    // the shared heap, not in the arena of the isolate whose turn adds it, where another
+    // isolate's turn would fault on it while ordering its own entry.
+    jsg::SharedHeapScope sharedHeap;
     return threadContext.getUnsafeTimer().atTime(monotonicClock.now() + delay);
   }
 
   kj::Promise<void> afterLimitTimeout(kj::Duration t) override {
+    jsg::SharedHeapScope sharedHeap;  // see atTime()
     return threadContext.getUnsafeTimer().afterDelay(t);
   }
 
@@ -5785,7 +5910,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     }
   }
 
-  auto isolateGroup = v8::IsolateGroup::GetDefault();
+  auto isolatePlacement = jsg::newIsolateGroup();
   kj::Array<Worker::Api::InboundListener> listeners;
   KJ_IF_SOME(l, inboundListeners.find(name)) {
     listeners = KJ_MAP(listener, l) {
@@ -5797,8 +5922,8 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     };
   }
   auto api = kj::heap<WorkerdApi>(globalContext->v8System, def.featureFlags, extensions,
-      limitEnforcer->getCreateParams(), isolateGroup, kj::mv(jsgobserver), *memoryCacheProvider,
-      pythonConfig, kj::mv(listeners));
+      limitEnforcer->getCreateParams(), kj::mv(isolatePlacement), kj::mv(jsgobserver),
+      *memoryCacheProvider, pythonConfig, kj::mv(listeners));
 
   auto inspectorPolicy = Worker::Isolate::InspectorPolicy::DISALLOW;
   if (inspectorOverride != kj::none) {

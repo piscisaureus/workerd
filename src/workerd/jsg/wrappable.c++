@@ -34,6 +34,14 @@ bool HeapTracer::isInCppgcDestructor() {
   return inCppgcShimDestructor;
 }
 
+bool HeapTracer::saveInCppgcDestructorForGuestTurn() {
+  return inCppgcShimDestructor;
+}
+
+void HeapTracer::restoreInCppgcDestructorAfterGuestTurn(bool value) {
+  inCppgcShimDestructor = value;
+}
+
 void HeapTracer::clearWrappers() {
   // When clearing wrappers (at isolate shutdown), we may be destroying objects that were recently
   // determined to be unreachable, but the CppgcShim destructors haven't been run yet. We need to

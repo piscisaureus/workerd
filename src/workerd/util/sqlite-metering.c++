@@ -195,6 +195,14 @@ SqliteMemoryScope::~SqliteMemoryScope() noexcept(false) {
   }
 }
 
+SqliteMemoryScope* SqliteMemoryScope::saveThreadLocalForGuestTurn() {
+  return threadLocalScope;
+}
+
+void SqliteMemoryScope::restoreThreadLocalAfterGuestTurn(SqliteMemoryScope* value) {
+  threadLocalScope = value;
+}
+
 void installSqliteCustomAllocator() {
   // sqlite3_config() must be called before sqlite3_initialize(), which is itself invoked
   // implicitly by the first sqlite3_vfs_register() or sqlite3_open_v2() call. We rely on callers

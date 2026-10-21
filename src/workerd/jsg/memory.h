@@ -9,6 +9,7 @@
 #pragma once
 
 #include <workerd/jsg/jsvalue-defs.h>
+#include <workerd/util/memory-class.h>
 
 #include <v8-profiler.h>
 
@@ -173,7 +174,7 @@ concept V8Value = requires(T a) { std::is_assignable_v<v8::Value, T>; };
 
 // jsg::MemoryTracker is used to construct the embedder graph for v8 heap
 // snapshot construction.
-class MemoryTracker final {
+class WD_MEMORY_CLASS_ISOLATE MemoryTracker final {
  public:
   inline void trackFieldWithSize(
       kj::StringPtr edgeName, size_t size, kj::Maybe<kj::StringPtr> nodeName = kj::none);

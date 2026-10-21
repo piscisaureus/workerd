@@ -513,6 +513,12 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // `hasCurrent() && tcx == current()`).
   bool isCurrent();
 
+  // The thread-local behind current(), for the host side of a guest turn to save before the turn
+  // and put back after it (see GuestTurnThreadLocals in guest-turn-thread-locals.h). The value is
+  // opaque to the caller: it is only ever stored back.
+  static IoContext* saveThreadLocalForGuestTurn();
+  static void restoreThreadLocalAfterGuestTurn(IoContext* value);
+
   // A process-unique identifier assigned to each IoContext at construction. IDs are monotonically
   // increasing and never reused, so a captured Id can be compared against the current IoContext's
   // Id to determine whether execution is happening in the same context -- without retaining a
@@ -561,7 +567,7 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // IoContext) can later check whether this context is current, still alive, or defer work
   // into it. Safe to retain beyond this context's lifetime.
   IoCrossContextExecutor getCrossContextExecutor() {
-    return IoCrossContextExecutor(deleteQueue.queue.addRef());
+    return IoCrossContextExecutor(deleteQueue.queue);
   }
 
   // A WeakRef is a weak reference to a IoContext. Note that because IoContext is not
@@ -1203,7 +1209,7 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   kj::Maybe<Worker::Lock&> currentLock;
   kj::Maybe<InputGate::Lock> currentInputLock;
 
-  DeleteQueuePtr deleteQueue;
+  DeleteQueueOwner deleteQueue;
   kj::Arc<ReverseIoOwnValidity> reverseIoOwnValidity;
 
   kj::Maybe<kj::Exception> abortException;
@@ -1217,7 +1223,8 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
 
   // Objects pointed to by IoOwn<T>s.
   // NOTE: This must live below `deleteQueue`, as some of these OwnedObjects may own attachctx()'ed
-  //   objects which reference `deleteQueue` in their destructors.
+  //   objects which reference `deleteQueue` in their destructors, and the list's head is in the
+  //   record `deleteQueue` owns.
   OwnedObjectList ownedObjects;
 
   kj::Maybe<kj::Rc<ExternalPusherImpl>> externalPusher;
@@ -1274,6 +1281,11 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
     using Exceptional = IoContext_Runnable_Exceptional;
     virtual void run(Worker::Lock& lock) = 0;
   };
+  // Runs one JS turn for this context on its locked worker, inside the guest kernel when it is
+  // enabled and directly otherwise (see jsg::runInGuest). Defined with runImpl(), its only caller.
+  template <typename Func>
+  void runJsTurn(Worker::Lock& workerLock, Func&& body);
+
   void runImpl(Runnable& runnable,
       Worker::LockType lockType,
       kj::Maybe<InputGate::Lock> inputLock,
@@ -1432,20 +1444,55 @@ kj::PromiseForResult<Func, Worker::Lock&> IoContext::runSingle(
 
     using Result = decltype(func(kj::instance<Worker::Lock&>()));
 
+    // Under the guest-kernel host-frame wall (see IoContext::runJsTurn / gk.h), run() executes at
+    // guest ring 3 and the RunnableImpl, on the caller's stack above the guest boundary, is
+    // read-only for the turn. The callable writes to its own closure as it runs -- awaitIo's
+    // continuation is a mutable lambda that moves its captures (the resolver, the I/O result)
+    // out -- and a non-void result has to be stored somewhere, so neither may live in this frame.
+    // Hold both on the C++ heap (a KEEP/RW mapping, outside the wall) and read the result back
+    // host-side after the turn returns.
+    //
+    // TODO(guest-kernel): the heap result is written in-guest and consumed host-side as a C++
+    //   object. Every non-void Result in the codebase is a kj::Promise (a heap node with its
+    //   own disposer), a jsg::JsRef, or a bool, so the host takes guest-written ownership words
+    //   when it moves the result out. A by-value representation of the result, as
+    //   jsg::GuestTurnOutcome is for the turn's own outcome, closes this for the bool but not
+    //   for the promise: its node is built in the isolate's memory whatever the out-parameter
+    //   looks like, and the host calls through that node's vtable. The promise has to be
+    //   created host-side and resolved by the turn through a channel instead; see
+    //   experimental/guest-kernel/memory-classes.md.
     if constexpr (kj::isSameType<Result, void>()) {
       struct RunnableImpl: public Runnable {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+        kj::Own<kj::Decay<Func>> func;
+
+        RunnableImpl(Func&& func): func(kj::heap<kj::Decay<Func>>(kj::fwd<Func>(func))) {}
+        void run(Worker::Lock& lock) override {
+          (*func)(lock);
+        }
+#else
         Func func;
 
         RunnableImpl(Func&& func): func(kj::fwd<Func>(func)) {}
         void run(Worker::Lock& lock) override {
           func(lock);
         }
+#endif
       };
 
       RunnableImpl runnable(kj::fwd<Func>(func));
       runImpl(runnable, lock, kj::mv(inputLock), Runnable::Exceptional(false));
     } else {
       struct RunnableImpl: public Runnable {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+        kj::Own<kj::Decay<Func>> func;
+        kj::Own<kj::Maybe<Result>> result = kj::heap<kj::Maybe<Result>>();
+
+        RunnableImpl(Func&& func): func(kj::heap<kj::Decay<Func>>(kj::fwd<Func>(func))) {}
+        void run(Worker::Lock& lock) override {
+          *result = (*func)(lock);
+        }
+#else
         Func func;
         kj::Maybe<Result> result;
 
@@ -1453,11 +1500,16 @@ kj::PromiseForResult<Func, Worker::Lock&> IoContext::runSingle(
         void run(Worker::Lock& lock) override {
           result = func(lock);
         }
+#endif
       };
 
       RunnableImpl runnable{kj::fwd<Func>(func)};
       runImpl(runnable, lock, kj::mv(inputLock), Runnable::Exceptional(false));
+#ifdef WORKERD_HAS_GUEST_KERNEL
+      KJ_IF_SOME(r, *runnable.result) {
+#else
       KJ_IF_SOME(r, runnable.result) {
+#endif
         return kj::mv(r);
       } else {
         KJ_UNREACHABLE;
@@ -1800,13 +1852,13 @@ auto IoContext::makeReentryCallbackImpl(Func func, kj::Own<void> attachment) {
 template <typename T>
 inline IoOwn<T> IoContext::addObject(kj::Own<T> obj) {
   requireCurrent();
-  return deleteQueue.queue->addObject(kj::mv(obj), ownedObjects);
+  return deleteQueue.queue.addObject(kj::mv(obj), ownedObjects);
 }
 
 template <typename T>
 inline IoPtr<T> IoContext::addObject(T& obj) {
   requireCurrent();
-  return IoPtr<T>(deleteQueue.queue.addRef(), &obj);
+  return IoPtr<T>(deleteQueue.queue, &obj);
 }
 
 template <typename T>
@@ -1869,7 +1921,7 @@ template <typename T>
 inline ReverseIoOwn<T> IoContext::addObjectReverse(kj::Own<T> obj) {
   // We intentionally don't requireCurrent() -- the only requirement is that the caller is in the
   // same thread.
-  return deleteQueue.queue->addObjectReverse(
+  return deleteQueue.queue.addObjectReverse(
       reverseIoOwnValidity.addRef(), kj::mv(obj), ownedObjects);
 }
 

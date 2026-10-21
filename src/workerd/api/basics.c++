@@ -593,6 +593,12 @@ AbortSignal::AbortSignal(kj::Maybe<kj::Exception> exception,
       maybeAbortException(kj::mv(exception)),
       reason(kj::mv(maybeReason)) {}
 
+AbortSignal::~AbortSignal() noexcept(false) {
+  for (auto& reg: nativeRegistrations) {
+    disarmNativeRegistration(*reg);
+  }
+}
+
 kj::Maybe<jsg::JsValue> AbortSignal::getOnAbort(jsg::Lock& js) {
   return getEventHandlerAttribute(js, kAbortEvent);
 }
@@ -804,21 +810,75 @@ void sweepCells(kj::Vector<kj::Arc<T>>& cells, SlotOf slotOf) {
 
 }  // namespace
 
+void AbortSignal::disarmNativeRegistration(NativeRegistration& reg) {
+  if (reg.armed != 0 &&
+      hostMemory::resolveOfType(reg.armed, hostMemory::resolveTypeTag<NativeRegistration>()) ==
+          &reg) {
+    hostMemory::unregisterResolve(reg.armed);
+  }
+  reg.armed = 0;
+}
+
+void AbortSignal::sweepNativeRegistrations() {
+  size_t dst = 0;
+  for (size_t i = 0; i < nativeRegistrations.size(); i++) {
+    auto& reg = *nativeRegistrations[i];
+    bool dead = reg.action == kj::none ||
+        hostMemory::resolveOfType(reg.armed, hostMemory::resolveTypeTag<NativeRegistration>()) !=
+            &reg ||
+        reg.executor.isTargetDestroyed();
+    if (dead) {
+      disarmNativeRegistration(reg);
+      continue;
+    }
+    if (dst != i) {
+      nativeRegistrations[dst] = kj::mv(nativeRegistrations[i]);
+    }
+    ++dst;
+  }
+  nativeRegistrations.truncate(dst);
+}
+
 kj::Own<void> AbortSignal::addAbortAction(
     jsg::Lock& js, kj::Function<void(jsg::Lock&, const kj::Exception&)> action) {
-  // The RAII registration handle. Clearing the cell's slot is the only thing it does, which
-  // makes it safe to drop from any thread; the emptied cell itself is removed from the
-  // signal by a later sweep under the isolate lock.
+  // The RAII registration handle. Retiring the record's table entry is the only thing it
+  // does, which is why it is safe to drop from any thread and why dropping it outside the
+  // isolate lock -- on the event loop, where the objects holding it are destroyed -- touches
+  // neither the signal nor the action. Both the action and the record that holds it are
+  // destroyed later, by a sweep or by the signal, under the isolate lock.
   class Registration final {
    public:
-    Registration(kj::Arc<RegistrationCell> cell): cell(kj::mv(cell)) {}
+    Registration(hostMemory::ResolveHandle handle): handle(handle) {}
     ~Registration() noexcept(false) {
-      *cell->action.lockExclusive() = kj::none;
+      void* record =
+          hostMemory::resolveOfType(handle, hostMemory::resolveTypeTag<NativeRegistration>());
+      if (record == nullptr) {
+        // The signal retired the entry first, with the record it named.
+        return;
+      }
+#ifdef WORKERD_GK_NEG_ABORT_CELL
+      // WORKERD_GK_NEG_ABORT_CELL is a negative-test build, never shipped: the handle clears
+      // the action wherever it is dropped, as it did when the slot was a mutex in the signal's
+      // own memory, so the host destroys a function object a turn can rewrite. The guest
+      // kernel's abort-signal-test.sh must then fail; this is the check that the test tests
+      // where the action is destroyed.
+      static_cast<NativeRegistration*>(record)->action = kj::none;
+      static_cast<NativeRegistration*>(record)->armed = 0;
+#else
+      if (hostMemory::inTurn()) {
+        // Under the isolate lock, inside the turn that owns the record: clear the action now
+        // as well, since a release made inside a turn retires the entry only once the turn
+        // ends, and the signal may abort before then.
+        static_cast<NativeRegistration*>(record)->action = kj::none;
+        static_cast<NativeRegistration*>(record)->armed = 0;
+      }
+#endif
+      hostMemory::unregisterResolve(handle);
     }
     KJ_DISALLOW_COPY_AND_MOVE(Registration);
 
    private:
-    kj::Arc<RegistrationCell> cell;
+    hostMemory::ResolveHandle handle;
   };
 
   if (getNeverAborts()) {
@@ -832,11 +892,16 @@ kj::Own<void> AbortSignal::addAbortAction(
 
   auto& ioContext = IoContext::current();
 
-  sweepCells(nativeRegistrations, [](auto& cell) -> auto& { return cell.action; });
+  sweepNativeRegistrations();
 
-  auto cell = kj::arc<RegistrationCell>(ioContext.getCrossContextExecutor(), kj::mv(action));
-  nativeRegistrations.add(cell.addRef());
-  return kj::heap<Registration>(kj::mv(cell));
+  auto reg = kj::heap<NativeRegistration>(ioContext.getCrossContextExecutor(), kj::mv(action));
+  hostMemory::ResolveHandle handle =
+      hostMemory::registerResolve(reg.get(), hostMemory::resolveTypeTag<NativeRegistration>());
+  JSG_REQUIRE(handle != 0, Error,
+      "Too many outstanding AbortSignal registrations; cannot register another.");
+  reg->armed = handle;
+  nativeRegistrations.add(kj::mv(reg));
+  return kj::heap<Registration>(handle);
 }
 
 kj::Own<void> AbortSignal::addAbortAlgorithm(jsg::Lock& js, jsg::Function<void()> algorithm) {
@@ -891,6 +956,16 @@ kj::Own<void> AbortSignal::registerPendingCancellation(jsg::Lock& js, ReleasingC
       [&canceler](jsg::Lock& js, const kj::Exception& exception) { canceler.cancel(exception); });
 }
 
+kj::Exception AbortSignal::abortExceptionForCancellation(jsg::Lock& js) {
+  KJ_IF_SOME(e, maybeAbortException) {
+    return e.clone();
+  }
+  KJ_IF_SOME(r, deserializePendingReason(js)) {
+    return js.exceptionToKj(r);
+  }
+  KJ_UNREACHABLE;
+}
+
 AbortSignal::Cancellation AbortSignal::newCanceler(jsg::Lock& js) {
   if (getNeverAborts()) {
     return {
@@ -901,17 +976,8 @@ AbortSignal::Cancellation AbortSignal::newCanceler(jsg::Lock& js) {
 
   if (getAborted(js)) {
     // Already aborted: hand back a pre-canceled canceler; there is no future abort to hook.
-    auto exception = [&]() -> kj::Exception {
-      KJ_IF_SOME(e, maybeAbortException) {
-        return e.clone();
-      }
-      KJ_IF_SOME(r, deserializePendingReason(js)) {
-        return js.exceptionToKj(r);
-      }
-      KJ_UNREACHABLE;
-    }();
     return {
-      .canceler = kj::heap<ReleasingCanceler>(kj::mv(exception)),
+      .canceler = kj::heap<ReleasingCanceler>(abortExceptionForCancellation(js)),
       .registration = kj::Own<void>(),
     };
   }
@@ -1042,23 +1108,36 @@ void AbortSignal::runAbortSteps(jsg::Lock& js) {
   //    already gone (in which case everything it wanted to cancel died with it). Taking the
   //    vector up front makes this safe against re-entrant registration.
   //
-  //    A deferred delivery does not take the action with it: it re-takes the cell's slot on
-  //    arrival in the owning context, so that a consumer (and the references its action
-  //    captures) that went away in the meantime reliably turns the delivery into a no-op.
-  auto cells = kj::mv(nativeRegistrations);
-  for (auto& cell: cells) {
-    if (cell->executor.isCurrent()) {
-      KJ_IF_SOME(action, take(cell->action)) {
-        action(js, exception);
-      }
-    } else {
-      cell->executor.tryExecute(
-          [cell = cell.addRef(), ex = exception.clone()](jsg::Lock& js) mutable {
-        KJ_IF_SOME(action, take(cell->action)) {
-          action(js, ex);
+  //    Whether a consumer still wants its action is its table entry, which its handle
+  //    retires when it is dropped, so a registration whose entry no longer resolves is
+  //    skipped. A deferred delivery carries the action and resolves the handle again on
+  //    arrival, so a consumer (and the references its action captures) that went away in
+  //    the meantime still turns the delivery into a no-op.
+  auto regs = kj::mv(nativeRegistrations);
+  for (auto& reg: regs) {
+    bool stillWanted = hostMemory::resolve(reg->armed) == reg.get();
+    auto taken = kj::mv(reg->action);
+    reg->action = kj::none;
+    if (stillWanted) {
+      KJ_IF_SOME(action, taken) {
+        if (reg->executor.isCurrent()) {
+          disarmNativeRegistration(*reg);
+          action(js, exception);
+          continue;
         }
-      });
+        // The emptied record stays with the signal until a sweep, because the entry is what
+        // the arrival check resolves: retiring it here would answer "gone" for every
+        // deferred delivery.
+        reg->executor.tryExecute([handle = reg->armed, action = kj::mv(action),
+                                     ex = exception.clone()](jsg::Lock& js) mutable {
+          if (hostMemory::resolve(handle) == nullptr) return;
+          action(js, ex);
+        });
+        nativeRegistrations.add(kj::mv(reg));
+        continue;
+      }
     }
+    disarmNativeRegistration(*reg);
   }
 
   // 3. Dispatch to RPC clients, with the same per-registration routing and re-take.
@@ -1189,6 +1268,18 @@ jsg::Ref<AbortSignal> AbortSignal::deserialize(
   signal->pendingReason = kj::mv(resolvedSignal.reason);
 
   return signal;
+}
+
+AbortSignal::NativeRegistrationForTest AbortSignal::newestNativeRegistrationForTest() {
+  if (nativeRegistrations.size() == 0) return {nullptr, nullptr, 0};
+  auto& reg = *nativeRegistrations.back();
+  void** slot = nullptr;
+  KJ_IF_SOME(action, reg.action) {
+    // kj::Function is one kj::Own, whose first word is the disposer the destroying thread
+    // calls through. That word is what a write primitive aims at.
+    slot = reinterpret_cast<void**>(&action);
+  }
+  return {&reg, slot, reg.armed};
 }
 
 int AbortSignal::getNativeRegistrationCountForTest() {

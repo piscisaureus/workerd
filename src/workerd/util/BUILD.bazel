@@ -133,6 +133,85 @@ wd_cc_library(
 )
 
 wd_cc_library(
+    name = "memory-class",
+    hdrs = ["memory-class.h"],
+    visibility = ["//visibility:public"],
+)
+
+# Measurement-only allocation census (see alloc-census.h). Off by default and never in a
+# shipping build. On, every C++ and C heap allocation is recorded with its call site and the
+# isolate lock that was held, which needs both the define and --wrap on the link of the binary
+# that links it -- hence a flag here rather than a command line. Pair it with
+# --//src/workerd/server:use_tcmalloc=False, since tcmalloc defines operator new itself.
+bool_flag(
+    name = "alloc_census",
+    build_setting_default = False,
+)
+
+config_setting(
+    name = "census_enabled",
+    flag_values = {"alloc_census": "True"},
+)
+
+wd_cc_library(
+    name = "alloc-census",
+    srcs = ["alloc-census.c++"],
+    hdrs = ["alloc-census.h"],
+    defines = select({
+        ":census_enabled": ["WD_ALLOC_CENSUS=1"],
+        "//conditions:default": [],
+    }),
+    linkopts = select({
+        ":census_enabled": ["-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free"],
+        "//conditions:default": [],
+    }),
+    visibility = ["//visibility:public"],
+)
+
+# Host memory (see host-memory.h): backed by the guest kernel's gk_host_alloc on
+# the platform that has it, by the ordinary heap elsewhere.
+wd_cc_library(
+    name = "host-memory",
+    srcs = ["host-memory.c++"],
+    hdrs = ["host-memory.h"],
+    implementation_deps = select({
+        # Experimental guest-kernel isolation is x86-64 Linux only; the dep and
+        # its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
+    visibility = ["//visibility:public"],
+    deps = [
+        ":hostcall",
+        ":memory-class",
+        "@capnp-cpp//src/kj",
+    ],
+)
+
+# The event loop's run queue, relocated out of guest-writable memory (see host-event-queue.h).
+wd_cc_library(
+    name = "host-event-queue",
+    srcs = ["host-event-queue.c++"],
+    hdrs = ["host-event-queue.h"],
+    implementation_deps = select({
+        # Experimental guest-kernel isolation is x86-64 Linux only; the dep and
+        # its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
+    visibility = ["//visibility:public"],
+    deps = [
+        ":host-memory",
+        ":hostcall",
+        "@capnp-cpp//src/kj:kj-async-core",
+    ],
+)
+
+wd_cc_library(
     name = "checked-queue",
     hdrs = ["checked-queue.h"],
     visibility = ["//visibility:public"],
@@ -247,10 +326,19 @@ wd_cc_library(
         ":strings",
         "//src/workerd/jsg:exception",
         "@sqlite3",
-    ],
+    ] + select({
+        # The VFS root hostcall handler sets the guest kernel's turn directory; the dep and
+        # its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         ":account-limits",
+        ":host-memory",
+        ":hostcall",
         ":sentry",
         ":sqlite-metering",
         "@capnp-cpp//src/kj:kj-async-core",
@@ -306,6 +394,14 @@ wd_cc_library(
     name = "thread-scopes",
     srcs = ["thread-scopes.c++"],
     hdrs = ["thread-scopes.h"],
+    implementation_deps = select({
+        # The progress counter's state goes to the guest kernel's thread words when it is on;
+        # the dep and its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         "@capnp-cpp//src/kj/compat:kj-http",
@@ -341,6 +437,36 @@ wd_cc_library(
     hdrs = ["entropy.h"],
     implementation_deps = [
         "@ncrypto",
+        "@ssl",
+    ],
+    visibility = ["//visibility:public"],
+    deps = ["@capnp-cpp//src/kj"],
+)
+
+# Hostcalls (see hostcall.h): a synchronous call from a JS turn to a host-side handler, through
+# the guest kernel on the platform that has it, by direct call elsewhere.
+wd_cc_library(
+    name = "hostcall",
+    srcs = ["hostcall.c++"],
+    hdrs = ["hostcall.h"],
+    implementation_deps = select({
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
+    visibility = ["//visibility:public"],
+    deps = ["@capnp-cpp//src/kj"],
+)
+
+# Entropy for host-side secrets (see host-entropy.h): buffered in host memory and drawn from the
+# system generator, so nothing a guest can reach decides the bytes.
+wd_cc_library(
+    name = "host-entropy",
+    srcs = ["host-entropy.c++"],
+    hdrs = ["host-entropy.h"],
+    implementation_deps = [
+        ":host-memory",
         "@ssl",
     ],
     visibility = ["//visibility:public"],
@@ -403,6 +529,13 @@ exports_files(["autogate.h"])
         "duration-exceeded-logger-test.c++",
     ]
 ]
+
+kj_test(
+    src = "host-entropy-test.c++",
+    deps = [
+        ":host-entropy",
+    ],
+)
 
 kj_test(
     src = "string-buffer-test.c++",

@@ -11,6 +11,7 @@
 //   - consume.c++: workerd-consume check
 //   - coroutine-hostile-raii.c++: workerd-coroutine-hostile-raii check
 //   - legacy-stream-alloc.c++: workerd-legacy-stream-alloc check
+//   - memory-class.c++: workerd-memory-class check
 //   - promise-ignore-result.c++: workerd-promise-ignore-result check
 //   - visit-for-gc.c++: jsg-visit-for-gc check
 //   - unsafe-continuation-capture.c++: workerd-unsafe-continuation-capture check
@@ -20,6 +21,7 @@
 #include "consume.h"
 #include "coroutine-hostile-raii.h"
 #include "legacy-stream-alloc.h"
+#include "memory-class.h"
 #include "promise-ignore-result.h"
 #include "unsafe-continuation-capture.h"
 #include "visit-for-gc.h"
@@ -35,6 +37,7 @@ class WorkerdLintModule: public clang::tidy::ClangTidyModule {
     CheckFactories.registerCheck<ConsumeCheck>("workerd-consume");
     CheckFactories.registerCheck<CoroutineHostileRAIICheck>("workerd-coroutine-hostile-raii");
     CheckFactories.registerCheck<LegacyStreamAllocCheck>("workerd-legacy-stream-alloc");
+    CheckFactories.registerCheck<MemoryClassCheck>("workerd-memory-class");
     CheckFactories.registerCheck<PromiseIgnoreResultCheck>("workerd-promise-ignore-result");
     CheckFactories.registerCheck<UnsafeContinuationCaptureCheck>(
         "workerd-unsafe-continuation-capture");

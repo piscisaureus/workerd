@@ -1,0 +1,48 @@
+{
+ "rows": [
+  {
+   "cycles_per_req": 299782.5668899197,
+   "gk": false,
+   "instructions_per_req": 265463.3429890683,
+   "ipc": 0.8855196142427674,
+   "kvm_exits_per_req": 0.0,
+   "majflt_per_req": 0.0,
+   "minflt_per_req": 0.14807917211286153,
+   "path": "/",
+   "rps": 30525.9
+  },
+  {
+   "cycles_per_req": 514440.3778229864,
+   "gk": true,
+   "instructions_per_req": 281004.3665932627,
+   "ipc": 0.5462331082610964,
+   "kvm_exits_per_req": 1.885002867623984,
+   "majflt_per_req": 0.0,
+   "minflt_per_req": 0.8041791561610631,
+   "path": "/",
+   "rps": 9241.1
+  },
+  {
+   "cycles_per_req": 345206.1474044717,
+   "gk": false,
+   "instructions_per_req": 284340.59839332406,
+   "ipc": 0.8236834729949564,
+   "kvm_exits_per_req": 0.0,
+   "majflt_per_req": 0.0,
+   "minflt_per_req": 0.14092123029083456,
+   "path": "/work",
+   "rps": 26884.7
+  },
+  {
+   "cycles_per_req": 601489.1345311671,
+   "gk": true,
+   "instructions_per_req": 313111.5669911057,
+   "ipc": 0.5205606369517575,
+   "kvm_exits_per_req": 1.8309370489619186,
+   "majflt_per_req": 0.0,
+   "minflt_per_req": 0.6872895155619703,
+   "path": "/work",
+   "rps": 8106.3
+  }
+ ]
+}

@@ -5,6 +5,8 @@
 #pragma once
 
 #include <workerd/util/account-limits.h>
+#include <workerd/util/host-memory.h>
+#include <workerd/util/hostcall.h>
 #include <workerd/util/sqlite-metering.h>
 
 #include <kj/filesystem.h>
@@ -871,6 +873,24 @@ class SqliteDatabase::Vfs {
     return name;
   }
 
+  // The hostcall through which a native VFS call running inside a guest-kernel turn has the
+  // VFS's root directory made the thread's turn directory (see "The VFS root under the guest
+  // kernel" in sqlite.c++). workerd's main installs it (hostcall::install) once gk_init() has
+  // run; installHostcall() does that and seeds SQLite's PRNG on the host, since a confined turn
+  // cannot open /dev/urandom.
+  static const hostcall::Entry HOSTCALL;
+  static void installHostcall();
+
+  // Whether a wrapped native method may name a file by path, and so has the turn directory set
+  // for its duration; the methods that only act on descriptors they already hold do not.
+  enum class Paths { NO, YES };
+
+  // Test-only (experimental/guest-kernel/vfs-root-test.sh): makes every native VFS call on this
+  // thread run with its directory descriptor rewritten to `fd` -- as a turn that overwrote the
+  // thread-local would -- while the turn directory the hostcall sets is still the VFS's own.
+  // A negative `fd` restores the real descriptor. Host-side.
+  static void rewriteRootForTest(int fd);
+
   KJ_DISALLOW_COPY_AND_MOVE(Vfs);
 
  private:
@@ -888,7 +908,16 @@ class SqliteDatabase::Vfs {
   // Result of `directory.getFd()`, if it returns non-null. Cached here for convenience.
   int rootFd = -1;
 
-  template <typename T, T slot>
+  // The same descriptor in host memory, which the VFS root hostcall's handler reads through the
+  // slot's handle when a native VFS call asks for the turn directory: the handle is what crosses
+  // from the turn, and the handler takes the descriptor from the table it names, never from the
+  // turn. Empty unless the VFS wraps the native one.
+  struct RootDir;
+  HostSlot<RootDir> rootDir;
+
+  static long hostcallHandler(hostcall::Frame& frame);
+
+  template <typename T, T slot, Paths paths>
   struct MethodWrapperHack;
 
   struct WrappedNativeFileImpl;

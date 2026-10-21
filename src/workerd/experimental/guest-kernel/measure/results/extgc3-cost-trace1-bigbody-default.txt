@@ -1,0 +1,4 @@
+trace-default-bigbody round=1 arm=critical wl=bigbody c=1 n=7584 p50=750 p90=789 p99=1429 mean=790 rps=1263 non200=0 errors=1 rss_kb=132268 mc=1176 sc=0
+trace-default-bigbody round=1 arm=plain wl=bigbody c=1 n=7616 p50=755 p90=810 p99=1298 mean=787 rps=1269 non200=0 errors=1 rss_kb=130652 mc=588 sc=0
+trace-default-bigbody round=1 arm=off wl=bigbody c=1 n=6201 p50=756 p90=1320 p99=1491 mean=966 rps=1033 non200=0 errors=1 rss_kb=5779604 mc=0 sc=0
+DONE trace-default-bigbody

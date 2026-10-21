@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Sat, 18 Oct 2026 12:00:00 +0000
+Subject: Add Isolate::CollectGarbageForExternalMemory
+
+An embedder that reports memory V8 cannot see has no public way to ask for
+one plain major collection. MemoryPressureNotification(kCritical) is the only
+level V8 acts on when incremental marking is disabled, but it is a near-OOM
+path: CheckMemoryPressure() first clears the compilation cache and the
+serializer data, aborts concurrent optimization jobs, flushes Liftoff code and
+releases the pooled pages of every isolate in the group, and
+CollectGarbageOnMemoryPressure() then runs a second collection whenever
+committed-minus-live plus the reported external total is over 8 MB and a tenth
+of committed, which for a small heap it almost always is.
+
+This exposes the collection on its own: one full mark-compact with
+GCFlag::kNoFlags, attributed to kExternalMemoryPressure, which runs the
+embedder's weak callbacks and so lets what the embedder reported be freed, and
+leaves V8's caches and page pools alone.
+
+diff --git a/include/v8-isolate.h b/include/v8-isolate.h
+--- a/include/v8-isolate.h
++++ b/include/v8-isolate.h
+@@ -1177,6 +1177,20 @@
+    */
+   int64_t AdjustAmountOfExternalAllocatedMemoryImpl(int64_t change_in_bytes);
+ 
++  /**
++   * Performs one full garbage collection, so that memory the embedder has
++   * reported through AdjustAmountOfExternalAllocatedMemoryImpl() and holds
++   * until a weak callback runs can be freed. Unlike
++   * MemoryPressureNotification(MemoryPressureLevel::kCritical) it collects
++   * once and leaves the compilation cache, the serializer data, concurrent
++   * optimization jobs and the isolate group's page pools alone; unlike
++   * LowMemoryNotification() it does not collect repeatedly until the root set
++   * is stable. Intended for an embedder that has disabled incremental
++   * marking, for which V8 does not act on reported memory on its own. The
++   * isolate must be entered and locked by the calling thread.
++   */
++  void CollectGarbageForExternalMemory();
++
+   /**
+    * Returns heap profiler for this isolate. Will return NULL until the isolate
+    * is initialized.
+diff --git a/src/api/api.cc b/src/api/api.cc
+--- a/src/api/api.cc
++++ b/src/api/api.cc
+@@ -9892,7 +9892,14 @@
+   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(this);
+   return i_isolate->heap()->UpdateExternalMemory(change_in_bytes);
+ }
+ 
++void Isolate::CollectGarbageForExternalMemory() {
++  DCHECK_EQ(this, Isolate::TryGetCurrent());
++  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(this);
++  i_isolate->heap()->CollectAllGarbage(
++      i::GCFlag::kNoFlags, i::GarbageCollectionReason::kExternalMemoryPressure);
++}
++
+ bool Isolate::RetryCustomAllocate(std::function<bool()> allocate) {
+   i::Heap* heap = reinterpret_cast<i::Isolate*>(this)->heap();
+   return heap->allocator()->RetryCustomAllocate(

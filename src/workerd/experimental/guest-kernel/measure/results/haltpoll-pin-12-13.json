@@ -1,0 +1,512 @@
+{
+ "env": {
+  "GK_RUNNER": "resident",
+  "GK_RUNNER_PIN": "13"
+ },
+ "gk": true,
+ "host_halt_poll_ns": [
+  "200000",
+  "200000"
+ ],
+ "rows": [
+  {
+   "cpu_us": 50.02535453618291,
+   "cpus_busy": 1.3499547908342933,
+   "halt_delta": {
+    "exits": 372341,
+    "halt_attempted_poll": 175510,
+    "halt_exits": 175510,
+    "halt_poll_fail_ns": 1097757,
+    "halt_poll_invalid": 0,
+    "halt_poll_success_ns": 2549223145,
+    "halt_successful_poll": 175490,
+    "halt_wait_ns": 56168898,
+    "halt_wakeup": 20,
+    "nmi_injections": 175510
+   },
+   "halt_per_req": {
+    "exits": 2.1214681700862053,
+    "halt_attempted_poll": 0.9999943023514196,
+    "halt_exits": 0.9999943023514196,
+    "halt_poll_fail_ns": 6.2546336127080355,
+    "halt_poll_invalid": 0.0,
+    "halt_poll_success_ns": 14524.577633310733,
+    "halt_successful_poll": 0.999880349379811,
+    "halt_wait_ns": 320.0306419540656,
+    "halt_wakeup": 0.00011395297160861713,
+    "nmi_injections": 0.9999943023514196
+   },
+   "launch": 0,
+   "p50_us": 28.108,
+   "p99_us": 35.839,
+   "placement": [
+    {
+     "client": [
+      20,
+      14
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      20,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      20,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      20,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      20,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      20,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      20,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      20,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      20,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      20,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      20,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      20
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      20
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    }
+   ],
+   "requests": 175511,
+   "round": 0,
+   "rps": 29250.8,
+   "runner_cpu_us": 33.44519716712913
+  },
+  {
+   "cpu_us": 49.680705057677265,
+   "cpus_busy": 1.3469448497247154,
+   "halt_delta": {
+    "exits": 377020,
+    "halt_attempted_poll": 176326,
+    "halt_exits": 176326,
+    "halt_poll_fail_ns": 891962,
+    "halt_poll_invalid": 0,
+    "halt_poll_success_ns": 2518694914,
+    "halt_successful_poll": 176304,
+    "halt_wait_ns": 55119530,
+    "halt_wakeup": 22,
+    "nmi_injections": 176326
+   },
+   "halt_per_req": {
+    "exits": 2.1381985640234564,
+    "halt_attempted_poll": 1.0,
+    "halt_exits": 1.0,
+    "halt_poll_fail_ns": 5.058596009663918,
+    "halt_poll_invalid": 0.0,
+    "halt_poll_success_ns": 14284.308122454999,
+    "halt_successful_poll": 0.9998752311060195,
+    "halt_wait_ns": 312.6001270374193,
+    "halt_wakeup": 0.000124768893980468,
+    "nmi_injections": 1.0
+   },
+   "launch": 1,
+   "p50_us": 27.888,
+   "p99_us": 36.04,
+   "placement": [
+    {
+     "client": [
+      6,
+      14
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      6,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      6,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      6,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      6,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      6,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      6,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      6,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      6,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      6,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      6,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      6
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      6
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    }
+   ],
+   "requests": 176326,
+   "round": 0,
+   "rps": 29386.7,
+   "runner_cpu_us": 33.17718317207899
+  },
+  {
+   "cpu_us": 50.96242838900148,
+   "cpus_busy": 1.3377310188217082,
+   "halt_delta": {
+    "exits": 368530,
+    "halt_attempted_poll": 170714,
+    "halt_exits": 170714,
+    "halt_poll_fail_ns": 1427501,
+    "halt_poll_invalid": 0,
+    "halt_poll_success_ns": 2468922398,
+    "halt_successful_poll": 170692,
+    "halt_wait_ns": 53978681,
+    "halt_wakeup": 22,
+    "nmi_injections": 170714
+   },
+   "halt_per_req": {
+    "exits": 2.158756751057324,
+    "halt_attempted_poll": 1.0,
+    "halt_exits": 1.0,
+    "halt_poll_fail_ns": 8.361944538819312,
+    "halt_poll_invalid": 0.0,
+    "halt_poll_success_ns": 14462.33113862952,
+    "halt_successful_poll": 0.9998711294914301,
+    "halt_wait_ns": 316.193639654627,
+    "halt_wakeup": 0.00012887050856988882,
+    "nmi_injections": 1.0
+   },
+   "launch": 2,
+   "p50_us": 27.969,
+   "p99_us": 36.61,
+   "placement": [
+    {
+     "client": [
+      25,
+      14
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      25,
+      14
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      25,
+      14
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      25,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      25,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      25,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      25,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      25,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      25,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      25,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      25,
+      15
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      25
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    },
+    {
+     "client": [
+      25
+     ],
+     "owner": 12,
+     "runner": [
+      13
+     ]
+    }
+   ],
+   "requests": 170714,
+   "round": 0,
+   "rps": 28451.4,
+   "runner_cpu_us": 34.32641728270675
+  }
+ ],
+ "vmscape": [
+  "Mitigation: IBPB before exit to userspace",
+  "Mitigation: IBPB before exit to userspace"
+ ]
+}

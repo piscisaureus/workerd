@@ -768,6 +768,12 @@ class TmpDirStoreScope final {
  public:
   static bool hasCurrent();
   static TmpDirStoreScope& current();
+
+  // The thread-local current scope, for the host side of a guest turn to save before the turn
+  // and put back after it (see GuestTurnThreadLocals in guest-turn-thread-locals.h). Opaque to
+  // the caller: only ever stored back.
+  static TmpDirStoreScope* saveThreadLocalForGuestTurn();
+  static void restoreThreadLocalAfterGuestTurn(TmpDirStoreScope* value);
   TmpDirStoreScope(kj::Maybe<kj::Badge<TmpDirStoreScope>> guard = kj::none);
   KJ_DISALLOW_COPY_AND_MOVE(TmpDirStoreScope);
   ~TmpDirStoreScope() noexcept(false);
@@ -800,6 +806,12 @@ class SymbolicLinkRecursionGuardScope final {
   SymbolicLinkRecursionGuardScope();
   ~SymbolicLinkRecursionGuardScope() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(SymbolicLinkRecursionGuardScope);
+
+  // The thread-local active guard, for the host side of a guest turn to save before the turn and
+  // put back after it (see GuestTurnThreadLocals in guest-turn-thread-locals.h). Opaque to the
+  // caller: only ever stored back.
+  static SymbolicLinkRecursionGuardScope* saveThreadLocalForGuestTurn();
+  static void restoreThreadLocalAfterGuestTurn(SymbolicLinkRecursionGuardScope* value);
 
   // Whenever a symbolic link is resolved, it needs to be checked against
   // the recursion guard. If the link has already been seen, an exception

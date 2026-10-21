@@ -50,12 +50,21 @@ class JsReadableStream final {
   // Holds the in-memory data backing a buffer-backed (rewindable) JsReadableStream.  `owned`
   // is always kj-heap memory: the streams built from it are read on the kj event loop without
   // the isolate lock, so the bytes must not sit in the V8 sandbox.
+  //
+  // The bytes are reported to V8 as the isolate's external memory for as long as the Buffer
+  // lives. It lives as long as the Request or Response whose body it backs, which the GC sees
+  // only as a small wrapper: a worker that builds bodies from large buffers makes garbage that
+  // grows the JS heap by a few hundred bytes per body and the C++ heap by the whole body, and
+  // without the report V8 has no reason to collect it until some unrelated major GC. With the
+  // C++ heap shared, that is bloat; with a per-isolate heap arena (jsg/heap-arena.h), which is a
+  // fixed region, a few thousand such bodies exhaust the isolate's memory.
   struct Buffer {
     kj::Array<const kj::byte> owned;
     kj::ArrayPtr<const kj::byte> view;
+    jsg::ExternalMemoryAdjustment accounted;
 
-    explicit Buffer(kj::Array<const kj::byte> data);
-    explicit Buffer(jsg::Ref<Blob> data);
+    explicit Buffer(jsg::Lock& js, kj::Array<const kj::byte> data);
+    explicit Buffer(jsg::Lock& js, jsg::Ref<Blob> data);
   };
 
   struct Impl {

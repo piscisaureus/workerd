@@ -29,8 +29,13 @@
 #include <workerd/io/io-context.h>
 #include <workerd/io/tracer.h>
 #include <workerd/jsg/async-context.h>
+#include <workerd/jsg/guest-run.h>
 #include <workerd/jsg/ser.h>
+#include <workerd/jsg/setup.h>
 #include <workerd/jsg/util.h>
+#include <workerd/util/entropy.h>
+#include <workerd/util/host-event-queue.h>
+#include <workerd/util/host-memory.h>
 #include <workerd/util/sentry.h>
 #include <workerd/util/stream-utils.h>
 #include <workerd/util/thread-scopes.h>
@@ -39,7 +44,25 @@
 
 #include <v8-microtask-queue.h>
 
+#ifdef __linux__
+#include <setjmp.h>
+#include <signal.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <time.h>
+#include <ucontext.h>
+#include <unistd.h>
+#endif
+
 #include <kj/encoding.h>
+#include <kj/thread.h>
+
+#include <atomic>
+#include <cstring>
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <workerd/experimental/guest-kernel/gk.h>
+#endif
 
 namespace workerd::api {
 
@@ -304,6 +327,1894 @@ kj::Promise<void> ServiceWorkerGlobalScope::connectUdp(kj::String host,
   JSG_FAIL_REQUIRE(Error, "Handler does not export a connect() function.");
 }
 
+namespace {
+
+#ifdef __linux__
+// Test-only stand-in for the CPU limiter's signal (see maybeForceGuestFaultForTest below).
+constexpr long WASM_SIGNAL_PROBE_MS = 20;
+const TrackedWasmInstanceList* wasmSignalProbeList = nullptr;
+timer_t wasmSignalProbeTimer;
+bool wasmSignalProbeTimerArmed = false;
+
+void wasmSignalProbeHandler(int) {
+  if (wasmSignalProbeList != nullptr) wasmSignalProbeList->writeShutdownSignal();
+}
+
+// Host-side, on the event loop: installs the SIGXCPU handler once and arms the thread's timer.
+void armWasmSignalTimerForTest(const TrackedWasmInstanceList& list) {
+  static const bool installed = []() {
+    struct sigaction sa {};
+    sa.sa_handler = &wasmSignalProbeHandler;
+    sa.sa_flags = SA_RESTART;
+    return sigaction(SIGXCPU, &sa, nullptr) == 0;
+  }();
+  KJ_REQUIRE(installed);
+  wasmSignalProbeList = &list;
+  if (wasmSignalProbeTimerArmed) timer_delete(wasmSignalProbeTimer);
+  struct sigevent sev {};
+  sev.sigev_notify = SIGEV_THREAD_ID;
+  sev.sigev_signo = SIGXCPU;
+  sev._sigev_un._tid = static_cast<int>(syscall(SYS_gettid));
+  // The clock is the one the turn's CPU is charged to: this thread's, unless the guest kernel
+  // runs the turn's instructions on a vCPU runner thread (GK_RUNNER), whose clock gk names
+  // then. The signal still comes to this thread, where the handler's write belongs.
+  clockid_t clock = CLOCK_THREAD_CPUTIME_ID;
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (gk_initialized()) gk_turn_cpu_clockid(&clock);
+#endif
+  KJ_SYSCALL(timer_create(clock, &sev, &wasmSignalProbeTimer));
+  wasmSignalProbeTimerArmed = true;
+  struct itimerspec its {};
+  its.it_value.tv_nsec = WASM_SIGNAL_PROBE_MS * 1000000;
+  KJ_SYSCALL(timer_settime(wasmSignalProbeTimer, 0, &its, nullptr));
+  KJ_LOG(WARNING,
+      "WORKERD_GK_TEST_PROBE: armed a CPU-time timer on the clock the turn is charged to, whose "
+      "signal handler on this thread writes the Wasm shutdown signal",
+      WASM_SIGNAL_PROBE_MS, clock);
+}
+
+// The buffer a write primitive would aim the old descriptor at, and the descriptors as they
+// were, for the restore.
+byte chosenWasmBuffer[64] = {};
+struct SavedWasmDescriptor {
+  TrackedWasmInstance* entry;
+  byte memory[sizeof(kj::Array<byte>)];
+  kj::Maybe<uint32_t> signalByteOffset;
+};
+kj::Vector<SavedWasmDescriptor> savedWasmDescriptors;
+
+// In-turn: rewrites each entry's `memory` (a kj::Array: pointer, size, disposer) to name the
+// chosen buffer, and its signal offset to 0, as a write primitive with the old layout in mind
+// would.
+void corruptWasmDescriptorsForTest(const TrackedWasmInstanceList& list, kj::StringPtr url) {
+  auto& entries = const_cast<SignalSafeList<TrackedWasmInstance>&>(list.signals());
+  entries.iterate([&](TrackedWasmInstance& entry) {
+    SavedWasmDescriptor saved{.entry = &entry, .signalByteOffset = entry.signalByteOffset};
+    memcpy(saved.memory, &entry.memory, sizeof(saved.memory));
+    savedWasmDescriptors.add(kj::mv(saved));
+    uintptr_t words[2] = {reinterpret_cast<uintptr_t>(chosenWasmBuffer), sizeof(chosenWasmBuffer)};
+    uintptr_t oldWords[2];
+    memcpy(oldWords, &entry.memory, sizeof(oldWords));
+    memcpy(&entry.memory, words, sizeof(words));
+    entry.signalByteOffset = static_cast<uint32_t>(0);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: overwrote a Wasm signal descriptor in the heap from inside the "
+        "JS turn",
+        url, kj::str("0x", kj::hex(oldWords[0])), oldWords[1], kj::str("0x", kj::hex(words[0])),
+        words[1]);
+  });
+}
+
+// In-turn: reports what the chosen buffer holds and puts the descriptors back.
+void checkWasmDescriptorsForTest(kj::StringPtr url) {
+  uint32_t word = 0;
+  memcpy(&word, chosenWasmBuffer, sizeof(word));
+  KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the chosen buffer's first word after the signal", url,
+      word, kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(chosenWasmBuffer))));
+  for (auto& saved: savedWasmDescriptors) {
+    memcpy(&saved.entry->memory, saved.memory, sizeof(saved.memory));
+    saved.entry->signalByteOffset = saved.signalByteOffset;
+  }
+  KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: restored the Wasm signal descriptors",
+      savedWasmDescriptors.size());
+  savedWasmDescriptors.clear();
+}
+#endif  // __linux__
+
+// Test-only hooks for the experimental guest kernel's fault path. With the guest kernel enabled
+// and WORKERD_GK_TEST_FAULT set, a request whose path is /__gk_fault dereferences a null pointer
+// from inside the JS turn. At guest ring 3 that is a page fault the guest cannot service, so
+// gk_run_here_user() returns GK_EFAULT to IoContext::runImpl (see runJsTurn there), which must
+// fail the request, condemn the isolate and keep the process serving. Both gates are required: a
+// production process (no WORKERD_GK_TEST_FAULT) never takes this branch, and neither does one
+// running without the guest kernel, where the dereference would be a host-side SIGSEGV.
+// A request whose path is /__gk_fault_timeout takes the same fault inside a timeout callback
+// instead: it sets a zero-delay timeout on this request's IoContext whose callback dereferences
+// the null pointer, so the fault lands in the turn the timer fires, the one that runs a JS
+// setTimeout callback, with that turn's own host state (the TimeoutState marked running, see
+// TimeoutManagerImpl in io/io-context.c++) abandoned by the fault; the script keeps the request
+// alive until the timer has fired (fault-timeout-test.sh). A request whose path is
+// /__gk_fault_cache_fallback arms the next MemoryCache fallback on this thread to take the fault
+// in the frame that runs the fallback (see forceGuestFaultInNextMemoryCacheFallbackForTest), so
+// the fault lands in the turn a cache read's fallback runs in, with the fallback's done-callback
+// -- what releases the cache's in-progress entry for the key -- as that frame left it
+// (memory-cache-fault-test.sh).
+//
+// Two more paths take the fault with state a turn's frame holds that costs more than the turn
+// (fault-leak-test.sh). /__gk_fault_disallow_dtors faults inside a scope that disallows
+// destroying kj::AsyncObjects, which is what Wrappable::maybeDeferDestruction enters around
+// every destruction of a JS heap object inside a turn: the scope is reached through a
+// thread-local pointer to the scope object on the stack, so the fault leaves that pointer
+// naming an abandoned frame and the next ~AsyncObject on the thread dereferences it from a
+// noexcept function. /__gk_fault_gc_dtor faults with the flag that says this thread is inside a
+// CppgcShim destructor set, which is what a cppgc destructor running inside a turn leaves
+// behind; /__gk_gc_dtor_check then reports what the host reads on the event loop afterwards.
+// Both are stand-ins for their real sites, as the Wasm signal timer is for the CPU limiter:
+// each leaves the state its site leaves, without having to make the collection or the drop
+// land on the fault.
+//
+// With WORKERD_GK_TEST_PROBE set, a request whose path is /__gk_probe_host instead reads one
+// byte of the channel token key, and one whose path is /__gk_probe_host_entropy one byte of the
+// host entropy buffer, from inside the JS turn; both are host-memory tenants registered through
+// hostMemory::setProbeTargetForTest(). Host memory is mapped into no guest root, so at ring 3
+// that is the same kind of fault, at the byte's own address; this is how the guest kernel's
+// host-memory-test.sh shows both are out of a turn's reach. The same two gates apply.
+//
+// With the same variable set, a request whose path is /__gk_poison_entropy overwrites, from
+// inside the JS turn, the whole of this thread's getEntropy() buffer with one byte value and
+// marks all of it unconsumed, which is what a turn that wants to choose the bytes a later draw
+// on the thread returns would do. On the event loop afterwards, outside the guest, the host
+// mints an RPC channel token (see hostMemory::setHostUseForTest) and logs its nonce, then draws
+// from getEntropy() and logs that too: the latter must be the pattern, showing the turn's write
+// reached the host's next draw on that path, and the nonce must not be, showing the token's
+// nonce comes from somewhere else. The buffer is then discarded so later draws are fresh.
+//
+// /__gk_ioown_steal_drop is the retire side of the cross-isolate rewrite: the thief destroys
+// the holder carrying the stolen handle inside a turn, which asks the host to retire another
+// isolate's entry and unlink its node, and the announcing request, still in flight, uses its
+// object again once the host has answered.
+//
+// /__gk_ioown_type_swap is the same-isolate half: a turn writes one of its own IoOwn handles
+// over another of its own, of an unrelated class, then calls a virtual through it and drops it.
+//
+// With the same variable set, a request whose path is /__gk_corrupt_handle overwrites, from
+// inside the JS turn, the handle through which the tenant's owner reaches it (registered through
+// hostMemory::setHandleProbeForTest()) with the address of a buffer this code chose, which is
+// what a write primitive would leave in place of a pointer; the owner is in the ordinary heap,
+// so the write lands and the turn completes. The host's use of the tenant then runs on the
+// event loop, outside the guest, as the real uses do: it must be refused rather than reach the
+// buffer. The handle is restored afterwards and the use run again.
+//
+// With the same variable set, three request paths exercise the Wasm shutdown signal, whose
+// descriptors the guest kernel keeps in its own table (see TrackedWasmInstanceList). The signal
+// has no source in workerd itself, so /__gk_wasm_arm stands in for the CPU limiter: on the event
+// loop after the turn, it arms a one-shot CPU-time timer of WASM_SIGNAL_PROBE_MS on this thread,
+// whose SIGXCPU handler calls writeShutdownSignal() on the isolate's list, as a limiter would
+// from its own signal handler; a following request that burns CPU reading a registered module's
+// field sees the value land. /__gk_wasm_corrupt first overwrites, from inside the turn, the heap
+// entry of every registered module -- the pointer and size of its linear memory, and the signal
+// offset -- with a buffer this code chose, which is what a write primitive aiming the old
+// descriptor would do, then arms the timer the same way; the signal must still reach the
+// module's real memory and the chosen buffer must stay untouched, which /__gk_wasm_check reads
+// out and logs before restoring the entries.
+// With the same variable set, a request whose path is /__gk_tls_restore overwrites, from inside
+// the turn, the heap slot the isolate lock restores Worker::Api's thread-local from, with a
+// sentinel; the host puts the real value back from a stack frame when the lock is released (see
+// ~Worker::Lock and GuestTurnThreadLocals in io/), so an event-loop callback observes Worker::Api
+// not holding the sentinel. This is how tls-test.sh shows the guest-writable thread-locals the
+// host reads after a turn do not carry a turn's value past it.
+//
+// With the same variable set, two request paths exercise the pointer this thread finds its event
+// loop through (threadLocalEventLoop in kj/async.c++, reached with
+// kj::EventLoop::saveCurrentLoopPointer), which stands at the head of every host lookup of
+// event-loop state and is thread-local storage a turn can write (event-loop-test.sh).
+// /__gk_loop_repoint builds an EventLoop of its own inside the turn and leaves the pointer naming
+// it, as the turn's last act in the guest -- the rest of the turn arms its own events through
+// that pointer -- and /__gk_loop_clear leaves the pointer null, the other state a hostile or
+// faulted turn can leave. The host must find its own loop either way: the frame that entered the
+// guest puts the pointer back as soon as the guest returns (runTrampolineInGuest), and both the
+// first host-side lookup after the turn, while the isolate lock is still held, and one on the
+// event loop afterwards report what kj::EventLoop::Id::current() finds against the loop the turn
+// ran on.
+//
+// With the same variable set, /__gk_loop_firing does the same for the event this thread is firing
+// (threadLocalCurrentlyFiring in kj/async.c++), which kj clears when the fire() that ran the turn
+// returns -- leaving the rest of that fire() to run on what the turn left, where ~Event() compares
+// the pointer with every event destroyed on the thread from a noexcept function that aborts the
+// process on a match. The turn leaves a sentinel, and the host-side report, taken inside that same
+// fire(), must find the event the turn ran under.
+//
+// With the same variable set, /__gk_loop_other_arm, /__gk_loop_other_poison and
+// /__gk_loop_other_check ask whether a turn reaches another thread's copy of the loop pointer,
+// which no save in this thread's frame could put back (event-loop-cross-test.sh). The arm starts a
+// parked host thread with a loop of its own and identifies its slot, both host-side, since a turn
+// could do neither; the poison reads and writes that word from inside a turn; the check reports
+// host-side what the word holds and puts the thread's own value back.
+//
+// With the same variable set, four request paths exercise the isolate's lock slot, the V8 data
+// slot jsg::Lock::from reads, which is in the C++ isolate object in the shared heap and so
+// writable from any isolate's turn (lock-slot-test.sh). /__gk_lock_slot overwrites this isolate's
+// own slot from inside the turn with a sentinel (0x1), as the turn's last act in the guest
+// (jsg::setGuestTurnTailHookForTest), and arranges for the host to report, once
+// the turn is over but while it still holds the lock (Worker::Lock::runAtNextReleaseForTest),
+// what jsg::Lock::from returns against the lock it holds, and for an event-loop callback to
+// report the slot once the lock is gone. /__gk_lock_announce records this isolate for another
+// worker's turn; /__gk_lock_poison_other, on that other worker, overwrites the announced
+// isolate's slot from inside its own turn and has an event-loop callback report the slot, to
+// show the write landed; /__gk_lock_check on the announced worker then reports the same two
+// things as /__gk_lock_slot without writing anything. The host must find its own lock in the
+// slot in every case and must not act on the sentinel, including by refusing the lock as
+// recursive.
+// Per thread: a request arms it from inside its JS turn and the fallback that consumes it runs
+// on the same event loop, so another thread's fallback must not take the fault instead.
+thread_local bool faultInNextMemoryCacheFallbackForTest = false;
+
+// The identity of this thread's event loop as a JS turn saw it, before the turn rewrote the
+// pointer the host finds that loop through (see /__gk_loop_repoint below). Test-only, and itself
+// thread-local storage a turn could write: it is the probe's record of what the host should find,
+// not something the host relies on.
+thread_local kj::Maybe<kj::EventLoop::Id> loopIdBeforeTurnForTest;
+
+// What kj::EventLoop::Id::current() -- the host's own lookup of this thread's event loop, which
+// starts from that pointer -- finds now, against that record. "cleared" is the lookup failing
+// outright, which is what a turn that leaves the pointer null costs the host.
+kj::StringPtr currentLoopVerdictForTest() {
+  kj::Maybe<kj::EventLoop::Id> current;
+  if (kj::runCatchingExceptions([&]() { current = kj::EventLoop::Id::current(); }) != kj::none) {
+    return "cleared"_kj;
+  }
+  KJ_IF_SOME(before, loopIdBeforeTurnForTest) {
+    KJ_IF_SOME(now, current) {
+      return now == before ? "restored"_kj : "repointed"_kj;
+    }
+  }
+  return "unrecorded"_kj;
+}
+
+kj::String hexAddrForTest(const void* p) {
+  return kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(p)));
+}
+
+// The event this thread was firing when a turn began, so the host can tell the value it put back
+// from the one the turn left (see /__gk_loop_firing below).
+thread_local kj::_::Event* firingEventBeforeTurnForTest = nullptr;
+
+// The loop's run-queue handle a turn forged and the real one it replaced, carried from the in-turn
+// rewrite to the host-side resolution below (see /__gk_queue_head_poison). The fake queue is the
+// one the turn builds in its own memory for the forged handle to point at.
+thread_local uint64_t queueHandleRealForTest = 0;
+thread_local uint64_t queueHandleForgedForTest = 0;
+thread_local uint64_t fakeQueueForTest[16] = {};
+kj::_::Event* const FIRING_SENTINEL_FOR_TEST = reinterpret_cast<kj::_::Event*>(0x1);
+
+#ifdef __linux__
+// Cross-thread reach of kj's event-loop thread-locals (see /__gk_loop_other_poison below). The
+// save and restore around a turn (runTrampolineInGuest) covers the thread the turn runs on; this
+// asks the other half, whether a turn can reach the same pointer belonging to a different thread,
+// whose own turns would then run on a loop this one chose -- which no save in this thread's frame
+// could undo.
+//
+// The other thread is a parked host thread with an event loop of its own. Its copy of kj's
+// current-loop pointer is found by offset: a thread-local of this file's own is the anchor, and
+// the distance from the anchor to kj's pointer is the same in every thread's static TLS block, so
+// the offset at which this thread's anchor neighbourhood holds this thread's loop and the other
+// thread's holds the other thread's loop names the slot. Two values matching at one offset is
+// what identifies it; the count of matching offsets is logged so a coincidence shows up.
+thread_local uint64_t tlsAnchorForTest = 0;
+constexpr uint64_t TLS_ANCHOR_MAGIC = 0x5a5a5a5a5a5a5a5aull;
+constexpr uint64_t TLS_CROSS_SENTINEL = 0xdeadbeefdeadbeefull;
+
+struct OtherThreadLoopForTest {
+  uint64_t* anchor;
+  kj::EventLoop* loop;
+  kj::EventLoop** slot;  // null if no offset identified it
+};
+kj::Maybe<OtherThreadLoopForTest> otherThreadLoopForTest;
+
+// Reads one word of this process's own memory without faulting on an unmapped page: the search
+// below walks off the end of a TLS block.
+bool peekWordForTest(const void* addr, uint64_t& out) {
+  iovec local{&out, sizeof(out)};
+  iovec remote{const_cast<void*>(addr), sizeof(out)};
+  return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(sizeof(out));
+}
+
+struct PublishedTlsForTest {
+  std::atomic<uint64_t*> anchor{nullptr};
+  std::atomic<kj::EventLoop*> loop{nullptr};
+};
+
+// Host-side, on the event loop: start the other thread and identify its slot.
+void armOtherThreadLoopForTest(kj::StringPtr url) {
+  if (otherThreadLoopForTest != kj::none) return;
+  // Never freed, because the thread below is never joined.
+  auto* published = new PublishedTlsForTest();
+  {
+    kj::Thread thread([published]() {
+      tlsAnchorForTest = TLS_ANCHOR_MAGIC;
+      kj::EventLoop loop;
+      kj::WaitScope waitScope(loop);
+      published->loop.store(kj::EventLoop::saveCurrentLoopPointer());
+      published->anchor.store(&tlsAnchorForTest);
+      // Parked for the life of the process, so neither the loop nor the wait scope is destroyed.
+      for (;;) ::pause();
+    });
+    thread.detach();
+  }
+  for (uint i = 0; i < 1000 && published->anchor.load() == nullptr; i++) {
+    ::usleep(1000);
+  }
+
+  uint64_t* mineAnchor = &tlsAnchorForTest;
+  kj::EventLoop* mineLoop = kj::EventLoop::saveCurrentLoopPointer();
+  uint64_t* theirAnchor = published->anchor.load();
+  kj::EventLoop* theirLoop = published->loop.load();
+  kj::EventLoop** slot = nullptr;
+  uint matches = 0;
+  if (theirAnchor != nullptr) {
+    constexpr int WORDS = 4096;  // the search covers 32 KiB either side of the anchor
+    for (int d = -WORDS; d <= WORDS; d++) {
+      uint64_t mineWord = 0;
+      uint64_t theirWord = 0;
+      if (!peekWordForTest(mineAnchor + d, mineWord)) continue;
+      if (mineWord != reinterpret_cast<uint64_t>(mineLoop)) continue;
+      if (!peekWordForTest(theirAnchor + d, theirWord)) continue;
+      if (theirWord != reinterpret_cast<uint64_t>(theirLoop)) continue;
+      if (matches++ == 0) slot = reinterpret_cast<kj::EventLoop**>(theirAnchor + d);
+    }
+  }
+  otherThreadLoopForTest = OtherThreadLoopForTest{theirAnchor, theirLoop, slot};
+  auto mineAnchorAt = hexAddrForTest(mineAnchor);
+  auto mineLoopAt = hexAddrForTest(mineLoop);
+  auto theirAnchorAt = hexAddrForTest(theirAnchor);
+  auto theirLoopAt = hexAddrForTest(theirLoop);
+  auto slotAt = hexAddrForTest(slot);
+  KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: another thread's event loop pointer", url, mineAnchorAt,
+      mineLoopAt, theirAnchorAt, theirLoopAt, slotAt, matches);
+}
+
+// The word a turn reads and writes: the other thread's copy of kj's current-loop pointer, or, if
+// no offset identified it, the anchor word, which is in the same TLS block and so on the same
+// pages and answers the same question.
+uint64_t* otherThreadTargetForTest(const OtherThreadLoopForTest& other) {
+  if (other.slot != nullptr) return reinterpret_cast<uint64_t*>(other.slot);
+  return other.anchor;
+}
+
+// __cxa_get_globals is part of the Itanium C++ ABI and statically linked into this binary, but it
+// is not declared in the public <cxxabi.h>; declare it here. It returns a pointer to the calling
+// thread's __cxa_eh_globals, whose first member is caughtExceptions.
+extern "C" void* __cxa_get_globals() noexcept;
+
+// Cross-thread reach of the C++ exception runtime's caughtExceptions pointer (see
+// /__gk_eh_poison below). This is the sharpest of the technique-A thread-locals: a write to it
+// steers __cxa_end_catch, on the Itanium ABI's foreign-exception path, into an indirect call
+// through a forged exception's exception_cleanup -- a jump to a guest-chosen address on a thread
+// holding no isolate lock.
+//
+// The victim is a thread that throws and catches a C++ exception without the isolate lock, which
+// in a serve configured with moduleFallback is the fallback-service thread
+// (FallbackServiceClient::threadMain throws and catches on every failed fetch). This reproduces
+// that thread with a stand-in, for the reason event-loop-cross-test.sh gives for the loop
+// pointer: the server's services share one event-loop thread, and that thread blocks in
+// FallbackServiceClient::tryResolve for the whole of a real resolution, so no concurrent JS turn
+// reaches the fallback thread's caughtExceptions in the window between __cxa_begin_catch and
+// __cxa_end_catch. The stand-in throws and catches a real kj::Exception and holds inside the real
+// catch handler, which lets a turn write the word in-window; the consumer is the real libc++abi
+// __cxa_end_catch either way.
+//
+// The forged __cxa_exception leaves its unwindHeader.exception_class zero, so __isOurException
+// Class treats it as foreign and __cxa_end_catch reaches _Unwind_DeleteException, which calls
+// unwindHeader.exception_cleanup. That pointer is a sentinel in unmapped memory, so control
+// reaching it faults at that exact rip; a SIGSEGV handler on the victim thread records it.
+// rip == the sentinel is the proof that the indirect call transferred control there, as distinct
+// from any incidental data fault.
+constexpr uintptr_t EH_CLEANUP_SENTINEL_FOR_TEST = 0x00005e5e5e5e5e5eull;
+constexpr uint64_t EH_CLASS_MASK_FOR_TEST = 0xffffffffffffff00ull;
+constexpr uint64_t EH_CLASS_CLANG_FOR_TEST = 0x434c4e47432b2b00ull;  // "CLNGC++\0"
+constexpr uint64_t EH_CLASS_GNU_FOR_TEST = 0x474e5543432b2b00ull;    // "GNUCC++\0"
+
+struct EhVictimForTest {
+  std::atomic<void**> ehGlobals{nullptr};    // &caughtExceptions on the victim thread
+  std::atomic<uint64_t*> anchor{nullptr};    // the victim's &tlsAnchorForTest, for the delta check
+  std::atomic<void*> nativeHeader{nullptr};  // the real __cxa_exception while held in-catch
+  std::atomic<bool> armed{false};            // the victim is in-catch and its state is published
+  std::atomic<bool> poisoned{false};         // a turn has written the forged pointer
+  std::atomic<bool> faulted{false};
+  std::atomic<bool> endCatchReturned{false};  // end_catch ran without reaching the sentinel
+  std::atomic<uintptr_t> faultRip{0};
+  std::atomic<uintptr_t> faultAddr{0};
+  sigjmp_buf recover;
+};
+EhVictimForTest* ehVictimForTest = nullptr;
+
+// The forged __cxa_exception, in this binary's .bss where the victim thread (host code) reads it.
+// Large enough to hold unwindHeader at whatever offset this toolchain's __cxa_exception puts it;
+// that offset is derived at arm time from a real native header.
+byte forgedCxaExceptionForTest[1024] = {};
+bool ehForgedReadyForTest = false;
+int ehHeaderOffsetForTest = -1;
+struct sigaction ehOldSegvForTest = {};
+
+// Async-signal-safe: write "...; rip=0x..; addr=0x..\n" to stderr, which is the workerd log.
+void writeEhFaultLineForTest(uintptr_t rip, uintptr_t addr) {
+  static const char kPrefix[] =
+      "WORKERD_GK_TEST_PROBE: the C++ unwinder called through the forged cleanup pointer; rip=0x";
+  static const char kAddr[] = "; addr=0x";
+  static const char kHex[] = "0123456789abcdef";
+  char buf[256];
+  size_t n = 0;
+  for (size_t i = 0; i < sizeof(kPrefix) - 1; i++) buf[n++] = kPrefix[i];
+  for (int s = 60; s >= 0; s -= 4) buf[n++] = kHex[(rip >> s) & 0xf];
+  for (size_t i = 0; i < sizeof(kAddr) - 1; i++) buf[n++] = kAddr[i];
+  for (int s = 60; s >= 0; s -= 4) buf[n++] = kHex[(addr >> s) & 0xf];
+  buf[n++] = '\n';
+  ssize_t r = ::write(STDERR_FILENO, buf, n);
+  (void)r;
+}
+
+void ehVictimSigsegvForTest(int sig, siginfo_t* si, void* uc) {
+  auto* ctx = static_cast<ucontext_t*>(uc);
+  // REG_RIP is index 16 of gregs on x86-64 Linux, where this probe runs.
+  uintptr_t rip = static_cast<uintptr_t>(ctx->uc_mcontext.gregs[16]);
+  if (ehVictimForTest != nullptr && rip == EH_CLEANUP_SENTINEL_FOR_TEST) {
+    uintptr_t addr = reinterpret_cast<uintptr_t>(si->si_addr);
+    ehVictimForTest->faultRip.store(rip);
+    ehVictimForTest->faultAddr.store(addr);
+    ehVictimForTest->faulted.store(true);
+    writeEhFaultLineForTest(rip, addr);
+    siglongjmp(ehVictimForTest->recover, 1);
+  }
+  // Not the steer: restore whatever handler was here before (V8's trap handler, or the default)
+  // and let the instruction re-run into it, so a genuine crash elsewhere is not swallowed.
+  ::sigaction(sig, &ehOldSegvForTest, nullptr);
+}
+
+// The victim thread: throw and catch a real kj::Exception (as a failed fallback fetch does), hold
+// inside the catch handler with the state published, and let __cxa_end_catch run once the turn
+// has poisoned caughtExceptions.
+void ehVictimThreadMainForTest() {
+  auto* v = ehVictimForTest;
+  tlsAnchorForTest = TLS_ANCHOR_MAGIC;
+  v->anchor.store(&tlsAnchorForTest);
+  {
+    struct sigaction sa {};
+    sa.sa_sigaction = &ehVictimSigsegvForTest;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    ::sigaction(SIGSEGV, &sa, &ehOldSegvForTest);
+  }
+  if (sigsetjmp(v->recover, 1) == 0) {
+    try {
+      kj::throwFatalException(
+          KJ_EXCEPTION(DISCONNECTED, "guest-kernel probe: a failed fallback fetch's exception"));
+    } catch (kj::Exception& exception) {
+      // Inside the real catch handler: __cxa_begin_catch has set caughtExceptions to this native
+      // exception. Publish eh_globals and the native header, then hold until a turn writes the
+      // forged pointer. The handler's scope closes below, running __cxa_end_catch against it.
+      (void)exception;
+      void** eh = reinterpret_cast<void**>(__cxa_get_globals());
+      v->ehGlobals.store(eh);
+      v->nativeHeader.store(eh[0]);
+      v->armed.store(true);
+      for (int i = 0; i < 100000 && !v->poisoned.load(); i++) ::usleep(1000);
+    }
+    // __cxa_end_catch returned without faulting: the forged value was not consumed. A build that
+    // closed the hole would land here.
+    v->endCatchReturned.store(true);
+  }
+  // Recovered from the steer, or end_catch returned: park for the life of the process.
+  for (;;) ::pause();
+}
+
+// Host-side, on the event loop: start the stand-in, identify its eh_globals the fixed-offset way,
+// and build the forged exception. A turn could do none of this; it does only the one write in
+// /__gk_eh_poison. Identification is by constant delta from the anchor, as the memory-classes.md
+// R7 row describes: eh_globals sits at the same offset from tlsAnchorForTest in every thread's
+// static TLS block, so the victim's eh_globals must be the same delta from the victim's anchor as
+// this thread's eh_globals is from this thread's anchor.
+void armEhVictimForTest(kj::StringPtr url) {
+  if (ehVictimForTest != nullptr) return;
+  ehVictimForTest = new EhVictimForTest();
+  {
+    kj::Thread thread([]() { ehVictimThreadMainForTest(); });
+    thread.detach();
+  }
+  auto* v = ehVictimForTest;
+  for (int i = 0; i < 2000 && !v->armed.load(); i++) ::usleep(1000);
+
+  void** mineEh = reinterpret_cast<void**>(__cxa_get_globals());
+  uint64_t* mineAnchor = &tlsAnchorForTest;
+  void** theirEh = v->ehGlobals.load();
+  uint64_t* theirAnchor = v->anchor.load();
+  int64_t mineDelta = reinterpret_cast<char*>(mineEh) - reinterpret_cast<char*>(mineAnchor);
+  int64_t theirDelta = 0;
+  bool deltaMatches = false;
+  if (theirEh != nullptr && theirAnchor != nullptr) {
+    theirDelta = reinterpret_cast<char*>(theirEh) - reinterpret_cast<char*>(theirAnchor);
+    deltaMatches = mineDelta == theirDelta;
+  }
+
+  // Derive the offset of unwindHeader within __cxa_exception from a real native header, and build
+  // the forged exception: exception_class left zero (foreign), exception_cleanup the sentinel.
+  int headerOffset = -1;
+  uint64_t classMagic = 0;
+  void* native = v->nativeHeader.load();
+  if (native != nullptr) {
+    auto* p = reinterpret_cast<const byte*>(native);
+    for (int off = 0; off + 8 <= 512; off += 8) {
+      uint64_t q = 0;
+      memcpy(&q, p + off, sizeof(q));
+      if ((q & EH_CLASS_MASK_FOR_TEST) == EH_CLASS_CLANG_FOR_TEST ||
+          (q & EH_CLASS_MASK_FOR_TEST) == EH_CLASS_GNU_FOR_TEST) {
+        headerOffset = off;
+        classMagic = q;
+        break;
+      }
+    }
+  }
+  if (headerOffset >= 0 &&
+      headerOffset + 16 <= static_cast<int>(sizeof(forgedCxaExceptionForTest))) {
+    memset(forgedCxaExceptionForTest, 0, sizeof(forgedCxaExceptionForTest));
+    uintptr_t sentinel = EH_CLEANUP_SENTINEL_FOR_TEST;
+    memcpy(forgedCxaExceptionForTest + headerOffset + 8, &sentinel, sizeof(sentinel));
+    ehHeaderOffsetForTest = headerOffset;
+    ehForgedReadyForTest = true;
+  }
+  auto mineEhAt = hexAddrForTest(mineEh);
+  auto theirEhAt = hexAddrForTest(theirEh);
+  auto theirAnchorAt = hexAddrForTest(theirAnchor);
+  kj::StringPtr deltaVerdict = deltaMatches ? "match"_kj : "mismatch"_kj;
+  kj::StringPtr forgedVerdict = ehForgedReadyForTest ? "forged"_kj : "not-forged"_kj;
+  auto classMagicHex = kj::str("0x", kj::hex(classMagic));
+  KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the fallback-thread stand-in's exception runtime", url,
+      mineEhAt, theirEhAt, theirAnchorAt, mineDelta, theirDelta, deltaVerdict, headerOffset,
+      classMagicHex, forgedVerdict);
+}
+#endif  // __linux__
+
+void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
+  static const bool faultEnabled =
+      jsg::isGuestKernelEnabled() && getenv("WORKERD_GK_TEST_FAULT") != nullptr;
+  if (faultEnabled && url.endsWith("/__gk_fault")) {
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_FAULT: forcing a guest fault for this request", url);
+    *static_cast<volatile int*>(nullptr) = 0;
+  }
+  if (faultEnabled && url.endsWith("/__gk_fault_timeout")) {
+    lock.getGlobalScope().setTimeoutInternal([url = kj::str(url)](jsg::Lock&) {
+      KJ_LOG(
+          WARNING, "WORKERD_GK_TEST_FAULT: forcing a guest fault inside a timeout callback", url);
+      *static_cast<volatile int*>(nullptr) = 0;
+    }, 0);
+  }
+  if (faultEnabled && url.endsWith("/__gk_fault_cache_fallback")) {
+    faultInNextMemoryCacheFallbackForTest = true;
+  }
+  if (faultEnabled && url.endsWith("/__gk_fault_disallow_dtors")) {
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_FAULT: forcing a guest fault inside a scope that disallows async "
+        "destructors",
+        url);
+    kj::DisallowAsyncDestructorsScope disallow(
+        "guest-kernel probe: a turn's frame that disallows async destructors");
+    *static_cast<volatile int*>(nullptr) = 0;
+  }
+  if (faultEnabled && url.endsWith("/__gk_fault_gc_dtor")) {
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_FAULT: forcing a guest fault with the cppgc-destructor flag set", url);
+    jsg::setInGcDestructorForTest(true);
+    *static_cast<volatile int*>(nullptr) = 0;
+  }
+  static const bool probeEnabled =
+      jsg::isGuestKernelEnabled() && getenv("WORKERD_GK_TEST_PROBE") != nullptr;
+  auto probeHost = [&](kj::StringPtr name) {
+    KJ_IF_SOME(target, hostMemory::probeTargetForTest(name)) {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: reading host memory from inside the JS turn", url,
+          name, kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(target))));
+      volatile byte probed = *static_cast<const volatile byte*>(target);
+      (void)probed;
+    }
+  };
+  if (probeEnabled && url.endsWith("/__gk_probe_host")) {
+    probeHost("token-key");
+  }
+  if (probeEnabled && url.endsWith("/__gk_probe_host_entropy")) {
+    probeHost("host-entropy");
+  }
+  if (probeEnabled && url.endsWith("/__gk_probe_actor_key")) {
+    probeHost("actor-id-key");
+  }
+  if (probeEnabled && url.endsWith("/__gk_gc_dtor_check")) {
+    // Host-side, on the event loop and on the thread an earlier turn faulted on: the flag
+    // jsg::isInGcDestructor() reads, which the host consults when it destroys a Data and when
+    // it tears an isolate down. Reported from here rather than from the faulted request, whose
+    // IoContext is aborted by the fault and runs no further tasks.
+    IoContext::current().addTask(kj::evalLater([]() {
+      kj::StringPtr cppgcFlag = jsg::isInGcDestructor() ? "leaked"_kj : "clear"_kj;
+      KJ_LOG(
+          WARNING, "WORKERD_GK_TEST_PROBE: the cppgc-destructor flag on the event loop", cppgcFlag);
+    }));
+  }
+#ifdef WORKERD_HAS_HEAP_ARENA
+  if (probeEnabled && url.endsWith("/__gk_heap_region")) {
+    // Reports this isolate's heap arena footprint (see HeapArena::Stats), so that a probe can
+    // watch the region it is allocated from over a workload.
+    KJ_IF_SOME(arena, jsg::IsolateBase::from(lock.getIsolate()).getGuestArena()) {
+      KJ_IF_SOME(heap, arena.getHeapArena()) {
+        auto stats = heap.getStats();
+        // The memory reported to V8 as external (ExternalMemoryAdjustment); a zero adjustment
+        // reads the total.
+        int64_t externalMemory = lock.getIsolate()->AdjustAmountOfExternalAllocatedMemoryImpl(0);
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: heap arena region", url, stats.regionBytes,
+            stats.allocated, stats.active, stats.mapped, stats.retained, stats.dirty,
+            externalMemory);
+      }
+    }
+  }
+  if (probeEnabled && url.endsWith("/__gk_gc")) {
+    // A full GC of this isolate, so that a probe can tell memory the isolate holds until its
+    // next GC from memory it has lost.
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: forcing a full GC", url);
+    lock.getIsolate()->LowMemoryNotification();
+  }
+#endif
+  if (probeEnabled && url.endsWith("/__gk_poison_entropy")) {
+    constexpr byte PATTERN = 0x5a;
+    poisonEntropyBufferForTest(PATTERN);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: overwrote this thread's entropy buffer from inside the JS turn",
+        url, kj::hex(PATTERN));
+    IoContext::current().addTask(kj::evalLater([]() {
+      KJ_IF_SOME(mint, hostMemory::hostUseForTest("mint-token")) {
+        mint();
+      }
+      byte drawn[12] = {};
+      getEntropy(drawn);
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: getEntropy() on the host after the turn returned",
+          kj::encodeHex(kj::arrayPtr(drawn)));
+      discardEntropyBufferForTest();
+    }));
+  }
+#ifdef __linux__
+  if (probeEnabled && url.endsWith("/__gk_wasm_arm")) {
+    auto& list = lock.getWorker().getIsolate().getLimitEnforcer().getTrackedWasmInstances();
+    IoContext::current().addTask(kj::evalLater([&list]() { armWasmSignalTimerForTest(list); }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_wasm_corrupt")) {
+    auto& list = lock.getWorker().getIsolate().getLimitEnforcer().getTrackedWasmInstances();
+    corruptWasmDescriptorsForTest(list, url);
+    IoContext::current().addTask(kj::evalLater([&list]() { armWasmSignalTimerForTest(list); }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_wasm_check")) {
+    checkWasmDescriptorsForTest(url);
+  }
+#endif
+  if (probeEnabled && url.endsWith("/__gk_tls_restore")) {
+    // A JS turn's guest-writable thread-locals are put back by the host after the turn (see
+    // GuestTurnThreadLocals and ~Worker::Lock), so a value the turn leaves in them does not reach
+    // the host. This exercises the Api case, whose restored value must come from a host stack
+    // frame and not from the heap slot the lock otherwise restores from. From inside the turn,
+    // overwrite that heap slot (Isolate::Impl::Lock::oldCurrentApi, which ~Worker::Lock reads) with
+    // a sentinel, as a write primitive would; ~Worker::Lock must still leave Worker::Api's
+    // thread-local holding the value it had before the lock, which an event-loop callback checks
+    // once the lock is gone -- it must not be the sentinel.
+    auto* apiSlot = static_cast<const Worker::Api**>(lock.savedApiStorageForTest());
+    const auto* sentinel = reinterpret_cast<const Worker::Api*>(0x1);
+    const auto* heapWas = *apiSlot;
+    *apiSlot = sentinel;
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: overwrote the Api restore slot from inside the JS turn",
+        url, kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(apiSlot))),
+        kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(heapWas))));
+    IoContext::current().addTask(kj::evalLater([]() {
+      // On the event loop, no isolate lock held: Worker::Api's thread-local holds whatever the
+      // request's lock left. If the stack restore held, it is not the sentinel.
+      const Worker::Api* cur = nullptr;
+      KJ_IF_SOME(api, Worker::Api::tryCurrent()) {
+        cur = &api;
+      }
+      kj::StringPtr verdict =
+          cur == reinterpret_cast<const Worker::Api*>(0x1) ? "leaked"_kj : "restored"_kj;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: Worker::Api after the turn",
+          kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(cur))), verdict);
+    }));
+  }
+  // The isolate's lock slot (see the comment above and jsg::Lock::from).
+  static v8::Isolate* announcedIsolate = nullptr;
+  auto addr = [](const void* p) { return kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(p))); };
+  static void* const LOCK_SENTINEL = reinterpret_cast<void*>(0x1);
+  // A count of held locks no thread reaches, for asking the same question of the thread-local
+  // count that LOCK_SENTINEL asks of the slot.
+  constexpr uint LOCK_DEPTH_SENTINEL = 0x5a5a;
+  if (probeEnabled && url.endsWith("/__gk_lock_announce")) {
+    jsg::Lock& js = lock;
+    announcedIsolate = js.v8Isolate;
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: announced this isolate for another worker's turn", url,
+        addr(js.v8Isolate), addr(js.v8Isolate->GetData(jsg::SET_DATA_LOCK)));
+  }
+  if (probeEnabled && url.endsWith("/__gk_lock_poison_other")) {
+    jsg::Lock& js = lock;
+    v8::Isolate* other = announcedIsolate;
+    KJ_REQUIRE(other != nullptr, "no isolate announced");
+    KJ_REQUIRE(other != js.v8Isolate, "the announced isolate is this one");
+    void* was = other->GetData(jsg::SET_DATA_LOCK);
+    other->SetData(jsg::SET_DATA_LOCK, LOCK_SENTINEL);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: overwrote another isolate's lock slot from inside the JS turn", url,
+        addr(other), addr(was), addr(LOCK_SENTINEL));
+    IoContext::current().addTask(kj::evalLater([other, addr]() {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the other isolate's lock slot on the event loop",
+          addr(other), addr(other->GetData(jsg::SET_DATA_LOCK)));
+    }));
+  }
+  if (probeEnabled && (url.endsWith("/__gk_lock_slot") || url.endsWith("/__gk_lock_check"))) {
+    jsg::Lock& js = lock;
+    if (url.endsWith("/__gk_lock_slot")) {
+      // As the turn's last act, in the guest: the rest of this turn calls jsg::Lock::from itself,
+      // at ring 3, and a sentinel there would fault the turn before the host got to read it.
+      v8::Isolate* isolate = js.v8Isolate;
+      jsg::Lock* held = &js;
+      jsg::setGuestTurnTailHookForTest(
+          [isolate, held, addr, sentinel = LOCK_DEPTH_SENTINEL, url = kj::str(url)]() {
+        isolate->SetData(jsg::SET_DATA_LOCK, LOCK_SENTINEL);
+        // The count of locks this thread holds is thread-local storage the turn can write too,
+        // and the host's next lock on this isolate reads it (see jsg::saveLockDepthForGuestTurn).
+        jsg::setLockDepthForTest(sentinel);
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: overwrote this isolate's lock slot from inside the JS turn",
+            url, addr(isolate), addr(held), addr(LOCK_SENTINEL), sentinel);
+      });
+    }
+    Worker::Lock::runAtNextReleaseForTest(
+        [addr, sentinel = LOCK_DEPTH_SENTINEL](Worker::Lock& released) {
+      // Host-side, after the turn, with the isolate still locked: what jsg::Lock::from hands host
+      // code now, against the lock this frame holds.
+      jsg::Lock& held = released;
+      jsg::Lock* from = &jsg::Lock::from(held.v8Isolate);
+      kj::StringPtr verdict = from == &held ? "restored"_kj
+          : from == LOCK_SENTINEL           ? "leaked"_kj
+                                            : "other"_kj;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: jsg::Lock::from on the host after the turn",
+          addr(from), addr(&held), verdict);
+      // The same question of the lock count: the host holds this one lock, so the count it
+      // reads must be 1, not what the turn left.
+      uint depth = jsg::lockDepthForTest();
+      kj::StringPtr depthVerdict = depth == 1 ? "restored"_kj
+          : depth == sentinel                 ? "leaked"_kj
+                                              : "other"_kj;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the lock count on the host after the turn", depth,
+          depthVerdict);
+    });
+    v8::Isolate* isolate = js.v8Isolate;
+    IoContext::current().addTask(kj::evalLater([isolate, addr]() {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the lock slot on the event loop after the lock",
+          addr(isolate), addr(isolate->GetData(jsg::SET_DATA_LOCK)));
+    }));
+  }
+  // The pointer this thread finds its event loop through (see the comment above, and
+  // runTrampolineInGuest in jsg/guest-run.c++ for where the host puts it back).
+  if (probeEnabled && (url.endsWith("/__gk_loop_repoint") || url.endsWith("/__gk_loop_clear"))) {
+    loopIdBeforeTurnForTest = kj::EventLoop::Id::current();
+    bool clear = url.endsWith("/__gk_loop_clear");
+    // As the turn's last act in the guest: the rest of the turn arms its own events, at ring 3,
+    // and would arm them on whatever the pointer names.
+    jsg::setGuestTurnTailHookForTest([clear, addr, url = kj::str(url)]() {
+      kj::EventLoop* was = kj::EventLoop::saveCurrentLoopPointer();
+      // A loop of the turn's own, built inside the turn and left for the host to find, which is
+      // what a turn that aimed the pointer somewhere would leave. It is never destroyed:
+      // ~EventLoop makes itself current, and this one never is.
+      kj::EventLoop* chosen = clear ? nullptr : new kj::EventLoop();
+      kj::EventLoop::restoreCurrentLoopPointer(chosen);
+      // Read back here, at ring 3 inside the turn: the store landed rather than faulting the
+      // guest, which is what makes this thread-local a hazard in the first place.
+      kj::EventLoop* readBack = kj::EventLoop::saveCurrentLoopPointer();
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: rewrote this thread's event loop pointer from inside the JS turn",
+          url, addr(was), addr(chosen), addr(readBack));
+    });
+    Worker::Lock::runAtNextReleaseForTest([](Worker::Lock&) {
+      // Host-side, after the turn, with the isolate still locked: the first host lookup of this
+      // thread's event loop after the turn.
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the event loop pointer on the host after the turn",
+          currentLoopVerdictForTest());
+    });
+    IoContext::current().addTask(kj::evalLater([]() {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the event loop pointer on the event loop",
+          currentLoopVerdictForTest());
+    }));
+  }
+  // The event this thread is firing (see the comment above and runTrampolineInGuest).
+  if (probeEnabled && url.endsWith("/__gk_loop_firing")) {
+    firingEventBeforeTurnForTest = kj::EventLoop::saveCurrentlyFiringEvent();
+    // As the turn's last act in the guest, like the paths above.
+    jsg::setGuestTurnTailHookForTest([addr, url = kj::str(url)]() {
+      kj::_::Event* was = kj::EventLoop::saveCurrentlyFiringEvent();
+      kj::EventLoop::restoreCurrentlyFiringEvent(FIRING_SENTINEL_FOR_TEST);
+      kj::_::Event* readBack = kj::EventLoop::saveCurrentlyFiringEvent();
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: rewrote the firing event from inside the JS turn",
+          url, addr(was), addr(FIRING_SENTINEL_FOR_TEST), addr(readBack));
+    });
+    Worker::Lock::runAtNextReleaseForTest([addr](Worker::Lock&) {
+      // Host-side, after the turn, inside the fire() that ran it: what ~Event() would compare
+      // every event destroyed from here on against.
+      kj::_::Event* cur = kj::EventLoop::saveCurrentlyFiringEvent();
+      kj::StringPtr verdict = cur == FIRING_SENTINEL_FOR_TEST ? "leaked"_kj
+          : cur == firingEventBeforeTurnForTest               ? "restored"_kj
+                                                              : "other"_kj;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the firing event on the host after the turn",
+          addr(cur), verdict);
+    });
+  }
+  // The handle the loop names its (host-memory) run queue by, which a turn can write in the
+  // shared-heap loop object (EventLoop::queueHandle). The run-queue relocation: a handle a turn
+  // forges resolves, through the guest kernel's slot table, to no queue -- not to memory the turn
+  // chose -- so head()/turn() walk nothing the turn aimed them at, unlike the pre-relocation queue
+  // whose head a turn could write directly (event-loop-queue-test.sh).
+  if (probeEnabled && url.endsWith("/__gk_queue_head_poison")) {
+    jsg::setGuestTurnTailHookForTest([addr]() {
+      kj::EventLoop* loop = kj::EventLoop::saveCurrentLoopPointer();
+      uint64_t real = loop->queueHandle();
+      // A fake run queue the turn builds in its own memory, with a head of its choosing -- what the
+      // pre-relocation steer aimed EventLoop::head() at. `forged` is its address, a value the turn
+      // writes into the handle as a write primitive would.
+      fakeQueueForTest[0] = 0xdeadbeef;
+      uint64_t forged = reinterpret_cast<uint64_t>(&fakeQueueForTest);
+      loop->setQueueHandle(forged);
+      uint64_t readBack = loop->queueHandle();
+      // Put the real handle back before the turn returns, so the turn-end apply finds the real
+      // queue and the serving loop keeps working; the readback already shows the forged value
+      // landed at ring 3.
+      loop->setQueueHandle(real);
+      queueHandleRealForTest = real;
+      queueHandleForgedForTest = forged;
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: rewrote the loop's queue handle from inside the JS turn",
+          addr(reinterpret_cast<void*>(real)), addr(reinterpret_cast<void*>(forged)),
+          addr(reinterpret_cast<void*>(readBack)));
+    });
+    Worker::Lock::runAtNextReleaseForTest([addr](Worker::Lock&) {
+      // Host-side, after the turn: resolve each value through the slot table exactly as head()/
+      // turn() do. The real handle names the loop's queue; the forged one names no slot and
+      // resolves to null, so a turn's write to the handle redirects what turn() dereferences
+      // nowhere.
+      const void* realResolved = workerd::resolveQueueHandleForTest(queueHandleRealForTest);
+      const void* forgedResolved = workerd::resolveQueueHandleForTest(queueHandleForgedForTest);
+      kj::StringPtr verdict =
+          (forgedResolved == nullptr && realResolved != nullptr) ? "inert"_kj : "redirected"_kj;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: queue handle resolution on the host",
+          addr(realResolved), addr(forgedResolved), verdict);
+    });
+  }
+  // The journal metadata the host trusts to apply a turn's arms and disarms -- the record cursor
+  // and the loop/queue the records belong to -- no longer lives in guest-writable memory, so a turn
+  // that forges the cursor or scribbles the records cannot drop its own disarm and strand a
+  // host-queue link pointing at its own freed event. The host walks the journal's full capacity
+  // rather than the cursor, and reaches the queue through a per-thread supervisor word a turn
+  // cannot write (util/host-event-queue.c++). This drives that proof on the host: it arms two
+  // events, applies, then records a disarm of the first at a high slot with the cursor forged to
+  // zero and applies again -- the disarm still runs, so no link is left on the freed event.
+  if (probeEnabled && url.endsWith("/__gk_queue_count_forge")) {
+    Worker::Lock::runAtNextReleaseForTest([](Worker::Lock&) {
+      bool inert = workerd::countForgeInertForTest();
+      kj::StringPtr verdict = inert ? "inert"_kj : "stranded"_kj;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: event journal count forge on the host", verdict);
+    });
+  }
+#ifdef __linux__
+  // Another thread's copy of the same pointer (see the comment above armOtherThreadLoopForTest).
+  if (probeEnabled && url.endsWith("/__gk_loop_other_arm")) {
+    // Host-side: the thread is started and the slot identified outside the guest, which a turn
+    // could not do -- it is clone() plus process_vm_readv().
+    IoContext::current().addTask(
+        kj::evalLater([url = kj::str(url)]() { armOtherThreadLoopForTest(url); }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_loop_other_poison")) {
+    KJ_IF_SOME(other, otherThreadLoopForTest) {
+      // At ring 3, inside the turn: one read and one write of another thread's word. Memory the
+      // arena does not map faults the turn here, which fails this request and condemns this
+      // isolate and is the safe outcome; a write that lands reaches a thread the save and restore
+      // around this turn cannot speak for.
+      volatile uint64_t* word =
+          reinterpret_cast<volatile uint64_t*>(otherThreadTargetForTest(other));
+      uint64_t before = *word;
+      *word = TLS_CROSS_SENTINEL;
+      uint64_t readBack = *word;
+      auto wordAt = hexAddrForTest(const_cast<uint64_t*>(word));
+      auto wasHex = kj::str("0x", kj::hex(before));
+      auto nowHex = kj::str("0x", kj::hex(readBack));
+      kj::StringPtr which = other.slot != nullptr ? "kj's loop pointer"_kj : "the anchor word"_kj;
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: read and wrote another thread's TLS from inside the JS turn", url,
+          wordAt, wasHex, nowHex, which);
+    }
+  }
+  if (probeEnabled && url.endsWith("/__gk_loop_other_check")) {
+    IoContext::current().addTask(kj::evalLater([]() {
+      KJ_IF_SOME(other, otherThreadLoopForTest) {
+        uint64_t* word = otherThreadTargetForTest(other);
+        kj::StringPtr verdict = *word == TLS_CROSS_SENTINEL ? "overwritten"_kj : "intact"_kj;
+        auto wordAt = hexAddrForTest(word);
+        auto heldHex = kj::str("0x", kj::hex(*word));
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: another thread's TLS on the host", wordAt, heldHex,
+            verdict);
+        // Put the other thread's own value back either way, so it is not left broken.
+        *word = other.slot != nullptr ? reinterpret_cast<uint64_t>(other.loop) : TLS_ANCHOR_MAGIC;
+      }
+    }));
+  }
+  // The C++ exception runtime's caughtExceptions pointer on a throwing thread that holds no
+  // isolate lock (see the comment above armEhVictimForTest). eh-globals-cross-test.sh.
+  if (probeEnabled && url.endsWith("/__gk_eh_arm")) {
+    // Host-side: start the stand-in, identify its eh_globals and build the forged exception.
+    IoContext::current().addTask(
+        kj::evalLater([url = kj::str(url)]() { armEhVictimForTest(url); }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_eh_poison")) {
+    if (ehVictimForTest != nullptr && ehForgedReadyForTest) {
+      auto* v = ehVictimForTest;
+      // At ring 3, inside the turn: the one write of the stand-in thread's caughtExceptions, the
+      // same reach /__gk_loop_other_poison shows for the loop pointer, aimed at eh_globals. A
+      // page the arena does not map would fault the turn here; this word is in the stand-in's
+      // static TLS block, which the arena maps, so it lands.
+      void** eh = v->ehGlobals.load();
+      void* volatile* w = reinterpret_cast<void* volatile*>(eh);
+      void* before = w[0];
+      w[0] = &forgedCxaExceptionForTest[0];
+      void* after = w[0];
+      auto wordAt = hexAddrForTest(eh);
+      auto beforeAt = hexAddrForTest(before);
+      auto afterAt = hexAddrForTest(after);
+      auto forgedAt = hexAddrForTest(&forgedCxaExceptionForTest[0]);
+      auto sentinelAt = kj::str("0x", kj::hex(EH_CLEANUP_SENTINEL_FOR_TEST));
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: wrote the fallback-thread stand-in's caughtExceptions from "
+          "inside the JS turn",
+          url, wordAt, beforeAt, afterAt, forgedAt, sentinelAt, ehHeaderOffsetForTest);
+      v->poisoned.store(true);
+    }
+  }
+  if (probeEnabled && url.endsWith("/__gk_eh_check")) {
+    IoContext::current().addTask(kj::evalLater([url = kj::str(url)]() {
+      if (ehVictimForTest != nullptr) {
+        auto* v = ehVictimForTest;
+        bool faulted = v->faulted.load();
+        uintptr_t rip = v->faultRip.load();
+        kj::StringPtr verdict = (faulted && rip == EH_CLEANUP_SENTINEL_FOR_TEST) ? "sentinel"_kj
+            : faulted                                                            ? "other-fault"_kj
+            : v->endCatchReturned.load() ? "end-catch-returned"_kj
+                                         : "pending"_kj;
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the steer's outcome on the stand-in thread", url,
+            kj::str("0x", kj::hex(rip)), kj::str("0x", kj::hex(v->faultAddr.load())), verdict);
+      }
+    }));
+  }
+#endif  // __linux__
+  if (probeEnabled && url.endsWith("/__gk_vfs_rewrite")) {
+    // SQLite's native VFS keeps the directory descriptor for its path syscalls in a thread-local
+    // a turn can write (currentVfsRoot in util/sqlite.c++); the guest kernel's turn directory is
+    // what keeps a rewritten descriptor from redirecting the files. The rewrite is armed on the
+    // event loop (the directory it names must be opened on the host, which a confined turn
+    // cannot do) and applies to every native VFS call after that; /__gk_vfs_restore lifts it.
+    IoContext::current().addTask(kj::evalLater([]() {
+      KJ_IF_SOME(rewrite, hostMemory::hostUseForTest("vfs-root-rewrite")) {
+        rewrite();
+      }
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_vfs_restore")) {
+    IoContext::current().addTask(kj::evalLater([]() {
+      KJ_IF_SOME(restore, hostMemory::hostUseForTest("vfs-root-restore")) {
+        restore();
+      }
+    }));
+  }
+  // The IoOwn handle (see the comment above and io/io-own.h): the probe object is a T an IoOwn
+  // owns, held in a heap holder that stands in for the JS wrapper's C++ object a turn can write.
+  struct IoOwnProbe {
+    IoOwnProbe(uint64_t magic): magic(magic) {}
+    ~IoOwnProbe() noexcept(false) {
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: an IoOwn probe object was disposed of through its "
+          "own disposer",
+          kj::str("0x", kj::hex(magic)));
+    }
+    uint64_t magic;
+  };
+  struct IoOwnProbeHolder {
+    IoOwn<IoOwnProbe> own;
+  };
+  constexpr uint64_t IOOWN_GOOD_MAGIC = 0x600d600d600d600d;
+  constexpr uint64_t IOOWN_CHOSEN_MAGIC = 0xbadbadbadbadbad0;
+  constexpr uint64_t IOOWN_OTHER_MAGIC = 0x0e7e70e7e70e7e70;
+  constexpr uint64_t IOOWN_NODE_MAGIC = 0x0de0de0de0de0de0;
+  constexpr uint64_t IOOWN_TYPE_A_MAGIC = 0x0a11a11a11a11a10;
+  constexpr uint64_t IOOWN_TYPE_B_MAGIC = 0x0b22b22b22b22b20;
+  // The IoOwn's first word is the context's handle (its DeleteQueue) and its second the object's
+  // handle, before the disposal record; a write primitive aiming at either writes exactly there.
+  static_assert(
+      sizeof(IoOwn<IoOwnProbe>) == sizeof(DeleteQueue) + sizeof(uint64_t) + sizeof(OwnedDisposal));
+  constexpr size_t IOOWN_CONTEXT_OFFSET = 0;
+  constexpr size_t IOOWN_HANDLE_OFFSET = sizeof(DeleteQueue);
+  auto ioOwnWord = [](IoOwnProbeHolder& holder, size_t offset) {
+    uint64_t word;
+    memcpy(&word, reinterpret_cast<byte*>(&holder.own) + offset, sizeof(word));
+    return word;
+  };
+  auto setIoOwnWord = [](IoOwnProbeHolder& holder, size_t offset, uint64_t word) {
+    memcpy(reinterpret_cast<byte*>(&holder.own) + offset, &word, sizeof(word));
+  };
+  auto ioOwnHandle = [ioOwnWord](IoOwnProbeHolder& holder) {
+    return ioOwnWord(holder, IOOWN_HANDLE_OFFSET);
+  };
+  auto setIoOwnHandle = [setIoOwnWord](IoOwnProbeHolder& holder, uint64_t handle) {
+    setIoOwnWord(holder, IOOWN_HANDLE_OFFSET, handle);
+  };
+  auto ioOwnContext = [ioOwnWord](IoOwnProbeHolder& holder) {
+    return ioOwnWord(holder, IOOWN_CONTEXT_OFFSET);
+  };
+  auto setIoOwnContext = [setIoOwnWord](IoOwnProbeHolder& holder, uint64_t context) {
+    setIoOwnWord(holder, IOOWN_CONTEXT_OFFSET, context);
+  };
+  // A later turn of the same request uses the IoOwn, as an API call on the wrapper would, and
+  // reports what it reached: the magic it read, or the refusal.
+  auto useIoOwnLater = [addr](IoContext& context, kj::StringPtr what, IoOwnProbeHolder& holder) {
+    return context.run([what, &holder, addr](Worker::Lock&) {
+      kj::String verdict;
+      KJ_IF_SOME(e, kj::runCatchingExceptions([&]() {
+        uint64_t magic = holder.own->magic;
+        verdict = kj::str("read magic 0x", kj::hex(magic), " at ", addr(holder.own.operator->()));
+      })) {
+        verdict = kj::str("refused: ", e.getDescription());
+      }
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: IoOwn use after the overwrite", what, verdict);
+    });
+  };
+  static uint64_t announcedIoOwnHandle = 0;
+  static uint64_t announcedIoOwnContext = 0;
+  // Fulfilled by /__gk_ioown_steal_drop once the host has acted on the thief's release, so that
+  // the announcing request, which is still in flight, uses its own object again afterwards --
+  // on its own context, which is the only context that may dereference its IoOwn.
+  static kj::Maybe<kj::Own<kj::PromiseFulfiller<void>>> announcedIoOwnRecheck;
+  if (probeEnabled && url.endsWith("/__gk_ioown_corrupt")) {
+    auto& context = IoContext::current();
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_GOOD_MAGIC))});
+    IoOwnProbeHolder& h = *holder;
+    uint64_t handle = ioOwnHandle(h);
+    // The buffer the turn chose: an object as the one the handle names, carrying a magic of its
+    // own, so a host that dereferences the address reads it.
+    static auto* chosen = new IoOwnProbe(IOOWN_CHOSEN_MAGIC);
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: created an IoOwn inside the JS turn", url,
+        kj::str("0x", kj::hex(handle)), addr(h.own.operator->()));
+    // A later turn first uses the IoOwn as it is (the control: the handle committed at the end
+    // of this turn resolves to the object) and then overwrites the handle, as the turn's own
+    // act; the use after that runs in a further turn. Then the holder is destroyed on the event
+    // loop, outside any turn, which hands the handle to the delete queue, and one more turn
+    // makes the host drain that queue -- host-side, before the turn enters the guest -- which
+    // must refuse the handle rather than unlink through the chosen address.
+    context.addWaitUntil(
+        useIoOwnLater(context, "intact", h)
+            .then([&context, &h, url = kj::str(url), addr, handle, setIoOwnHandle]() mutable {
+      return context.run([&h, url = kj::mv(url), addr, handle, setIoOwnHandle](Worker::Lock&) {
+        setIoOwnHandle(h, reinterpret_cast<uintptr_t>(chosen));
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: overwrote the IoOwn's handle from inside the JS turn", url,
+            kj::str("0x", kj::hex(handle)), addr(chosen), addr(chosen));
+      });
+    })
+            .then(
+                [&context, &h, useIoOwnLater]() { return useIoOwnLater(context, "rewritten", h); })
+            .then([holder = kj::mv(holder)]() mutable {
+      return kj::evalLater([holder = kj::mv(holder)]() mutable {
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: destroying the IoOwn's holder on the event loop");
+        holder = nullptr;
+      });
+    }).then([&context]() {
+      // On the event loop, with no current context: the context is alive for as long as this
+      // waitUntil runs, and run() makes it current again for the turn.
+      return context.run([](Worker::Lock&) {
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the turn after the holder's destruction ran");
+      });
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_ioown_announce")) {
+    // This isolate's IoOwn, for another isolate's turn to name. The object lives in this
+    // request's owned list and is retired with the request's context, which the worker's JS
+    // keeps open for a while (see ioown-test.capnp); the holder outlives it.
+    auto& context = IoContext::current();
+    static kj::Maybe<kj::Own<IoOwnProbeHolder>> announced;
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_OTHER_MAGIC))});
+    announcedIoOwnHandle = ioOwnHandle(*holder);
+    announcedIoOwnContext = ioOwnContext(*holder);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: announced this isolate's IoOwn for another worker's turn", url,
+        kj::str("0x", kj::hex(announcedIoOwnHandle)), addr(holder->own.operator->()),
+        kj::str("0x", kj::hex(announcedIoOwnContext)));
+    IoOwnProbeHolder& announcedHolder = *holder;
+    announced = kj::mv(holder);
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    announcedIoOwnRecheck = kj::mv(paf.fulfiller);
+    context.addWaitUntil(useIoOwnLater(context, "announced-own", announcedHolder)
+                             .then([&context, &announcedHolder, useIoOwnLater,
+                                       recheck = kj::mv(paf.promise)]() mutable {
+      return recheck.then([&context, &announcedHolder, useIoOwnLater]() {
+        return useIoOwnLater(context, "announced-own-after-theft", announcedHolder);
+      });
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_ioown_steal")) {
+    // From inside this isolate's turn, rewrite an IoOwn of its own to the other isolate's live
+    // handle. The entry carries the page-table root it was registered under, which the ring-0
+    // lookup compares against the root this turn runs under, so the use is refused: the handle
+    // is the other isolate's. The host-side resolve logged after it, which makes no such
+    // comparison, reaches the object through the same handle, so the refusal is about who
+    // asked and not about the entry having gone.
+    KJ_REQUIRE(announcedIoOwnHandle != 0, "no IoOwn announced");
+    auto& context = IoContext::current();
+    static kj::Maybe<kj::Own<IoOwnProbeHolder>> thief;
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_GOOD_MAGIC))});
+    IoOwnProbeHolder& h = *holder;
+    uint64_t handle = ioOwnHandle(h);
+    setIoOwnHandle(h, announcedIoOwnHandle);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: overwrote the IoOwn's handle from inside the JS turn with another isolate's",
+        url, kj::str("0x", kj::hex(handle)), kj::str("0x", kj::hex(announcedIoOwnHandle)));
+    // The thief is never destroyed, so the stolen handle is never handed to a delete queue; its
+    // own entry is retired with its context. The use runs now, and again when asked for later.
+    thief = kj::mv(holder);
+    context.addWaitUntil(useIoOwnLater(context, "cross-isolate", h).then([addr]() {
+      return kj::evalLater([addr]() {
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the stolen handle, resolved host-side",
+            kj::str("0x", kj::hex(announcedIoOwnHandle)),
+            addr(hostMemory::resolve(announcedIoOwnHandle)));
+      });
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_ioown_steal_again")) {
+    // The same stolen handle, used after the other isolate's request, and so its context, has
+    // ended: the entry is retired with the context's owned list.
+    static kj::Maybe<kj::Own<IoOwnProbeHolder>> thief2;
+    auto& context = IoContext::current();
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_GOOD_MAGIC))});
+    IoOwnProbeHolder& h = *holder;
+    setIoOwnHandle(h, announcedIoOwnHandle);
+    thief2 = kj::mv(holder);
+    context.addWaitUntil(useIoOwnLater(context, "cross-isolate-after-release", h));
+  }
+  if (probeEnabled && url.endsWith("/__gk_ioown_steal_drop")) {
+    // The retire side of the same theft. The owner check the ring-0 lookup makes refuses a
+    // stolen handle a *use*, but a drop is not a use: OwnedObjectList::drop releases the entry
+    // whatever the resolve answered, and the release goes into the turn's journal for the host
+    // to act on after the turn, where the host's own lookup compares no owner. So this turn
+    // rewrites one of its own IoOwns to the other isolate's live handle and then destroys the
+    // holder inside a turn, which is the host being asked to retire that isolate's entry and
+    // unlink the node behind it. The journal flush must refuse it; the announcing isolate then
+    // uses its object again, on its own context.
+    KJ_REQUIRE(announcedIoOwnHandle != 0, "no IoOwn announced");
+    auto& context = IoContext::current();
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_GOOD_MAGIC))});
+    uint64_t own = ioOwnHandle(*holder);
+    setIoOwnHandle(*holder, announcedIoOwnHandle);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: overwrote an IoOwn's handle with another isolate's, to drop it "
+        "inside a turn",
+        url, kj::str("0x", kj::hex(own)), kj::str("0x", kj::hex(announcedIoOwnHandle)));
+    context.addWaitUntil(context
+                             .run([holder = kj::mv(holder)](Worker::Lock&) mutable {
+      // Inside the turn: ~IoOwn hands the stolen handle to OwnedObjectList::drop, which
+      // releases it through the journal. The host flushes the journal once this turn returns.
+      holder = nullptr;
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: destroyed the thief's holder inside the JS turn, with the "
+          "stolen handle in it");
+    }).then([addr]() {
+      return kj::evalLater([addr]() {
+        // Host-side, after the flush: the entry and the node behind it, as the host sees them.
+        auto node = OwnedObjectList::nodeForTest(announcedIoOwnHandle);
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the stolen handle after the thief's drop",
+            kj::str("0x", kj::hex(announcedIoOwnHandle)),
+            addr(hostMemory::resolve(announcedIoOwnHandle)),
+            kj::str("node ", node.node == nullptr ? "gone"_kj : "intact"_kj));
+        KJ_IF_SOME(f, announcedIoOwnRecheck) {
+          f->fulfill();  // the announcing request uses its object again, if it is still running
+        }
+      });
+    }));
+  }
+  // Type confusion inside one isolate (see the type word in experimental/guest-kernel/gk.h).
+  // The owner says whose entry a handle names and says nothing about what it names, so a turn
+  // that writes one of its own IoOwn handles over another of its own reaches an object of the
+  // wrong class: a call through the wrong vtable, and a drop that frees an object its real
+  // holder still names. Two unrelated classes, each with a virtual that answers with its own
+  // magic, so the swap is visible as a wrong answer rather than only as a null.
+  struct TypeProbeA {
+    virtual ~TypeProbeA() = default;
+    virtual uint64_t magic() const {
+      return IOOWN_TYPE_A_MAGIC;
+    }
+  };
+  struct TypeProbeB {
+    virtual ~TypeProbeB() = default;
+    virtual uint64_t magic() const {
+      return IOOWN_TYPE_B_MAGIC;
+    }
+  };
+  struct TypeProbeHolder {
+    IoOwn<TypeProbeA> a;
+    IoOwn<TypeProbeB> b;
+  };
+  // For the IoPtr half of the same swap: a holder of each, so that one can be dropped on the
+  // event loop while the other keeps naming its object.
+  struct PtrProbeHolder {
+    IoPtr<TypeProbeA> ptr;
+  };
+  struct OwnProbeHolder {
+    IoOwn<TypeProbeB> own;
+  };
+  static_assert(sizeof(IoOwn<TypeProbeA>) == sizeof(IoOwn<TypeProbeB>));
+  // An IoPtr keeps its handle in the same word an IoOwn does, after its DeleteQueue, so the
+  // same write primitive reaches it.
+  static_assert(sizeof(IoPtr<TypeProbeA>) == sizeof(DeleteQueue) + sizeof(uint64_t));
+  // Reads or writes the handle word of any IoOwn, which is the word after its DeleteQueue, as
+  // a write primitive aiming at it would.
+  auto ownHandle = [](auto& own) {
+    uint64_t word;
+    memcpy(&word, reinterpret_cast<byte*>(&own) + IOOWN_HANDLE_OFFSET, sizeof(word));
+    return word;
+  };
+  auto setOwnHandle = [](auto& own, uint64_t handle) {
+    memcpy(reinterpret_cast<byte*>(&own) + IOOWN_HANDLE_OFFSET, &handle, sizeof(handle));
+  };
+  // Calls the virtual through one of the two holders and reports what came back.
+  auto callMagic = [](IoContext& context, kj::StringPtr what, auto& own) {
+    return context.run([what, &own](Worker::Lock&) {
+      kj::String verdict;
+      KJ_IF_SOME(e, kj::runCatchingExceptions([&]() {
+        verdict = kj::str("read magic 0x", kj::hex(own->magic()));
+      })) {
+        verdict = kj::str("refused: ", e.getDescription());
+      }
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: IoOwn use after the type swap", what, verdict);
+    });
+  };
+  if (probeEnabled && url.endsWith("/__gk_ioown_type_swap")) {
+    auto& context = IoContext::current();
+    auto holder =
+        kj::heap<TypeProbeHolder>(TypeProbeHolder{.a = context.addObject(kj::heap<TypeProbeA>()),
+          .b = context.addObject(kj::heap<TypeProbeB>())});
+    TypeProbeHolder& h = *holder;
+    uint64_t ha = ownHandle(h.a), hb = ownHandle(h.b);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: created an IoOwn of each of two classes inside the JS turn", url,
+        kj::str("0x", kj::hex(ha)), kj::str("0x", kj::hex(hb)));
+    context.addWaitUntil(
+        // The control: each holder reaches its own class's object.
+        callMagic(context, "control-a", h.a)
+            .then([&context, &h, callMagic]() { return callMagic(context, "control-b", h.b); })
+            .then([&context, &h, hb, setOwnHandle, url = kj::str(url)]() mutable {
+      return context.run([&h, hb, setOwnHandle, url = kj::mv(url)](Worker::Lock&) {
+        // The turn's own act: the A holder now names the B entry, which is live and this
+        // isolate's, so the owner has nothing to say about it.
+        setOwnHandle(h.a, hb);
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: overwrote an IoOwn's handle from inside the JS turn with one "
+            "of another class",
+            url, kj::str("0x", kj::hex(hb)));
+      });
+    })
+            .then([&context, &h, callMagic]() { return callMagic(context, "type-swap", h.a); })
+            .then([&context, &h]() {
+      // The drop half: the swapped holder is released inside a turn, which would hand the
+      // host the other class's entry to retire and its node to free.
+      return context.run([&h](Worker::Lock&) {
+        h.a = nullptr;
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: dropped the swapped IoOwn inside the JS turn");
+      });
+    })
+            .then([&context, &h, callMagic]() {
+      return callMagic(context, "other-class-after-drop", h.b);
+    }).then([holder = kj::mv(holder)]() mutable {
+      return kj::evalLater([holder = kj::mv(holder)]() mutable { holder = nullptr; });
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_ioptr_type_swap")) {
+    // The IoPtr half of the type swap. An IoPtr owns its table entry but not the object the
+    // entry names, and its destructor retires that entry wherever the holder is dropped --
+    // including on the event loop, outside any turn, which is where a JS wrapper's C++ object
+    // is destroyed and where no turn's arena is there to compare the handle against. So the
+    // class comparison is what keeps a handle written over another of this isolate's from
+    // retiring that entry: the holder that really owns it would then resolve nothing and every
+    // later use of its object would be refused.
+    auto& context = IoContext::current();
+    // The object the IoPtr legitimately names; an IoPtr owns nothing, so it outlives the holder.
+    static TypeProbeA* target = new TypeProbeA();
+    // The other class's object, kept alive with its own holder past this request's turns.
+    static kj::Vector<kj::Own<OwnProbeHolder>> kept;
+    kept.add(
+        kj::heap<OwnProbeHolder>(OwnProbeHolder{.own = context.addObject(kj::heap<TypeProbeB>())}));
+    OwnProbeHolder& victim = *kept.back();
+    uint64_t hb = ownHandle(victim.own);
+    auto holder = kj::heap<PtrProbeHolder>(PtrProbeHolder{.ptr = context.addObject(*target)});
+    uint64_t ha = ownHandle(holder->ptr);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: created an IoPtr and an IoOwn of another class inside the JS turn",
+        url, kj::str("0x", kj::hex(ha)), kj::str("0x", kj::hex(hb)));
+    context.addWaitUntil(
+        // The control: the IoOwn of the other class reaches its own object.
+        callMagic(context, "ioptr-control-b", victim.own)
+            .then([&context, holder = kj::mv(holder), hb, setOwnHandle,
+                      url = kj::str(url)]() mutable {
+      return context
+          .run([&h = *holder, hb, setOwnHandle, url = kj::mv(url)](Worker::Lock&) {
+        // The turn's own act: the IoPtr now names the IoOwn's entry, which is live and this
+        // isolate's, so the owner the entry records has nothing to say about it.
+        setOwnHandle(h.ptr, hb);
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: overwrote an IoPtr's handle from inside the JS turn with an "
+            "IoOwn's of another class",
+            url, kj::str("0x", kj::hex(hb)));
+      }).then([holder = kj::mv(holder)]() mutable {
+        // Outside any turn, on the event loop: ~IoPtr retires the entry its handle names.
+        return kj::evalLater([holder = kj::mv(holder)]() mutable {
+          holder = nullptr;
+          KJ_LOG(WARNING,
+              "WORKERD_GK_TEST_PROBE: dropped the IoPtr on the event loop, with the other "
+              "class's handle in it");
+        });
+      });
+    })
+            .then([addr, hb]() {
+      return kj::evalLater([addr, hb]() {
+        // Host-side: the victim's entry, which the drop must have left alone.
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the IoOwn's entry after the IoPtr's drop",
+            kj::str("0x", kj::hex(hb)), addr(hostMemory::resolve(hb)));
+      });
+    }).then([&context, &victim, callMagic]() {
+      return callMagic(context, "ioptr-other-class-after-drop", victim.own);
+    }));
+  }
+  // The owned node (see OwnedObjectList in io/io-own.h): the record the host keeps about the
+  // object behind an IoOwn's handle, in host memory. The turn creates an IoOwn; after the turn
+  // the host, on the event loop, finds the node behind its handle and announces its address; a
+  // later turn rewrites the node's link and disposer to a slot and a disposer the turn chose,
+  // as a write primitive would. Under the guest kernel the write faults at the node, the isolate
+  // is condemned and the request's context is torn down host-side, where the walk disposes of
+  // the object through the disposer the node recorded. Where the write lands (no guest kernel,
+  // or the WORKERD_GK_NEG_IOOWN_NODE build), the holder is destroyed on the event loop and the
+  // next turn's drain follows the rewritten node: it writes the chosen slot and calls the chosen
+  // disposer, which logs that it was reached.
+  struct ChosenDisposer final: public kj::Disposer {
+    void disposeImpl(void* pointer) const override {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the chosen disposer was called by the host",
+          kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(pointer))));
+    }
+  };
+  static const ChosenDisposer chosenDisposer;
+  static void* chosenSlot = nullptr;
+  if (probeEnabled && url.endsWith("/__gk_ioown_node_corrupt")) {
+    auto& context = IoContext::current();
+    static kj::Maybe<kj::Own<IoOwnProbeHolder>> nodeHolder;
+    // The node's fields, found host-side and kept for the turn: the lookup itself reads host
+    // state a turn cannot.
+    static OwnedObjectList::NodeForTest probedNode = {nullptr, nullptr, nullptr};
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_NODE_MAGIC))});
+    uint64_t handle = ioOwnHandle(*holder);
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: created an IoOwn for the node probe inside the JS turn",
+        url, kj::str("0x", kj::hex(handle)), addr(holder->own.operator->()));
+    nodeHolder = kj::mv(holder);
+    context.addWaitUntil(kj::evalLater([&context, handle, addr, url = kj::str(url)]() mutable {
+      // On the event loop, after the turn: the node exists in host memory now.
+      probedNode = OwnedObjectList::nodeForTest(handle);
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the owned node behind the IoOwn, found host-side",
+          kj::str("0x", kj::hex(handle)), addr(probedNode.node), addr(probedNode.prev),
+          addr(probedNode.disposer));
+      return context
+          .run([addr, url = kj::mv(url)](Worker::Lock&) {
+        auto node = probedNode;
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: rewriting the owned node from inside the JS turn",
+            url, addr(node.node), addr(&chosenSlot), addr(&chosenDisposer));
+        // The write: under the guest kernel this faults at the node and nothing below runs.
+        *node.prev = &chosenSlot;
+        *node.disposer = &chosenDisposer;
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: the owned node was rewritten from inside the JS turn; the "
+            "write landed",
+            addr(node.node));
+      })
+          .then([]() {
+        return kj::evalLater([]() {
+          KJ_LOG(WARNING,
+              "WORKERD_GK_TEST_PROBE: destroying the node probe's holder on the event loop");
+          nodeHolder = kj::none;
+        });
+      }).then([&context, addr]() {
+        return context.run([addr](Worker::Lock&) {
+          KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the turn after the node holder's destruction ran",
+              addr(chosenSlot));
+        });
+      });
+    }));
+  }
+  // The delete queue (see DeleteQueue in io/io-own.h): a holder names its context by the
+  // context's handle, and the queue is in the context's record in host memory.
+  //
+  // /__gk_queue_corrupt aims at the record. The turn creates an IoOwn; after the turn the host
+  // finds the record behind the IoOwn's context handle and announces its address and the word
+  // holding the cross-thread signal's fulfiller, which the host calls through when it queues an
+  // action; a later turn writes a fulfiller of its choosing into that word, as a write primitive
+  // would. Under the guest kernel the write faults at the record, the isolate is condemned and
+  // the context is torn down host-side, which locks the record and disposes of the object. Where
+  // the write lands (no guest kernel, or the WORKERD_GK_NEG_DELETE_QUEUE build), the host then
+  // queues an action for the context from the event loop and calls the chosen fulfiller, which
+  // logs that it was reached.
+  //
+  // /__gk_queue_rewrite aims at the handle: a later turn overwrites the IoOwn's context handle
+  // with the address of a buffer the turn chose, laid out as a record would be, which is what the
+  // delete queue pointer was; the holder is then destroyed on the event loop. The host must
+  // refuse the handle and queue nothing, leaving the object to the context's list, and must not
+  // read or write the buffer. /__gk_queue_steal overwrites it with another isolate's live context
+  // handle instead (announced by /__gk_ioown_announce): the host finds that context, but the
+  // handle the holder drops names an object of this context's list, so nothing is queued there
+  // either. /__gk_queue_after queues an action for this context from the event loop, the
+  // host-side path through the record's lock and the fulfiller, and reports when the action has
+  // run in a turn.
+  struct ChosenFulfiller final: public kj::CrossThreadPromiseFulfiller<void> {
+    void fulfill(kj::_::Void&& value) const override {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the chosen fulfiller was called by the host");
+    }
+    void reject(kj::Exception&& exception) const override {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the chosen fulfiller was called by the host");
+    }
+    bool isWaiting() const override {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the chosen fulfiller was called by the host");
+      return true;
+    }
+  };
+  static const ChosenFulfiller chosenFulfiller;
+  constexpr uint64_t IOOWN_QUEUE_MAGIC = 0x0bab0bab0bab0bab;
+  constexpr uint64_t IOOWN_REWRITE_MAGIC = 0x0cab0cab0cab0cab;
+  constexpr uint64_t IOOWN_STEAL_MAGIC = 0x0dab0dab0dab0dab;
+  if (probeEnabled && url.endsWith("/__gk_queue_corrupt")) {
+    auto& context = IoContext::current();
+    static kj::Maybe<kj::Own<IoOwnProbeHolder>> queueHolder;
+    static DeleteQueue::RecordForTest probedRecord = {nullptr, 0, nullptr};
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_QUEUE_MAGIC))});
+    uint64_t ctx = ioOwnContext(*holder);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: created an IoOwn for the queue probe inside the JS turn", url,
+        kj::str("0x", kj::hex(ctx)), addr(holder->own.operator->()));
+    queueHolder = kj::mv(holder);
+    context.addWaitUntil(kj::evalLater([&context, ctx, addr, url = kj::str(url)]() mutable {
+      // On the event loop, after the turn: the record exists in host memory, with the signal
+      // task's fulfiller installed.
+      probedRecord = DeleteQueue::recordForTest(ctx);
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the context record behind the IoOwn, found host-side",
+          kj::str("0x", kj::hex(ctx)), addr(probedRecord.record), probedRecord.size,
+          addr(probedRecord.fulfiller),
+          addr(probedRecord.fulfiller == nullptr ? nullptr : *probedRecord.fulfiller));
+      return context
+          .run([addr, url = kj::mv(url)](Worker::Lock&) {
+        auto record = probedRecord;
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: rewriting the context record from inside the JS turn", url,
+            addr(record.record), addr(&chosenFulfiller));
+        // The write: under the guest kernel this faults at the record and nothing below runs.
+        *record.fulfiller = const_cast<ChosenFulfiller*>(&chosenFulfiller);
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: the context record was rewritten from inside the JS turn; "
+            "the write landed",
+            addr(record.record));
+      })
+          .then([&context]() {
+        return kj::evalLater([&context]() {
+          // Host-side: queuing an action calls the fulfiller the record holds.
+          bool queued = context.getCrossContextExecutor().tryExecute([](jsg::Lock&) {});
+          KJ_LOG(
+              WARNING, "WORKERD_GK_TEST_PROBE: queued an action for the context host-side", queued);
+        });
+      }).then([&context]() {
+        return context.run([](Worker::Lock&) {
+          KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the turn after the record rewrite ran");
+        });
+      });
+    }));
+  }
+  // The buffer /__gk_queue_rewrite aims the context handle at: a chosen fulfiller where a record
+  // keeps its own, and a mutex-sized word of zeroes before it, checked afterwards for a host
+  // write.
+  static uint64_t chosenRecord[8] = {
+    0, 0, 0, 0, 0, 0, 0, reinterpret_cast<uintptr_t>(&chosenFulfiller)};
+  if (probeEnabled && url.endsWith("/__gk_queue_rewrite")) {
+    auto& context = IoContext::current();
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_REWRITE_MAGIC))});
+    IoOwnProbeHolder& h = *holder;
+    uint64_t ctx = ioOwnContext(h);
+    uint64_t handle = ioOwnHandle(h);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: created an IoOwn for the rewrite probe inside the JS turn", url,
+        kj::str("0x", kj::hex(ctx)), kj::str("0x", kj::hex(handle)), addr(h.own.operator->()));
+    context.addWaitUntil(
+        context
+            .run([&h, url = kj::str(url), addr, ctx, setIoOwnContext](Worker::Lock&) {
+      setIoOwnContext(h, reinterpret_cast<uintptr_t>(chosenRecord));
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: overwrote the IoOwn's context handle from inside the JS turn",
+          url, kj::str("0x", kj::hex(ctx)), addr(chosenRecord));
+    })
+            .then([holder = kj::mv(holder)]() mutable {
+      return kj::evalLater([holder = kj::mv(holder)]() mutable {
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: destroying the rewrite probe's holder on the event loop");
+        holder = nullptr;
+      });
+    }).then([&context]() {
+      return context.run([](Worker::Lock&) {
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: the turn after the rewrite probe holder's destruction ran",
+            kj::str("0x", kj::hex(chosenRecord[0])), kj::str("0x", kj::hex(chosenRecord[7])));
+      });
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_queue_steal")) {
+    KJ_REQUIRE(announcedIoOwnContext != 0, "no IoOwn announced");
+    auto& context = IoContext::current();
+    auto holder = kj::heap<IoOwnProbeHolder>(
+        IoOwnProbeHolder{.own = context.addObject(kj::heap<IoOwnProbe>(IOOWN_STEAL_MAGIC))});
+    IoOwnProbeHolder& h = *holder;
+    uint64_t ctx = ioOwnContext(h);
+    uint64_t handle = ioOwnHandle(h);
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: created an IoOwn for the queue steal probe inside the JS turn", url,
+        kj::str("0x", kj::hex(ctx)), kj::str("0x", kj::hex(handle)), addr(h.own.operator->()));
+    context.addWaitUntil(context
+                             .run([&h, url = kj::str(url), ctx, setIoOwnContext](Worker::Lock&) {
+      setIoOwnContext(h, announcedIoOwnContext);
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: overwrote the IoOwn's context handle from inside the JS turn "
+          "with another isolate's",
+          url, kj::str("0x", kj::hex(ctx)), kj::str("0x", kj::hex(announcedIoOwnContext)));
+    })
+                             .then([holder = kj::mv(holder)]() mutable {
+      return kj::evalLater([holder = kj::mv(holder)]() mutable {
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: destroying the queue steal probe's holder on the event loop");
+        holder = nullptr;
+      });
+    }).then([&context]() {
+      return context.run([](Worker::Lock&) {
+        KJ_LOG(WARNING,
+            "WORKERD_GK_TEST_PROBE: the turn after the queue steal probe holder's destruction "
+            "ran");
+      });
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_queue_after")) {
+    auto& context = IoContext::current();
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    context.addWaitUntil(kj::evalLater([&context, fulfiller = kj::mv(paf.fulfiller)]() mutable {
+      bool queued = context.getCrossContextExecutor().tryExecute(
+          [fulfiller = kj::mv(fulfiller)](jsg::Lock&) mutable {
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: a host-side queued action ran in its context");
+        fulfiller->fulfill();
+      });
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: queued an action for the context host-side", queued);
+    }).then([promise = kj::mv(paf.promise)]() mutable { return kj::mv(promise); }));
+  }
+  // /__gk_action_steal is the action side of the theft. An action a context is asked to run
+  // from inside a turn is boxed on the heap there and the box noted for the host to queue once
+  // the turn has returned; the note lives in the turn's journal, which is the turn's own
+  // memory, so a turn can leave behind a note naming a context that is not its isolate's. The
+  // probe makes real actions through the cross-context executor -- one it leaves alone, as the
+  // control, and then a run of them whose note it rewrites to the other isolate's announced
+  // context, as a write primitive would -- and counts the closures that are destroyed. The host
+  // must queue none of the rewritten ones there and must destroy every box no context took, so
+  // the count after the turn is the number of notes rewritten and the other isolate runs
+  // nothing. (In the WORKERD_GK_NEG_FOREIGN_ACTION build the host leaves those boxes alone,
+  // none of the closures is destroyed, and this script fails.)
+  static size_t stolenActionsDestroyed = 0;
+  static size_t controlActionsDestroyed = 0;
+  struct ActionProbe {
+    bool stolen;
+    explicit ActionProbe(bool stolen): stolen(stolen) {}
+    KJ_DISALLOW_COPY_AND_MOVE(ActionProbe);
+    ~ActionProbe() {
+      if (stolen) {
+        stolenActionsDestroyed++;
+      } else {
+        controlActionsDestroyed++;
+      }
+    }
+  };
+  if (probeEnabled && url.endsWith("/__gk_action_steal")) {
+    KJ_REQUIRE(announcedIoOwnContext != 0, "no IoOwn announced");
+    auto& context = IoContext::current();
+    // Fewer than the notes a turn may hold, so every one of them is still in the journal when
+    // the turn ends and the host reads them there.
+    constexpr size_t STOLEN_ACTIONS = 400;
+    auto executor = context.getCrossContextExecutor();
+    // The notes are read by the host after the turn, and what it says about the ones it refuses
+    // is budgeted (hostMemory::logBudget), so the count comes from the hook's own counter rather
+    // than from the log.
+    uint64_t foreignBefore = OwnedObjectList::statsForTest().foreignActionNotes;
+    // The control is queued on this context, which runs it when the signal wakes it: the
+    // request waits for that, so the context is still there to run it.
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    bool control = executor.tryExecute([probe = kj::heap<ActionProbe>(false),
+                                           fulfiller = kj::mv(paf.fulfiller)](jsg::Lock&) mutable {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: a control action ran in its own context");
+      fulfiller->fulfill();
+    });
+    size_t stolen = 0;
+    for (size_t i = 0; i < STOLEN_ACTIONS; i++) {
+      if (!executor.tryExecute([probe = kj::heap<ActionProbe>(true)](jsg::Lock&) mutable {
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: a stolen action ran in a context");
+      })) {
+        break;
+      }
+      uint64_t* note = hostMemory::lastNoteForTest();
+      if (note == nullptr) break;
+      note[1] = announcedIoOwnContext;
+      stolen++;
+    }
+    KJ_LOG(WARNING,
+        "WORKERD_GK_TEST_PROBE: rewrote the actions' notes to another isolate's context from "
+        "inside the JS turn",
+        control, stolen, kj::str("0x", kj::hex(announcedIoOwnContext)));
+    context.addWaitUntil(kj::evalLater([stolen, foreignBefore]() {
+      uint64_t foreignRefused = OwnedObjectList::statsForTest().foreignActionNotes - foreignBefore;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the actions after the turn", stolen, foreignRefused,
+          stolenActionsDestroyed, controlActionsDestroyed);
+    }).then([promise = kj::mv(paf.promise)]() mutable { return kj::mv(promise); }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_refused_registration")) {
+    // What becomes of an owned object whose registration the commit hook refuses. The
+    // registration names a context that no longer exists, which is a refusal the hook makes on
+    // its own terms; registerOwned() has handed the object to the table by then and the holder
+    // keeps only a handle, so the refusal is the last thing that can reach the object and has
+    // to dispose of it. The destructor says so. (Where a refusal only retires the entry, as in
+    // the WORKERD_GK_NEG_REFUSED_DISPOSE build, nothing says so and this script fails.)
+    struct Probe {
+      ~Probe() noexcept(false) {
+        KJ_LOG(
+            WARNING, "WORKERD_GK_TEST_PROBE: the object of a refused registration was disposed of");
+      }
+    };
+    auto obj = kj::heap<Probe>();
+    const kj::Disposer& disposer = obj.getDisposer();
+    Probe* object = obj.get();
+    auto handle =
+        OwnedObjectList::registerRefusedForTest(object, kj::_::castToVoid(object), disposer);
+    obj.disown(&disposer);
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: registered an owned object naming no live context",
+        kj::hex(handle));
+  }
+  if (probeEnabled && url.endsWith("/__gk_refused_in_refill")) {
+    // The same refusal, found inside the refill hostcall rather than at the end of the turn.
+    // The hook that disposes of the object cannot run in a handler, so the host holds the
+    // refusal until the turn returns and holds a bounded number of them; a turn with more of
+    // them settles no further and is refused its next registration. Either way every refused
+    // registration reaches the hook, which is what the refused and disposed counts say. Each
+    // round
+    // registers one object against a context that no longer exists and then enough objects
+    // against this one to spend a pool, so that a later round's refill is what settles it.
+    struct Probe {
+      ~Probe() noexcept(false) {
+        KJ_LOG(
+            WARNING, "WORKERD_GK_TEST_PROBE: the object of a refused registration was disposed of");
+      }
+    };
+    struct Filler {};
+    constexpr size_t ROUNDS = 40;
+    constexpr size_t FILL = 300;
+    auto& context = IoContext::current();
+    kj::Vector<IoOwn<Filler>> fillers(ROUNDS * FILL);
+    size_t rounds = 0;
+    kj::Maybe<kj::Exception> stopped = kj::runCatchingExceptions([&]() {
+      while (rounds < ROUNDS) {
+        auto obj = kj::heap<Probe>();
+        const kj::Disposer& disposer = obj.getDisposer();
+        Probe* object = obj.get();
+        OwnedObjectList::registerRefusedForTest(object, kj::_::castToVoid(object), disposer);
+        obj.disown(&disposer);
+        rounds++;
+        for (size_t i = 0; i < FILL; i++) fillers.add(context.addObject(kj::heap<Filler>()));
+      }
+    });
+    kj::StringPtr outcome =
+        stopped == kj::none ? "every round ran"_kj : "the turn ran out of entries"_kj;
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: registrations refused across refills", rounds, outcome);
+  }
+  if (probeEnabled && url.endsWith("/__gk_log_flood_turn")) {
+    // The same flood from inside the turn. A holder released at ring 3 whose handle names an
+    // entry of another class is refused there, in the turn's own code: no entry is spent, the
+    // turn is not ended, and it can make the refusal again as often as it can make a holder.
+    constexpr size_t DROPS = 5000;
+    auto& context = IoContext::current();
+    auto other = context.addObject(kj::heap<TypeProbeB>());
+    uint64_t hb = ownHandle(other);
+    kj::Vector<IoOwn<TypeProbeA>> victims(DROPS);
+    for (size_t i = 0; i < DROPS; i++) victims.add(context.addObject(kj::heap<TypeProbeA>()));
+    for (auto& v: victims) setOwnHandle(v, hb);
+    victims.clear();
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: holders dropped naming another class", DROPS);
+  }
+  if (probeEnabled && url.endsWith("/__gk_log_flood")) {
+    // How much log a turn can draw out of the refusal paths. A note is the turn's own memory,
+    // so a turn with a write primitive chooses what one says, and a note of a kind the host
+    // does not know is the cheapest refusal there is to force: no entry is spent on it and the
+    // journal refills itself, so a turn can make them for as long as it runs. The host reports
+    // each one, and that report is the volume this measures. The count the probe logs is what
+    // the turn journaled; the cap is what the host chose to say about them.
+    constexpr size_t NOTES = 20000;
+    constexpr uint64_t UNKNOWN_KIND = 0xbadbad;
+    size_t made = 0;
+    for (size_t i = 0; i < NOTES; i++) {
+      uint64_t words[hostMemory::NOTE_WORDS] = {UNKNOWN_KIND, 0, 0, 0};
+      if (!hostMemory::noteInTurn(words)) break;
+      made++;
+    }
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: notes of an unknown kind journaled", made);
+  }
+  if (probeEnabled && url.endsWith("/__gk_ioown_counts")) {
+    // The host-memory block and resolve-entry counts, for a leak check across a load: read on
+    // the event loop, since the entry count is the guest kernel's, which a turn cannot read.
+    IoContext::current().addTask(kj::evalLater([]() {
+      auto stats = OwnedObjectList::statsForTest();
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: owned-node counts", stats.foreignInTurnDrops,
+          stats.registrationsRefused, stats.objectsDisposedOnRefusal, stats.foreignActionNotes,
+          stats.actionsDestroyedOnDrop, stats.nodesAllocated, stats.nodesFreed,
+          stats.recordsAllocated, stats.recordsFreed, stats.chunksAllocated, stats.chunksFreed,
+          hostMemory::liveResolveEntries());
+    }));
+  }
+  // The AbortSignal native registration (api/basics.h): the record holding one abort action,
+  // which the signal owns and only code under the isolate lock reads, and the table entry that
+  // says the consumer still wants it, which the consumer's RAII handle owns and retires when
+  // it is dropped -- on the event loop, outside the guest, where a `fetch` with a signal drops
+  // it when its promise settles. /__gk_abort_cell_corrupt creates a signal and an action in
+  // the turn, keeps both alive, and then, from a later turn, overwrites the disposer word of
+  // the action's kj::Function with a disposer the turn chose, as a write primitive would. The
+  // handle is then dropped on the event loop: it must retire the entry and nothing else, so
+  // the chosen disposer is never called. (Where the handle clears the action instead, as in
+  // the WORKERD_GK_NEG_ABORT_CELL build, the host destroys the function and calls the disposer
+  // the turn chose, which logs that it was reached, and this script fails.)
+  //
+  // /__gk_abort_cell_live and /__gk_abort_cell_dropped are the behaviour either side of that:
+  // a signal aborted while its consumer's handle is alive must run the action, and one aborted
+  // after the handle was dropped on the event loop must not.
+  struct ChosenActionDisposer final: public kj::Disposer {
+    void disposeImpl(void* pointer) const override {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the chosen action disposer was called",
+          kj::str("0x", kj::hex(reinterpret_cast<uintptr_t>(pointer))),
+          kj::str("inTurn = ", hostMemory::inTurn()));
+    }
+  };
+  static const ChosenActionDisposer chosenActionDisposer;
+  struct AbortProbe {
+    jsg::Ref<AbortSignal> signal;
+    kj::Own<void> registration;
+  };
+  if (probeEnabled && url.endsWith("/__gk_abort_cell_corrupt")) {
+    jsg::Lock& js = lock;
+    auto& context = IoContext::current();
+    static kj::Maybe<AbortProbe> corruptProbe;
+    auto signal = js.alloc<AbortSignal>();
+    auto registration = signal->addAbortAction(js, [](jsg::Lock&, const kj::Exception&) {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the corrupt probe's abort action ran");
+    });
+    auto found = signal->newestNativeRegistrationForTest();
+    KJ_REQUIRE(found.record != nullptr && found.actionDisposerSlot != nullptr,
+        "no native registration was made");
+    KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: created an AbortSignal registration inside the JS turn",
+        url, addr(found.record), addr(found.actionDisposerSlot),
+        kj::str("0x", kj::hex(found.armed)));
+    corruptProbe = AbortProbe{.signal = kj::mv(signal), .registration = kj::mv(registration)};
+    context.addWaitUntil(context
+                             .run([url = kj::str(url), addr](Worker::Lock& lock) {
+      auto& probe = KJ_ASSERT_NONNULL(corruptProbe);
+      auto found = probe.signal->newestNativeRegistrationForTest();
+      void* saved = found.actionDisposerSlot[0];
+      found.actionDisposerSlot[0] = const_cast<ChosenActionDisposer*>(&chosenActionDisposer);
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: overwrote the abort action's disposer from inside the JS turn",
+          url, addr(found.record), addr(saved), addr(&chosenActionDisposer));
+    })
+                             .then([]() {
+      return kj::evalLater([]() {
+        // On the event loop, outside the guest, as the holder of a signal-wrapped promise is.
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: dropping the abort registration on the event loop",
+            kj::str("inTurn = ", hostMemory::inTurn()));
+        KJ_ASSERT_NONNULL(corruptProbe).registration = nullptr;
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the abort registration was dropped");
+      });
+    }).then([&context]() {
+      return context.run([](Worker::Lock&) {
+        auto& probe = KJ_ASSERT_NONNULL(corruptProbe);
+        auto found = probe.signal->newestNativeRegistrationForTest();
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the turn after the registration was dropped ran",
+            kj::str("count = ", probe.signal->getNativeRegistrationCountForTest()),
+            kj::str("armed = 0x", kj::hex(found.armed)),
+            kj::str("resolves = ", hostMemory::resolve(found.armed) == found.record),
+            kj::str("action = ", found.actionDisposerSlot != nullptr ? "present" : "destroyed"));
+      });
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_abort_cell_live")) {
+    // The control: the handle is still held, so the abort runs the action.
+    jsg::Lock& js = lock;
+    auto& context = IoContext::current();
+    static kj::Maybe<AbortProbe> liveProbe;
+    auto signal = js.alloc<AbortSignal>();
+    auto registration = signal->addAbortAction(js, [](jsg::Lock&, const kj::Exception&) {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the live probe's abort action ran");
+    });
+    liveProbe = AbortProbe{.signal = kj::mv(signal), .registration = kj::mv(registration)};
+    context.addWaitUntil(context.run([](Worker::Lock& lock) {
+      jsg::Lock& js = lock;
+      auto& probe = KJ_ASSERT_NONNULL(liveProbe);
+      probe.signal->triggerAbort(js, kj::none);
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the live probe's signal was aborted");
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_abort_cell_dropped")) {
+    // The other side: the handle is dropped on the event loop first, so the abort must not run
+    // the action even though the record is still the signal's.
+    jsg::Lock& js = lock;
+    auto& context = IoContext::current();
+    static kj::Maybe<AbortProbe> droppedProbe;
+    auto signal = js.alloc<AbortSignal>();
+    auto registration = signal->addAbortAction(js, [](jsg::Lock&, const kj::Exception&) {
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the dropped probe's abort action ran");
+    });
+    droppedProbe = AbortProbe{.signal = kj::mv(signal), .registration = kj::mv(registration)};
+    context.addWaitUntil(kj::evalLater([]() {
+      KJ_ASSERT_NONNULL(droppedProbe).registration = nullptr;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the dropped probe's registration was dropped",
+          kj::str("inTurn = ", hostMemory::inTurn()));
+    }).then([&context]() {
+      return context.run([](Worker::Lock& lock) {
+        jsg::Lock& js = lock;
+        auto& probe = KJ_ASSERT_NONNULL(droppedProbe);
+        probe.signal->triggerAbort(js, kj::none);
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: the dropped probe's signal was aborted");
+      });
+    }));
+  }
+  if (probeEnabled && url.endsWith("/__gk_corrupt_handle")) {
+    KJ_IF_SOME(probe, hostMemory::handleProbeForTest()) {
+      static byte chosenKey[32] = {0x41};
+      hostMemory::SlotHandle saved;
+      memcpy(&saved, probe.handleStorage, sizeof(saved));
+      hostMemory::SlotHandle chosen = reinterpret_cast<uintptr_t>(chosenKey);
+      memcpy(probe.handleStorage, &chosen, sizeof(chosen));
+      KJ_LOG(WARNING,
+          "WORKERD_GK_TEST_PROBE: overwrote the tenant's handle from inside the JS turn", url,
+          kj::str("0x", kj::hex(saved)), kj::str("0x", kj::hex(chosen)));
+      IoContext::current().addTask(kj::evalLater([&probe, saved]() {
+        probe.useOnHost();
+        memcpy(probe.handleStorage, &saved, sizeof(saved));
+        KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: restored the tenant's handle",
+            kj::str("0x", kj::hex(saved)));
+        probe.useOnHost();
+      }));
+    }
+  }
+}
+
+}  // namespace
+
+bool takeForcedGuestFaultInMemoryCacheFallbackForTest() {
+  bool armed = faultInNextMemoryCacheFallbackForTest;
+  faultInNextMemoryCacheFallbackForTest = false;
+  return armed;
+}
+
 kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(kj::HttpMethod method,
     kj::StringPtr url,
     const kj::HttpHeaders& headers,
@@ -314,6 +2225,7 @@ kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(kj::HttpMetho
     kj::Maybe<ExportedHandler&> exportedHandler,
     kj::Maybe<jsg::Ref<AbortSignal>> abortSignal) {
   TRACE_EVENT("workerd", "ServiceWorkerGlobalScope::request()");
+  maybeForceGuestFaultForTest(url, lock);
   // To construct a ReadableStream object, we're supposed to pass in an Own<AsyncInputStream>, so
   // that it can drop the reference whenever it gets GC'ed. But in this case the stream's lifetime
   // is not under our control -- it's attached to the request. So, we wrap it in a

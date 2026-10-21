@@ -1,0 +1,11 @@
+{
+ "conns_per_tenant": 2,
+ "mode": "procs-gk",
+ "n": 16,
+ "p50_us_median_tenant": 211.262,
+ "p50_us_worst_tenant": 336.585,
+ "rps_per_core": 10290.77384656276,
+ "rps_per_tenant": 11227.0625,
+ "server_cores_busy": 17.455732938878988,
+ "total_rps": 179633.0
+}

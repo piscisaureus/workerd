@@ -10,7 +10,12 @@
 #include <workerd/jsg/modules-new.h>
 #include <workerd/jsg/modules.h>
 #include <workerd/jsg/util.h>
+#include <workerd/util/alloc-census.h>
 #include <workerd/util/thread-scopes.h>
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <workerd/experimental/guest-kernel/gk.h>
+#endif
 
 #ifdef V8_ENABLE_SANDBOX
 #include <sys/mman.h>
@@ -138,33 +143,107 @@ void Data::moveFromTraced(Data& other, v8::TracedReference<v8::Data>& otherTrace
   other.tracedHandle = kj::none;
 }
 
-Lock::Lock(v8::Isolate* v8Isolate)
-    : v8Isolate(v8Isolate),
-      locker(v8Isolate),
-      isolateScope(v8Isolate),
-      previousData(v8Isolate->GetData(SET_DATA_LOCK)),
-      warningsLogged(IsolateBase::from(v8Isolate).areWarningsLogged()) {
-  if (previousData != nullptr) {
-    // Hmm, there's already a current lock. It must be a recursive lock (i.e. a second lock taken
-    // on the same isolate in the same thread), otherwise `locker`'s constructor would have blocked
-    // waiting for the other thread to release the lock. We don't want to support this, but
-    // historically we have.
+namespace {
+// The C++ heap arena of `isolate`'s guest-kernel arena, if it has one.
+kj::Maybe<HeapArena&> heapArenaOf(v8::Isolate* isolate) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  KJ_IF_SOME(arena, IsolateBase::from(isolate).getGuestArena()) {
+    return arena.getHeapArena();
+  }
+#endif
+  return kj::none;
+}
+}  // namespace
+
+GuestArenaScope::GuestArenaScope(v8::Isolate* isolate): heapArenaScope(heapArenaOf(isolate)) {
+  allocCensus::enterIsolate(isolate);
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  KJ_IF_SOME(arena, IsolateBase::from(isolate).getGuestArena()) {
+    int result = gk_arena_enter(arena.get());
+    KJ_REQUIRE(result == 0, "guest-kernel: could not enter the isolate's arena", result);
+    entered = true;
+  }
+#endif
+}
+
+GuestArenaScope::~GuestArenaScope() noexcept(false) {
+  allocCensus::leaveIsolate();
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (entered) {
+    // Leaves what gk recorded this thread as having entered, whatever this object says.
+    int result = gk_arena_leave();
+    if (result != 0) {
+      KJ_LOG(ERROR, "guest-kernel: leaving the isolate's arena failed", result);
+    }
+  }
+#endif
+}
+
+namespace {
+
+// How many Locks are alive on this thread, for the recursion check below. It is a count kept
+// here rather than the lock slot, which is memory a guest turn can write and which the
+// constructor therefore must not read (see Lock::from); the host puts it back after a turn as
+// it does the slots (runTrampolineInGuest in guest-run.c++).
+thread_local uint locksHeld = 0;
+
+// A second Lock on an isolate this thread already has a Lock for is not supported: the lock
+// slot (SET_DATA_LOCK) names one Lock, and the inner one's destructor clears the slot rather
+// than restoring the outer one, which would leave the outer one unnamed and Lock::from()
+// returning null. That is what this refuses, in release as well as debug, because the slot
+// cannot represent it in any build.
+//
+// It takes both halves to say it. v8::Locker::IsLocked() -- V8's thread manager, asked before
+// `locker` is constructed -- says this thread holds this isolate's lock, but says nothing about
+// what holds it: an embedder may hold a bare v8::Locker, which V8 supports and which leaves the
+// slot alone (src/rust/jsg-test's harness holds one for the life of the harness and takes one
+// Lock at a time inside it). The count says a Lock on this thread holds one, but not of which
+// isolate, so a Lock held for another isolate makes it nonzero on its own. Together they are
+// true of a recursive Lock and, short of a Lock on one isolate taken while another isolate this
+// thread has a bare Locker on is locked, of nothing else.
+v8::Isolate* requireNotLockedByThisThread(v8::Isolate* isolate) {
+  if (v8::Locker::IsLocked(isolate) && locksHeld != 0) {
 #ifdef KJ_DEBUG
     // In debug mode, abort immediately. This makes it a little easier to debug than if we threw
     // an exception.
     ([]() noexcept { KJ_FAIL_REQUIRE("attempt to take recursive isolate lock"); })();
 #else
-    // In release mode, log the error.
-    // TODO(soon): This shouldn't happen but we know it does in at least one case. Once things
-    // are cleaned up and we know this no longer happens in production, change this to throw.
-    // Then we can stop storing `previousData`.
-    KJ_LOG(ERROR, "took recursive isolate lock", kj::getStackTrace());
+    KJ_FAIL_REQUIRE("attempt to take recursive isolate lock");
 #endif
   }
+  return isolate;
+}
+
+}  // namespace
+
+uint saveLockDepthForGuestTurn() {
+  return locksHeld;
+}
+void restoreLockDepthAfterGuestTurn(uint depth) {
+  locksHeld = depth;
+}
+uint lockDepthForTest() {
+  return locksHeld;
+}
+void setLockDepthForTest(uint depth) {
+  locksHeld = depth;
+}
+
+Lock::Lock(v8::Isolate* v8Isolate)
+    : v8Isolate(requireNotLockedByThisThread(v8Isolate)),
+      locker(v8Isolate),
+      isolateScope(v8Isolate),
+      guestArenaScope(v8Isolate),
+      warningsLogged(IsolateBase::from(v8Isolate).areWarningsLogged()) {
+  ++locksHeld;
   v8Isolate->SetData(SET_DATA_LOCK, this);
 }
 Lock::~Lock() noexcept(false) {
-  v8Isolate->SetData(SET_DATA_LOCK, previousData);
+  // The slot is cleared rather than restored: with no recursive locks there is nothing to put
+  // back, and a value kept for that in this object would be a pointer the host writes into the
+  // slot from heap memory a guest turn can write.
+  v8Isolate->SetData(SET_DATA_LOCK, nullptr);
+  --locksHeld;
 }
 
 #ifdef WORKERD_ASAN
@@ -479,12 +558,7 @@ void ExternalMemoryTarget::maybeDeferAdjustment(ssize_t amount) const {
     // making such a change, and that's us, and we're not.
     KJ_ASSERT(v8::Locker::IsLocked(target));
 
-    // We use AdjustAmountOfExternalAllocatedMemoryImpl() instead of ExternalMemoryAccounter
-    // because we explicitly want external memory to be allowed to live beyond the isolate
-    // in some cases. The Impl variant bypasses the destructor check that
-    // ExternalMemoryAccounter enforces (requiring adjustment to return to zero).
-    // See patches/v8/0031-Expose-AdjustAmountOfExternalAllocatedMemoryImpl.patch
-    target->AdjustAmountOfExternalAllocatedMemoryImpl(amount);
+    applyLocked(target, amount);
   } else {
     // We don't hold the isolate lock. Instead, record the adjustment to be applied the next time
     // the isolate lock is acquired.
@@ -500,7 +574,63 @@ void ExternalMemoryTarget::adjustNow(Lock& js, ssize_t amount) const {
   }
 #endif
   if (amount == 0) return;
-  js.v8Isolate->AdjustAmountOfExternalAllocatedMemoryImpl(amount);
+  applyLocked(js.v8Isolate, amount);
+}
+
+namespace {
+// How far the memory reported through a target may grow past the least it has been since the
+// last collection before the isolate collects garbage: V8's kExternalAllocationSoftLimit.
+//
+// V8 itself never collects for the memory an embedder reports in a workerd. Past this soft
+// limit it starts incremental marking, which workerd runs without (see setup.c++), so that
+// answer is nothing; its own hard limit for external memory is applied nowhere any more; and
+// beyond that the reported total only counts against the global allocation limit, which is
+// consulted when the JS heap next needs an old-space page
+// (Heap::ShouldExpandOldGenerationOnSlowAllocation), whatever heap limit the isolate was given.
+// A worker that holds large C++ objects until their JS owners are collected -- a Response built
+// from a 4 MiB buffer keeps its copy of the buffer until the Response is -- and promotes little
+// therefore accumulates them until that page is needed, gigabytes later, with a 128 MiB heap
+// limit exactly as with none (measure/findings.md in experimental/guest-kernel). With a shared
+// heap that is bloat; with a per-isolate heap arena (heap-arena.h), whose region is fixed, it
+// exhausts the isolate's memory. So the soft limit is applied here, the way V8 applies it with
+// incremental marking on, through a collection on the spot.
+constexpr int64_t EXTERNAL_MEMORY_SOFT_LIMIT = 64 * 1024 * 1024;
+}  // namespace
+
+void ExternalMemoryTarget::applyLocked(v8::Isolate* isolate, int64_t amount) const {
+  // We use AdjustAmountOfExternalAllocatedMemoryImpl() instead of ExternalMemoryAccounter
+  // because we explicitly want external memory to be allowed to live beyond the isolate
+  // in some cases. The Impl variant bypasses the destructor check that
+  // ExternalMemoryAccounter enforces (requiring adjustment to return to zero).
+  // See patches/v8/0031-Expose-AdjustAmountOfExternalAllocatedMemoryImpl.patch
+  isolate->AdjustAmountOfExternalAllocatedMemoryImpl(amount);
+
+  int64_t total = reported.fetch_add(amount, std::memory_order_relaxed) + amount;
+  int64_t low = reportedLowWater.load(std::memory_order_relaxed);
+  if (total < low) {
+    reportedLowWater.store(total, std::memory_order_relaxed);
+  } else if (total - low > EXTERNAL_MEMORY_SOFT_LIMIT &&
+      !collecting.load(std::memory_order_relaxed)) {
+    // The low-water mark is reset to where the collection was asked for rather than to what it
+    // leaves behind: what the collection frees lowers it as the frees are reported, and what it
+    // cannot free is live, and grows the mark so that the next collection waits for another
+    // soft limit's worth of growth, as V8's does.
+    reportedLowWater.store(total, std::memory_order_relaxed);
+    // A collection runs finalizers, which report the memory they free through this target; the
+    // flag keeps that from asking for another collection from inside this one.
+    collecting.store(true, std::memory_order_relaxed);
+    KJ_DEFER(collecting.store(false, std::memory_order_relaxed));
+    // One full collection on the spot (the thread holds the isolate locked), which is all this
+    // needs: a major mark-compact runs the weak callbacks that detach the wrappers of the dead
+    // objects holding the reported memory, so the memory is freed before the call returns. The
+    // level V8 acts on without incremental marking through its public pressure notification is
+    // kCritical, which is a near-OOM path: besides collecting it drops the compilation cache,
+    // the serializer data and the concurrent optimization jobs, releases the pooled pages of
+    // every isolate in the group -- the process, with a shared heap -- and collects a second
+    // time whenever committed-minus-live plus the reported total is over 8 MB and a tenth of
+    // committed, which for a small heap it almost always is. See patches/v8/0052.
+    isolate->CollectGarbageForExternalMemory();
+  }
 }
 
 ExternalMemoryAdjustment ExternalMemoryTarget::getAdjustment(size_t amount) const {
@@ -510,7 +640,7 @@ ExternalMemoryAdjustment ExternalMemoryTarget::getAdjustment(size_t amount) cons
 void ExternalMemoryTarget::applyDeferredMemoryUpdate() const {
   int64_t amount = pendingExternalMemoryUpdate.exchange(0, std::memory_order_relaxed);
   if (amount != 0) {
-    isolate.load(std::memory_order_relaxed)->AdjustAmountOfExternalAllocatedMemoryImpl(amount);
+    applyLocked(isolate.load(std::memory_order_relaxed), amount);
   }
 }
 
@@ -644,6 +774,10 @@ bool isInGcDestructor() {
   return HeapTracer::isInCppgcDestructor();
 }
 
+void setInGcDestructorForTest(bool value) {
+  HeapTracer::restoreInCppgcDestructorAfterGuestTurn(value);
+}
+
 bool USVString::isValidUtf8() const {
   return simdutf::validate_utf8(cStr(), size());
 }
@@ -667,20 +801,20 @@ void ContextGlobal::setSchemaLoader(const capnp::SchemaLoader& schemaLoader) {
 }
 
 #ifdef V8_ENABLE_SANDBOX
-// These are disabled by default in workerd. We do not build workerd with
-// the V8_ENABLED_SANDBOX flag. If we do decide to enable it, we will need
-// additional setup to ensure that these are handled correctly on all platforms.
-// For now, keeping it simple. This bit will only be used in the internal
-// project.
+// V8 reports -1 as the key when sandbox hardware support (memory protection keys) is not
+// compiled in or not active; in that case there is nothing to switch and the scope is a no-op.
 static constexpr int kPkeyNoRestrictions = 0;
+static constexpr int kNoPkey = -1;
 MemoryProtectionKeyScope::MemoryProtectionKeyScope(Lock& js)
     : pkey(js.v8Isolate->GetMemoryProtectionKey()) {}
 
-MemoryProtectionKeyScope::PkeyScope::PkeyScope(int pkey): key(pkey), saved(pkey_get(key)) {
-  pkey_set(pkey, kPkeyNoRestrictions);
+MemoryProtectionKeyScope::PkeyScope::PkeyScope(int pkey)
+    : key(pkey),
+      saved(key == kNoPkey ? kPkeyNoRestrictions : pkey_get(key)) {
+  if (key != kNoPkey) pkey_set(key, kPkeyNoRestrictions);
 }
 MemoryProtectionKeyScope::PkeyScope::~PkeyScope() {
-  pkey_set(key, saved);
+  if (key != kNoPkey) pkey_set(key, saved);
 }
 #endif
 

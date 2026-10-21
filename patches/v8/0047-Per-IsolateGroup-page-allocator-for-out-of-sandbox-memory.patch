@@ -1,0 +1,345 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Wed, 23 Sep 2026 12:00:00 +0000
+Subject: Per-IsolateGroup page allocator for out-of-sandbox memory
+
+An isolate group keeps two regions outside of its sandbox and pointer
+compression cage: the code range and, with the sandbox, the trusted
+range. Both are reserved from the process-wide platform page allocator
+at addresses V8 picks, even when the embedder placed the group's sandbox
+in its own reservation (v8::IsolateGroup::CreateParams). Embedders that
+manage the address space themselves, for example to apply hardware
+memory isolation per isolate group, need those regions to be placed
+too.
+
+Add v8::IsolateGroup::CreateParams::page_allocator. When set, the
+group's trusted range and code range are reserved through it instead of
+the platform page allocator: TrustedRange::InitReservation() takes the
+allocator from the group, and CodeRange::InitReservation() takes an
+optional out-of-cage allocator that replaces the platform allocator it
+otherwise switches to for the external code space. Everything else
+about the two ranges (alignment, hints, permissions, red zones, the
+BoundedPageAllocator on top) is unchanged, and a null allocator keeps
+the existing behavior.
+
+A CppHeap has its own page allocator, taken from the platform. Add
+v8::CppHeapCreateParams::page_allocator so an embedder that creates the
+CppHeap itself can allocate its pages through the same per-group
+allocator; when null the platform's allocator (or cppgc's default) is
+used as before.
+
+diff --git a/include/v8-isolate.h b/include/v8-isolate.h
+--- a/include/v8-isolate.h
++++ b/include/v8-isolate.h
+@@ -269,6 +269,28 @@
+      */
+     void* sandbox_reservation = nullptr;
+     size_t sandbox_reservation_size = 0;
++
++    /**
++     * When set, the memory that the group keeps outside of its sandbox (and
++     * pointer compression cage), i.e. the code range and the trusted range,
++     * is allocated through this page allocator instead of the platform's page
++     * allocator. This lets an embedder that manages the address space itself
++     * decide where a group's out-of-sandbox memory lives.
++     *
++     * The allocator must outlive the group. V8 calls AllocatePages (with a
++     * hint that may be ignored, but the requested alignment must be honored),
++     * FreePages, ReleasePages, SetPermissions, RecommitPages,
++     * DiscardSystemPages, DecommitPages, AllocatePageSize, CommitPageSize and
++     * GetRandomMmapAddr on it; SealPages is used when memory sealing is
++     * enabled.
++     *
++     * Memory that V8 obtains for the group in other ways is not affected: the
++     * sandbox itself, pointer tables backed by the platform's virtual address
++     * space, and ordinary malloc'ed memory. A CppHeap attached to an isolate
++     * of the group has its own page allocator; see
++     * CppHeapCreateParams::page_allocator to place it alongside.
++     */
++    v8::PageAllocator* page_allocator = nullptr;
+   };
+ 
+   /**
+diff --git a/include/v8-cppgc.h b/include/v8-cppgc.h
+--- a/include/v8-cppgc.h
++++ b/include/v8-cppgc.h
+@@ -58,6 +58,12 @@
+    * heap.
+    */
+   std::optional<cppgc::StackStartMarker> stack_start_marker = std::nullopt;
++  /**
++   * Optional page allocator that the heap allocates its pages from. When null,
++   * the platform's page allocator is used, or cppgc's default page allocator
++   * if the platform does not provide one. Must outlive the heap.
++   */
++  v8::PageAllocator* page_allocator = nullptr;
+ };
+ 
+ /**
+diff --git a/src/api/api.cc b/src/api/api.cc
+--- a/src/api/api.cc
++++ b/src/api/api.cc
+@@ -9947,7 +9947,7 @@
+ IsolateGroup IsolateGroup::Create(const CreateParams& params) {
+   return IsolateGroup(i::IsolateGroup::New(
+       reinterpret_cast<i::Address>(params.sandbox_reservation),
+-      params.sandbox_reservation_size));
++      params.sandbox_reservation_size, params.page_allocator));
+ }
+ 
+ IsolateGroup::IsolateGroup(IsolateGroup&& other) {
+diff --git a/src/init/isolate-group.h b/src/init/isolate-group.h
+--- a/src/init/isolate-group.h
++++ b/src/init/isolate-group.h
+@@ -128,9 +128,12 @@
+   // sandbox is placed inside the embedder-owned reservation starting there
+   // (see v8::IsolateGroup::CreateParams for the requirements). Aborts if a
+   // reservation is given but the sandbox is disabled or the platform cannot
+-  // adopt embedder memory.
++  // adopt embedder memory. When |embedder_page_allocator| is non-null, the
++  // group's out-of-sandbox memory (code range, trusted range) is allocated
++  // through it instead of the platform page allocator.
+   static IsolateGroup* New(Address sandbox_reservation_base,
+-                           size_t sandbox_reservation_size);
++                           size_t sandbox_reservation_size,
++                           v8::PageAllocator* embedder_page_allocator);
+ 
+   static void InitializeOncePerProcess();
+   static void TearDownOncePerProcess();
+@@ -147,6 +150,15 @@
+   void Release();
+ 
+   v8::PageAllocator* page_allocator() const { return page_allocator_; }
++
++  // The page allocator for memory that the group keeps outside of its pointer
++  // compression cage and sandbox, such as the trusted range: the allocator the
++  // embedder supplied when creating the group, or else the platform's.
++  v8::PageAllocator* out_of_sandbox_page_allocator() const {
++    return embedder_page_allocator_ ? embedder_page_allocator_
++                                    : GetPlatformPageAllocator();
++  }
++
+   v8::PageAllocator* read_only_page_allocator() const {
+     if (read_only_page_allocator_) {
+       return read_only_page_allocator_.get();
+@@ -309,6 +321,10 @@
+   std::atomic<int> reference_count_{1};
+   v8::PageAllocator* page_allocator_ = nullptr;
+   std::unique_ptr<v8::PageAllocator> read_only_page_allocator_;
++  // Embedder-owned allocator for the group's out-of-sandbox memory, or null
++  // to use the platform page allocator. See
++  // v8::IsolateGroup::CreateParams::page_allocator.
++  v8::PageAllocator* embedder_page_allocator_ = nullptr;
+ 
+ #ifdef V8_COMPRESS_POINTERS
+   VirtualMemoryCage* trusted_pointer_compression_cage_ = nullptr;
+diff --git a/src/init/isolate-group.cc b/src/init/isolate-group.cc
+--- a/src/init/isolate-group.cc
++++ b/src/init/isolate-group.cc
+@@ -184,7 +184,8 @@
+       base::PageFreeingMode::kMakeInaccessible);
+ #endif  // CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
+ 
+-  if (!trusted_range_.InitReservation(kMaximalTrustedRangeSize)) {
++  if (!trusted_range_.InitReservation(out_of_sandbox_page_allocator(),
++                                      kMaximalTrustedRangeSize)) {
+     V8::FatalProcessOutOfMemory(
+         nullptr, "Failed to reserve virtual memory for TrustedRange");
+   }
+@@ -301,10 +302,12 @@
+ 
+ namespace {
+ void InitCodeRangeOnce(std::unique_ptr<CodeRange>* code_range_member,
+-                       v8::PageAllocator* page_allocator, size_t requested_size,
+-                       bool immutable) {
++                       v8::PageAllocator* page_allocator,
++                       v8::PageAllocator* out_of_cage_page_allocator,
++                       size_t requested_size, bool immutable) {
+   CodeRange* code_range = new CodeRange();
+-  if (!code_range->InitReservation(page_allocator, requested_size, immutable)) {
++  if (!code_range->InitReservation(page_allocator, requested_size, immutable,
++                                   out_of_cage_page_allocator)) {
+     V8::FatalProcessOutOfMemory(
+         nullptr, "Failed to reserve virtual memory for CodeRange");
+   }
+@@ -321,7 +324,8 @@
+ 
+ CodeRange* IsolateGroup::EnsureCodeRange(size_t requested_size) {
+   base::CallOnce(&init_code_range_, InitCodeRangeOnce, &code_range_,
+-                 page_allocator_, requested_size, process_wide_);
++                 page_allocator_, embedder_page_allocator_, requested_size,
++                 process_wide_);
+   return code_range_.get();
+ }
+ 
+@@ -411,11 +415,12 @@
+ }
+ 
+ // static
+-IsolateGroup* IsolateGroup::New() { return New(kNullAddress, 0); }
++IsolateGroup* IsolateGroup::New() { return New(kNullAddress, 0, nullptr); }
+ 
+ // static
+ IsolateGroup* IsolateGroup::New(Address sandbox_reservation_base,
+-                                size_t sandbox_reservation_size) {
++                                size_t sandbox_reservation_size,
++                                v8::PageAllocator* embedder_page_allocator) {
+   if (!CanCreateNewGroups()) {
+     FATAL(
+         "Creation of new isolate groups requires enabling "
+@@ -423,6 +428,8 @@
+   }
+ 
+   IsolateGroup* group = new IsolateGroup;
++  // Must be set before Initialize() reserves the trusted range.
++  group->embedder_page_allocator_ = embedder_page_allocator;
+ #ifdef V8_ENABLE_SANDBOX
+   Sandbox* sandbox;
+   if (sandbox_reservation_base != kNullAddress) {
+diff --git a/src/heap/trusted-range.h b/src/heap/trusted-range.h
+--- a/src/heap/trusted-range.h
++++ b/src/heap/trusted-range.h
+@@ -21,7 +21,9 @@
+ // reference objects. We have one trusted range per isolate group.
+ class TrustedRange final : public VirtualMemoryCage {
+  public:
+-  bool InitReservation(size_t requested);
++  // Reserves the trusted range from |page_allocator|, which must allocate
++  // outside of the sandbox.
++  bool InitReservation(v8::PageAllocator* page_allocator, size_t requested);
+ };
+ 
+ #endif  // V8_ENABLE_SANDBOX
+diff --git a/src/heap/trusted-range.cc b/src/heap/trusted-range.cc
+--- a/src/heap/trusted-range.cc
++++ b/src/heap/trusted-range.cc
+@@ -12,12 +12,12 @@
+ 
+ #ifdef V8_ENABLE_SANDBOX
+ 
+-bool TrustedRange::InitReservation(size_t requested) {
++bool TrustedRange::InitReservation(v8::PageAllocator* page_allocator,
++                                   size_t requested) {
++  DCHECK_NOT_NULL(page_allocator);
+   DCHECK_LE(requested, kMaximalTrustedRangeSize);
+   DCHECK_GE(requested, kMinimumTrustedRangeSize);
+ 
+-  auto page_allocator = GetPlatformPageAllocator();
+-
+   const size_t kPageSize = NormalPage::kPageSize;
+   CHECK(IsAligned(kPageSize, page_allocator->AllocatePageSize()));
+ 
+diff --git a/src/heap/code-range.h b/src/heap/code-range.h
+--- a/src/heap/code-range.h
++++ b/src/heap/code-range.h
+@@ -143,8 +143,15 @@
+   // Initialize the address space reservation for the code range. The immutable
+   // flag specifies if the reservation will live until the end of the process
+   // and can be sealed.
++  //
++  // With the external code space the code range must live outside of the
++  // pointer compression cage, so |page_allocator| (which may belong to that
++  // cage) is not used; the reservation is then made through
++  // |out_of_cage_page_allocator| if non-null and through the platform page
++  // allocator otherwise.
+   bool InitReservation(v8::PageAllocator* page_allocator, size_t requested,
+-                       bool immutable);
++                       bool immutable,
++                       v8::PageAllocator* out_of_cage_page_allocator = nullptr);
+ 
+   V8_EXPORT_PRIVATE void Free();
+ 
+diff --git a/src/heap/code-range.cc b/src/heap/code-range.cc
+--- a/src/heap/code-range.cc
++++ b/src/heap/code-range.cc
+@@ -148,11 +148,13 @@
+ #define TRACE(...) \
+   if (v8_flags.trace_code_range_allocation) PrintF(__VA_ARGS__)
+ 
+-bool CodeRange::InitReservation(v8::PageAllocator* page_allocator,
+-                                size_t requested, bool immutable) {
++bool CodeRange::InitReservation(
++    v8::PageAllocator* page_allocator, size_t requested, bool immutable,
++    v8::PageAllocator* out_of_cage_page_allocator) {
+   DCHECK_NE(requested, 0);
+   if (V8_EXTERNAL_CODE_SPACE_BOOL) {
+-    page_allocator = GetPlatformPageAllocator();
++    page_allocator = out_of_cage_page_allocator ? out_of_cage_page_allocator
++                                                : GetPlatformPageAllocator();
+   }
+ 
+   if (requested <= kMinimumCodeRangeSize) {
+diff --git a/src/heap/cppgc-js/cpp-heap.h b/src/heap/cppgc-js/cpp-heap.h
+--- a/src/heap/cppgc-js/cpp-heap.h
++++ b/src/heap/cppgc-js/cpp-heap.h
+@@ -108,7 +108,9 @@
+     return static_cast<const CppHeap*>(heap);
+   }
+ 
+-  CppHeap(v8::Platform*,
++  // |page_allocator| may be null, in which case the platform's page allocator
++  // is used (see v8::CppHeapCreateParams::page_allocator).
++  CppHeap(v8::Platform*, v8::PageAllocator* page_allocator,
+           const std::vector<std::unique_ptr<cppgc::CustomSpaceBase>>&,
+           cppgc::Heap::MarkingType, cppgc::Heap::SweepingType,
+           std::optional<cppgc::StackStartMarker>);
+diff --git a/src/heap/cppgc-js/cpp-heap.cc b/src/heap/cppgc-js/cpp-heap.cc
+--- a/src/heap/cppgc-js/cpp-heap.cc
++++ b/src/heap/cppgc-js/cpp-heap.cc
+@@ -105,8 +105,9 @@
+ std::unique_ptr<CppHeap> CppHeap::Create(v8::Platform* platform,
+                                          const CppHeapCreateParams& params) {
+   return std::make_unique<internal::CppHeap>(
+-      platform, params.custom_spaces, params.marking_support,
+-      params.sweeping_support, params.stack_start_marker);
++      platform, params.page_allocator, params.custom_spaces,
++      params.marking_support, params.sweeping_support,
++      params.stack_start_marker);
+ }
+ 
+ cppgc::AllocationHandle& CppHeap::GetAllocationHandle() {
+@@ -159,13 +160,23 @@
+ 
+ namespace {
+ 
++// The page allocator a CppHeap uses: the one the embedder passed for the heap
++// if any, else the platform's, else cppgc's default.
++cppgc::PageAllocator* SelectPageAllocator(v8::Platform* platform,
++                                          v8::PageAllocator* page_allocator) {
++  if (page_allocator) return page_allocator;
++  if (auto* platform_allocator = platform->GetPageAllocator()) {
++    return platform_allocator;
++  }
++  return &cppgc::internal::GetGlobalPageAllocator();
++}
++
+ class CppgcPlatformAdapter final : public cppgc::Platform {
+  public:
+-  explicit CppgcPlatformAdapter(v8::Platform* platform)
++  CppgcPlatformAdapter(v8::Platform* platform,
++                       v8::PageAllocator* page_allocator)
+       : platform_(platform),
+-        page_allocator_(platform->GetPageAllocator()
+-                            ? platform->GetPageAllocator()
+-                            : &cppgc::internal::GetGlobalPageAllocator()) {}
++        page_allocator_(SelectPageAllocator(platform, page_allocator)) {}
+ 
+   CppgcPlatformAdapter(const CppgcPlatformAdapter&) = delete;
+   CppgcPlatformAdapter& operator=(const CppgcPlatformAdapter&) = delete;
+@@ -523,13 +534,14 @@
+ }
+ 
+ CppHeap::CppHeap(
+-    v8::Platform* platform,
++    v8::Platform* platform, v8::PageAllocator* page_allocator,
+     const std::vector<std::unique_ptr<cppgc::CustomSpaceBase>>& custom_spaces,
+     cppgc::Heap::MarkingType marking_support,
+     cppgc::Heap::SweepingType sweeping_support,
+     std::optional<cppgc::StackStartMarker> stack_start_marker)
+     : cppgc::internal::HeapBase(
+-          std::make_shared<CppgcPlatformAdapter>(platform), custom_spaces,
++          std::make_shared<CppgcPlatformAdapter>(platform, page_allocator),
++          custom_spaces,
+           cppgc::internal::HeapBase::StackSupport::
+               kSupportsConservativeStackScan,
+           marking_support, sweeping_support, *this, stack_start_marker),

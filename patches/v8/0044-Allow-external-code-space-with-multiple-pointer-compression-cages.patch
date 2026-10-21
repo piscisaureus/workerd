@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bert Belder <bertbelder@gmail.com>
+Date: Wed, 23 Sep 2026 12:00:00 +0000
+Subject: Allow external code space with multiple pointer compression cages
+
+The Bazel build only enabled the external code space when the shared
+pointer compression cage was in use, which in turn disabled the sandbox
+and static roots for multi-cage builds. The GN build has no such
+restriction: external code space only requires pointer compression, and
+V8's own "no shared cage" bot builds with the sandbox and the external
+code space enabled. Gate the external code space on pointer compression
+alone so that a multi-cage build (v8_enable_pointer_compression_shared_cage
+= False) keeps the external code space, static roots and the sandbox.
+
+diff --git a/BUILD.bazel b/BUILD.bazel
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -418,12 +418,12 @@
+     default = True,
+ )
+
+-# Enable support for external code range if enable_pointer_compression_shared_cage and
+-# v8_enable_external_code_space.
++# Enable support for external code range if v8_enable_pointer_compression and
++# v8_enable_external_code_space. This applies to both shared and multiple cages.
+ selects.config_setting_group(
+     name = "enable_external_code_space",
+     match_all = [
+-        ":enable_pointer_compression_shared_cage",
++        ":is_v8_enable_pointer_compression",
+         ":is_v8_enable_external_code_space",
+     ],
+ )

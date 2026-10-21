@@ -1,0 +1,4 @@
+trace-jemalloc-bigbody round=1 arm=critical wl=bigbody c=1 n=6271 p50=882 p90=914 p99=2160 mean=956 rps=1045 non200=0 errors=1 rss_kb=149684 mc=967 sc=0
+trace-jemalloc-bigbody round=1 arm=plain wl=bigbody c=1 n=6531 p50=878 p90=913 p99=1559 mean=918 rps=1088 non200=0 errors=1 rss_kb=150732 mc=503 sc=0
+trace-jemalloc-bigbody round=1 arm=off wl=bigbody c=1 n=5511 p50=889 p90=1901 p99=2202 mean=1088 rps=918 non200=0 errors=1 rss_kb=6789132 mc=7 sc=2
+DONE trace-jemalloc-bigbody
