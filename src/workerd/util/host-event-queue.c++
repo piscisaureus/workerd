@@ -3,12 +3,15 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include <workerd/util/host-event-queue.h>
-
 #include <workerd/util/host-memory.h>
 #include <workerd/util/hostcall.h>
 
 #include <kj/async.h>
 #include <kj/debug.h>
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+#include <workerd/experimental/guest-kernel/gk.h>
+#endif
 
 #include <new>
 
@@ -19,9 +22,22 @@ using kj::EventLoop;
 using Event = kj::_::Event;
 using ArmKind = kj::_::ArmKind;
 
+// Whether the guest kernel is active, read once host-side and kept (gk_init() runs before any
+// isolate exists and never again). Mirrors host-memory.c++'s own cached check; without the guest
+// kernel it is always false and every gk-gated branch below is dropped.
+bool guestKernelActive() {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  static const bool active = gk_initialized() != 0;
+  return active;
+#else
+  return false;
+#endif
+}
+
 // The journal capacity before an in-turn arm or disarm must flush it through one VM exit to make
 // room. A single named constant so it is tunable; 256 is the chosen size, matching the reserved
-// pool a turn's resolve registrations use (util/host-memory.h).
+// pool a turn's resolve registrations use (util/host-memory.h). It is the capacity the host
+// iterates when it applies the journal, never a count the guest can write (see applyJournal).
 constexpr size_t EVENT_JOURNAL_CAP = 256;
 
 // What a loop keeps for an event's place, encoded into the eight bytes kj holds for it (the
@@ -93,8 +109,8 @@ struct HostQueue {
       a.next = &b;
       b.prev = &a.next;
     };
-    for (HostLink* s: {&headLink, &depthPoint, &breadthPoint, &tailLink, &wouldSleepHead,
-             &wouldSleepTail}) {
+    for (HostLink* s:
+        {&headLink, &depthPoint, &breadthPoint, &tailLink, &wouldSleepHead, &wouldSleepTail}) {
       *s = HostLink{nullptr, nullptr, nullptr};
     }
     chain(headLink, depthPoint);
@@ -227,9 +243,10 @@ struct HostQueue {
   }
 };
 
-// A turn's journal: arms and disarms recorded in order, applied host-side when the turn ends. ARM
-// names the event to arm; DISARM names the host-queue link index of an already-applied arm; NOP is
-// an arm annulled by a disarm in the same turn before it was applied.
+// A turn's journal record: an arm or disarm recorded in order, applied host-side when the turn
+// ends. ARM names the event to arm; DISARM names the host-queue link index of an already-applied
+// arm; NOP is an arm annulled by a disarm in the same turn before it was applied, or a slot the
+// host has consumed. These are payloads only -- nothing the host trusts rides in them.
 struct Record {
   enum Op : uint8_t { NOP, ARM, DISARM } op;
   ArmKind kind;
@@ -237,17 +254,89 @@ struct Record {
   uint64_t index;
 };
 
-// Per thread. The records are ordinary (guest-writable) memory the turn appends to; the host reads
-// them when the turn ends, validating each (a disarm's index against the pool, an arm against the
-// event's own token). `loop` is captured host-side at the turn's start, not from anything the turn
-// writes.
-struct Journal {
-  Record records[EVENT_JOURNAL_CAP];
-  size_t count = 0;
+// The guest-writable per-thread record region: the payloads a turn appends at ring 3, read by the
+// host when the turn ends but never trusted. `count` is the turn's own append cursor; the host
+// does not read it to decide what to apply -- applyJournal walks the full capacity and validates
+// each slot on its own, so a forged cursor can neither drop a record nor send the host into a slot
+// the turn did not write (every unwritten slot is NOP). Static thread-local storage is ordinary
+// process memory every arena maps writable (memory-classes.md R7), so each isolate's turn on this
+// thread appends to the same region, which is why the records live here and not in host memory the
+// guest cannot reach or on the C++ heap the first isolate's arena would claim.
+struct JournalRecords {
+  Record records[EVENT_JOURNAL_CAP] = {};
+  size_t count = 0;  // untrusted append cursor; see above
+};
+thread_local JournalRecords tlRecords;
+
+// The per-thread metadata the host trusts when it applies a journal or flushes it mid-turn: which
+// loop and relocated queue the records belong to, and whether a turn is in progress. None of it
+// lives in guest-writable memory. With the guest kernel it sits behind a per-thread supervisor
+// word (EVENT_THREAD_WORD below) a JS turn at ring 3 cannot write, exactly as the resolve pool
+// sits behind POOL_THREAD_WORD (util/host-memory.c++); without the guest kernel it sits behind a
+// thread-local, where there is no turn to distrust and today's behavior is preserved. `queue` is
+// the resolved host-memory queue, cached host-side while the loop's handle is provably the host's
+// own (onLoopConstructed, or the turn's start), so a handle a turn forges mid-turn cannot steer
+// which queue a flush or an apply mutates.
+struct EventThreadState {
   EventLoop* loop = nullptr;
+  HostQueue* queue = nullptr;
   bool active = false;
 };
-thread_local Journal tlJournal;
+
+#ifdef WORKERD_HAS_GUEST_KERNEL
+// The free per-thread word above the ones already owned: the progress counter's 0..2
+// (util/thread-scopes.c++) and the resolve pool's 3 (util/host-memory.c++, POOL_THREAD_WORD).
+constexpr unsigned EVENT_THREAD_WORD = 4;
+static_assert(EVENT_THREAD_WORD < GK_THREAD_WORDS);
+#endif
+// Used only without the guest kernel (or before gk_init()); see stateOfThread().
+thread_local EventThreadState* fallbackState = nullptr;
+
+EventThreadState* stateOfThread() {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (guestKernelActive()) {
+    uint64_t word = 0;
+    if (gk_thread_words_get(EVENT_THREAD_WORD, 1, &word) != 0) return nullptr;
+    return reinterpret_cast<EventThreadState*>(static_cast<uintptr_t>(word));
+  }
+#endif
+  return fallbackState;
+}
+
+void setStateOfThread(EventThreadState* state) {
+#ifdef WORKERD_HAS_GUEST_KERNEL
+  if (guestKernelActive()) {
+    uint64_t word = reinterpret_cast<uintptr_t>(state);
+    KJ_ASSERT(gk_thread_words_set(EVENT_THREAD_WORD, 1, &word) == 0);
+    return;
+  }
+#endif
+  fallbackState = state;
+}
+
+// Frees the thread's state block when the thread exits. The loop and queue it names are owned
+// elsewhere (onLoopDestroyed tears the queue down); this only reclaims the block itself.
+struct StateReleaser {
+  ~StateReleaser() noexcept(false) {
+    EventThreadState* state = stateOfThread();
+    if (state == nullptr) return;
+    setStateOfThread(nullptr);
+    state->~EventThreadState();
+    hostMemory::deallocate(state, sizeof(EventThreadState), alignof(EventThreadState));
+  }
+};
+
+EventThreadState& ensureStateOfThread() {
+  EventThreadState* state = stateOfThread();
+  if (state == nullptr) {
+    state = new (hostMemory::allocate(sizeof(EventThreadState), alignof(EventThreadState)))
+        EventThreadState();
+    setStateOfThread(state);
+    static thread_local StateReleaser releaser;
+    (void)releaser;
+  }
+  return *state;
+}
 
 HostQueue* resolveQueue(EventLoop& loop) {
   uint64_t handle = loop.queueHandle();
@@ -255,15 +344,23 @@ HostQueue* resolveQueue(EventLoop& loop) {
   return static_cast<HostQueue*>(hostMemory::resolveSlot(handle));
 }
 
-void applyJournal(HostQueue& queue, Journal& journal) {
-  for (size_t i = 0; i < journal.count; i++) {
-    Record& r = journal.records[i];
-    switch (r.op) {
+// Apply the records to the loop's host-memory queue. Walks the host-trusted capacity, never
+// rec.count: a forged cursor cannot make the host skip a record -- skipping a disarm would strand a
+// host-queue link pointing at a freed event for turn() to fire. Each slot is validated on its own
+// and consumed (set NOP) as it is read, so that no stale payload survives to a later apply where it
+// would be re-read against an event that has since been freed. An arm is honored only while the
+// event still holds the PENDING token this very slot wrote; a disarm's link index is bounds-checked
+// against the loop's own pool inside disarmByIndex. A payload a turn scribbles can therefore do no
+// more than disturb this isolate's own queue (fired at ring 3, within the isolate).
+void applyJournal(HostQueue& queue, JournalRecords& rec) {
+  for (size_t i = 0; i < EVENT_JOURNAL_CAP; i++) {
+    Record& r = rec.records[i];
+    Record::Op op = r.op;
+    r.op = Record::NOP;  // consume the slot before acting on it
+    switch (op) {
       case Record::NOP:
         break;
       case Record::ARM:
-        // Apply only if the event is still the pending arm this record stands for; a disarm earlier
-        // in the turn annuls it (NOP) or supersedes it.
         if (tokenState(r.event->queueToken()) == TokenState::PENDING &&
             tokenPayload(r.event->queueToken()) == i) {
           size_t index = queue.armLink(*r.event, r.kind);
@@ -275,25 +372,24 @@ void applyJournal(HostQueue& queue, Journal& journal) {
         break;
     }
   }
-  journal.count = 0;
+  rec.count = 0;
 }
 
-// Apply the calling thread's journal to its loop's host-memory queue. Runs host-side, either at the
-// end of the turn (HostEventQueueTurn) or, when the journal fills mid-turn, through this hostcall --
-// one VM exit, which the guest kernel turns into a direct call when it is off.
+// Apply the calling thread's records to its loop's host-memory queue. Runs host-side, either at the
+// end of the turn (HostEventQueueTurn) or, when the records fill mid-turn, through this hostcall --
+// one VM exit, which the guest kernel turns into a direct call when it is off. The queue comes from
+// the host-trusted per-thread state, never from anything the turn can write, so a forged handle or
+// loop pointer cannot steer which queue this mutates.
 long eventQueueHostcall(hostcall::Frame& frame) {
   (void)frame;
-  Journal& journal = tlJournal;
-  if (journal.loop != nullptr) {
-    HostQueue* queue = resolveQueue(*journal.loop);
-    if (queue != nullptr) {
-      applyJournal(*queue, journal);
-      return 0;
-    }
+  EventThreadState* state = stateOfThread();
+  if (state != nullptr && state->queue != nullptr) {
+    applyJournal(*state->queue, tlRecords);
+    return 0;
   }
-  // No queue to apply to (a forged or cleared handle); drop the records so the slab makes room. The
-  // applied arms this would strand are the turn's own; see the handle discussion above.
-  journal.count = 0;
+  // No queue to apply to (none cached for this thread); drop the records so the slab makes room.
+  // The applied arms this would strand are the turn's own.
+  tlRecords.count = 0;
   return 0;
 }
 
@@ -310,10 +406,13 @@ void flushJournalMidTurn() {
 }
 
 void journalArm(Event& event, ArmKind kind) {
-  if (tlJournal.count == EVENT_JOURNAL_CAP) flushJournalMidTurn();
-  size_t slot = tlJournal.count;
-  tlJournal.records[slot] = Record{Record::ARM, kind, &event, 0};
-  tlJournal.count = slot + 1;
+  // count is the turn's own cursor; a value it has drifted to at or past the capacity flushes the
+  // slab (which resets the cursor) rather than writing past the records, so a forged cursor harms
+  // only this turn's own bookkeeping, never host memory.
+  if (tlRecords.count >= EVENT_JOURNAL_CAP) flushJournalMidTurn();
+  size_t slot = tlRecords.count;
+  tlRecords.records[slot] = Record{Record::ARM, kind, &event, 0};
+  tlRecords.count = slot + 1;
   event.setQueueToken(makeToken(TokenState::PENDING, slot));
 }
 
@@ -339,17 +438,19 @@ void disarmHook(EventLoop& loop, Event& event) {
   uint64_t payload = tokenPayload(token);
   if (hostMemory::inTurn()) {
     if (state == TokenState::PENDING) {
-      // Annul the pending arm in place: no new record, nothing to apply. (Still in this journal
-      // generation at `payload`; a flush since the arm would have left the event APPLIED instead.)
-      if (payload < tlJournal.count && tlJournal.records[payload].event == &event) {
-        tlJournal.records[payload].op = Record::NOP;
+      // Annul the pending arm in place: no new record, nothing to apply. The slot is bounded by the
+      // capacity (not the untrusted cursor) and confirmed to still name this event; if it does not,
+      // the arm is left to the apply, which skips it anyway because the token below goes to zero.
+      // (A flush since the arm would have left the event APPLIED instead of PENDING.)
+      if (payload < EVENT_JOURNAL_CAP && tlRecords.records[payload].event == &event) {
+        tlRecords.records[payload].op = Record::NOP;
       }
       event.setQueueToken(0);
     } else if (state == TokenState::APPLIED) {
-      if (tlJournal.count == EVENT_JOURNAL_CAP) flushJournalMidTurn();
-      size_t slot = tlJournal.count;
-      tlJournal.records[slot] = Record{Record::DISARM, ArmKind::DEPTH_FIRST, &event, payload};
-      tlJournal.count = slot + 1;
+      if (tlRecords.count >= EVENT_JOURNAL_CAP) flushJournalMidTurn();
+      size_t slot = tlRecords.count;
+      tlRecords.records[slot] = Record{Record::DISARM, ArmKind::DEPTH_FIRST, &event, payload};
+      tlRecords.count = slot + 1;
       event.setQueueToken(0);
     }
   } else {
@@ -399,14 +500,25 @@ void onLoopConstructedHook(EventLoop& loop) {
   hostMemory::SlotHandle handle = hostMemory::allocateSlot(sizeof(HostQueue), alignof(HostQueue));
   void* mem = hostMemory::resolveSlot(handle);
   KJ_ASSERT(mem != nullptr, "a fresh host slot handle must resolve");
-  new (mem) HostQueue();
+  auto* queue = new (mem) HostQueue();
   loop.setQueueHandle(handle);
+  // Cache the loop and its just-resolved queue in the host-trusted per-thread state, while the
+  // handle is provably the host's own (a turn has not run on this loop yet). The turn-end apply and
+  // the mid-turn flush read the queue from here, never by re-resolving a handle a turn can forge.
+  EventThreadState& st = ensureStateOfThread();
+  st.loop = &loop;
+  st.queue = queue;
 }
 
 void onLoopDestroyedHook(EventLoop& loop) {
   uint64_t handle = loop.queueHandle();
   if (handle == 0) return;
   auto* queue = static_cast<HostQueue*>(hostMemory::resolveSlot(handle));
+  EventThreadState* st = stateOfThread();
+  if (st != nullptr && st->loop == &loop) {
+    st->loop = nullptr;
+    st->queue = nullptr;
+  }
   if (queue != nullptr) {
     queue->teardown();
     queue->~HostQueue();
@@ -426,11 +538,66 @@ const kj::_::EventQueueHooks HOOKS = {
   &onLoopDestroyedHook,
 };
 
+// A standalone event for the count-forge check: it carries only a queue token and is never fired or
+// armed through kj, so it needs no running loop. Its token is cleared before it is destroyed, so
+// ~Event's disarm() sees it unarmed and touches no queue.
+struct TestEvent final: public Event {
+  TestEvent(): Event(kj::SourceLocation()) {}
+  void fire() override {}
+  void traceEvent(kj::_::TraceBuilder&) override {}
+};
+
+bool countForgeInert() {
+  // The standalone events are destroyed on this host frame, which may sit under a scope that
+  // forbids destroying async objects; this check builds and tears down its own, so permit it.
+  kj::AllowAsyncDestructorsScope allowDestructors;
+  HostQueue queue;
+  JournalRecords rec;
+  TestEvent e0;
+  TestEvent e1;
+
+  // Arm two events through the journal and apply, as a turn's end would: both take a host link and
+  // their tokens become APPLIED, with e0 at the head.
+  rec.records[0] = Record{Record::ARM, ArmKind::DEPTH_FIRST, &e0, 0};
+  e0.setQueueToken(makeToken(TokenState::PENDING, 0));
+  rec.records[1] = Record{Record::ARM, ArmKind::DEPTH_FIRST, &e1, 0};
+  e1.setQueueToken(makeToken(TokenState::PENDING, 1));
+  rec.count = 2;
+  applyJournal(queue, rec);
+
+  bool armedBoth = queue.head() == &e0 && tokenState(e0.queueToken()) == TokenState::APPLIED &&
+      tokenState(e1.queueToken()) == TokenState::APPLIED;
+
+  // The attack: record a disarm of e0 at a high slot, then forge the cursor down to zero. An apply
+  // that trusted the cursor would walk no records and leave e0's link live past its disarm.
+  uint64_t e0LinkIndex = tokenPayload(e0.queueToken());
+  size_t highSlot = EVENT_JOURNAL_CAP - 1;
+  rec.records[highSlot] = Record{Record::DISARM, ArmKind::DEPTH_FIRST, &e0, e0LinkIndex};
+  rec.count = 0;  // forged
+  applyJournal(queue, rec);
+
+  // The disarm ran despite the forged cursor: e0's link is freed and the head is now e1, so no link
+  // is left pointing at the event the disarm named. That is the forge shown inert.
+  bool disarmRan = queue.head() == &e1;
+
+  // Leave the events unarmed before they fall out of scope (~Event would otherwise read the token
+  // as a link), and tear the standalone queue down.
+  e0.setQueueToken(0);
+  e1.setQueueToken(0);
+  queue.teardown();
+
+  return armedBoth && disarmRan;
+}
+
 }  // namespace
 
 const void* resolveQueueHandleForTest(uint64_t handle) {
   if (handle == 0) return nullptr;
   return hostMemory::resolveSlot(handle);
+}
+
+bool countForgeInertForTest() {
+  return countForgeInert();
 }
 
 void installHostEventQueue() {
@@ -440,25 +607,29 @@ void installHostEventQueue() {
 
 HostEventQueueTurn::HostEventQueueTurn(): outermost(false) {
   if (kj::_::getEventQueueHooks() == nullptr) return;  // not a guest-kernel build: nothing to do
-  if (tlJournal.active) return;                        // nested in an outer turn
+  EventThreadState& st = ensureStateOfThread();
+  if (st.active) return;  // nested in an outer turn
   outermost = true;
-  tlJournal.active = true;
-  tlJournal.count = 0;
-  tlJournal.loop = kj::EventLoop::saveCurrentLoopPointer();
+  st.active = true;
+  // The loop running on this thread, read host-side before the turn can forge anything. Its queue
+  // was cached host-side at onLoopConstructed; resolve it here for a loop whose cache this thread
+  // does not hold (handle still the host's own, the turn not yet entered).
+  EventLoop* loop = kj::EventLoop::saveCurrentLoopPointer();
+  if (loop != nullptr && loop != st.loop) {
+    st.loop = loop;
+    st.queue = resolveQueue(*loop);
+  }
 }
 
 HostEventQueueTurn::~HostEventQueueTurn() noexcept(false) {
   if (!outermost) return;
-  if (tlJournal.loop != nullptr) {
-    HostQueue* queue = resolveQueue(*tlJournal.loop);
-    if (queue != nullptr) {
-      applyJournal(*queue, tlJournal);
-      tlJournal.loop->setRunnableFromQueueHooks(queue->head() != nullptr);
-    }
+  EventThreadState& st = ensureStateOfThread();
+  if (st.queue != nullptr) {
+    applyJournal(*st.queue, tlRecords);
+    if (st.loop != nullptr) st.loop->setRunnableFromQueueHooks(st.queue->head() != nullptr);
   }
-  tlJournal.count = 0;
-  tlJournal.active = false;
-  tlJournal.loop = nullptr;
+  tlRecords.count = 0;
+  st.active = false;
 }
 
 }  // namespace workerd

@@ -174,7 +174,7 @@ struct Record {
 
 class Journal {
  public:
-  Journal(HostQueue& q, size_t cap): queue(q), cap(cap), records(new Record[cap]) {}
+  Journal(HostQueue& q, size_t cap): queue(q), cap(cap), records(new Record[cap]()) {}
   ~Journal() {
     delete[] records;
   }
@@ -213,9 +213,11 @@ class Journal {
   // runs host-side after the guest returns; at turn end it rides the return that ends the turn, so
   // it is not an extra exit. A mid-turn flush is one extra exit, counted.
   void apply() {
-    for (uint32_t i = 0; i < count; i++) {
+    for (uint32_t i = 0; i < cap; i++) {
       Record& r = records[i];
-      switch (r.op) {
+      Record::Op op = r.op;
+      r.op = Record::NOP;  // consume the slot before acting on it
+      switch (op) {
         case Record::NOP:
           break;
         case Record::ARM: {

@@ -1184,6 +1184,21 @@ void maybeForceGuestFaultForTest(kj::StringPtr url, Worker::Lock& lock) {
           addr(realResolved), addr(forgedResolved), verdict);
     });
   }
+  // The journal metadata the host trusts to apply a turn's arms and disarms -- the record cursor
+  // and the loop/queue the records belong to -- no longer lives in guest-writable memory, so a turn
+  // that forges the cursor or scribbles the records cannot drop its own disarm and strand a
+  // host-queue link pointing at its own freed event. The host walks the journal's full capacity
+  // rather than the cursor, and reaches the queue through a per-thread supervisor word a turn
+  // cannot write (util/host-event-queue.c++). This drives that proof on the host: it arms two
+  // events, applies, then records a disarm of the first at a high slot with the cursor forged to
+  // zero and applies again -- the disarm still runs, so no link is left on the freed event.
+  if (probeEnabled && url.endsWith("/__gk_queue_count_forge")) {
+    Worker::Lock::runAtNextReleaseForTest([](Worker::Lock&) {
+      bool inert = workerd::countForgeInertForTest();
+      kj::StringPtr verdict = inert ? "inert"_kj : "stranded"_kj;
+      KJ_LOG(WARNING, "WORKERD_GK_TEST_PROBE: event journal count forge on the host", verdict);
+    });
+  }
 #ifdef __linux__
   // Another thread's copy of the same pointer (see the comment above armOtherThreadLoopForTest).
   if (probeEnabled && url.endsWith("/__gk_loop_other_arm")) {

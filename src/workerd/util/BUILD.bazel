@@ -195,6 +195,14 @@ wd_cc_library(
     name = "host-event-queue",
     srcs = ["host-event-queue.c++"],
     hdrs = ["host-event-queue.h"],
+    implementation_deps = select({
+        # Experimental guest-kernel isolation is x86-64 Linux only; the dep and
+        # its WORKERD_HAS_GUEST_KERNEL define are dropped elsewhere.
+        "//src/workerd/experimental/guest-kernel:is_linux_x86_64": [
+            "//src/workerd/experimental/guest-kernel",
+        ],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         ":host-memory",

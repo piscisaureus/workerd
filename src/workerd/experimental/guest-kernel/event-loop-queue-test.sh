@@ -19,6 +19,13 @@
 # it resolves both the real handle and the forged value through the slot table exactly as the loop
 # does: the real one names the loop's queue, the forged one resolves to nothing -- "inert".
 #
+# /__gk_queue_count_forge drives the companion proof for the journal the turn's in-turn arms and
+# disarms go through. The metadata the host trusts to apply it -- the record cursor and which
+# loop/queue the records belong to -- is in host memory a turn cannot write, and the host applies
+# the journal by walking its full capacity rather than the cursor. So a turn that forges the cursor
+# to zero cannot drop its own disarm and leave a host-queue link pointing at an event it has freed:
+# the disarm still runs -- "inert".
+#
 # Usage: event-loop-queue-test.sh [path/to/workerd]
 #   defaults to bazel-bin/src/workerd/server/workerd in the repo root. Needs /dev/kvm and curl.
 #   GK_LOOPQ_TEST_HELLO_PORT / GK_LOOPQ_TEST_VICTIM_PORT override the ports (8805 / 8804).
@@ -100,4 +107,21 @@ echo "3. GET $victim/ -> $s (the loop still serves after the poisoned turn)"
 s=$(status "$hello/")
 [ "$s" = 200 ] || fail "hello stopped serving"
 
-echo "PASS: a turn's write to the loop's queue handle is inert; turn() dereferences only the host-memory queue"
+# The journal the in-turn arms and disarms go through. A turn that forges the record cursor to zero
+# cannot drop its own disarm: the host applies the journal by walking its full capacity, not the
+# cursor, and reaches the queue through a per-thread word a turn cannot write, so the disarm still
+# runs and no host-queue link is left on the freed event. /__gk_queue_count_forge drives this on the
+# host -- arm two events, apply, record a disarm of the first at a high slot with the cursor forged
+# to zero, apply again -- and reports the verdict.
+s=$(status "$victim/__gk_queue_count_forge")
+echo "4. GET $victim/__gk_queue_count_forge -> $s (the count-forge probe must complete)"
+[ "$s" = 200 ] || fail "the count-forge probe request did not complete"
+kill -0 "$pid" 2>/dev/null || fail "workerd died running the count-forge probe"
+
+forge=$(wait_line "event journal count forge on the host" 1)
+[ -n "$forge" ] || fail "the count-forge probe did not run on the host"
+echo "5. $forge"
+[ "$(last_field "$forge")" = inert ] ||
+  fail "a forged journal cursor dropped a disarm (a host-queue link was left on a freed event)"
+
+echo "PASS: a turn's write to the loop's queue handle is inert and a forged journal cursor cannot drop a disarm; turn() dereferences only the host-memory queue"
